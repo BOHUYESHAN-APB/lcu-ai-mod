@@ -24,7 +24,7 @@ public class MovementSystem {
 
     public static void moveTo(double x, double y, double z, float speed) {
         lastSpeed = speed;
-        Pathfinder.navigateTo(x, y, z);
+        Pathfinder.navigateTo(null, x, y, z);
     }
 
     public static void stop() {

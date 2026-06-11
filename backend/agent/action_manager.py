@@ -26,6 +26,10 @@ class Action:
     timed_out: bool = False
     result: Any = None
     error: Optional[str] = None
+    req_id: Optional[str] = None
+    dispatched: bool = False
+    progress: float = 0.0
+    progress_message: str = ""
 
     @property
     def elapsed(self) -> float:
@@ -111,12 +115,20 @@ class ActionManager:
 
         # Execute the action function
         try:
-            result = cur.fn()
-            if result is not None:
+            if not cur.dispatched:
+                result = cur.fn()
+                cur.dispatched = True
                 cur.result = result
-                cur.completed = True
-                logger.info("[ActionMgr] Completed: %s", cur.label)
-                self.current = None
+
+                if isinstance(result, dict) and result.get("req_id"):
+                    cur.req_id = str(result["req_id"])
+                    logger.info("[ActionMgr] Dispatched: %s (req=%s)", cur.label, cur.req_id)
+                    return
+
+                if result is not None:
+                    cur.completed = True
+                    logger.info("[ActionMgr] Completed immediately: %s", cur.label)
+                    self.current = None
         except Exception as e:
             cur.error = str(e)
             cur.interrupted = True
@@ -126,8 +138,19 @@ class ActionManager:
     def handle_response(self, req_id: str, success: bool):
         """Handle a response from the Java mod for a pending action."""
         cur = self.current
-        if cur:
+        if cur and cur.req_id == req_id:
             logger.debug("[ActionMgr] Response for %s: req=%s success=%s", cur.label, req_id, success)
+            cur.completed = success
+            if not success:
+                cur.error = f"command failed: {req_id}"
+                cur.interrupted = True
+            self.current = None
+
+    def handle_progress(self, req_id: str, progress: float, message: str = ""):
+        cur = self.current
+        if cur and cur.req_id == req_id:
+            cur.progress = progress
+            cur.progress_message = message
 
     def pop_resume(self) -> Optional[Action]:
         """Return next resume-able action if idle, or None."""
@@ -157,6 +180,9 @@ class ActionManager:
                 "completed": cur.completed,
                 "interrupted": cur.interrupted,
                 "timed_out": cur.timed_out,
+                "req_id": cur.req_id,
+                "progress": cur.progress,
+                "progress_message": cur.progress_message,
             }
         return {"label": None, "resume_queue": len(self._resume_queue)}
 

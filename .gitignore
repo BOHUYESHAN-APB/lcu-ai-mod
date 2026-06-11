@@ -24,6 +24,12 @@ Thumbs.db
 # Python backend
 backend/__pycache__/
 backend/*/__pycache__/
+backend/**/__pycache__/
+backend/data/
+backend/*.db
+backend/**/*.db
+backend/config.json
+*.pyc
 backend/.env
 backend/.api_key
 backend/*.egg-info/

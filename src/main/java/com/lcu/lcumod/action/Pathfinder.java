@@ -1,6 +1,7 @@
 package com.lcu.lcumod.action;
 
 import com.lcu.lcumod.LCUMod;
+import com.lcu.lcumod.network.WireServer;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
@@ -51,18 +52,23 @@ public class Pathfinder {
     private static boolean isNavigating = false;
     private static Vec3 lastPosition = null;
     private static int stuckTicks = 0;
+    private static String lastFailureReason = "";
+    private static String activeRequestId = null;
 
-    public static void navigateTo(double x, double y, double z) {
+    public static boolean navigateTo(String requestId, double x, double y, double z) {
         targetPos = new Vec3(x, y, z);
         currentPath.clear();
         currentPathIndex = 0;
         isNavigating = true;
         lastPosition = null;
         stuckTicks = 0;
-        calculatePath();
+        lastFailureReason = "";
+        activeRequestId = requestId;
+        return calculatePath();
     }
 
     public static void stop() {
+        activeRequestId = null;
         targetPos = null;
         currentPath.clear();
         currentPathIndex = 0;
@@ -80,12 +86,14 @@ public class Pathfinder {
 
         if (!InputIsolation.isAiControlled()) {
             InputIsolation.clearAiControls();
+            reportProgress(0.0, "navigation canceled: user override");
             stop();
             return;
         }
 
         Vec3 playerPos = mc.player.position();
         if (isReached(playerPos, targetPos)) {
+            reportProgress(1.0, "arrived");
             stop();
             return;
         }
@@ -100,6 +108,7 @@ public class Pathfinder {
             calculatePath();
             if (currentPath.isEmpty()) {
                 LCUMod.LOGGER.warn("[Pathfinder] No path found to target");
+                reportProgress(0.0, lastFailureReason.isBlank() ? "no path found" : lastFailureReason);
                 stop();
                 return;
             }
@@ -117,28 +126,41 @@ public class Pathfinder {
         moveToward(mc, playerPos, nextPoint);
     }
 
-    private static void calculatePath() {
+    private static boolean calculatePath() {
         Minecraft mc = Minecraft.getInstance();
-        if (mc.player == null || mc.level == null || targetPos == null) return;
+        if (mc.player == null || mc.level == null || targetPos == null) return false;
 
-        StandingNode start = findClosestStandingNode(mc.level, mc.player.position(), 1, 3);
-        StandingNode goal = findClosestStandingNode(mc.level, targetPos, 2, 4);
+        StandingNode start = findClosestStandingNode(mc.level, mc.player.position(), 2, 4);
+        StandingNode goal = findClosestStandingNode(mc.level, targetPos, 3, 6);
         currentPath.clear();
         currentPathIndex = 0;
 
         if (start == null || goal == null) {
-            LCUMod.LOGGER.warn("[Pathfinder] Could not resolve start/goal stand positions");
-            return;
+            lastFailureReason = start == null && goal == null
+                ? "could not resolve start and goal stand positions"
+                : start == null
+                    ? "could not resolve current stand position"
+                    : "could not resolve target stand position";
+            LCUMod.LOGGER.warn("[Pathfinder] {}", lastFailureReason);
+            return false;
+        }
+
+        if (isGoal(start, goal)) {
+            currentPath.add(goal.standingPos);
+            LCUMod.LOGGER.info("[Pathfinder] Start and goal share the same stand node; using direct target point");
+            return true;
         }
 
         List<Vec3> solved = findPath(mc, start, goal);
         if (solved.isEmpty()) {
-            LCUMod.LOGGER.warn("[Pathfinder] A* search failed: start={} goal={}", start.supportPos, goal.supportPos);
-            return;
+            lastFailureReason = String.format("A* search failed from %s to %s", start.supportPos, goal.supportPos);
+            LCUMod.LOGGER.warn("[Pathfinder] {}", lastFailureReason);
+            return false;
         }
 
         currentPath.addAll(solved);
         LCUMod.LOGGER.info("[Pathfinder] Calculated path with {} waypoints", currentPath.size());
+        return true;
     }
 
     private static List<Vec3> findPath(Minecraft mc, StandingNode start, StandingNode goal) {
@@ -450,6 +472,16 @@ public class Pathfinder {
         }
         return String.format("Navigating to (%.0f, %.0f, %.0f) path=%d idx=%d",
             targetPos.x, targetPos.y, targetPos.z, currentPath.size(), currentPathIndex);
+    }
+
+    public static String getLastFailureReason() {
+        return lastFailureReason;
+    }
+
+    private static void reportProgress(double progress, String message) {
+        if (activeRequestId != null && LCUMod.WIRE != null) {
+            LCUMod.WIRE.sendProgress(activeRequestId, progress, message);
+        }
     }
 
     private record StandingNode(BlockPos supportPos, Vec3 standingPos) {}

@@ -164,6 +164,11 @@ class Session:
                 req_id = data.get("id", "?")
                 success = data.get("success", False)
                 self.action_manager.handle_response(req_id, success)
+            case "command_progress":
+                req_id = data.get("id", "?")
+                progress = float(data.get("progress", 0.0) or 0.0)
+                message = data.get("message", "")
+                self.action_manager.handle_progress(req_id, progress, message)
             case _:
                 logger.debug("[Session] Unhandled event: %s", event_type)
 

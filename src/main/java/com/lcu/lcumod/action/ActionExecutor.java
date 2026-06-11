@@ -303,7 +303,14 @@ public class ActionExecutor {
         double z = args.get("z").getAsDouble();
         
         // Use Pathfinder for A* navigation
-        Pathfinder.navigateTo(x, y, z);
+        boolean accepted = Pathfinder.navigateTo(cmd.id(), x, y, z);
+        if (!accepted) {
+            sendResponse(cmd.id(), false, Pathfinder.getLastFailureReason());
+            return;
+        }
+        if (LCUMod.WIRE != null) {
+            LCUMod.WIRE.sendProgress(cmd.id(), 0.05, "path accepted");
+        }
         sendResponse(cmd.id(), true, "Navigating to " + (int)x + "," + (int)y + "," + (int)z);
     }
 

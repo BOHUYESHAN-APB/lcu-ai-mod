@@ -150,12 +150,14 @@ finish()"""
                       context: dict) -> Optional[str]:
         """执行规划结果。"""
         plan_lower = plan_text.lower()
+        reply_text: Optional[str] = None
+        executed_any_action = False
         
         # 回复
         if "reply(" in plan_lower:
             content = self._extract_between(plan_text, "reply(", ")")
             if content:
-                return content.strip()
+                reply_text = content.strip()
         
         # 移动
         if "move_to(" in plan_lower:
@@ -163,7 +165,7 @@ finish()"""
             if coords and len(coords) >= 3:
                 self.skills.move_to(coords[0], coords[1], coords[2])
                 logger.info("[Planner] 移动到 (%.0f, %.0f, %.0f)", coords[0], coords[1], coords[2])
-                return None
+                executed_any_action = True
         
         # 跟随玩家
         if "follow(" in plan_lower:
@@ -171,25 +173,25 @@ finish()"""
             if player_name:
                 self.skills.follow_player(player_name.strip())
                 logger.info("[Planner] 跟随 %s", player_name.strip())
-                return None
+                executed_any_action = True
         
         # 攻击
         if "attack()" in plan_lower:
             self.skills.attack()
             logger.info("[Planner] 攻击")
-            return None
+            executed_any_action = True
         
         # 挖掘
         if "mine_block()" in plan_lower or "mine(" in plan_lower:
             self.skills.mine_block()
             logger.info("[Planner] 挖掘")
-            return None
+            executed_any_action = True
         
         # 放置方块
         if "place_block()" in plan_lower or "place(" in plan_lower:
             self.skills.place_block()
             logger.info("[Planner] 放置")
-            return None
+            executed_any_action = True
         
         # 合成
         if "craft(" in plan_lower:
@@ -197,7 +199,7 @@ finish()"""
             if item_name:
                 self.skills.craft_item(item_name.strip())
                 logger.info("[Planner] 合成 %s", item_name.strip())
-                return None
+                executed_any_action = True
         
         # 收集
         if "collect(" in plan_lower:
@@ -208,7 +210,7 @@ finish()"""
                 count = int(parts[1].strip()) if len(parts) > 1 else 1
                 self.skills.collect_blocks(block_type, count)
                 logger.info("[Planner] 收集 %s x%d", block_type, count)
-                return None
+                executed_any_action = True
         
         # 装备
         if "equip(" in plan_lower:
@@ -216,13 +218,13 @@ finish()"""
             if slot:
                 self.skills.equip(slot.strip())
                 logger.info("[Planner] 装备 %s", slot.strip())
-                return None
+                executed_any_action = True
         
         # 查看背包
         if "get_inventory()" in plan_lower:
             self.skills.get_inventory()
             logger.info("[Planner] 查看背包")
-            return None
+            executed_any_action = True
         
         # 探索
         if "explore(" in plan_lower:
@@ -234,7 +236,7 @@ finish()"""
                     logger.info("[Planner] 探索 %d 格", radius)
                 except ValueError:
                     self.skills.explore(16)
-                return None
+                executed_any_action = True
         
         # 交易
         if "trade(" in plan_lower:
@@ -242,19 +244,19 @@ finish()"""
             if villager_type:
                 self.skills.trade(villager_type.strip())
                 logger.info("[Planner] 交易 %s", villager_type.strip())
-                return None
+                executed_any_action = True
         
         # 睡觉
         if "sleep()" in plan_lower:
             self.skills.sleep()
             logger.info("[Planner] 睡觉")
-            return None
+            executed_any_action = True
         
         # 吃东西
         if "eat()" in plan_lower:
             self.skills.eat()
             logger.info("[Planner] 吃东西")
-            return None
+            executed_any_action = True
         
         # 丢弃物品
         if "drop(" in plan_lower:
@@ -265,13 +267,13 @@ finish()"""
                 count = int(parts[1].strip()) if len(parts) > 1 else 1
                 self.skills.drop_item(item, count)
                 logger.info("[Planner] 丢弃 %s x%d", item, count)
-                return None
+                executed_any_action = True
         
         # 整理背包
         if "sort_inventory()" in plan_lower:
             self.skills.sort_inventory()
             logger.info("[Planner] 整理背包")
-            return None
+            executed_any_action = True
         
         # 建造
         if "build(" in plan_lower:
@@ -284,14 +286,20 @@ finish()"""
                         structure = parts[3].strip()
                         self.skills.build(x, y, z, structure)
                         logger.info("[Planner] 建造 %s 在 (%.0f, %.0f, %.0f)", structure, x, y, z)
+                        executed_any_action = True
                     except ValueError:
                         pass
-                return None
         
         # 结束
         if "finish()" in plan_lower:
             logger.info("[Planner] 结束本轮")
-            return None
+            return reply_text
+
+        if executed_any_action:
+            return reply_text
+
+        if reply_text:
+            return reply_text
         
         # 如果没有匹配到任何动作，将整个文本作为回复
         logger.info("[Planner] 未匹配到动作，作为回复: %s", plan_text[:50])

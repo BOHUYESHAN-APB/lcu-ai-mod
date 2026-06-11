@@ -93,6 +93,7 @@ class Orchestrator:
         req_id = data.get("id", "?")
         progress = data.get("progress", 0)
         message = data.get("message", "")
+        self.session.handle_event("command_progress", data)
         if message:
             logger.debug("[Orch] Progress %s: %.0f%% - %s", req_id, progress * 100, message)
 
