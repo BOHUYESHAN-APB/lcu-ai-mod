@@ -68,6 +68,10 @@ class TimingGate:
             if candidate and candidate.lower() in lowered_message:
                 logger.info("[TimingGate] 提及唤醒名 %s，立刻回复", candidate)
                 return True, f"mentioned:{candidate}"
+
+        if self._looks_like_direct_command(message):
+            logger.info("[TimingGate] 识别到直接命令语气，优先回复")
+            return True, "direct_command"
         
         # 2. 检查是否是私聊（MC /msg 命令格式）
         # MC 私聊格式: "[Player -> You] message" 或 "[You -> Player] message"
@@ -168,6 +172,15 @@ class TimingGate:
         except Exception as e:
             logger.warning("[TimingGate] LLM 调用失败: %s", e)
             return True  # 降级：默认回复
+
+    @staticmethod
+    def _looks_like_direct_command(message: str) -> bool:
+        text = message.replace(" ", "")
+        keywords = [
+            "跟着我", "跟我走", "跟随我", "过来", "来这里", "来这", "过来一下",
+            "帮我", "攻击", "挖", "挖掘", "放置", "建造", "吃东西", "回血", "别动", "停下",
+        ]
+        return any(keyword in text for keyword in keywords)
     
     def record_reply(self):
         """记录一次回复。"""

@@ -40,6 +40,8 @@ public class ActionExecutor {
     private static boolean wasDead = false;
     private static int respawnRetryTicks = 0;
     private static int respawnAttempts = 0;
+    private static String followTargetName = null;
+    private static int followRefreshTicks = 0;
     private int tickCount = 0;
 
     public static void notifyInterrupted(String reason) {
@@ -61,6 +63,9 @@ public class ActionExecutor {
 
         // ── Pathfinder (A* navigation) ──
         Pathfinder.tick(mc);
+
+        // ── Follow controller (persistent follow target) ──
+        tickFollowTarget(mc);
 
         // ── Movement system (packet-based) ──
         MovementSystem.tick(mc);
@@ -154,6 +159,7 @@ public class ActionExecutor {
             InputIsolation.clearAiControls();
             MovementSystem.stop();
             Pathfinder.stop();
+            followTargetName = null;
         } else {
             InputIsolation.clearUserControls();
         }
@@ -723,6 +729,7 @@ public class ActionExecutor {
 
     private void handleStopAll(WireServer.WireCommand cmd) {
         var mc = Minecraft.getInstance();
+        followTargetName = null;
         Pathfinder.stop();
         MovementSystem.stop();
         releaseAllInputs();
@@ -912,6 +919,8 @@ public class ActionExecutor {
             return;
         }
         String playerName = args.get("player").getAsString();
+        followTargetName = playerName;
+        followRefreshTicks = 0;
         
         // Find player by name
         for (var player : mc.level.players()) {
@@ -1147,6 +1156,31 @@ public class ActionExecutor {
 
     private void sendResponse(String id, boolean success, JsonObject data) {
         if (LCUMod.WIRE != null) LCUMod.WIRE.sendResponse(id, success, data);
+    }
+
+    private void tickFollowTarget(Minecraft mc) {
+        if (followTargetName == null || !InputIsolation.isAiControlled() || mc.player == null || mc.level == null) {
+            return;
+        }
+
+        if (followRefreshTicks-- > 0) {
+            return;
+        }
+        followRefreshTicks = 10;
+
+        for (var player : mc.level.players()) {
+            if (!player.getName().getString().equalsIgnoreCase(followTargetName) || player == mc.player) {
+                continue;
+            }
+
+            double distance = mc.player.distanceTo(player);
+            if (distance > 4.5) {
+                MovementSystem.moveTo(player.getX(), player.getY(), player.getZ(), 1.1f);
+            } else if (distance < 2.0 && Pathfinder.isNavigating()) {
+                Pathfinder.stop();
+            }
+            return;
+        }
     }
 
     // ── Break Tasks ──

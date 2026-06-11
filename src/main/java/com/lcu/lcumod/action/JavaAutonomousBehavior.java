@@ -51,6 +51,7 @@ public class JavaAutonomousBehavior {
     // Survival
     private static int eatCooldown = 0;
     private static final int EAT_COOLDOWN_TICKS = 40;  // 2 seconds
+    private static int eatingTicksRemaining = 0;
     
     // Head tracking
     private static Entity trackTarget = null;
@@ -95,7 +96,12 @@ public class JavaAutonomousBehavior {
             return true;
         }
         
-        // Priority 3: Eat if hungry
+        // Priority 3: Eat if hungry or keep eating until the consume window ends
+        if (currentState == BehaviorState.EATING && eatingTicksRemaining > 0) {
+            eatingTicksRemaining--;
+            return true;
+        }
+
         if (shouldEat(mc)) {
             if (currentState != BehaviorState.EATING) {
                 setState(BehaviorState.EATING);
@@ -254,7 +260,10 @@ public class JavaAutonomousBehavior {
         }
         
         int hunger = mc.player.getFoodData().getFoodLevel();
-        return hunger < 14;  // Eat below 14 hunger
+        float health = mc.player.getHealth();
+        float maxHealth = mc.player.getMaxHealth();
+        boolean needsHealingFood = health < maxHealth && hunger < 19;
+        return hunger < 14 || needsHealingFood;
     }
     
     private static void eatFood(Minecraft mc) {
@@ -273,12 +282,13 @@ public class JavaAutonomousBehavior {
                     mc.gameMode.useItem(mc.player, net.minecraft.world.InteractionHand.MAIN_HAND);
                 }
                 eatCooldown = EAT_COOLDOWN_TICKS;
-                setState(BehaviorState.IDLE);
+                eatingTicksRemaining = 36;
                 return;
             }
         }
         
         // No food found
+        eatingTicksRemaining = 0;
         setState(BehaviorState.IDLE);
     }
     
