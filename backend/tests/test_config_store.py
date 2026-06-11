@@ -42,6 +42,18 @@ class ConfigStoreTests(unittest.TestCase):
             self.assertEqual(persona["personality"], "quiet")
             self.assertEqual(persona["external_context"]["origin"], "upstream")
 
+    def test_default_provider_is_mimo_with_wake_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConfigStore(Path(tmp) / "config.json")
+
+            config = store.get_agent_llm_config("default", redact=False)
+            persona = store.get_persona()
+
+            self.assertEqual(config["provider"], "mimo")
+            self.assertEqual(config["base_url"], "https://token-plan-cn.xiaomimimo.com/v1")
+            self.assertEqual(config["model"], "mimo-v2.5")
+            self.assertIn("小A", persona["wake_names"])
+
 
 if __name__ == "__main__":
     unittest.main()

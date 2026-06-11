@@ -226,6 +226,10 @@ body{font-family:'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;backgroun
       <input type="text" id="personality" placeholder="友好、自然">
     </div>
     <div class="form-row">
+      <label>唤醒名</label>
+      <input type="text" id="wakeNames" placeholder="AI,小A">
+    </div>
+    <div class="form-row">
       <label>说话风格</label>
       <input type="text" id="speakingStyle" placeholder="口语化、简短，不暴露 AI 身份">
     </div>
@@ -490,6 +494,7 @@ function savePermissionConfig() {
 function savePersonaConfig() {
   const payload = {
     name: document.getElementById('aiName').value || 'AI',
+    wake_names: document.getElementById('wakeNames').value.split(',').map(s=>s.trim()).filter(Boolean),
     personality: document.getElementById('personality').value || '',
     speaking_style: document.getElementById('speakingStyle').value || ''
   };
@@ -514,6 +519,7 @@ function loadPermissionConfig() {
 function loadPersonaConfig() {
   fetch('/api/persona').then(r=>r.json()).then(p=>{
     document.getElementById('aiName').value = p.name || 'AI';
+    document.getElementById('wakeNames').value = (p.wake_names || []).join(',');
     document.getElementById('personality').value = p.personality || '';
     document.getElementById('speakingStyle').value = p.speaking_style || '';
     document.getElementById('personaStatus').textContent = `🟢 已加载：${p.name || 'AI'}`;

@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from protocol import WireClient
+from .config_store import DEFAULT_CONFIG_PATH
 from .action_manager import ActionManager
 from .memory import Memory
 from .skills import Skills
@@ -123,7 +124,8 @@ class Session:
                 should_respond, reason = self.timing_gate.should_respond(
                     sender, message, 
                     recent_messages=self.memory.get_recent_context(10),
-                    bot_name=self._get_bot_name()
+                    bot_name=self._get_bot_name(),
+                    wake_names=self._get_wake_names()
                 )
                 
                 if not should_respond:
@@ -182,12 +184,24 @@ class Session:
         player = self.runtime.get("player", {})
         return player.get("name", "AI")
 
+    def _get_wake_names(self) -> list[str]:
+        persona = self.runtime.get("persona", {})
+        bot_name = self._get_bot_name()
+        if isinstance(persona, dict):
+            wake_names = persona.get("wake_names") or []
+            if isinstance(wake_names, list):
+                merged = [str(name).strip() for name in wake_names if str(name).strip()]
+                if bot_name not in merged:
+                    merged.append(bot_name)
+                return merged
+        return [bot_name]
+
     def _check_chat_permission(self, sender: str, is_system: bool) -> bool:
         """Check if a chat sender is allowed to talk to this AI."""
         # Load whitelist from config
         try:
             import json
-            config_path = Path(__file__).parent.parent / "config.json"
+            config_path = DEFAULT_CONFIG_PATH
             if config_path.exists():
                 config = json.loads(config_path.read_text(encoding="utf-8"))
             else:

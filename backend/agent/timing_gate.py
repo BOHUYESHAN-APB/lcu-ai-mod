@@ -44,7 +44,8 @@ class TimingGate:
     
     def should_respond(self, sender: str, message: str, 
                        recent_messages: Optional[list] = None,
-                       bot_name: str = "AI") -> tuple[bool, str]:
+                       bot_name: str = "AI",
+                       wake_names: Optional[list[str]] = None) -> tuple[bool, str]:
         """
         判断是否应该回复。
         
@@ -60,9 +61,13 @@ class TimingGate:
         now = time.time()
         
         # 1. 检查是否 @提及 AI
-        if bot_name.lower() in message.lower():
-            logger.info("[TimingGate] @提及 %s，立刻回复", bot_name)
-            return True, "mentioned"
+        wake_names = wake_names or [bot_name]
+        lowered_message = message.lower()
+        for wake_name in wake_names:
+            candidate = str(wake_name).strip()
+            if candidate and candidate.lower() in lowered_message:
+                logger.info("[TimingGate] 提及唤醒名 %s，立刻回复", candidate)
+                return True, f"mentioned:{candidate}"
         
         # 2. 检查是否是私聊（MC /msg 命令格式）
         # MC 私聊格式: "[Player -> You] message" 或 "[You -> Player] message"

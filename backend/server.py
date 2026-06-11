@@ -17,13 +17,13 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from agent import LLMService
-from agent.config_store import ConfigStore
+from agent.config_store import ConfigStore, DEFAULT_CONFIG_PATH
 from agent.orchestrator import Orchestrator
 from protocol import WireClient
 
 app = FastAPI(title="LCUMod Backend")
 
-CONFIG_PATH = Path(__file__).parent / "config.json"
+CONFIG_PATH = DEFAULT_CONFIG_PATH
 config_store = ConfigStore(CONFIG_PATH)
 app_config = config_store.raw(redact=True)
 

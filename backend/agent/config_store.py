@@ -17,6 +17,8 @@ from typing import Any
 
 
 DEFAULT_AGENT = "default"
+DEFAULT_CONFIG_PATH = Path(__file__).parent.parent / ".local" / "config.json"
+LEGACY_CONFIG_PATH = Path(__file__).parent.parent / "config.json"
 
 
 PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
@@ -26,6 +28,22 @@ PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
         "base_url": "https://api.openai.com/v1",
         "models_path": "/models",
         "default_model": "gpt-4o-mini",
+        "api_key_required": True,
+        "openai_compatible": True,
+    },
+    "mimo": {
+        "id": "mimo",
+        "name": "Xiaomi MiMo / TokenPlan",
+        "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+        "models_path": "/models",
+        "default_model": "mimo-v2.5",
+        "recommended_models": [
+            "mimo-v2.5",
+            "mimo-v2.5-pro",
+            "mimo-v2-pro",
+            "mimo-v2-omni",
+            "mimo-v2-flash",
+        ],
         "api_key_required": True,
         "openai_compatible": True,
     },
@@ -106,7 +124,7 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 
 
 def _default_config() -> dict[str, Any]:
-    preset = PROVIDER_PRESETS["openai"]
+    preset = PROVIDER_PRESETS["mimo"]
     return {
         "version": 1,
         "llm": {
@@ -124,6 +142,7 @@ def _default_config() -> dict[str, Any]:
         },
         "persona": {
             "name": "AI",
+            "wake_names": ["AI", "小A"],
             "personality": "友好、自然、像真人玩家",
             "speaking_style": "口语化、简短，不暴露 AI 身份",
             "external_context": {},
@@ -150,10 +169,13 @@ class ConfigStore:
 
     def _load(self) -> dict[str, Any]:
         defaults = _default_config()
-        if not self.path.exists():
+        source_path = self.path
+        if not source_path.exists() and self.path == DEFAULT_CONFIG_PATH and LEGACY_CONFIG_PATH.exists():
+            source_path = LEGACY_CONFIG_PATH
+        if not source_path.exists():
             return defaults
         try:
-            loaded = json.loads(self.path.read_text(encoding="utf-8"))
+            loaded = json.loads(source_path.read_text(encoding="utf-8"))
             if not isinstance(loaded, dict):
                 return defaults
             return _deep_merge(defaults, loaded)
@@ -219,7 +241,7 @@ class ConfigStore:
             return copy.deepcopy(self._data.setdefault("persona", _default_config()["persona"]))
 
     def set_persona(self, payload: dict[str, Any]) -> dict[str, Any]:
-        allowed = {"name", "personality", "speaking_style", "external_context"}
+        allowed = {"name", "wake_names", "personality", "speaking_style", "external_context"}
         with self._lock:
             persona = self._data.setdefault("persona", _default_config()["persona"])
             for key in allowed:
