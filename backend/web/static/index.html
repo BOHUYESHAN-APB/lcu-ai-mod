@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LCU Command Center</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;background:#0d1117;color:#c9d1d9;height:100vh;overflow:hidden;display:flex;flex-direction:column}
+
+/* Top Bar */
+.topbar{display:flex;align-items:center;justify-content:space-between;padding:8px 20px;background:#161b22;border-bottom:1px solid #30363d;flex-shrink:0}
+.topbar .title{font-size:16px;font-weight:700;color:#58a6ff}
+.topbar .title span{color:#8b949e;font-weight:400;font-size:13px}
+.topbar .online{font-size:13px;color:#8b949e}
+
+/* Tabs */
+.tabs{display:flex;background:#161b22;border-bottom:1px solid #30363d;flex-shrink:0}
+.tab{padding:10px 20px;cursor:pointer;font-size:13px;color:#8b949e;border-bottom:2px solid transparent;transition:all .2s}
+.tab:hover{color:#c9d1d9;background:#21262d}
+.tab.active{color:#58a6ff;border-bottom-color:#58a6ff}
+
+/* Main Content */
+.main{flex:1;overflow:hidden}
+.page{display:none;height:100%;overflow-y:auto;padding:20px}
+.page.active{display:block}
+
+/* Cards */
+.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin-bottom:16px}
+.card h3{font-size:14px;font-weight:600;margin-bottom:12px;color:#58a6ff}
+
+/* Form Elements */
+.form-row{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+.form-row label{font-size:12px;color:#8b949e;min-width:80px}
+.form-row input,.form-row select{flex:1;background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:6px 10px;color:#c9d1d9;font-size:12px}
+.form-row input:focus,.form-row select:focus{border-color:#58a6ff;outline:none}
+.form-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.hint{font-size:11px;color:#8b949e;margin-top:6px;line-height:1.5}
+.form-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.hint{font-size:11px;color:#8b949e;margin-top:6px;line-height:1.5}
+
+/* Buttons */
+.btn{background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:6px 12px;font-size:12px;cursor:pointer;transition:all .15s}
+.btn:hover{background:#30363d}
+.btn.primary{background:#1f6feb;color:#fff;border-color:#1f6feb}
+.btn.primary:hover{background:#388bfd}
+.btn.danger{background:#da3633;color:#fff;border-color:#da3633}
+.btn.danger:hover{background:#f85149}
+
+/* Status */
+.status{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px}
+.status.online{background:rgba(63,185,80,.15);color:#3fb950}
+.status.offline{background:rgba(139,148,158,.15);color:#8b949e}
+.status.warning{background:rgba(210,153,34,.15);color:#d29922}
+
+/* Stats */
+.stats{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px}
+.stat{background:#0d1117;border-radius:6px;padding:10px}
+.stat .label{font-size:11px;color:#8b949e;margin-bottom:4px}
+.stat .value{font-size:16px;font-weight:600}
+
+/* Chat */
+.chat-container{display:flex;flex-direction:column;height:100%}
+.chat-messages{flex:1;overflow-y:auto;padding:10px;background:#0d1117;border-radius:6px;margin-bottom:10px}
+.chat-input{display:flex;gap:8px}
+.chat-input input{flex:1}
+.msg{margin-bottom:8px;padding:8px;background:#161b22;border-radius:6px}
+.msg .sender{font-size:11px;color:#58a6ff;margin-bottom:4px}
+.msg .text{font-size:13px}
+
+/* Player List */
+.player-card{display:flex;align-items:center;gap:10px;padding:10px;background:#0d1117;border-radius:6px;margin-bottom:8px}
+.player-card .avatar{width:32px;height:32px;border-radius:4px;background:#30363d}
+.player-card .info{flex:1}
+.player-card .name{font-size:13px;font-weight:600}
+.player-card .meta{font-size:11px;color:#8b949e}
+
+/* Debug Log */
+.debug-log{background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:8px;font-family:monospace;font-size:11px;color:#8b949e;max-height:200px;overflow-y:auto;white-space:pre-wrap}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="title">🔴 LCU Command Center <span>— AI 控制台</span></div>
+  <div class="online">
+    <span id="connectionStatus" class="status offline">● 未连接</span>
+  </div>
+</div>
+
+<div class="tabs">
+  <div class="tab active" onclick="showPage('dashboard')">📊 仪表盘</div>
+  <div class="tab" onclick="showPage('chat')">💬 聊天</div>
+  <div class="tab" onclick="showPage('settings')">⚙️ 设置</div>
+  <div class="tab" onclick="showPage('debug')">🔧 调试</div>
+</div>
+
+<div class="main">
+
+<!-- Dashboard Page -->
+<div id="page-dashboard" class="page active">
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+    <div class="card">
+      <h3>🤖 AI 状态</h3>
+      <div class="stats">
+        <div class="stat">
+          <div class="label">生命值</div>
+          <div class="value" id="health">-</div>
+        </div>
+        <div class="stat">
+          <div class="label">饥饿值</div>
+          <div class="value" id="hunger">-</div>
+        </div>
+        <div class="stat">
+          <div class="label">坐标</div>
+          <div class="value" id="position">-</div>
+        </div>
+        <div class="stat">
+          <div class="label">控制模式</div>
+          <div class="value" id="controlMode">AI</div>
+        </div>
+      </div>
+      <div style="margin-top:12px">
+        <button class="btn primary" onclick="toggleAutonomy()">切换自主模式</button>
+        <button class="btn" onclick="toggleControl()">切换控制权</button>
+      </div>
+    </div>
+    
+    <div class="card">
+      <h3>👥 在线玩家</h3>
+      <div id="playerList">暂无玩家</div>
+    </div>
+  </div>
+  
+  <div class="card">
+    <h3>📋 任务队列</h3>
+    <div id="taskQueue">暂无任务</div>
+  </div>
+</div>
+
+<!-- Chat Page -->
+<div id="page-chat" class="page">
+  <div class="card" style="height:calc(100% - 16px)">
+    <h3>💬 聊天记录</h3>
+    <div class="chat-container">
+      <div class="chat-messages" id="chatMessages">
+        <div style="color:#484f58;text-align:center;padding:40px">等待连接...</div>
+      </div>
+      <div class="chat-input">
+        <input type="text" id="chatInput" placeholder="输入消息..." onkeydown="if(event.key==='Enter')sendChat()">
+        <button class="btn primary" onclick="sendChat()">发送</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Settings Page -->
+<div id="page-settings" class="page">
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+    <div class="card">
+      <h3>🔑 LLM 配置</h3>
+      <div class="form-row">
+        <label>Agent</label>
+        <select id="agentSelect" onchange="loadAgentLLMConfig()">
+          <option value="default">默认</option>
+          <option value="planner">Planner</option>
+          <option value="timing_gate">Timing Gate</option>
+          <option value="self_prompter">Self Prompter</option>
+          <option value="conversation">Conversation</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>服务商</label>
+        <select id="providerSelect" onchange="applyProviderPreset()"></select>
+      </div>
+      <div class="form-row">
+        <label>Base URL</label>
+        <input type="text" id="baseUrl" placeholder="https://api.openai.com/v1">
+      </div>
+      <div class="form-row">
+        <label>API Key</label>
+        <input type="password" id="apiKey" placeholder="sk-xxxx">
+      </div>
+      <div class="form-row">
+        <label>模型</label>
+        <input type="text" id="modelInput" list="modelOptions" placeholder="gpt-4o-mini">
+        <datalist id="modelOptions"></datalist>
+      </div>
+      <div class="form-actions">
+        <button class="btn" onclick="fetchModels()">获取模型列表</button>
+        <button class="btn primary" onclick="saveLLMConfig()">保存 LLM 配置</button>
+      </div>
+      <div id="llmStatus" style="margin-top:8px;font-size:11px;color:#8b949e">⚪ 未配置</div>
+      <div class="hint">服务商预设会自动填 Base URL 和默认模型；API Key 不会从后端回显明文。</div>
+    </div>
+    
+    <div class="card">
+      <h3>🛡️ 权限配置</h3>
+      <div class="form-row">
+        <label>白名单</label>
+        <input type="text" id="whitelist" placeholder="玩家1,玩家2">
+      </div>
+      <div class="form-row">
+        <label>监听公聊</label>
+        <select id="listenPublic">
+          <option value="true">是</option>
+          <option value="false">否</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>巡逻半径</label>
+        <input type="number" id="patrolRadius" value="8" min="1" max="32">
+      </div>
+      <button class="btn primary" onclick="savePermissionConfig()">保存权限配置</button>
+    </div>
+  </div>
+  
+  <div class="card">
+    <h3>🧠 人设配置</h3>
+    <div class="form-row">
+      <label>AI 名字</label>
+      <input type="text" id="aiName" placeholder="AI">
+    </div>
+    <div class="form-row">
+      <label>性格</label>
+      <input type="text" id="personality" placeholder="友好、自然">
+    </div>
+    <div class="form-row">
+      <label>说话风格</label>
+      <input type="text" id="speakingStyle" placeholder="口语化、简短，不暴露 AI 身份">
+    </div>
+    <button class="btn primary" onclick="savePersonaConfig()">保存人设</button>
+    <div id="personaStatus" style="margin-top:8px;font-size:11px;color:#8b949e">等待加载</div>
+  </div>
+</div>
+
+<!-- Debug Page -->
+<div id="page-debug" class="page">
+  <div class="card">
+    <h3>🔧 调试控制</h3>
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:12px">
+      <button class="btn" onclick="dbgCmd('move_to',{x:0,y:0,z:1})">前进</button>
+      <button class="btn" onclick="dbgCmd('move_to',{x:0,y:0,z:-1})">后退</button>
+      <button class="btn" onclick="dbgCmd('move_to',{x:-1,y:0,z:0})">左移</button>
+      <button class="btn" onclick="dbgCmd('move_to',{x:1,y:0,z:0})">右移</button>
+      <button class="btn" onclick="dbgCmd('jump',{})">跳跃</button>
+      <button class="btn" onclick="dbgCmd('attack',{})">攻击</button>
+      <button class="btn" onclick="dbgCmd('mine_block',{})">挖掘</button>
+      <button class="btn" onclick="dbgCmd('place_block',{})">放置</button>
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:12px">
+      <input type="text" id="debugCmd" placeholder="命令名称" style="width:120px">
+      <input type="text" id="debugArgs" placeholder="参数(JSON)" style="flex:1">
+      <button class="btn" onclick="sendDebugCmd()">发送</button>
+    </div>
+    <div class="debug-log" id="debugLog">等待日志...</div>
+  </div>
+</div>
+
+</div>
+
+<script>
+// ── WebSocket ──
+const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+let ws = null;
+let reconnectTimer = null;
+let providerPresets = [];
+let llmConfig = null;
+let sessionPollInFlight = false;
+
+function connectWS() {
+  ws = new WebSocket(`${wsProto}//${location.host}/ws`);
+  ws.onopen = () => {
+    document.getElementById('connectionStatus').className = 'status online';
+    document.getElementById('connectionStatus').textContent = '● 已连接';
+    dbgLog('WebSocket 已连接');
+  };
+  ws.onclose = () => {
+    document.getElementById('connectionStatus').className = 'status offline';
+    document.getElementById('connectionStatus').textContent = '● 未连接';
+    reconnectTimer = setTimeout(connectWS, 3000);
+  };
+  ws.onmessage = (e) => {
+    try {
+      handleMessage(JSON.parse(e.data));
+    } catch(err) {
+      dbgLog('消息解析错误: ' + err);
+    }
+  };
+}
+connectWS();
+
+// ── Page Navigation ──
+function showPage(name) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('page-' + name).classList.add('active');
+  event.target.classList.add('active');
+}
+
+// ── Local Settings Cache ──
+function rememberSetting(key, value) {
+  localStorage.setItem('lcu.' + key, value || '');
+}
+
+function recallSetting(key, fallback='') {
+  return localStorage.getItem('lcu.' + key) || fallback;
+}
+
+// ── Message Handler ──
+function handleMessage(msg) {
+  if (msg.type === 'event') {
+    handleEvent(msg.data);
+  } else if (msg.type === 'chat') {
+    addChatMessage(msg.sender, msg.message);
+  } else if (msg.type === 'response') {
+    dbgLog(`响应: ${msg.success ? '✅' : '❌'} ${msg.data?.message || ''}`);
+  }
+}
+
+function handleEvent(data) {
+  const type = data.event || data.type;
+  if (type === 'state_update') {
+    updateDashboard(data);
+  } else if (type === 'player_chat') {
+    addChatMessage(data.sender, data.message);
+  }
+}
+
+// ── Dashboard ──
+function updateDashboard(data) {
+  const p = data.player || {};
+  if (p.health !== undefined) {
+    document.getElementById('health').textContent = `${p.health.toFixed(1)}/${p.max_health || 20}`;
+  }
+  if (p.hunger !== undefined) {
+    document.getElementById('hunger').textContent = `${p.hunger}/20`;
+  }
+  if (p.x !== undefined) {
+    document.getElementById('position').textContent = `${Math.round(p.x)},${Math.round(p.y)},${Math.round(p.z)}`;
+  }
+  
+  // Update players
+  if (data.entities) {
+    const players = data.entities.filter(e => e.type === 'player');
+    const html = players.map(p => `
+      <div class="player-card">
+        <div class="avatar"></div>
+        <div class="info">
+          <div class="name">${p.name || '?'}</div>
+          <div class="meta">${p.distance?.toFixed(1) || '?'}m</div>
+        </div>
+      </div>
+    `).join('');
+    document.getElementById('playerList').innerHTML = html || '暂无玩家';
+  }
+}
+
+// ── Chat ──
+function addChatMessage(sender, message) {
+  const container = document.getElementById('chatMessages');
+  const div = document.createElement('div');
+  div.className = 'msg';
+  div.innerHTML = `<div class="sender">${escapeHtml(sender)}</div><div class="text">${escapeHtml(message)}</div>`;
+  container.appendChild(div);
+  container.scrollTop = container.scrollHeight;
+}
+
+function sendChat() {
+  const input = document.getElementById('chatInput');
+  const text = input.value.trim();
+  if (!text || !ws) return;
+  input.value = '';
+  ws.send(JSON.stringify({type:'chat', message:text}));
+  addChatMessage('我', text);
+}
+
+// ── Controls ──
+function toggleAutonomy() {
+  if (!ws) return;
+  ws.send(JSON.stringify({type:'command', cmd:'toggle_behavior', args:{}}));
+  dbgLog('切换自主模式');
+}
+
+function toggleControl() {
+  if (!ws) return;
+  ws.send(JSON.stringify({type:'command', cmd:'toggle_ai', args:{}}));
+  dbgLog('切换控制权');
+}
+
+// ── Settings ──
+function saveLLMConfig() {
+  const agent = document.getElementById('agentSelect').value || 'default';
+  const provider = document.getElementById('providerSelect').value || 'custom';
+  const baseUrl = document.getElementById('baseUrl').value;
+  const apiKey = document.getElementById('apiKey').value;
+  const model = document.getElementById('modelInput').value;
+  
+  const config = {agent, provider};
+  if (baseUrl) config.base_url = baseUrl;
+  if (apiKey) config.api_key = apiKey;
+  if (model) config.model = model;
+  rememberSetting('agent', agent);
+  rememberSetting('provider', provider);
+  rememberSetting('baseUrl.' + agent, baseUrl);
+  rememberSetting('model.' + agent, model);
+  
+  fetch('/api/llm/config', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(config)
+  }).then(r=>r.json()).then(d=>{
+    document.getElementById('llmStatus').textContent = `🟢 ${agent} 已保存：${d.config?.model || model || '-'}`;
+    document.getElementById('apiKey').value = '';
+    dbgLog(`LLM 配置已保存: ${agent}`);
+    loadLLMConfig();
+  });
+}
+
+function loadProviders() {
+  return fetch('/api/llm/providers').then(r=>r.json()).then(d=>{
+    providerPresets = d.providers || [];
+    const select = document.getElementById('providerSelect');
+    select.innerHTML = providerPresets.map(p => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name)}</option>`).join('');
+  });
+}
+
+function applyProviderPreset() {
+  const providerId = document.getElementById('providerSelect').value;
+  const preset = providerPresets.find(p => p.id === providerId);
+  if (!preset) return;
+  if (preset.base_url) document.getElementById('baseUrl').value = preset.base_url;
+  if (preset.default_model) document.getElementById('modelInput').value = preset.default_model;
+}
+
+function loadLLMConfig() {
+  return fetch('/api/llm/config').then(r=>r.json()).then(d=>{
+    llmConfig = d;
+    const agent = recallSetting('agent', d.default_agent || 'default');
+    document.getElementById('agentSelect').value = agent;
+    loadAgentLLMConfig();
+  }).catch(()=>{});
+}
+
+function loadAgentLLMConfig() {
+  const agent = document.getElementById('agentSelect').value || 'default';
+  rememberSetting('agent', agent);
+  const cfg = llmConfig?.agents?.[agent] || llmConfig?.agents?.default || {};
+  const provider = cfg.provider || recallSetting('provider', 'openai');
+  document.getElementById('providerSelect').value = provider;
+  document.getElementById('baseUrl').value = recallSetting('baseUrl.' + agent, cfg.base_url || '');
+  document.getElementById('modelInput').value = recallSetting('model.' + agent, cfg.model || '');
+  document.getElementById('llmStatus').textContent = cfg.api_key ? `🟢 ${agent} 已配置` : `⚪ ${agent} 未配置 API Key`;
+}
+
+function fetchModels() {
+  const agent = document.getElementById('agentSelect').value || 'default';
+  const baseUrl = document.getElementById('baseUrl').value;
+  const apiKey = document.getElementById('apiKey').value;
+  document.getElementById('llmStatus').textContent = '⏳ 获取模型列表...';
+  fetch('/api/llm/models', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({agent, base_url:baseUrl, api_key:apiKey})
+  }).then(r=>r.json()).then(d=>{
+    if (d.detail) throw new Error(d.detail);
+    const list = d.models || [];
+    document.getElementById('modelOptions').innerHTML = list.map(m => `<option value="${escapeHtml(m)}"></option>`).join('');
+    if (list.length && !document.getElementById('modelInput').value) document.getElementById('modelInput').value = list[0];
+    document.getElementById('llmStatus').textContent = `🟢 已获取 ${list.length} 个模型`;
+  }).catch(err=>{
+    document.getElementById('llmStatus').textContent = '🔴 获取模型失败: ' + err.message;
+  });
+}
+
+function savePermissionConfig() {
+  const whitelist = document.getElementById('whitelist').value.split(',').map(s=>s.trim()).filter(s=>s);
+  const config = {
+    whitelist: whitelist,
+    listen_public: document.getElementById('listenPublic').value === 'true',
+    patrol_radius: parseInt(document.getElementById('patrolRadius').value) || 8
+  };
+  fetch('/api/config', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(config)
+  }).then(()=>dbgLog('权限配置已保存'));
+}
+
+function savePersonaConfig() {
+  const payload = {
+    name: document.getElementById('aiName').value || 'AI',
+    personality: document.getElementById('personality').value || '',
+    speaking_style: document.getElementById('speakingStyle').value || ''
+  };
+  fetch('/api/persona', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(payload)
+  }).then(r=>r.json()).then(d=>{
+    document.getElementById('personaStatus').textContent = `🟢 已保存：${d.persona?.name || payload.name}`;
+    dbgLog('人设配置已保存');
+  });
+}
+
+function loadPermissionConfig() {
+  fetch('/api/config').then(r=>r.json()).then(cfg=>{
+    document.getElementById('whitelist').value = (cfg.whitelist || []).join(',');
+    document.getElementById('listenPublic').value = String(cfg.listen_public !== false);
+    document.getElementById('patrolRadius').value = cfg.patrol_radius || 8;
+  }).catch(()=>{});
+}
+
+function loadPersonaConfig() {
+  fetch('/api/persona').then(r=>r.json()).then(p=>{
+    document.getElementById('aiName').value = p.name || 'AI';
+    document.getElementById('personality').value = p.personality || '';
+    document.getElementById('speakingStyle').value = p.speaking_style || '';
+    document.getElementById('personaStatus').textContent = `🟢 已加载：${p.name || 'AI'}`;
+  }).catch(()=>{});
+}
+
+// ── Debug ──
+function dbgCmd(cmd, args) {
+  if (!ws) return;
+  ws.send(JSON.stringify({type:'command', cmd:cmd, args:args}));
+  dbgLog(`发送: ${cmd}`);
+}
+
+function sendDebugCmd() {
+  const cmd = document.getElementById('debugCmd').value;
+  let args = {};
+  try { args = JSON.parse(document.getElementById('debugArgs').value || '{}'); } catch(e) {}
+  dbgCmd(cmd, args);
+}
+
+function dbgLog(msg) {
+  const el = document.getElementById('debugLog');
+  const time = new Date().toLocaleTimeString('zh-CN');
+  el.textContent = `[${time}] ${msg}\n` + el.textContent;
+  el.textContent = el.textContent.split('\n').slice(0,50).join('\n');
+}
+
+// ── Helpers ──
+function escapeHtml(str) {
+  const d = document.createElement('div');
+  d.textContent = str;
+  return d.innerHTML;
+}
+
+// ── Init ──
+Promise.resolve()
+  .then(loadProviders)
+  .then(loadLLMConfig)
+  .then(loadPermissionConfig)
+  .then(loadPersonaConfig)
+  .catch(err => dbgLog('初始化配置失败: ' + err));
+
+setInterval(()=>{
+  if (sessionPollInFlight || document.hidden) return;
+  sessionPollInFlight = true;
+  fetch('/api/session')
+    .then(r=>r.json())
+    .then(updateDashboard)
+    .catch(()=>{})
+    .finally(()=>{ sessionPollInFlight = false; });
+}, 5000);
+</script>
+</body>
+</html>
