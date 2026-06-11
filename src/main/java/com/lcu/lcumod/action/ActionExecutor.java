@@ -38,6 +38,8 @@ public class ActionExecutor {
     // AI/User control
     private static boolean aiControlled = true;
     private static boolean wasDead = false;
+    private static int respawnRetryTicks = 0;
+    private static int respawnAttempts = 0;
     private int tickCount = 0;
 
     public static void notifyInterrupted(String reason) {
@@ -72,6 +74,11 @@ public class ActionExecutor {
             }
         }
 
+        boolean runtimeBusy = Pathfinder.isNavigating()
+                || MovementSystem.isMoving()
+                || JavaAutonomousBehavior.getState() != JavaAutonomousBehavior.BehaviorState.IDLE
+                || !WireServer.commandQueue.isEmpty();
+
         // ── Human-like idle behavior (head tracking) ──
         if (InputIsolation.isAiControlled()
                 && JavaAutonomousBehavior.getState() == JavaAutonomousBehavior.BehaviorState.IDLE
@@ -80,16 +87,34 @@ public class ActionExecutor {
             HumanLikeBehavior.tick(mc);
         }
 
+        // ── Anti-AFK subtle activity pulses ──
+        ActivitySignalController.tick(mc, runtimeBusy);
+
         // ── Auto-respawn ──
-        if (mc.player.isDeadOrDying() && !wasDead) {
-            wasDead = true;
-            LCUMod.LOGGER.info("[AutoRespawn] Player died, sending respawn packet...");
-            var conn = mc.getConnection();
-            if (conn != null) {
-                conn.send(new ServerboundClientCommandPacket(ServerboundClientCommandPacket.Action.PERFORM_RESPAWN));
+        if (mc.player.isDeadOrDying()) {
+            if (!wasDead) {
+                wasDead = true;
+                respawnAttempts = 0;
+                respawnRetryTicks = 0;
+                releaseAllInputs();
+                Pathfinder.stop();
+                MovementSystem.stop();
             }
-        } else if (!mc.player.isDeadOrDying()) {
+
+            if (respawnRetryTicks-- <= 0) {
+                respawnRetryTicks = 12;
+                respawnAttempts++;
+                LCUMod.LOGGER.info("[AutoRespawn] Attempt {}", respawnAttempts);
+                var conn = mc.getConnection();
+                if (conn != null) {
+                    conn.send(new ServerboundClientCommandPacket(ServerboundClientCommandPacket.Action.PERFORM_RESPAWN));
+                }
+            }
+        } else if (wasDead) {
             wasDead = false;
+            respawnAttempts = 0;
+            respawnRetryTicks = 0;
+            ActivitySignalController.reset();
         }
 
         // ── Jump cooldown ──
