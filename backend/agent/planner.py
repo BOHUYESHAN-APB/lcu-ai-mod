@@ -115,9 +115,18 @@ class Planner:
         ])
         nearby_blocks = context.get("nearby_blocks", []) if isinstance(context, dict) else []
         nearby_entities = context.get("entities", []) if isinstance(context, dict) else []
+        inventory = context.get("inventory", []) if isinstance(context, dict) else []
+        inventory_text = ", ".join(
+            f"{item.get('name', '?')}x{item.get('count', 1)}"
+            for item in inventory[:12]
+        ) or "无"
         nearby_block_text = ", ".join(
             f"{block.get('block_id', block.get('name', '?'))}@{block.get('distance', '?')}m"
             for block in nearby_blocks[:8]
+        ) or "无"
+        nearby_entity_text = ", ".join(
+            f"{entity.get('type', '?')}:{entity.get('name', '?')}@{entity.get('distance', '?')}m"
+            for entity in nearby_entities[:8]
         ) or "无"
         nearby_item_text = ", ".join(
             f"{entity.get('item_id', entity.get('name', '?'))}x{entity.get('item_count', 1)}@{entity.get('distance', '?')}m"
@@ -144,9 +153,15 @@ class Planner:
 当前任务状态：
 {context.get('task_state', {'kind': 'idle', 'status': 'idle'})}
 
+当前库存摘要：
+{inventory_text}
+
 附近资源：
 - 方块：{nearby_block_text}
 - 掉落物：{nearby_item_text}
+
+附近实体：
+{nearby_entity_text}
 
 可用动作：
 - reply(内容): 生成一条回复
@@ -179,6 +194,7 @@ class Planner:
 7. tool()/动作参数必须是可执行的真实参数，不能写“随机位置”“附近”“合适的地方”这种占位词
 8. 如果用户要求停止跟随或停止当前动作，优先使用 stop()
 9. 中文常见物品名要转换成 Minecraft 英文物品 ID，例如 木剑=wooden_sword，木头=oak_log
+10. 如果当前任务状态不是 idle，且用户没有明确改变目标，不要重复下发同一个任务，优先继续或补全当前任务链
 
 请分析情况并决定下一步行动。如果需要回复，使用 reply()。如果需要执行动作，优先使用 tool(动作名, JSON参数)。
 如果不需要做任何事，使用 finish()。
