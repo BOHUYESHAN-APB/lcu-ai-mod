@@ -211,9 +211,9 @@ class MultiAgentOrchestrator:
         """挖掘"""
         await self.action_agent.mine_block()
     
-    async def craft_item(self, item_name: str):
+    async def craft_item(self, item_name: str, count: int = 1):
         """合成物品"""
-        await self.action_agent.craft_item(item_name)
+        await self.action_agent.craft_item(item_name, count)
     
     # ── 状态查询 ──
     

@@ -1363,32 +1363,76 @@ public class ActionExecutor {
 
         CraftingPlanner.CraftStep step = plan.steps.get(0);
 
-        boolean needsTable = step.needsCraftingTable;
-        if (needsTable && !isCraftingTableOpen(mc)) {
-            if (!openNearbyCraftingTable(mc)) {
-                if (LCUMod.WIRE != null) {
-                    LCUMod.WIRE.sendProgress(pendingCraftReqId, 0.0, "need nearby crafting table for " + pendingCraftItem);
+        if (step.mode.equals("craft")) {
+            boolean needsTable = step.needsCraftingTable;
+            if (needsTable && !isCraftingTableOpen(mc)) {
+                if (!openNearbyCraftingTable(mc)) {
+                    if (LCUMod.WIRE != null) {
+                        LCUMod.WIRE.sendProgress(pendingCraftReqId, 0.0, "need nearby crafting table for " + pendingCraftItem);
+                    }
+                    pendingCraftItem = null;
+                    pendingCraftReqId = null;
+                    pendingCraftGoalCount = 1;
+                    clearTaskState();
+                    sendBehaviorSnapshot();
                 }
-                pendingCraftItem = null;
-                pendingCraftReqId = null;
-                pendingCraftGoalCount = 1;
-                clearTaskState();
-                sendBehaviorSnapshot();
+                return;
             }
-            return;
-        }
 
-        pendingCraftAttempts++;
-        mc.gameMode.handlePlaceRecipe(mc.player.containerMenu.containerId, step.recipe, false);
-        mc.gameMode.handleInventoryMouseClick(mc.player.containerMenu.containerId, 0, 0, ClickType.QUICK_MOVE, mc.player);
-        String detail = "craft step " + pendingCraftAttempts + ": " + step.itemId + " x" + step.craftOperations;
-        setTaskState("craft", "crafting", pendingCraftItem, detail, Math.min(0.9, 0.35 + pendingCraftAttempts * 0.12));
-        if (LCUMod.WIRE != null) {
-            LCUMod.WIRE.sendProgress(
-                pendingCraftReqId,
-                Math.min(0.9, 0.35 + pendingCraftAttempts * 0.12),
-                detail
-            );
+            pendingCraftAttempts++;
+            mc.gameMode.handlePlaceRecipe(mc.player.containerMenu.containerId, step.recipe, false);
+            mc.gameMode.handleInventoryMouseClick(mc.player.containerMenu.containerId, 0, 0, ClickType.QUICK_MOVE, mc.player);
+            String detail = "craft step " + pendingCraftAttempts + ": " + step.itemId + " x" + step.craftOperations;
+            setTaskState("craft", "crafting", pendingCraftItem, detail, Math.min(0.9, 0.35 + pendingCraftAttempts * 0.12));
+            if (LCUMod.WIRE != null) {
+                LCUMod.WIRE.sendProgress(
+                    pendingCraftReqId,
+                    Math.min(0.9, 0.35 + pendingCraftAttempts * 0.12),
+                    detail
+                );
+            }
+        } else {
+            if (!isProcessingStationOpen(mc, step.mode)) {
+                if (!openNearbyProcessingStation(mc, step.stationBlockId)) {
+                    if (LCUMod.WIRE != null) {
+                        LCUMod.WIRE.sendProgress(pendingCraftReqId, 0.0, "need nearby " + step.stationBlockId + " for " + pendingCraftItem);
+                    }
+                    pendingCraftItem = null;
+                    pendingCraftReqId = null;
+                    pendingCraftGoalCount = 1;
+                    clearTaskState();
+                    sendBehaviorSnapshot();
+                }
+                return;
+            }
+
+            if (pickupProcessedOutputIfReady(mc, step.itemId)) {
+                setTaskState("craft", "processing", pendingCraftItem, "collecting processed output", Math.min(0.95, 0.55 + pendingCraftAttempts * 0.05));
+                return;
+            }
+
+            if (!ensureProcessingFuel(mc)) {
+                String fuelTarget = selectFuelCollectionTarget(mc);
+                if (LCUMod.WIRE != null) {
+                    LCUMod.WIRE.sendProgress(pendingCraftReqId, 0.2, "collecting furnace fuel: " + fuelTarget);
+                }
+                startCollectTask(mc, pendingCraftReqId, fuelTarget, 1);
+                setTaskState("craft", "collecting", pendingCraftItem, "collecting furnace fuel: " + fuelTarget, 0.2);
+                sendBehaviorSnapshot();
+                return;
+            }
+
+            pendingCraftAttempts++;
+            mc.gameMode.handlePlaceRecipe(mc.player.containerMenu.containerId, step.recipe, false);
+            String detail = step.mode + " step " + pendingCraftAttempts + ": " + step.itemId + " x" + step.craftOperations;
+            setTaskState("craft", "processing", pendingCraftItem, detail, Math.min(0.9, 0.45 + pendingCraftAttempts * 0.08));
+            if (LCUMod.WIRE != null) {
+                LCUMod.WIRE.sendProgress(
+                    pendingCraftReqId,
+                    Math.min(0.9, 0.45 + pendingCraftAttempts * 0.08),
+                    detail
+                );
+            }
         }
 
         if (pendingCraftAttempts >= 8 && countInventoryItem(mc, pendingCraftItem) < pendingCraftGoalCount) {
@@ -1524,6 +1568,144 @@ public class ActionExecutor {
             }
         }
         return false;
+    }
+
+    private boolean isProcessingStationOpen(Minecraft mc, String mode) {
+        if (mc.player.containerMenu == null || mc.player.containerMenu == mc.player.inventoryMenu) {
+            return false;
+        }
+        String menuName = mc.player.containerMenu.getClass().getSimpleName().toLowerCase();
+        return switch (mode) {
+            case "smelt" -> menuName.contains("furnace") && !menuName.contains("blast") && !menuName.contains("smoker");
+            case "blast" -> menuName.contains("blast");
+            case "smoke" -> menuName.contains("smoker");
+            default -> false;
+        };
+    }
+
+    private boolean openNearbyProcessingStation(Minecraft mc, String stationBlockId) {
+        BlockPos playerPos = mc.player.blockPosition();
+        for (int dx = -4; dx <= 4; dx++) {
+            for (int dy = -2; dy <= 2; dy++) {
+                for (int dz = -4; dz <= 4; dz++) {
+                    BlockPos pos = playerPos.offset(dx, dy, dz);
+                    String blockId = BuiltInRegistries.BLOCK.getKey(mc.level.getBlockState(pos).getBlock()).toString();
+                    if (!blockId.equals(stationBlockId)) continue;
+                    Vec3 hitVec = Vec3.atCenterOf(pos);
+                    BlockHitResult hitResult = new BlockHitResult(hitVec, Direction.UP, pos, false);
+                    mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, hitResult);
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private boolean pickupProcessedOutputIfReady(Minecraft mc, String expectedItemId) {
+        if (mc.player.containerMenu == null || mc.player.containerMenu.slots.size() < 3) {
+            return false;
+        }
+        var outputStack = mc.player.containerMenu.slots.get(2).getItem();
+        if (outputStack.isEmpty()) {
+            return false;
+        }
+        String outputId = BuiltInRegistries.ITEM.getKey(outputStack.getItem()).toString();
+        if (!CraftingPlanner.matchesRegistryId(outputId, expectedItemId)) {
+            return false;
+        }
+        mc.gameMode.handleInventoryMouseClick(mc.player.containerMenu.containerId, 2, 0, ClickType.QUICK_MOVE, mc.player);
+        return true;
+    }
+
+    private boolean ensureProcessingFuel(Minecraft mc) {
+        if (mc.player.containerMenu == null || mc.player.containerMenu.slots.size() < 3) {
+            return false;
+        }
+
+        var fuelStack = mc.player.containerMenu.slots.get(1).getItem();
+        if (!fuelStack.isEmpty() && net.minecraft.world.level.block.entity.AbstractFurnaceBlockEntity.isFuel(fuelStack)) {
+            return true;
+        }
+
+        int fuelSlot = findFuelInventoryMenuSlot(mc);
+        if (fuelSlot < 0) {
+            return false;
+        }
+
+        mc.gameMode.handleInventoryMouseClick(mc.player.containerMenu.containerId, fuelSlot, 0, ClickType.PICKUP, mc.player);
+        mc.gameMode.handleInventoryMouseClick(mc.player.containerMenu.containerId, 1, 0, ClickType.PICKUP, mc.player);
+        if (!mc.player.containerMenu.getCarried().isEmpty()) {
+            mc.gameMode.handleInventoryMouseClick(mc.player.containerMenu.containerId, fuelSlot, 0, ClickType.PICKUP, mc.player);
+        }
+        return true;
+    }
+
+    private int findFuelInventoryMenuSlot(Minecraft mc) {
+        if (mc.player.containerMenu == null) {
+            return -1;
+        }
+        for (int slot = 3; slot < mc.player.containerMenu.slots.size(); slot++) {
+            var stack = mc.player.containerMenu.slots.get(slot).getItem();
+            if (!stack.isEmpty() && net.minecraft.world.level.block.entity.AbstractFurnaceBlockEntity.isFuel(stack)) {
+                return slot;
+            }
+        }
+        return -1;
+    }
+
+    private String selectFuelCollectionTarget(Minecraft mc) {
+        ItemEntity nearbyFuel = findNearbyFuelItem(mc, 16.0);
+        if (nearbyFuel != null) {
+            return BuiltInRegistries.ITEM.getKey(nearbyFuel.getItem().getItem()).toString();
+        }
+
+        String nearbyFuelBlockItem = findNearbyFuelBlockItem(mc, 16);
+        if (nearbyFuelBlockItem != null && !nearbyFuelBlockItem.isBlank()) {
+            return nearbyFuelBlockItem;
+        }
+
+        return "coal";
+    }
+
+    private ItemEntity findNearbyFuelItem(Minecraft mc, double radius) {
+        AABB searchBox = mc.player.getBoundingBox().inflate(radius);
+        ItemEntity nearest = null;
+        double nearestDistance = Double.MAX_VALUE;
+        for (Entity entity : mc.level.getEntities(mc.player, searchBox)) {
+            if (!(entity instanceof ItemEntity itemEntity)) continue;
+            if (!net.minecraft.world.level.block.entity.AbstractFurnaceBlockEntity.isFuel(itemEntity.getItem())) continue;
+            double distance = mc.player.distanceToSqr(itemEntity);
+            if (distance < nearestDistance) {
+                nearest = itemEntity;
+                nearestDistance = distance;
+            }
+        }
+        return nearest;
+    }
+
+    private String findNearbyFuelBlockItem(Minecraft mc, int radius) {
+        BlockPos origin = mc.player.blockPosition();
+        String bestFuelItem = null;
+        double bestDistance = Double.MAX_VALUE;
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dy = -4; dy <= 4; dy++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    BlockPos pos = origin.offset(dx, dy, dz);
+                    var blockState = mc.level.getBlockState(pos);
+                    if (blockState.isAir()) continue;
+                    var blockItem = blockState.getBlock().asItem();
+                    if (blockItem == net.minecraft.world.item.Items.AIR) continue;
+                    var blockStack = new net.minecraft.world.item.ItemStack(blockItem);
+                    if (!net.minecraft.world.level.block.entity.AbstractFurnaceBlockEntity.isFuel(blockStack)) continue;
+                    double distance = origin.distSqr(pos);
+                    if (distance < bestDistance) {
+                        bestDistance = distance;
+                        bestFuelItem = BuiltInRegistries.ITEM.getKey(blockItem).toString();
+                    }
+                }
+            }
+        }
+        return bestFuelItem;
     }
 
     private String normalizeItemName(String itemName) {

@@ -28,17 +28,28 @@ public final class CraftingPlanner {
     }
 
     public static final class CraftStep {
+        public final String mode;
         public final String itemId;
         public final int craftOperations;
+        public final String stationBlockId;
         public final boolean needsCraftingTable;
         public final RecipeHolder<?> recipe;
 
-        public CraftStep(String itemId, int craftOperations, boolean needsCraftingTable, RecipeHolder<?> recipe) {
+        public CraftStep(String mode, String itemId, int craftOperations, String stationBlockId, boolean needsCraftingTable, RecipeHolder<?> recipe) {
+            this.mode = mode;
             this.itemId = itemId;
             this.craftOperations = craftOperations;
+            this.stationBlockId = stationBlockId;
             this.needsCraftingTable = needsCraftingTable;
             this.recipe = recipe;
         }
+    }
+
+    private static final class RecipeIndexes {
+        final Map<String, RecipeHolder<?>> crafting = new HashMap<>();
+        final Map<String, RecipeHolder<?>> smelting = new HashMap<>();
+        final Map<String, RecipeHolder<?>> blasting = new HashMap<>();
+        final Map<String, RecipeHolder<?>> smoking = new HashMap<>();
     }
 
     public static final class CraftPlan {
@@ -63,9 +74,9 @@ public final class CraftingPlanner {
         }
 
         Map<String, Integer> available = snapshotInventory(mc);
-        Map<String, RecipeHolder<?>> recipeIndex = buildRecipeIndex(mc);
+        RecipeIndexes recipeIndexes = buildRecipeIndexes(mc);
         Set<String> visiting = new HashSet<>();
-        boolean resolved = resolve(mc, targetItemId, requestedCount, available, recipeIndex, visiting, plan);
+        boolean resolved = resolve(mc, targetItemId, requestedCount, available, recipeIndexes, visiting, plan);
         plan.success = resolved && plan.missingRaw.isEmpty();
         if (!plan.success && plan.failureReason.isBlank() && !plan.missingRaw.isEmpty()) {
             plan.failureReason = "missing raw resources";
@@ -78,7 +89,7 @@ public final class CraftingPlanner {
         String targetItemId,
         int neededCount,
         Map<String, Integer> available,
-        Map<String, RecipeHolder<?>> recipeIndex,
+        RecipeIndexes recipeIndexes,
         Set<String> visiting,
         CraftPlan plan
     ) {
@@ -95,8 +106,17 @@ public final class CraftingPlanner {
             return false;
         }
 
-        RecipeHolder<?> recipe = findRecipe(recipeIndex, targetItemId);
-        if (recipe == null || recipe.value().getType() != RecipeType.CRAFTING) {
+        RecipeHolder<?> recipe = findCraftRecipe(recipeIndexes, targetItemId);
+        String stepMode = "craft";
+        String stationBlockId = "minecraft:crafting_table";
+        boolean needsCraftingTable = true;
+        if (recipe == null) {
+            recipe = findProcessingRecipe(recipeIndexes, targetItemId);
+            stepMode = processingModeFor(recipe);
+            stationBlockId = processingStationFor(stepMode);
+            needsCraftingTable = false;
+        }
+        if (recipe == null) {
             visiting.remove(visitKey);
             plan.missingRaw.merge(targetItemId, remaining, Integer::sum);
             return false;
@@ -120,14 +140,14 @@ public final class CraftingPlanner {
                 continue;
             }
 
-            String candidateId = chooseIngredientCandidate(ingredient, available, recipeIndex);
+            String candidateId = chooseIngredientCandidate(ingredient, available, recipeIndexes);
             if (candidateId == null || candidateId.isBlank()) {
                 plan.failureReason = "recipe ingredient unresolved for " + targetItemId;
                 dependenciesResolved = false;
                 continue;
             }
 
-            if (!resolve(mc, candidateId, craftOperations, available, recipeIndex, visiting, plan)) {
+            if (!resolve(mc, candidateId, craftOperations, available, recipeIndexes, visiting, plan)) {
                 dependenciesResolved = false;
             }
         }
@@ -138,9 +158,11 @@ public final class CraftingPlanner {
         }
 
         plan.steps.add(new CraftStep(
+            stepMode,
             resolvedResultId,
             craftOperations,
-            !recipe.value().canCraftInDimensions(2, 2),
+            stationBlockId,
+            stepMode.equals("craft") && !recipe.value().canCraftInDimensions(2, 2),
             recipe
         ));
 
@@ -165,27 +187,44 @@ public final class CraftingPlanner {
         return available;
     }
 
-    private static Map<String, RecipeHolder<?>> buildRecipeIndex(Minecraft mc) {
-        Map<String, RecipeHolder<?>> index = new HashMap<>();
+    private static RecipeIndexes buildRecipeIndexes(Minecraft mc) {
+        RecipeIndexes indexes = new RecipeIndexes();
         for (RecipeHolder<?> recipe : mc.level.getRecipeManager().getRecipes()) {
-            if (recipe.value().getType() != RecipeType.CRAFTING) {
-                continue;
-            }
             ItemStack result = recipe.value().getResultItem(mc.level.registryAccess());
             if (result.isEmpty()) {
                 continue;
             }
             String id = BuiltInRegistries.ITEM.getKey(result.getItem()).toString();
-            index.putIfAbsent(id, recipe);
+            if (recipe.value().getType() == RecipeType.CRAFTING) {
+                indexes.crafting.putIfAbsent(id, recipe);
+            } else if (recipe.value().getType() == RecipeType.SMELTING) {
+                indexes.smelting.putIfAbsent(id, recipe);
+            } else if (recipe.value().getType() == RecipeType.BLASTING) {
+                indexes.blasting.putIfAbsent(id, recipe);
+            } else if (recipe.value().getType() == RecipeType.SMOKING) {
+                indexes.smoking.putIfAbsent(id, recipe);
+            }
         }
-        return index;
+        return indexes;
     }
 
-    private static RecipeHolder<?> findRecipe(Map<String, RecipeHolder<?>> recipeIndex, String targetItemId) {
-        if (recipeIndex.containsKey(targetItemId)) {
-            return recipeIndex.get(targetItemId);
+    private static RecipeHolder<?> findCraftRecipe(RecipeIndexes indexes, String targetItemId) {
+        return findRecipe(indexes.crafting, targetItemId);
+    }
+
+    private static RecipeHolder<?> findProcessingRecipe(RecipeIndexes indexes, String targetItemId) {
+        RecipeHolder<?> recipe = findRecipe(indexes.smelting, targetItemId);
+        if (recipe != null) return recipe;
+        recipe = findRecipe(indexes.blasting, targetItemId);
+        if (recipe != null) return recipe;
+        return findRecipe(indexes.smoking, targetItemId);
+    }
+
+    private static RecipeHolder<?> findRecipe(Map<String, RecipeHolder<?>> index, String targetItemId) {
+        if (index.containsKey(targetItemId)) {
+            return index.get(targetItemId);
         }
-        for (Map.Entry<String, RecipeHolder<?>> entry : recipeIndex.entrySet()) {
+        for (Map.Entry<String, RecipeHolder<?>> entry : index.entrySet()) {
             if (matchesRegistryId(entry.getKey(), targetItemId)) {
                 return entry.getValue();
             }
@@ -196,7 +235,7 @@ public final class CraftingPlanner {
     private static String chooseIngredientCandidate(
         Ingredient ingredient,
         Map<String, Integer> available,
-        Map<String, RecipeHolder<?>> recipeIndex
+        RecipeIndexes recipeIndexes
     ) {
         String bestCandidate = null;
         int bestScore = Integer.MIN_VALUE;
@@ -206,7 +245,7 @@ public final class CraftingPlanner {
             }
             String candidateId = BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
             int score = Math.min(available.getOrDefault(candidateId, 0), 64) * 100;
-            if (recipeIndex.containsKey(candidateId)) {
+            if (findCraftRecipe(recipeIndexes, candidateId) != null || findProcessingRecipe(recipeIndexes, candidateId) != null) {
                 score += 20;
             }
             if (bestCandidate == null || score > bestScore) {
@@ -215,6 +254,23 @@ public final class CraftingPlanner {
             }
         }
         return bestCandidate;
+    }
+
+    private static String processingModeFor(RecipeHolder<?> recipe) {
+        if (recipe == null) return "craft";
+        if (recipe.value().getType() == RecipeType.BLASTING) return "blast";
+        if (recipe.value().getType() == RecipeType.SMOKING) return "smoke";
+        if (recipe.value().getType() == RecipeType.SMELTING) return "smelt";
+        return "craft";
+    }
+
+    private static String processingStationFor(String mode) {
+        return switch (mode) {
+            case "blast" -> "minecraft:blast_furnace";
+            case "smoke" -> "minecraft:smoker";
+            case "smelt" -> "minecraft:furnace";
+            default -> "minecraft:crafting_table";
+        };
     }
 
     private static int consumeAvailable(Map<String, Integer> available, String targetItemId, int neededCount) {

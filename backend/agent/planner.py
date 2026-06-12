@@ -170,7 +170,7 @@ class Planner:
 - attack(): 攻击附近的敌人
 - mine_block(): 挖掘方块
 - place_block(): 放置方块
-- craft(item_name): 合成一个物品（如 wooden_pickaxe, stone_sword 等）
+- craft(item_name[, count]): 合成一个物品（如 wooden_pickaxe, stone_sword 等），并允许数量参数
 - collect(block_type, count): 收集指定数量的方块
 - equip(slot): 装备物品（mainhand, offhand, head, chest, legs, feet）
 - get_inventory(): 查看背包

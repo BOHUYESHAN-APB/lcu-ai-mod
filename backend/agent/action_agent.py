@@ -251,10 +251,10 @@ class ActionAgent:
             timeout=30.0
         )
     
-    async def craft_item(self, item_name: str):
+    async def craft_item(self, item_name: str, count: int = 1):
         """合成物品"""
         async def _craft():
-            self.skills.craft_item(item_name)
+            self.skills.craft_item(item_name, count)
         
         await self.submit_action(
             name="craft",
