@@ -175,6 +175,10 @@ class Session:
                 progress = float(data.get("progress", 0.0) or 0.0)
                 message = data.get("message", "")
                 self.action_manager.handle_progress(req_id, progress, message)
+            case "behavior_state":
+                self.runtime["behavior_state"] = data
+            case "control_state":
+                self.runtime["control_state"] = data
             case _:
                 logger.debug("[Session] Unhandled event: %s", event_type)
 

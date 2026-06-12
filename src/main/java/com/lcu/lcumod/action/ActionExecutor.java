@@ -51,6 +51,11 @@ public class ActionExecutor {
     private static String pendingCraftReqId = null;
     private static int pendingCraftTicks = 0;
     private static int pendingCraftAttempts = 0;
+    private static String pendingEatReqId = null;
+    private static int pendingEatTicks = 0;
+    private static int pendingEatAttempts = 0;
+    private static int pendingEatStartHunger = -1;
+    private static float pendingEatStartHealth = -1;
     private int tickCount = 0;
 
     public static void notifyInterrupted(String reason) {
@@ -78,6 +83,9 @@ public class ActionExecutor {
 
         // ── Craft controller (stateful crafting) ──
         tickPendingCraft(mc);
+
+        // ── Eat controller (stateful eating / healing) ──
+        tickPendingEat(mc);
 
         // ── Movement system (packet-based) ──
         MovementSystem.tick(mc);
@@ -746,6 +754,9 @@ public class ActionExecutor {
         pendingCraftReqId = null;
         pendingCraftTicks = 0;
         pendingCraftAttempts = 0;
+        pendingEatReqId = null;
+        pendingEatTicks = 0;
+        pendingEatAttempts = 0;
         Pathfinder.stop();
         MovementSystem.stop();
         releaseAllInputs();
@@ -1061,22 +1072,22 @@ public class ActionExecutor {
             sendResponse(cmd.id(), false, "No player");
             return;
         }
-        
-        // Find food in hotbar
-        var inv = mc.player.getInventory();
-        for (int i = 0; i < 9; i++) {
-            var stack = inv.getItem(i);
-            if (stack.isEmpty()) continue;
-            
-            // Check if item is food
-            if (stack.getItem().getFoodProperties(stack, mc.player) != null) {
-                inv.selected = i;
-                mc.gameMode.useItem(mc.player, InteractionHand.MAIN_HAND);
-                sendResponse(cmd.id(), true, "Eating food");
-                return;
-            }
+
+        if (!hasFoodInHotbar(mc)) {
+            sendResponse(cmd.id(), false, "No food in hotbar");
+            return;
         }
-        sendResponse(cmd.id(), false, "No food in hotbar");
+
+        pendingEatReqId = cmd.id();
+        pendingEatTicks = 0;
+        pendingEatAttempts = 0;
+        pendingEatStartHunger = mc.player.getFoodData().getFoodLevel();
+        pendingEatStartHealth = mc.player.getHealth();
+        startEating(mc);
+        if (LCUMod.WIRE != null) {
+            LCUMod.WIRE.sendProgress(cmd.id(), 0.05, "eat queued");
+        }
+        sendResponse(cmd.id(), true, "Eating food");
     }
 
     private void handleDropItem(WireServer.WireCommand cmd) {
@@ -1326,6 +1337,71 @@ public class ActionExecutor {
             case "石镐" -> "stone_pickaxe";
             default -> compact;
         };
+    }
+
+    private void tickPendingEat(Minecraft mc) {
+        if (pendingEatReqId == null || mc.player == null || mc.gameMode == null) {
+            return;
+        }
+
+        pendingEatTicks++;
+        if (mc.player.isUsingItem()) {
+            if (LCUMod.WIRE != null && pendingEatTicks % 10 == 0) {
+                LCUMod.WIRE.sendProgress(pendingEatReqId, 0.4, "eating in progress");
+            }
+            return;
+        }
+
+        int hunger = mc.player.getFoodData().getFoodLevel();
+        float health = mc.player.getHealth();
+        if ((hunger > pendingEatStartHunger || health > pendingEatStartHealth) && pendingEatTicks > 5) {
+            if (LCUMod.WIRE != null) {
+                LCUMod.WIRE.sendProgress(pendingEatReqId, 1.0, "eat complete");
+            }
+            pendingEatReqId = null;
+            pendingEatTicks = 0;
+            pendingEatAttempts = 0;
+            return;
+        }
+
+        if (pendingEatTicks % 8 == 0 && pendingEatAttempts < 3) {
+            pendingEatAttempts++;
+            startEating(mc);
+            return;
+        }
+
+        if (pendingEatAttempts >= 3 && pendingEatTicks > 30) {
+            if (LCUMod.WIRE != null) {
+                LCUMod.WIRE.sendProgress(pendingEatReqId, 0.0, "eat failed or cannot start use animation");
+            }
+            pendingEatReqId = null;
+            pendingEatTicks = 0;
+            pendingEatAttempts = 0;
+        }
+    }
+
+    private boolean hasFoodInHotbar(Minecraft mc) {
+        var inv = mc.player.getInventory();
+        for (int i = 0; i < 9; i++) {
+            var stack = inv.getItem(i);
+            if (!stack.isEmpty() && stack.getItem().getFoodProperties(stack, mc.player) != null) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void startEating(Minecraft mc) {
+        var inv = mc.player.getInventory();
+        for (int i = 0; i < 9; i++) {
+            var stack = inv.getItem(i);
+            if (stack.isEmpty()) continue;
+            if (stack.getItem().getFoodProperties(stack, mc.player) != null) {
+                inv.selected = i;
+                mc.gameMode.useItem(mc.player, InteractionHand.MAIN_HAND);
+                return;
+            }
+        }
     }
 
     // ── Break Tasks ──
