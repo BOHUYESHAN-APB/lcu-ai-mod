@@ -16,8 +16,8 @@ from typing import Any, Callable, Optional
 
 logger = logging.getLogger("commands")
 
-# Regex to find !command patterns in text
-CMD_RE = re.compile(r'!(\w+)((?:\s+\S+)*)')
+# Regex to find !command patterns, stopping before the next !command.
+CMD_RE = re.compile(r'!(\w+)((?:\s+(?!\!)\S+)*)')
 
 
 class CommandResult:
@@ -49,11 +49,11 @@ class Commands:
 
     def register_query(self, name: str, handler: Callable):
         """Register a read-only query command."""
-        self._queries[name] = handler
+        self._queries[name.lower()] = handler
 
     def register_action(self, name: str, handler: Callable):
         """Register a write/modify action command."""
-        self._actions[name] = handler
+        self._actions[name.lower()] = handler
 
     def get_docs(self) -> str:
         """Return command documentation string for LLM system prompt."""
@@ -232,7 +232,7 @@ class Commands:
         if args:
             block_type = args[0]
             count = int(args[1]) if len(args) > 1 else 1
-            self.skills.break_nearby(block_type)
+            self.skills.collect_blocks(block_type, count)
 
     def _act_look_at(self, args: list[str], state: dict):
         """!lookAt x y z"""
@@ -250,17 +250,12 @@ class Commands:
 
     def _act_craft(self, args: list[str], state: dict):
         """!craft [recipe_name] [count]"""
-        logger.info("[Cmd] Craft: %s", args)
+        if args:
+            self.skills.craft_item(args[0])
 
     def _act_place(self, args: list[str], state: dict):
         """!place x y z [block_type]"""
-        if len(args) >= 3:
-            try:
-                x, y, z = int(args[0]), int(args[1]), int(args[2])
-                block = args[3] if len(args) > 3 else ""
-                self.skills.place_block(x, y, z, block)
-            except ValueError:
-                pass
+        self.skills.place_block()
 
     def _act_drop(self, args: list[str], state: dict):
         """!drop [count]"""
@@ -278,8 +273,7 @@ class Commands:
 
     def _act_stop(self, args: list[str], state: dict):
         """!stop — stop current action."""
-        if hasattr(self.skills, "stop"):
-            self.skills.stop()
+        self.skills.stop_all()
 
     def _act_resume(self, args: list[str], state: dict):
         """!resume — resume last action."""

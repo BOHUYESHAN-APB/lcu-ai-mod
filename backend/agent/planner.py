@@ -311,11 +311,6 @@ finish()
             logger.info("[Planner] 整理背包")
             executed_any_action = True
 
-        if "stop()" in plan_lower:
-            self.skills.stop_all()
-            logger.info("[Planner] 停止当前动作")
-            executed_any_action = True
-        
         # 建造
         if "build(" in plan_lower:
             args = self._extract_between(plan_text, "build(", ")")

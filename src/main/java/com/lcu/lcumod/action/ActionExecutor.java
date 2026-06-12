@@ -162,6 +162,11 @@ public class ActionExecutor {
         if (tickCount++ % 100 == 0 && !MovementSystem.isMoving() && !Pathfinder.isNavigating()) {
             releaseAllInputs();
         }
+
+        if (tickCount % 10 == 0) {
+            sendBehaviorSnapshot();
+            sendControlState();
+        }
     }
 
     // ── AI/User Control Toggle ──
@@ -762,7 +767,14 @@ public class ActionExecutor {
         releaseAllInputs();
         if (mc.player != null) {
             if (mc.gameMode != null) stopDigging();
+            if (mc.player.isUsingItem()) {
+                mc.gameMode.releaseUsingItem(mc.player);
+            }
+            if (mc.player.containerMenu != null && mc.player.containerMenu != mc.player.inventoryMenu) {
+                mc.player.closeContainer();
+            }
         }
+        sendBehaviorSnapshot();
         sendResponse(cmd.id(), true, "All stopped");
     }
 
@@ -946,6 +958,13 @@ public class ActionExecutor {
             return;
         }
         String playerName = args.get("player").getAsString();
+        pendingCraftItem = null;
+        pendingCraftReqId = null;
+        pendingCraftTicks = 0;
+        pendingCraftAttempts = 0;
+        pendingEatReqId = null;
+        pendingEatTicks = 0;
+        pendingEatAttempts = 0;
         followTargetName = playerName;
         followRefreshTicks = 0;
         
@@ -954,10 +973,13 @@ public class ActionExecutor {
             if (player.getName().getString().equalsIgnoreCase(playerName)) {
                 // Move toward player
                 MovementSystem.moveTo(player.getX(), player.getY(), player.getZ(), 1.2f);
+                sendBehaviorSnapshot();
                 sendResponse(cmd.id(), true, "Following " + playerName);
                 return;
             }
         }
+        followTargetName = null;
+        sendBehaviorSnapshot();
         sendResponse(cmd.id(), false, "Player " + playerName + " not found");
     }
 
@@ -974,10 +996,13 @@ public class ActionExecutor {
         }
         String itemName = normalizeItemName(args.get("item").getAsString());
 
+        followTargetName = null;
+
         pendingCraftItem = itemName;
         pendingCraftReqId = cmd.id();
         pendingCraftTicks = 0;
         pendingCraftAttempts = 0;
+        sendBehaviorSnapshot();
         if (LCUMod.WIRE != null) {
             LCUMod.WIRE.sendProgress(cmd.id(), 0.05, "craft queued: " + itemName);
         }
@@ -997,6 +1022,7 @@ public class ActionExecutor {
         }
         String blockType = args.get("block_type").getAsString();
         int count = args.has("count") ? args.get("count").getAsInt() : 1;
+        followTargetName = null;
         
         // Search for nearby blocks of specified type
         BlockPos playerPos = mc.player.blockPosition();
@@ -1012,6 +1038,7 @@ public class ActionExecutor {
                     if (state.toString().contains(blockType)) {
                         // Move to block and mine it
                         MovementSystem.moveTo(pos.getX() + 0.5, pos.getY(), pos.getZ() + 0.5, 1.0f);
+                        sendBehaviorSnapshot();
                         sendResponse(cmd.id(), true, "Collecting " + blockType);
                         return;
                     }
@@ -1078,12 +1105,15 @@ public class ActionExecutor {
             return;
         }
 
+        followTargetName = null;
+
         pendingEatReqId = cmd.id();
         pendingEatTicks = 0;
         pendingEatAttempts = 0;
         pendingEatStartHunger = mc.player.getFoodData().getFoodLevel();
         pendingEatStartHealth = mc.player.getHealth();
         startEating(mc);
+        sendBehaviorSnapshot();
         if (LCUMod.WIRE != null) {
             LCUMod.WIRE.sendProgress(cmd.id(), 0.05, "eat queued");
         }
@@ -1160,11 +1190,20 @@ public class ActionExecutor {
     // ── State Sync ──
 
     private void sendBehaviorState(boolean enabled) {
-        if (LCUMod.WIRE != null) {
-            JsonObject data = new JsonObject();
-            data.addProperty("behaviors_enabled", enabled);
-            LCUMod.WIRE.sendEvent("behavior_state", data);
+        sendBehaviorSnapshot();
+    }
+
+    private void sendBehaviorSnapshot() {
+        if (LCUMod.WIRE == null) {
+            return;
         }
+        JsonObject data = new JsonObject();
+        data.addProperty("behaviors_enabled", LCUMod.BEHAVIORS == null || LCUMod.BEHAVIORS.isEnabled());
+        data.addProperty("follow_target", followTargetName == null ? "" : followTargetName);
+        data.addProperty("pending_craft_item", pendingCraftItem == null ? "" : pendingCraftItem);
+        data.addProperty("pending_eat", pendingEatReqId != null);
+        data.addProperty("navigating", Pathfinder.isNavigating());
+        LCUMod.WIRE.sendEvent("behavior_state", data);
     }
 
     private void sendControlState() {
@@ -1227,6 +1266,7 @@ public class ActionExecutor {
             pendingCraftReqId = null;
             pendingCraftTicks = 0;
             pendingCraftAttempts = 0;
+            sendBehaviorSnapshot();
             return;
         }
 
@@ -1242,6 +1282,7 @@ public class ActionExecutor {
             }
             pendingCraftItem = null;
             pendingCraftReqId = null;
+            sendBehaviorSnapshot();
             return;
         }
 
@@ -1253,6 +1294,7 @@ public class ActionExecutor {
                 }
                 pendingCraftItem = null;
                 pendingCraftReqId = null;
+                sendBehaviorSnapshot();
             }
             return;
         }
@@ -1274,6 +1316,7 @@ public class ActionExecutor {
             }
             pendingCraftItem = null;
             pendingCraftReqId = null;
+            sendBehaviorSnapshot();
         }
     }
 
@@ -1361,6 +1404,7 @@ public class ActionExecutor {
             pendingEatReqId = null;
             pendingEatTicks = 0;
             pendingEatAttempts = 0;
+            sendBehaviorSnapshot();
             return;
         }
 
@@ -1377,6 +1421,7 @@ public class ActionExecutor {
             pendingEatReqId = null;
             pendingEatTicks = 0;
             pendingEatAttempts = 0;
+            sendBehaviorSnapshot();
         }
     }
 

@@ -48,6 +48,7 @@ class Session:
         # Core subsystems
         self.action_manager = ActionManager()
         self.skills = Skills(wire)
+        self.skills.set_command_observer(self._on_skill_command)
         self.memory = Memory(path=f"data/memory/session_{self.id}.json")
         self.commands = Commands(self.skills)
         self.modes_engine = ModesEngine(self.skills, self.memory)
@@ -85,6 +86,8 @@ class Session:
         # Auto-save
         self._last_save = time.monotonic()
         self._manual_command_until = 0.0
+        self._manual_action_reqs: set[str] = set()
+        self._manual_task_kind: Optional[str] = None
 
     # ── Event handlers ──
 
@@ -93,8 +96,6 @@ class Session:
         match event_type:
             case "state_update":
                 self.runtime.update(data)
-                # Run modes engine on state update
-                self.modes_engine.tick(self.runtime, action_busy=self.action_manager.is_busy)
             case "player_chat":
                 sender = data.get("sender", "?")
                 message = data.get("message", "")
@@ -135,19 +136,22 @@ class Session:
                 
                 logger.info("[Chat] Timing Gate: 回复（%s）", reason)
 
+                planner_context = "chat"
                 if reason.startswith("direct_command") or reason.startswith("mentioned") or reason == "private_chat":
                     self._manual_command_until = time.time() + 20.0
+                    planner_context = "manual_chat"
                 
                 # 记录回复
                 self.timing_gate.record_reply()
                 
                 # 使用 Planner 规划回复
                 try:
-                    response = self.handle_chat(sender, message)
+                    response = self.handle_chat(sender, message, command_context=planner_context)
                     if response:
                         logger.info("[Chat] AI response: %s", response[:80])
                         # Send response as chat message
-                        self.skills.send_chat(response)
+                        with self.skills.command_context("chat_reply"):
+                            self.skills.send_chat(response)
                         # Save AI response to database
                         self.message_db.add_message(
                             sender="AI",
@@ -170,13 +174,28 @@ class Session:
                 req_id = data.get("id", "?")
                 success = data.get("success", False)
                 self.action_manager.handle_response(req_id, success)
+                if req_id in self._manual_action_reqs:
+                    if success and self._manual_task_kind in {"follow_player", "craft_item", "eat", "collect_blocks", "move_to", "explore", "build"}:
+                        self._manual_command_until = max(self._manual_command_until, time.time() + 30.0)
+                    elif not success:
+                        self._manual_action_reqs.discard(req_id)
+                        if not self._manual_action_reqs:
+                            self._manual_task_kind = None
             case "command_progress":
                 req_id = data.get("id", "?")
                 progress = float(data.get("progress", 0.0) or 0.0)
                 message = data.get("message", "")
                 self.action_manager.handle_progress(req_id, progress, message)
+                if req_id in self._manual_action_reqs:
+                    self._manual_command_until = max(self._manual_command_until, time.time() + 15.0)
+                    if progress <= 0.0 or progress >= 1.0:
+                        self._manual_action_reqs.discard(req_id)
             case "behavior_state":
                 self.runtime["behavior_state"] = data
+                if self._manual_behavior_active():
+                    self._manual_command_until = max(self._manual_command_until, time.time() + 8.0)
+                elif not self._manual_action_reqs:
+                    self._manual_task_kind = None
             case "control_state":
                 self.runtime["control_state"] = data
             case _:
@@ -234,7 +253,7 @@ class Session:
 
         return False
 
-    def handle_chat(self, sender: str, message: str) -> Optional[str]:
+    def handle_chat(self, sender: str, message: str, command_context: str = "chat") -> Optional[str]:
         """
         Process a chat message through the LLM.
         Uses Planner for intelligent action planning.
@@ -244,9 +263,10 @@ class Session:
         context["persona"] = self.runtime.get("persona", {})
         
         # Use Planner to plan and execute
-        response = self.planner.plan_and_execute(
-            sender, message, context, bot_name=self._get_bot_name()
-        )
+        with self.skills.command_context(command_context):
+            response = self.planner.plan_and_execute(
+                sender, message, context, bot_name=self._get_bot_name()
+            )
         
         if response:
             # Record interaction
@@ -296,13 +316,19 @@ class Session:
                    and not self.action_manager.is_busy)
 
         # Modes engine (priority behaviors that don't need LLM)
-        manual_override_active = time.time() < self._manual_command_until
-        mode_action = None if manual_override_active else self.modes_engine.tick(self.runtime, action_busy=self.action_manager.is_busy)
+        behavior_state = self.runtime.get("behavior_state", {}) if isinstance(self.runtime.get("behavior_state"), dict) else {}
+        control_state = self.runtime.get("control_state", {}) if isinstance(self.runtime.get("control_state"), dict) else {}
+        autonomy_enabled = control_state.get("ai_controlled", True) and behavior_state.get("behaviors_enabled", True)
+        manual_override_active = time.time() < self._manual_command_until or self._manual_behavior_active()
+        mode_action = None
+        if autonomy_enabled and not manual_override_active:
+            with self.skills.command_context("mode"):
+                mode_action = self.modes_engine.tick(self.runtime, action_busy=self.action_manager.is_busy)
         if mode_action:
             self.self_prompter.mark_action()
 
         # Self-prompter check (mindcraft-style: trigger LLM when idle too long)
-        if not manual_override_active and self.self_prompter.should_prompt(is_idle, self.action_manager.is_busy):
+        if autonomy_enabled and not manual_override_active and self.self_prompter.should_prompt(is_idle, self.action_manager.is_busy):
             prompt = self.self_prompter.build_prompt()
             logger.info("[Session] Self-prompt triggered: %s", prompt[:60])
             # Route through LLM service to generate commands
@@ -334,7 +360,8 @@ class Session:
             response_text = result.get("content", "")
             if response_text:
                 # Parse and execute commands from LLM output
-                cmd_results = self.commands.parse_and_execute(response_text, self.runtime)
+                with self.skills.command_context("self_prompt"):
+                    cmd_results = self.commands.parse_and_execute(response_text, self.runtime)
                 for cr in cmd_results:
                     self.memory.record_action(f"cmd:{cr.message.split()[0] if cr.message else '?'}", cr.success)
                     if cr.success:
@@ -366,3 +393,33 @@ class Session:
             "world": self.runtime.get("world", {}),
             "llm_usage": self.llm.get_usage(),
         }
+
+    def _on_skill_command(self, cmd: str, req_id: str, context: str, args: dict):
+        self.self_prompter.mark_action()
+        if context != "manual_chat" or cmd == "send_chat":
+            return
+        self._manual_action_reqs.add(req_id)
+        self._manual_task_kind = cmd
+        extension = 20.0
+        if cmd in {"follow_player", "craft_item", "eat", "collect_blocks", "move_to", "explore", "build"}:
+            extension = 45.0
+        elif cmd == "stop_all":
+            self._manual_action_reqs.clear()
+            self._manual_task_kind = None
+            extension = 6.0
+        self._manual_command_until = max(self._manual_command_until, time.time() + extension)
+
+    def _manual_behavior_active(self) -> bool:
+        behavior = self.runtime.get("behavior_state", {})
+        if not isinstance(behavior, dict):
+            return False
+        task_kind = self._manual_task_kind
+        if task_kind == "follow_player":
+            return bool(behavior.get("follow_target"))
+        if task_kind == "craft_item":
+            return bool(behavior.get("pending_craft_item"))
+        if task_kind == "eat":
+            return bool(behavior.get("pending_eat"))
+        if task_kind in {"move_to", "collect_blocks", "explore", "build"}:
+            return bool(behavior.get("navigating"))
+        return False

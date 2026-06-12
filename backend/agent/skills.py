@@ -11,6 +11,7 @@ Reference projects:
 import json
 import logging
 import time
+from contextlib import contextmanager
 from typing import Any, Optional
 
 logger = logging.getLogger("skills")
@@ -26,9 +27,23 @@ class Skills:
 
     def __init__(self, wire=None):
         self.wire = wire
+        self._command_observer = None
+        self._command_context = "default"
 
     def set_wire(self, wire):
         self.wire = wire
+
+    def set_command_observer(self, observer):
+        self._command_observer = observer
+
+    @contextmanager
+    def command_context(self, context: str):
+        previous = self._command_context
+        self._command_context = context
+        try:
+            yield
+        finally:
+            self._command_context = previous
 
     # ── Movement (mineflayer physics.js) ───────────────────────
 
@@ -223,5 +238,10 @@ class Skills:
             logger.warning("[Skills] No wire, skipping %s", cmd)
             return {"success": False, "message": "No wire connection"}
         req_id = self.wire.send_command(cmd, args)
+        if self._command_observer:
+            try:
+                self._command_observer(cmd, req_id, self._command_context, args)
+            except Exception as exc:
+                logger.debug("[Skills] Command observer failed for %s: %s", cmd, exc)
         logger.debug("[Skills] Sent: %s (req=%s)", cmd, req_id)
         return {"success": True, "message": f"{cmd} sent", "req_id": req_id}
