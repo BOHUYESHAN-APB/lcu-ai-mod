@@ -219,7 +219,7 @@ finish()
         """执行规划结果。"""
         plan_lower = plan_text.lower()
         reply_text: Optional[str] = None
-        executed_any_action = self._execute_tool_calls(plan_text)
+        executed_any_action = self._execute_tool_calls(plan_text, context)
         
         # 回复
         if "reply(" in plan_lower:
@@ -239,9 +239,11 @@ finish()
         if "follow(" in plan_lower:
             player_name = self._extract_between(plan_text, "follow(", ")")
             if player_name:
-                self.skills.follow_player(player_name.strip())
-                logger.info("[Planner] 跟随 %s", player_name.strip())
-                executed_any_action = True
+                normalized_target = player_name.strip()
+                if not self._is_duplicate_task(context, {"follow"}, normalized_target):
+                    self.skills.follow_player(normalized_target)
+                    logger.info("[Planner] 跟随 %s", normalized_target)
+                    executed_any_action = True
         
         # 攻击
         if "attack()" in plan_lower:
@@ -268,9 +270,10 @@ finish()
                 parts = [part.strip() for part in item_name.split(",") if part.strip()]
                 normalized_item = self._normalize_item_name(parts[0])
                 craft_count = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
-                self.skills.craft_item(normalized_item, craft_count)
-                logger.info("[Planner] 合成 %s x%d", normalized_item, craft_count)
-                executed_any_action = True
+                if not self._is_duplicate_task(context, {"craft"}, normalized_item):
+                    self.skills.craft_item(normalized_item, craft_count)
+                    logger.info("[Planner] 合成 %s x%d", normalized_item, craft_count)
+                    executed_any_action = True
         
         # 收集
         if "collect(" in plan_lower:
@@ -280,9 +283,10 @@ finish()
                 block_type = parts[0].strip() if len(parts) > 0 else ""
                 count = int(parts[1].strip()) if len(parts) > 1 else 1
                 normalized_block = self._normalize_block_name(block_type)
-                self.skills.collect_blocks(normalized_block, count)
-                logger.info("[Planner] 收集 %s x%d", normalized_block, count)
-                executed_any_action = True
+                if not self._is_duplicate_task(context, {"collect"}, normalized_block):
+                    self.skills.collect_blocks(normalized_block, count)
+                    logger.info("[Planner] 收集 %s x%d", normalized_block, count)
+                    executed_any_action = True
         
         # 装备
         if "equip(" in plan_lower:
@@ -404,7 +408,7 @@ finish()
         except ValueError:
             return None
 
-    def _execute_tool_calls(self, text: str) -> bool:
+    def _execute_tool_calls(self, text: str, context: dict) -> bool:
         executed = False
         for match in TOOL_CALL_RE.finditer(text):
             tool_name = match.group(1).strip().lower()
@@ -415,18 +419,18 @@ finish()
                 logger.warning("[Planner] 无法解析 tool 调用参数: %s", payload_text[:120])
                 continue
 
-            if self._dispatch_tool_call(tool_name, payload):
+            if self._dispatch_tool_call(tool_name, payload, context):
                 executed = True
         return executed
 
-    def _dispatch_tool_call(self, tool_name: str, payload: dict) -> bool:
+    def _dispatch_tool_call(self, tool_name: str, payload: dict, context: dict) -> bool:
         if tool_name == "move_to":
             if {"x", "y", "z"}.issubset(payload):
                 self.skills.move_to(float(payload["x"]), float(payload["y"]), float(payload["z"]))
                 return True
         elif tool_name == "follow":
             player = payload.get("player") or payload.get("player_name")
-            if player:
+            if player and not self._is_duplicate_task(context, {"follow"}, str(player)):
                 self.skills.follow_player(str(player))
                 return True
         elif tool_name == "attack":
@@ -440,13 +444,15 @@ finish()
             return True
         elif tool_name == "craft_item":
             item = payload.get("item") or payload.get("item_name")
-            if item:
-                self.skills.craft_item(self._normalize_item_name(str(item)), int(payload.get("count", 1)))
+            normalized_item = self._normalize_item_name(str(item)) if item else ""
+            if item and not self._is_duplicate_task(context, {"craft"}, normalized_item):
+                self.skills.craft_item(normalized_item, int(payload.get("count", 1)))
                 return True
         elif tool_name == "collect_blocks":
             block_type = payload.get("block_type") or payload.get("block")
-            if block_type:
-                self.skills.collect_blocks(self._normalize_block_name(str(block_type)), int(payload.get("count", 1)))
+            normalized_block = self._normalize_block_name(str(block_type)) if block_type else ""
+            if block_type and not self._is_duplicate_task(context, {"collect"}, normalized_block):
+                self.skills.collect_blocks(normalized_block, int(payload.get("count", 1)))
                 return True
         elif tool_name == "get_inventory":
             self.skills.get_inventory()
@@ -489,6 +495,19 @@ finish()
     def _normalize_block_name(self, block_name: str) -> str:
         stripped = block_name.strip().replace(" ", "")
         return BLOCK_ALIASES.get(stripped, block_name.strip())
+
+    def _is_duplicate_task(self, context: dict, kinds: set[str], target: str) -> bool:
+        task_state = context.get("task_state", {}) if isinstance(context, dict) else {}
+        if not isinstance(task_state, dict):
+            return False
+        kind = str(task_state.get("kind", "")).strip().lower()
+        status = str(task_state.get("status", "")).strip().lower()
+        active_target = self._normalize_task_target(str(task_state.get("target", "")))
+        requested_target = self._normalize_task_target(target)
+        return kind in kinds and status not in {"", "idle", "done", "failed", "cancelled"} and active_target == requested_target
+
+    def _normalize_task_target(self, target: str) -> str:
+        return target.strip().replace(" ", "").lower()
     
     def interrupt(self):
         """中断当前规划。"""
