@@ -113,6 +113,17 @@ class Planner:
             f"{msg.get('sender', '?')}: {msg.get('message', '')}" 
             for msg in recent
         ])
+        nearby_blocks = context.get("nearby_blocks", []) if isinstance(context, dict) else []
+        nearby_entities = context.get("entities", []) if isinstance(context, dict) else []
+        nearby_block_text = ", ".join(
+            f"{block.get('block_id', block.get('name', '?'))}@{block.get('distance', '?')}m"
+            for block in nearby_blocks[:8]
+        ) or "无"
+        nearby_item_text = ", ".join(
+            f"{entity.get('item_id', entity.get('name', '?'))}x{entity.get('item_count', 1)}@{entity.get('distance', '?')}m"
+            for entity in nearby_entities
+            if entity.get("type") == "item"
+        ) or "无"
         
         prompt = f"""你是 {persona_name}，一个正在玩 Minecraft 的玩家。你和服务器里的其他玩家一起玩。
 
@@ -132,6 +143,10 @@ class Planner:
 
 当前任务状态：
 {context.get('task_state', {'kind': 'idle', 'status': 'idle'})}
+
+附近资源：
+- 方块：{nearby_block_text}
+- 掉落物：{nearby_item_text}
 
 可用动作：
 - reply(内容): 生成一条回复

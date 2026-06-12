@@ -268,6 +268,11 @@ class Session:
         context["task_state"] = self.runtime.get("task_state", {})
         context["behavior_state"] = self.runtime.get("behavior_state", {})
         context["control_state"] = self.runtime.get("control_state", {})
+        context["player"] = self.runtime.get("player", {})
+        context["world"] = self.runtime.get("world", {})
+        context["inventory"] = self.runtime.get("inventory", [])
+        context["entities"] = self.runtime.get("entities", [])
+        context["nearby_blocks"] = self.runtime.get("nearby_blocks", [])
         
         # Use Planner to plan and execute
         with self.skills.command_context(command_context):
@@ -359,6 +364,11 @@ class Session:
         context["task_state"] = self.runtime.get("task_state", {})
         context["behavior_state"] = self.runtime.get("behavior_state", {})
         context["control_state"] = self.runtime.get("control_state", {})
+        context["player"] = self.runtime.get("player", {})
+        context["world"] = self.runtime.get("world", {})
+        context["inventory"] = self.runtime.get("inventory", [])
+        context["entities"] = self.runtime.get("entities", [])
+        context["nearby_blocks"] = self.runtime.get("nearby_blocks", [])
         system_prompt = self.llm.build_system_prompt(context, self.commands.get_docs())
         messages = [
             {"role": "system", "content": system_prompt},

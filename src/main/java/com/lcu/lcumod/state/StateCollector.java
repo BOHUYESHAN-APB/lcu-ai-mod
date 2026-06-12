@@ -5,6 +5,8 @@ import com.google.gson.JsonObject;
 import com.lcu.lcumod.LCUMod;
 import com.lcu.lcumod.config.ModConfig;
 import net.minecraft.client.Minecraft;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.*;
 import net.minecraft.world.entity.monster.Enemy;
@@ -17,6 +19,8 @@ import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
 import net.neoforged.neoforge.client.event.ClientTickEvent;
 
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 
 /**
@@ -187,6 +191,10 @@ public class StateCollector {
 
             if (entity instanceof ItemEntity) {
                 e.addProperty("type", "item");
+                var stack = ((ItemEntity) entity).getItem();
+                e.addProperty("item_id", BuiltInRegistries.ITEM.getKey(stack.getItem()).toString());
+                e.addProperty("item_count", stack.getCount());
+                e.addProperty("display", stack.getDisplayName().getString());
             } else if (entity instanceof Enemy) {
                 e.addProperty("type", "hostile");
             } else if (entity instanceof Animal) {
@@ -204,6 +212,46 @@ public class StateCollector {
             entities.add(e);
         }
         state.add("entities", entities);
+
+        // Nearby blocks/resources — compact perception map for planning
+        List<JsonObject> nearbyBlocks = new ArrayList<>();
+        BlockPos origin = p.blockPosition();
+        for (int dx = -6; dx <= 6; dx++) {
+            for (int dy = -2; dy <= 2; dy++) {
+                for (int dz = -6; dz <= 6; dz++) {
+                    BlockPos pos = origin.offset(dx, dy, dz);
+                    var blockState = mc.level.getBlockState(pos);
+                    if (blockState.isAir()) continue;
+
+                    double centerX = pos.getX() + 0.5;
+                    double centerY = pos.getY() + 0.5;
+                    double centerZ = pos.getZ() + 0.5;
+                    double distance = Math.sqrt(
+                        Math.pow(centerX - p.getX(), 2)
+                            + Math.pow(centerY - p.getY(), 2)
+                            + Math.pow(centerZ - p.getZ(), 2)
+                    );
+                    if (distance > 8.5) continue;
+
+                    JsonObject block = new JsonObject();
+                    String blockId = BuiltInRegistries.BLOCK.getKey(blockState.getBlock()).toString();
+                    block.addProperty("name", blockState.getBlock().getName().getString());
+                    block.addProperty("block_id", blockId);
+                    block.addProperty("item_id", BuiltInRegistries.ITEM.getKey(blockState.getBlock().asItem()).toString());
+                    block.addProperty("distance", Math.round(distance * 10.0) / 10.0);
+                    block.addProperty("x", pos.getX());
+                    block.addProperty("y", pos.getY());
+                    block.addProperty("z", pos.getZ());
+                    nearbyBlocks.add(block);
+                }
+            }
+        }
+        nearbyBlocks.sort(Comparator.comparingDouble(block -> block.get("distance").getAsDouble()));
+        JsonArray nearbyBlocksJson = new JsonArray();
+        for (int i = 0; i < Math.min(32, nearbyBlocks.size()); i++) {
+            nearbyBlocksJson.add(nearbyBlocks.get(i));
+        }
+        state.add("nearby_blocks", nearbyBlocksJson);
 
         LCUMod.WIRE.sendEvent("state_update", state);
     }

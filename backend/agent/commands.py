@@ -172,7 +172,10 @@ class Commands:
         matched = [b for b in blocks if b.get("distance", 999) <= radius][:20]
         if not matched:
             return CommandResult(True, f"No blocks within {radius}m")
-        msg = "Nearby: " + ", ".join(f"{b['name']} ({b['distance']}m)" for b in matched)
+        msg = "Nearby: " + ", ".join(
+            f"{b.get('block_id', b.get('name', '?'))} -> {b.get('item_id', '?')} ({b.get('distance', '?')}m)"
+            for b in matched
+        )
         return CommandResult(True, msg)
 
     def _query_position(self, args: list[str], state: dict) -> CommandResult:
@@ -251,7 +254,7 @@ class Commands:
     def _act_craft(self, args: list[str], state: dict):
         """!craft [recipe_name] [count]"""
         if args:
-            count = int(args[1]) if len(args) > 1 else 1
+            count = int(args[1]) if len(args) > 1 and args[1].isdigit() else 1
             self.skills.craft_item(args[0], count)
 
     def _act_place(self, args: list[str], state: dict):
