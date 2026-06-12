@@ -323,9 +323,13 @@ class Session:
 
         # Determine if we're in idle state (no active mode, no task, no busy action)
         active_mode = self.modes_engine._active_mode
+        task_state = self.runtime.get("task_state", {}) if isinstance(self.runtime.get("task_state"), dict) else {}
+        task_active = bool(task_state) and str(task_state.get("kind", "idle")).strip().lower() != "idle" \
+            and str(task_state.get("status", "idle")).strip().lower() not in {"", "idle", "done", "failed", "cancelled"}
         is_idle = (active_mode is None
                    and not self.task_queue
-                   and not self.action_manager.is_busy)
+                   and not self.action_manager.is_busy
+                   and not task_active)
 
         # Modes engine (priority behaviors that don't need LLM)
         behavior_state = self.runtime.get("behavior_state", {}) if isinstance(self.runtime.get("behavior_state"), dict) else {}
@@ -335,12 +339,12 @@ class Session:
         mode_action = None
         if autonomy_enabled and not manual_override_active:
             with self.skills.command_context("mode"):
-                mode_action = self.modes_engine.tick(self.runtime, action_busy=self.action_manager.is_busy)
+                mode_action = self.modes_engine.tick(self.runtime, action_busy=self.action_manager.is_busy or task_active)
         if mode_action:
             self.self_prompter.mark_action()
 
         # Self-prompter check (mindcraft-style: trigger LLM when idle too long)
-        if autonomy_enabled and not manual_override_active and self.self_prompter.should_prompt(is_idle, self.action_manager.is_busy):
+        if autonomy_enabled and not manual_override_active and self.self_prompter.should_prompt(is_idle, self.action_manager.is_busy or task_active):
             prompt = self.self_prompter.build_prompt()
             logger.info("[Session] Self-prompt triggered: %s", prompt[:60])
             # Route through LLM service to generate commands
