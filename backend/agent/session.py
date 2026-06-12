@@ -84,6 +84,7 @@ class Session:
 
         # Auto-save
         self._last_save = time.monotonic()
+        self._manual_command_until = 0.0
 
     # ── Event handlers ──
 
@@ -133,6 +134,9 @@ class Session:
                     return
                 
                 logger.info("[Chat] Timing Gate: 回复（%s）", reason)
+
+                if reason.startswith("direct_command") or reason.startswith("mentioned") or reason == "private_chat":
+                    self._manual_command_until = time.time() + 20.0
                 
                 # 记录回复
                 self.timing_gate.record_reply()
@@ -288,12 +292,13 @@ class Session:
                    and not self.action_manager.is_busy)
 
         # Modes engine (priority behaviors that don't need LLM)
-        mode_action = self.modes_engine.tick(self.runtime, action_busy=self.action_manager.is_busy)
+        manual_override_active = time.time() < self._manual_command_until
+        mode_action = None if manual_override_active else self.modes_engine.tick(self.runtime, action_busy=self.action_manager.is_busy)
         if mode_action:
             self.self_prompter.mark_action()
 
         # Self-prompter check (mindcraft-style: trigger LLM when idle too long)
-        if self.self_prompter.should_prompt(is_idle, self.action_manager.is_busy):
+        if not manual_override_active and self.self_prompter.should_prompt(is_idle, self.action_manager.is_busy):
             prompt = self.self_prompter.build_prompt()
             logger.info("[Session] Self-prompt triggered: %s", prompt[:60])
             # Route through LLM service to generate commands

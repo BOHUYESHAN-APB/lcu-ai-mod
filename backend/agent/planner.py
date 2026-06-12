@@ -11,11 +11,35 @@ Planner — 规划器。
 支持可中断规划：新消息到达时可以中断当前规划。
 """
 
+import json
 import logging
+import re
 import time
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger("planner")
+TOOL_CALL_RE = re.compile(r"tool\(\s*([a-zA-Z_]+)\s*,\s*(\{.*?\})\s*\)", re.DOTALL)
+
+ITEM_ALIASES = {
+    "木剑": "wooden_sword",
+    "木棍": "stick",
+    "木板": "oak_planks",
+    "原木": "oak_log",
+    "木头": "oak_log",
+    "工作台": "crafting_table",
+    "石剑": "stone_sword",
+    "石镐": "stone_pickaxe",
+    "木镐": "wooden_pickaxe",
+}
+
+BLOCK_ALIASES = {
+    "木头": "oak_log",
+    "原木": "oak_log",
+    "木板": "oak_planks",
+    "圆石": "cobblestone",
+    "煤": "coal_ore",
+    "铁": "iron_ore",
+}
 
 
 class Planner:
@@ -124,6 +148,7 @@ class Planner:
 - eat(): 吃东西
 - drop(item, count): 丢弃物品
 - sort_inventory(): 整理背包
+- stop(): 停止当前动作（例如停止跟随/停止自动移动）
 - finish(): 结束本轮
 
 重要规则：
@@ -133,16 +158,25 @@ class Planner:
 4. 如果玩家让你做某事，直接去做，不要问太多问题
 5. 回复要简短，不要长篇大论
 6. 如果需要多步操作，可以连续执行多个动作
+7. tool()/动作参数必须是可执行的真实参数，不能写“随机位置”“附近”“合适的地方”这种占位词
+8. 如果用户要求停止跟随或停止当前动作，优先使用 stop()
+9. 中文常见物品名要转换成 Minecraft 英文物品 ID，例如 木剑=wooden_sword，木头=oak_log
 
-请分析情况并决定下一步行动。如果需要回复，使用 reply()。如果需要执行动作，使用相应的动作函数。
+请分析情况并决定下一步行动。如果需要回复，使用 reply()。如果需要执行动作，优先使用 tool(动作名, JSON参数)。
 如果不需要做任何事，使用 finish()。
 
 回复格式：
 reply(你的回复内容)
 或
-动作函数
+tool(动作名, {"key":"value"})
 或
-finish()"""
+finish()
+
+特别规则：
+- 如果用户说“停下”“别跟了”“先别做了”，优先调用 stop()
+- 不要写 move_to(随机位置) 这种不可执行占位词，参数必须是真实值
+- 需要原版材料时，先 collect(...) 再 craft(...)
+"""
 
         return prompt
     
@@ -151,7 +185,7 @@ finish()"""
         """执行规划结果。"""
         plan_lower = plan_text.lower()
         reply_text: Optional[str] = None
-        executed_any_action = False
+        executed_any_action = self._execute_tool_calls(plan_text)
         
         # 回复
         if "reply(" in plan_lower:
@@ -197,8 +231,9 @@ finish()"""
         if "craft(" in plan_lower:
             item_name = self._extract_between(plan_text, "craft(", ")")
             if item_name:
-                self.skills.craft_item(item_name.strip())
-                logger.info("[Planner] 合成 %s", item_name.strip())
+                normalized_item = self._normalize_item_name(item_name)
+                self.skills.craft_item(normalized_item)
+                logger.info("[Planner] 合成 %s", normalized_item)
                 executed_any_action = True
         
         # 收集
@@ -208,8 +243,9 @@ finish()"""
                 parts = args.split(",")
                 block_type = parts[0].strip() if len(parts) > 0 else ""
                 count = int(parts[1].strip()) if len(parts) > 1 else 1
-                self.skills.collect_blocks(block_type, count)
-                logger.info("[Planner] 收集 %s x%d", block_type, count)
+                normalized_block = self._normalize_block_name(block_type)
+                self.skills.collect_blocks(normalized_block, count)
+                logger.info("[Planner] 收集 %s x%d", normalized_block, count)
                 executed_any_action = True
         
         # 装备
@@ -274,6 +310,11 @@ finish()"""
             self.skills.sort_inventory()
             logger.info("[Planner] 整理背包")
             executed_any_action = True
+
+        if "stop()" in plan_lower:
+            self.skills.stop_all()
+            logger.info("[Planner] 停止当前动作")
+            executed_any_action = True
         
         # 建造
         if "build(" in plan_lower:
@@ -289,6 +330,11 @@ finish()"""
                         executed_any_action = True
                     except ValueError:
                         pass
+
+        if "stop()" in plan_lower:
+            self.skills.stop_all()
+            logger.info("[Planner] 停止所有动作")
+            executed_any_action = True
         
         # 结束
         if "finish()" in plan_lower:
@@ -326,6 +372,92 @@ finish()"""
             return coords
         except ValueError:
             return None
+
+    def _execute_tool_calls(self, text: str) -> bool:
+        executed = False
+        for match in TOOL_CALL_RE.finditer(text):
+            tool_name = match.group(1).strip().lower()
+            payload_text = match.group(2).strip()
+            try:
+                payload = json.loads(payload_text)
+            except json.JSONDecodeError:
+                logger.warning("[Planner] 无法解析 tool 调用参数: %s", payload_text[:120])
+                continue
+
+            if self._dispatch_tool_call(tool_name, payload):
+                executed = True
+        return executed
+
+    def _dispatch_tool_call(self, tool_name: str, payload: dict) -> bool:
+        if tool_name == "move_to":
+            if {"x", "y", "z"}.issubset(payload):
+                self.skills.move_to(float(payload["x"]), float(payload["y"]), float(payload["z"]))
+                return True
+        elif tool_name == "follow":
+            player = payload.get("player") or payload.get("player_name")
+            if player:
+                self.skills.follow_player(str(player))
+                return True
+        elif tool_name == "attack":
+            self.skills.attack()
+            return True
+        elif tool_name == "mine_block":
+            self.skills.mine_block()
+            return True
+        elif tool_name == "place_block":
+            self.skills.place_block()
+            return True
+        elif tool_name == "craft_item":
+            item = payload.get("item") or payload.get("item_name")
+            if item:
+                self.skills.craft_item(self._normalize_item_name(str(item)))
+                return True
+        elif tool_name == "collect_blocks":
+            block_type = payload.get("block_type") or payload.get("block")
+            if block_type:
+                self.skills.collect_blocks(self._normalize_block_name(str(block_type)), int(payload.get("count", 1)))
+                return True
+        elif tool_name == "get_inventory":
+            self.skills.get_inventory()
+            return True
+        elif tool_name == "explore":
+            self.skills.explore(int(payload.get("radius", 16)))
+            return True
+        elif tool_name == "trade":
+            villager = payload.get("villager_type") or payload.get("type")
+            if villager:
+                self.skills.trade(str(villager))
+                return True
+        elif tool_name == "sleep":
+            self.skills.sleep()
+            return True
+        elif tool_name == "eat":
+            self.skills.eat()
+            return True
+        elif tool_name == "drop_item":
+            item = payload.get("item")
+            if item:
+                self.skills.drop_item(str(item), int(payload.get("count", 1)))
+                return True
+        elif tool_name == "sort_inventory":
+            self.skills.sort_inventory()
+            return True
+        elif tool_name == "build":
+            if {"x", "y", "z", "structure"}.issubset(payload):
+                self.skills.build(float(payload["x"]), float(payload["y"]), float(payload["z"]), str(payload["structure"]))
+                return True
+        elif tool_name == "stop":
+            self.skills.stop_all()
+            return True
+        return False
+
+    def _normalize_item_name(self, item_name: str) -> str:
+        stripped = item_name.strip().replace(" ", "")
+        return ITEM_ALIASES.get(stripped, item_name.strip())
+
+    def _normalize_block_name(self, block_name: str) -> str:
+        stripped = block_name.strip().replace(" ", "")
+        return BLOCK_ALIASES.get(stripped, block_name.strip())
     
     def interrupt(self):
         """中断当前规划。"""
