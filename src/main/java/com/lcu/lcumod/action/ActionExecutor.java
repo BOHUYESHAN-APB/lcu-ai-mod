@@ -1422,6 +1422,19 @@ public class ActionExecutor {
                 return;
             }
 
+            if (isProcessingStationBusy(mc)) {
+                String detail = step.mode + " in progress for " + pendingCraftItem;
+                setTaskState("craft", "processing", pendingCraftItem, detail, Math.min(0.88, 0.45 + pendingCraftAttempts * 0.06));
+                if (LCUMod.WIRE != null) {
+                    LCUMod.WIRE.sendProgress(
+                        pendingCraftReqId,
+                        Math.min(0.88, 0.45 + pendingCraftAttempts * 0.06),
+                        detail
+                    );
+                }
+                return;
+            }
+
             pendingCraftAttempts++;
             mc.gameMode.handlePlaceRecipe(mc.player.containerMenu.containerId, step.recipe, false);
             String detail = step.mode + " step " + pendingCraftAttempts + ": " + step.itemId + " x" + step.craftOperations;
@@ -1615,6 +1628,14 @@ public class ActionExecutor {
         }
         mc.gameMode.handleInventoryMouseClick(mc.player.containerMenu.containerId, 2, 0, ClickType.QUICK_MOVE, mc.player);
         return true;
+    }
+
+    private boolean isProcessingStationBusy(Minecraft mc) {
+        if (mc.player.containerMenu == null || mc.player.containerMenu.slots.size() < 3) {
+            return false;
+        }
+        return !mc.player.containerMenu.slots.get(0).getItem().isEmpty()
+            || !mc.player.containerMenu.slots.get(2).getItem().isEmpty();
     }
 
     private boolean ensureProcessingFuel(Minecraft mc) {
