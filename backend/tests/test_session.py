@@ -20,6 +20,17 @@ class SessionTests(unittest.TestCase):
 
         self.assertTrue(Session._manual_behavior_active(session))
 
+    def test_task_state_event_is_stored_in_runtime(self):
+        session = Session.__new__(Session)
+        session.runtime = {}
+        session._manual_task_kind = None
+        session._manual_action_reqs = set()
+
+        session.handle_event("task_state", {"kind": "craft", "status": "collecting", "target": "wooden_sword"})
+
+        self.assertEqual(session.runtime["task_state"]["kind"], "craft")
+        self.assertEqual(session.runtime["task_state"]["status"], "collecting")
+
 
 if __name__ == "__main__":
     unittest.main()

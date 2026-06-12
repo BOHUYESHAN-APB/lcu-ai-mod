@@ -130,6 +130,9 @@ class Planner:
 - 性格：{personality}
 - 说话风格：{speaking_style}
 
+当前任务状态：
+{context.get('task_state', {'kind': 'idle', 'status': 'idle'})}
+
 可用动作：
 - reply(内容): 生成一条回复
 - move_to(x, y, z): 移动到指定坐标
@@ -231,9 +234,11 @@ finish()
         if "craft(" in plan_lower:
             item_name = self._extract_between(plan_text, "craft(", ")")
             if item_name:
-                normalized_item = self._normalize_item_name(item_name)
-                self.skills.craft_item(normalized_item)
-                logger.info("[Planner] 合成 %s", normalized_item)
+                parts = [part.strip() for part in item_name.split(",") if part.strip()]
+                normalized_item = self._normalize_item_name(parts[0])
+                craft_count = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
+                self.skills.craft_item(normalized_item, craft_count)
+                logger.info("[Planner] 合成 %s x%d", normalized_item, craft_count)
                 executed_any_action = True
         
         # 收集
@@ -405,7 +410,7 @@ finish()
         elif tool_name == "craft_item":
             item = payload.get("item") or payload.get("item_name")
             if item:
-                self.skills.craft_item(self._normalize_item_name(str(item)))
+                self.skills.craft_item(self._normalize_item_name(str(item)), int(payload.get("count", 1)))
                 return True
         elif tool_name == "collect_blocks":
             block_type = payload.get("block_type") or payload.get("block")

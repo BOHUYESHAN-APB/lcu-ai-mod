@@ -196,6 +196,10 @@ class Session:
                     self._manual_command_until = max(self._manual_command_until, time.time() + 8.0)
                 elif not self._manual_action_reqs:
                     self._manual_task_kind = None
+            case "task_state":
+                self.runtime["task_state"] = data
+                if self._manual_behavior_active():
+                    self._manual_command_until = max(self._manual_command_until, time.time() + 8.0)
             case "control_state":
                 self.runtime["control_state"] = data
             case _:
@@ -261,6 +265,9 @@ class Session:
         # Get context
         context = self.memory.build_context()
         context["persona"] = self.runtime.get("persona", {})
+        context["task_state"] = self.runtime.get("task_state", {})
+        context["behavior_state"] = self.runtime.get("behavior_state", {})
+        context["control_state"] = self.runtime.get("control_state", {})
         
         # Use Planner to plan and execute
         with self.skills.command_context(command_context):
@@ -349,6 +356,9 @@ class Session:
         # Build system context
         context = self.memory.build_context()
         context["persona"] = self.runtime.get("persona", {})
+        context["task_state"] = self.runtime.get("task_state", {})
+        context["behavior_state"] = self.runtime.get("behavior_state", {})
+        context["control_state"] = self.runtime.get("control_state", {})
         system_prompt = self.llm.build_system_prompt(context, self.commands.get_docs())
         messages = [
             {"role": "system", "content": system_prompt},
@@ -391,6 +401,7 @@ class Session:
             "database": self.message_db.get_stats(),
             "player": self.runtime.get("player", {}),
             "world": self.runtime.get("world", {}),
+            "task_state": self.runtime.get("task_state", {}),
             "llm_usage": self.llm.get_usage(),
         }
 
@@ -411,15 +422,24 @@ class Session:
 
     def _manual_behavior_active(self) -> bool:
         behavior = self.runtime.get("behavior_state", {})
+        task_state = self.runtime.get("task_state", {})
         if not isinstance(behavior, dict):
             return False
         task_kind = self._manual_task_kind
         if task_kind == "follow_player":
             return bool(behavior.get("follow_target"))
         if task_kind == "craft_item":
-            return bool(behavior.get("pending_craft_item"))
+            return bool(behavior.get("pending_craft_item")) or (
+                isinstance(task_state, dict) and task_state.get("kind") == "craft" and task_state.get("status") != "idle"
+            )
         if task_kind == "eat":
             return bool(behavior.get("pending_eat"))
-        if task_kind in {"move_to", "collect_blocks", "explore", "build"}:
+        if task_kind == "collect_blocks":
+            return (
+                bool(behavior.get("navigating"))
+                or (isinstance(task_state, dict) and task_state.get("kind") in {"collect", "craft"}
+                    and task_state.get("status") in {"searching", "moving", "collecting", "mining"})
+            )
+        if task_kind in {"move_to", "explore", "build"}:
             return bool(behavior.get("navigating"))
         return False

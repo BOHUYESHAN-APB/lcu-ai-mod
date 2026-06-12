@@ -251,7 +251,8 @@ class Commands:
     def _act_craft(self, args: list[str], state: dict):
         """!craft [recipe_name] [count]"""
         if args:
-            self.skills.craft_item(args[0])
+            count = int(args[1]) if len(args) > 1 else 1
+            self.skills.craft_item(args[0], count)
 
     def _act_place(self, args: list[str], state: dict):
         """!place x y z [block_type]"""

@@ -27,6 +27,15 @@ class SkillsTests(unittest.TestCase):
         self.assertEqual(observed[0][2], "manual_chat")
         self.assertEqual(observed[0][3], {"player": "Alice"})
 
+    def test_craft_item_sends_count(self):
+        wire = DummyWire()
+        skills = Skills(wire)
+
+        skills.craft_item("wooden_sword", 3)
+
+        self.assertEqual(wire.sent[0][0], "craft_item")
+        self.assertEqual(wire.sent[0][1], {"item": "wooden_sword", "count": 3})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -10,8 +10,8 @@ class DummySkills:
     def collect_blocks(self, block_type, count=1):
         self.calls.append(("collect_blocks", block_type, count))
 
-    def craft_item(self, item_name):
-        self.calls.append(("craft_item", item_name))
+    def craft_item(self, item_name, count=1):
+        self.calls.append(("craft_item", item_name, count))
 
     def place_block(self):
         self.calls.append(("place_block",))
@@ -39,7 +39,7 @@ class CommandsTests(unittest.TestCase):
         commands.parse_and_execute("!collect oak_log 3 !craft wooden_sword !place 1 2 3 stone !stop", {})
 
         self.assertIn(("collect_blocks", "oak_log", 3), skills.calls)
-        self.assertIn(("craft_item", "wooden_sword"), skills.calls)
+        self.assertIn(("craft_item", "wooden_sword", 1), skills.calls)
         self.assertIn(("place_block",), skills.calls)
         self.assertIn(("stop_all",), skills.calls)
 

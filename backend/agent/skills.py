@@ -194,9 +194,9 @@ class Skills:
         """Follow a specific player."""
         return self._send_cmd("follow_player", {"player": player_name})
 
-    def craft_item(self, item_name: str) -> dict:
+    def craft_item(self, item_name: str, count: int = 1) -> dict:
         """Craft an item by name."""
-        return self._send_cmd("craft_item", {"item": item_name})
+        return self._send_cmd("craft_item", {"item": item_name, "count": count})
 
     def collect_blocks(self, block_type: str, count: int = 1) -> dict:
         """Collect specified number of blocks."""

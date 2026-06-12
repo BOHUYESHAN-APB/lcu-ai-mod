@@ -12,6 +12,7 @@ import net.minecraft.network.protocol.game.ServerboundClientCommandPacket;
 import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.inventory.ClickType;
 import net.minecraft.world.item.crafting.RecipeHolder;
 import net.minecraft.world.item.crafting.RecipeType;
@@ -56,6 +57,19 @@ public class ActionExecutor {
     private static int pendingEatAttempts = 0;
     private static int pendingEatStartHunger = -1;
     private static float pendingEatStartHealth = -1;
+    private static String pendingCollectItem = null;
+    private static String pendingCollectReqId = null;
+    private static int pendingCollectGoalCount = 0;
+    private static int pendingCollectBaselineCount = 0;
+    private static BlockPos pendingCollectTargetPos = null;
+    private static int pendingCollectTicks = 0;
+    private static int pendingCollectSearchMisses = 0;
+    private static int pendingCraftGoalCount = 1;
+    private static String activeTaskKind = "idle";
+    private static String activeTaskStatus = "idle";
+    private static String activeTaskTarget = "";
+    private static String activeTaskDetail = "";
+    private static double activeTaskProgress = 0.0;
     private int tickCount = 0;
 
     public static void notifyInterrupted(String reason) {
@@ -83,6 +97,9 @@ public class ActionExecutor {
 
         // ── Craft controller (stateful crafting) ──
         tickPendingCraft(mc);
+
+        // ── Collect controller (generic resource acquisition) ──
+        tickPendingCollect(mc);
 
         // ── Eat controller (stateful eating / healing) ──
         tickPendingEat(mc);
@@ -759,9 +776,17 @@ public class ActionExecutor {
         pendingCraftReqId = null;
         pendingCraftTicks = 0;
         pendingCraftAttempts = 0;
+        pendingCraftGoalCount = 1;
         pendingEatReqId = null;
         pendingEatTicks = 0;
         pendingEatAttempts = 0;
+        pendingCollectItem = null;
+        pendingCollectReqId = null;
+        pendingCollectGoalCount = 0;
+        pendingCollectBaselineCount = 0;
+        pendingCollectTargetPos = null;
+        pendingCollectTicks = 0;
+        pendingCollectSearchMisses = 0;
         Pathfinder.stop();
         MovementSystem.stop();
         releaseAllInputs();
@@ -774,6 +799,7 @@ public class ActionExecutor {
                 mc.player.closeContainer();
             }
         }
+        clearTaskState();
         sendBehaviorSnapshot();
         sendResponse(cmd.id(), true, "All stopped");
     }
@@ -967,6 +993,7 @@ public class ActionExecutor {
         pendingEatAttempts = 0;
         followTargetName = playerName;
         followRefreshTicks = 0;
+        setTaskState("follow", "running", playerName, "following player", 0.1);
         
         // Find player by name
         for (var player : mc.level.players()) {
@@ -995,6 +1022,7 @@ public class ActionExecutor {
             return;
         }
         String itemName = normalizeItemName(args.get("item").getAsString());
+        int requestedCount = args.has("count") ? Math.max(1, args.get("count").getAsInt()) : 1;
 
         followTargetName = null;
 
@@ -1002,6 +1030,15 @@ public class ActionExecutor {
         pendingCraftReqId = cmd.id();
         pendingCraftTicks = 0;
         pendingCraftAttempts = 0;
+        pendingCraftGoalCount = Math.max(countInventoryItem(mc, itemName), requestedCount);
+        if (pendingCraftGoalCount < requestedCount) {
+            pendingCraftGoalCount = requestedCount;
+        }
+        if (countInventoryItem(mc, itemName) >= requestedCount) {
+            pendingCraftGoalCount = countInventoryItem(mc, itemName);
+        }
+        clearPendingCollectTask();
+        setTaskState("craft", "planning", itemName, "analyzing recipe graph", 0.02);
         sendBehaviorSnapshot();
         if (LCUMod.WIRE != null) {
             LCUMod.WIRE.sendProgress(cmd.id(), 0.05, "craft queued: " + itemName);
@@ -1020,32 +1057,14 @@ public class ActionExecutor {
             sendResponse(cmd.id(), false, "No player");
             return;
         }
-        String blockType = args.get("block_type").getAsString();
+        String blockType = normalizeItemName(args.get("block_type").getAsString());
         int count = args.has("count") ? args.get("count").getAsInt() : 1;
         followTargetName = null;
-        
-        // Search for nearby blocks of specified type
-        BlockPos playerPos = mc.player.blockPosition();
-        int radius = 16;
-        
-        for (int x = -radius; x <= radius; x++) {
-            for (int y = -radius; y <= radius; y++) {
-                for (int z = -radius; z <= radius; z++) {
-                    BlockPos pos = playerPos.offset(x, y, z);
-                    var state = mc.level.getBlockState(pos);
-                    
-                    // Check if block matches type
-                    if (state.toString().contains(blockType)) {
-                        // Move to block and mine it
-                        MovementSystem.moveTo(pos.getX() + 0.5, pos.getY(), pos.getZ() + 0.5, 1.0f);
-                        sendBehaviorSnapshot();
-                        sendResponse(cmd.id(), true, "Collecting " + blockType);
-                        return;
-                    }
-                }
-            }
-        }
-        sendResponse(cmd.id(), false, "No " + blockType + " found nearby");
+
+        startCollectTask(mc, cmd.id(), blockType, Math.max(1, count));
+        setTaskState("collect", "searching", blockType, "searching nearby resources", 0.02);
+        sendBehaviorSnapshot();
+        sendResponse(cmd.id(), true, "Collecting " + blockType);
     }
 
     private void handleExplore(WireServer.WireCommand cmd) {
@@ -1112,6 +1131,8 @@ public class ActionExecutor {
         pendingEatAttempts = 0;
         pendingEatStartHunger = mc.player.getFoodData().getFoodLevel();
         pendingEatStartHealth = mc.player.getHealth();
+        clearPendingCollectTask();
+        setTaskState("eat", "running", "food", "consuming food", 0.05);
         startEating(mc);
         sendBehaviorSnapshot();
         if (LCUMod.WIRE != null) {
@@ -1202,8 +1223,40 @@ public class ActionExecutor {
         data.addProperty("follow_target", followTargetName == null ? "" : followTargetName);
         data.addProperty("pending_craft_item", pendingCraftItem == null ? "" : pendingCraftItem);
         data.addProperty("pending_eat", pendingEatReqId != null);
+        data.addProperty("pending_collect_item", pendingCollectItem == null ? "" : pendingCollectItem);
         data.addProperty("navigating", Pathfinder.isNavigating());
         LCUMod.WIRE.sendEvent("behavior_state", data);
+    }
+
+    private void sendTaskState() {
+        if (LCUMod.WIRE == null) {
+            return;
+        }
+        JsonObject data = new JsonObject();
+        data.addProperty("kind", activeTaskKind);
+        data.addProperty("status", activeTaskStatus);
+        data.addProperty("target", activeTaskTarget);
+        data.addProperty("detail", activeTaskDetail);
+        data.addProperty("progress", activeTaskProgress);
+        LCUMod.WIRE.sendEvent("task_state", data);
+    }
+
+    private void setTaskState(String kind, String status, String target, String detail, double progress) {
+        activeTaskKind = kind;
+        activeTaskStatus = status;
+        activeTaskTarget = target == null ? "" : target;
+        activeTaskDetail = detail == null ? "" : detail;
+        activeTaskProgress = Math.max(0.0, Math.min(1.0, progress));
+        sendTaskState();
+    }
+
+    private void clearTaskState() {
+        activeTaskKind = "idle";
+        activeTaskStatus = "idle";
+        activeTaskTarget = "";
+        activeTaskDetail = "";
+        activeTaskProgress = 0.0;
+        sendTaskState();
     }
 
     private void sendControlState() {
@@ -1266,7 +1319,13 @@ public class ActionExecutor {
             pendingCraftReqId = null;
             pendingCraftTicks = 0;
             pendingCraftAttempts = 0;
+            pendingCraftGoalCount = 1;
+            clearTaskState();
             sendBehaviorSnapshot();
+            return;
+        }
+
+        if (pendingCollectReqId != null && pendingCollectReqId.equals(pendingCraftReqId)) {
             return;
         }
 
@@ -1275,18 +1334,36 @@ public class ActionExecutor {
             return;
         }
 
-        RecipeHolder<?> recipe = findRecipeByResult(mc, pendingCraftItem);
-        if (recipe == null) {
+        int currentCount = countInventoryItem(mc, pendingCraftItem);
+        int missingCount = Math.max(0, pendingCraftGoalCount - currentCount);
+        CraftingPlanner.CraftPlan plan = CraftingPlanner.plan(mc, pendingCraftItem, missingCount);
+        if (!plan.missingRaw.isEmpty()) {
+            Map.Entry<String, Integer> firstMissing = plan.missingRaw.entrySet().iterator().next();
+            startCollectTask(mc, pendingCraftReqId, firstMissing.getKey(), firstMissing.getValue());
+            String detail = "collecting raw resource " + firstMissing.getKey() + " x" + firstMissing.getValue();
+            setTaskState("craft", "collecting", pendingCraftItem, detail, Math.min(0.45, 0.1 + pendingCraftAttempts * 0.05));
             if (LCUMod.WIRE != null) {
-                LCUMod.WIRE.sendProgress(pendingCraftReqId, 0.0, "no recipe for " + pendingCraftItem);
+                LCUMod.WIRE.sendProgress(pendingCraftReqId, Math.min(0.45, 0.1 + pendingCraftAttempts * 0.05), detail);
             }
-            pendingCraftItem = null;
-            pendingCraftReqId = null;
             sendBehaviorSnapshot();
             return;
         }
 
-        boolean needsTable = !recipe.value().canCraftInDimensions(2, 2);
+        if (!plan.success || plan.steps.isEmpty()) {
+            if (LCUMod.WIRE != null) {
+                LCUMod.WIRE.sendProgress(pendingCraftReqId, 0.0, plan.failureReason.isBlank() ? "no craft path for " + pendingCraftItem : plan.failureReason);
+            }
+            pendingCraftItem = null;
+            pendingCraftReqId = null;
+            pendingCraftGoalCount = 1;
+            clearTaskState();
+            sendBehaviorSnapshot();
+            return;
+        }
+
+        CraftingPlanner.CraftStep step = plan.steps.get(0);
+
+        boolean needsTable = step.needsCraftingTable;
         if (needsTable && !isCraftingTableOpen(mc)) {
             if (!openNearbyCraftingTable(mc)) {
                 if (LCUMod.WIRE != null) {
@@ -1294,30 +1371,111 @@ public class ActionExecutor {
                 }
                 pendingCraftItem = null;
                 pendingCraftReqId = null;
+                pendingCraftGoalCount = 1;
+                clearTaskState();
                 sendBehaviorSnapshot();
             }
             return;
         }
 
         pendingCraftAttempts++;
-        mc.gameMode.handlePlaceRecipe(mc.player.containerMenu.containerId, recipe, false);
+        mc.gameMode.handlePlaceRecipe(mc.player.containerMenu.containerId, step.recipe, false);
         mc.gameMode.handleInventoryMouseClick(mc.player.containerMenu.containerId, 0, 0, ClickType.QUICK_MOVE, mc.player);
+        String detail = "craft step " + pendingCraftAttempts + ": " + step.itemId + " x" + step.craftOperations;
+        setTaskState("craft", "crafting", pendingCraftItem, detail, Math.min(0.9, 0.35 + pendingCraftAttempts * 0.12));
         if (LCUMod.WIRE != null) {
             LCUMod.WIRE.sendProgress(
                 pendingCraftReqId,
-                Math.min(0.9, 0.2 + pendingCraftAttempts * 0.2),
-                "craft attempt " + pendingCraftAttempts + ": " + pendingCraftItem
+                Math.min(0.9, 0.35 + pendingCraftAttempts * 0.12),
+                detail
             );
         }
 
-        if (pendingCraftAttempts >= 4 && !hasItem(mc, pendingCraftItem)) {
+        if (pendingCraftAttempts >= 8 && countInventoryItem(mc, pendingCraftItem) < pendingCraftGoalCount) {
             if (LCUMod.WIRE != null) {
                 LCUMod.WIRE.sendProgress(pendingCraftReqId, 0.0, "craft failed or missing materials: " + pendingCraftItem);
             }
             pendingCraftItem = null;
             pendingCraftReqId = null;
+            pendingCraftGoalCount = 1;
+            clearTaskState();
             sendBehaviorSnapshot();
         }
+    }
+
+    private void tickPendingCollect(Minecraft mc) {
+        if (pendingCollectItem == null || pendingCollectReqId == null || mc.player == null || mc.level == null || mc.gameMode == null) {
+            return;
+        }
+
+        int currentCount = countInventoryItem(mc, pendingCollectItem);
+        if (currentCount >= pendingCollectGoalCount) {
+            if (LCUMod.WIRE != null) {
+                LCUMod.WIRE.sendProgress(pendingCollectReqId, pendingCraftReqId != null && pendingCollectReqId.equals(pendingCraftReqId) ? 0.5 : 1.0,
+                    "collected " + pendingCollectItem + " x" + Math.max(0, currentCount - pendingCollectBaselineCount));
+            }
+            clearPendingCollectTask();
+            if (pendingCraftReqId == null) {
+                clearTaskState();
+            }
+            sendBehaviorSnapshot();
+            return;
+        }
+
+        pendingCollectTicks++;
+        if (pendingCollectTicks % 5 != 0) {
+            return;
+        }
+
+        ItemEntity nearbyDrop = findNearbyCollectibleItem(mc, pendingCollectItem, 12.0);
+        if (nearbyDrop != null) {
+            pendingCollectTargetPos = null;
+            MovementSystem.moveTo(nearbyDrop.getX(), nearbyDrop.getY(), nearbyDrop.getZ(), 1.1f);
+            setTaskState(resolveRootTaskKind(), "collecting", pendingCollectItem, "picking up nearby drop", collectProgress(mc));
+            return;
+        }
+
+        if (pendingCollectTargetPos != null && !isMatchingCollectBlock(mc, pendingCollectTargetPos, pendingCollectItem)) {
+            pendingCollectTargetPos = null;
+        }
+
+        if (pendingCollectTargetPos == null) {
+            pendingCollectTargetPos = findNearestCollectibleBlock(mc, pendingCollectItem, 20);
+            if (pendingCollectTargetPos == null) {
+                pendingCollectSearchMisses++;
+                setTaskState(resolveRootTaskKind(), "searching", pendingCollectItem, "searching for collectible block or drop", collectProgress(mc));
+                if (pendingCollectSearchMisses >= 12) {
+                    if (LCUMod.WIRE != null) {
+                        LCUMod.WIRE.sendProgress(pendingCollectReqId, 0.0, "no collectible source found for " + pendingCollectItem);
+                    }
+                    clearPendingCollectTask();
+                    if (pendingCraftReqId == null) {
+                        clearTaskState();
+                    }
+                    sendBehaviorSnapshot();
+                }
+                return;
+            }
+            pendingCollectSearchMisses = 0;
+        }
+
+        double distance = mc.player.distanceToSqr(Vec3.atCenterOf(pendingCollectTargetPos));
+        if (distance > 16.0) {
+            MovementSystem.moveTo(pendingCollectTargetPos.getX() + 0.5, pendingCollectTargetPos.getY(), pendingCollectTargetPos.getZ() + 0.5, 1.0f);
+            setTaskState(resolveRootTaskKind(), "moving", pendingCollectItem, "moving to resource node", collectProgress(mc));
+            return;
+        }
+
+        if (diggingPos == null || !pendingCollectTargetPos.equals(diggingPos)) {
+            autoEquipForBlock(mc, pendingCollectTargetPos);
+            mc.player.lookAt(net.minecraft.commands.arguments.EntityAnchorArgument.Anchor.EYES, Vec3.atCenterOf(pendingCollectTargetPos));
+            mc.gameMode.startDestroyBlock(pendingCollectTargetPos, Direction.UP);
+            mc.player.swing(InteractionHand.MAIN_HAND);
+            diggingPos = pendingCollectTargetPos;
+            diggingDir = Direction.UP;
+            diggingTicks = 0;
+        }
+        setTaskState(resolveRootTaskKind(), "mining", pendingCollectItem, "mining resource block", collectProgress(mc));
     }
 
     private boolean hasItem(Minecraft mc, String itemName) {
@@ -1404,6 +1562,7 @@ public class ActionExecutor {
             pendingEatReqId = null;
             pendingEatTicks = 0;
             pendingEatAttempts = 0;
+            clearTaskState();
             sendBehaviorSnapshot();
             return;
         }
@@ -1421,8 +1580,132 @@ public class ActionExecutor {
             pendingEatReqId = null;
             pendingEatTicks = 0;
             pendingEatAttempts = 0;
+            clearTaskState();
             sendBehaviorSnapshot();
         }
+    }
+
+    private void startCollectTask(Minecraft mc, String requestId, String itemId, int desiredAdditionalCount) {
+        pendingCollectItem = itemId;
+        pendingCollectReqId = requestId;
+        pendingCollectBaselineCount = countInventoryItem(mc, itemId);
+        pendingCollectGoalCount = pendingCollectBaselineCount + Math.max(1, desiredAdditionalCount);
+        pendingCollectTargetPos = null;
+        pendingCollectTicks = 0;
+        pendingCollectSearchMisses = 0;
+    }
+
+    private void clearPendingCollectTask() {
+        pendingCollectItem = null;
+        pendingCollectReqId = null;
+        pendingCollectGoalCount = 0;
+        pendingCollectBaselineCount = 0;
+        pendingCollectTargetPos = null;
+        pendingCollectTicks = 0;
+        pendingCollectSearchMisses = 0;
+    }
+
+    private int countInventoryItem(Minecraft mc, String itemId) {
+        int total = 0;
+        for (int i = 0; i < mc.player.getInventory().getContainerSize(); i++) {
+            var stack = mc.player.getInventory().getItem(i);
+            if (stack.isEmpty()) continue;
+            String id = BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
+            if (CraftingPlanner.matchesRegistryId(id, itemId)) {
+                total += stack.getCount();
+            }
+        }
+        return total;
+    }
+
+    private ItemEntity findNearbyCollectibleItem(Minecraft mc, String itemId, double radius) {
+        AABB searchBox = mc.player.getBoundingBox().inflate(radius);
+        ItemEntity nearest = null;
+        double nearestDistance = Double.MAX_VALUE;
+        for (Entity entity : mc.level.getEntities(mc.player, searchBox)) {
+            if (!(entity instanceof ItemEntity itemEntity)) continue;
+            String dropId = BuiltInRegistries.ITEM.getKey(itemEntity.getItem().getItem()).toString();
+            if (!CraftingPlanner.matchesRegistryId(dropId, itemId)) continue;
+            double distance = mc.player.distanceToSqr(itemEntity);
+            if (distance < nearestDistance) {
+                nearest = itemEntity;
+                nearestDistance = distance;
+            }
+        }
+        return nearest;
+    }
+
+    private BlockPos findNearestCollectibleBlock(Minecraft mc, String itemId, int radius) {
+        BlockPos origin = mc.player.blockPosition();
+        BlockPos best = null;
+        double bestDistance = Double.MAX_VALUE;
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dy = -4; dy <= 4; dy++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    BlockPos pos = origin.offset(dx, dy, dz);
+                    if (!isMatchingCollectBlock(mc, pos, itemId)) continue;
+                    double distance = origin.distSqr(pos);
+                    if (distance < bestDistance) {
+                        best = pos.immutable();
+                        bestDistance = distance;
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    private boolean isMatchingCollectBlock(Minecraft mc, BlockPos pos, String itemId) {
+        var state = mc.level.getBlockState(pos);
+        if (state.isAir()) {
+            return false;
+        }
+        String blockId = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
+        if (CraftingPlanner.matchesRegistryId(blockId, itemId)) {
+            return true;
+        }
+        String itemFromBlock = BuiltInRegistries.ITEM.getKey(state.getBlock().asItem()).toString();
+        return CraftingPlanner.matchesRegistryId(itemFromBlock, itemId);
+    }
+
+    private void autoEquipForBlock(Minecraft mc, BlockPos blockPos) {
+        var blockState = mc.level.getBlockState(blockPos);
+        var inv = mc.player.getInventory();
+        int bestSlot = -1;
+        float bestSpeed = 0f;
+        for (int i = 0; i < 9; i++) {
+            var stack = inv.getItem(i);
+            if (stack.isEmpty()) continue;
+            float speed = stack.getDestroySpeed(blockState);
+            if (speed <= 0) continue;
+            float score = stack.isCorrectToolForDrops(blockState) ? speed * 3.0f : speed * 0.5f;
+            if (score > bestSpeed) {
+                bestSpeed = score;
+                bestSlot = i;
+            }
+        }
+        if (bestSlot >= 0 && bestSlot != inv.selected) {
+            inv.selected = bestSlot;
+        }
+    }
+
+    private String resolveRootTaskKind() {
+        if (pendingCraftReqId != null) return "craft";
+        if (pendingCollectReqId != null) return "collect";
+        if (pendingEatReqId != null) return "eat";
+        if (followTargetName != null) return "follow";
+        if (Pathfinder.isNavigating()) return "move";
+        return "idle";
+    }
+
+    private double collectProgress(Minecraft mc) {
+        if (pendingCollectItem == null || pendingCollectGoalCount <= pendingCollectBaselineCount) {
+            return 0.0;
+        }
+        int current = countInventoryItem(mc, pendingCollectItem);
+        int gained = Math.max(0, current - pendingCollectBaselineCount);
+        int required = Math.max(1, pendingCollectGoalCount - pendingCollectBaselineCount);
+        return Math.min(0.95, gained / (double) required);
     }
 
     private boolean hasFoodInHotbar(Minecraft mc) {
