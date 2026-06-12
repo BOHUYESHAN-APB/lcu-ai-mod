@@ -6,15 +6,20 @@ import com.lcu.lcumod.LCUMod;
 import com.lcu.lcumod.network.WireServer;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.protocol.game.ServerboundClientCommandPacket;
 import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.inventory.ClickType;
+import net.minecraft.world.item.crafting.RecipeHolder;
+import net.minecraft.world.item.crafting.RecipeType;
 import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.core.Direction;
+import net.minecraft.world.level.block.Blocks;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -42,6 +47,10 @@ public class ActionExecutor {
     private static int respawnAttempts = 0;
     private static String followTargetName = null;
     private static int followRefreshTicks = 0;
+    private static String pendingCraftItem = null;
+    private static String pendingCraftReqId = null;
+    private static int pendingCraftTicks = 0;
+    private static int pendingCraftAttempts = 0;
     private int tickCount = 0;
 
     public static void notifyInterrupted(String reason) {
@@ -66,6 +75,9 @@ public class ActionExecutor {
 
         // ── Follow controller (persistent follow target) ──
         tickFollowTarget(mc);
+
+        // ── Craft controller (stateful crafting) ──
+        tickPendingCraft(mc);
 
         // ── Movement system (packet-based) ──
         MovementSystem.tick(mc);
@@ -730,6 +742,10 @@ public class ActionExecutor {
     private void handleStopAll(WireServer.WireCommand cmd) {
         var mc = Minecraft.getInstance();
         followTargetName = null;
+        pendingCraftItem = null;
+        pendingCraftReqId = null;
+        pendingCraftTicks = 0;
+        pendingCraftAttempts = 0;
         Pathfinder.stop();
         MovementSystem.stop();
         releaseAllInputs();
@@ -945,12 +961,16 @@ public class ActionExecutor {
             sendResponse(cmd.id(), false, "No player");
             return;
         }
-        String itemName = args.get("item").getAsString();
-        
-        // For now, send chat message about crafting
-        // Full crafting system would need recipe lookup and inventory management
-        mc.player.connection.sendChat("I'll try to craft " + itemName);
-        sendResponse(cmd.id(), true, "Attempting to craft " + itemName);
+        String itemName = normalizeItemName(args.get("item").getAsString());
+
+        pendingCraftItem = itemName;
+        pendingCraftReqId = cmd.id();
+        pendingCraftTicks = 0;
+        pendingCraftAttempts = 0;
+        if (LCUMod.WIRE != null) {
+            LCUMod.WIRE.sendProgress(cmd.id(), 0.05, "craft queued: " + itemName);
+        }
+        sendResponse(cmd.id(), true, "Crafting queued for " + itemName);
     }
 
     private void handleCollectBlocks(WireServer.WireCommand cmd) {
@@ -1181,6 +1201,131 @@ public class ActionExecutor {
             }
             return;
         }
+    }
+
+    private void tickPendingCraft(Minecraft mc) {
+        if (pendingCraftItem == null || pendingCraftReqId == null || mc.player == null || mc.level == null || mc.gameMode == null) {
+            return;
+        }
+
+        if (hasItem(mc, pendingCraftItem)) {
+            if (LCUMod.WIRE != null) {
+                LCUMod.WIRE.sendProgress(pendingCraftReqId, 1.0, "crafted: " + pendingCraftItem);
+            }
+            pendingCraftItem = null;
+            pendingCraftReqId = null;
+            pendingCraftTicks = 0;
+            pendingCraftAttempts = 0;
+            return;
+        }
+
+        pendingCraftTicks++;
+        if (pendingCraftTicks % 10 != 0) {
+            return;
+        }
+
+        RecipeHolder<?> recipe = findRecipeByResult(mc, pendingCraftItem);
+        if (recipe == null) {
+            if (LCUMod.WIRE != null) {
+                LCUMod.WIRE.sendProgress(pendingCraftReqId, 0.0, "no recipe for " + pendingCraftItem);
+            }
+            pendingCraftItem = null;
+            pendingCraftReqId = null;
+            return;
+        }
+
+        boolean needsTable = !recipe.value().canCraftInDimensions(2, 2);
+        if (needsTable && !isCraftingTableOpen(mc)) {
+            if (!openNearbyCraftingTable(mc)) {
+                if (LCUMod.WIRE != null) {
+                    LCUMod.WIRE.sendProgress(pendingCraftReqId, 0.0, "need nearby crafting table for " + pendingCraftItem);
+                }
+                pendingCraftItem = null;
+                pendingCraftReqId = null;
+            }
+            return;
+        }
+
+        pendingCraftAttempts++;
+        mc.gameMode.handlePlaceRecipe(mc.player.containerMenu.containerId, recipe, false);
+        mc.gameMode.handleInventoryMouseClick(mc.player.containerMenu.containerId, 0, 0, ClickType.QUICK_MOVE, mc.player);
+        if (LCUMod.WIRE != null) {
+            LCUMod.WIRE.sendProgress(
+                pendingCraftReqId,
+                Math.min(0.9, 0.2 + pendingCraftAttempts * 0.2),
+                "craft attempt " + pendingCraftAttempts + ": " + pendingCraftItem
+            );
+        }
+
+        if (pendingCraftAttempts >= 4 && !hasItem(mc, pendingCraftItem)) {
+            if (LCUMod.WIRE != null) {
+                LCUMod.WIRE.sendProgress(pendingCraftReqId, 0.0, "craft failed or missing materials: " + pendingCraftItem);
+            }
+            pendingCraftItem = null;
+            pendingCraftReqId = null;
+        }
+    }
+
+    private boolean hasItem(Minecraft mc, String itemName) {
+        for (int i = 0; i < mc.player.getInventory().getContainerSize(); i++) {
+            var stack = mc.player.getInventory().getItem(i);
+            if (stack.isEmpty()) continue;
+            String id = BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
+            if (id.equals(itemName) || id.endsWith(":" + itemName)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private RecipeHolder<?> findRecipeByResult(Minecraft mc, String itemName) {
+        for (RecipeHolder<?> recipe : mc.level.getRecipeManager().getRecipes()) {
+            if (recipe.value().getType() != RecipeType.CRAFTING) continue;
+            var result = recipe.value().getResultItem(mc.level.registryAccess());
+            if (result.isEmpty()) continue;
+            String id = BuiltInRegistries.ITEM.getKey(result.getItem()).toString();
+            if (id.equals(itemName) || id.endsWith(":" + itemName)) {
+                return recipe;
+            }
+        }
+        return null;
+    }
+
+    private boolean isCraftingTableOpen(Minecraft mc) {
+        return mc.player.containerMenu != null
+            && mc.player.containerMenu != mc.player.inventoryMenu
+            && mc.player.containerMenu.slots.size() >= 10;
+    }
+
+    private boolean openNearbyCraftingTable(Minecraft mc) {
+        BlockPos playerPos = mc.player.blockPosition();
+        for (int dx = -4; dx <= 4; dx++) {
+            for (int dy = -2; dy <= 2; dy++) {
+                for (int dz = -4; dz <= 4; dz++) {
+                    BlockPos pos = playerPos.offset(dx, dy, dz);
+                    if (!mc.level.getBlockState(pos).is(Blocks.CRAFTING_TABLE)) continue;
+                    Vec3 hitVec = Vec3.atCenterOf(pos);
+                    BlockHitResult hitResult = new BlockHitResult(hitVec, Direction.UP, pos, false);
+                    mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, hitResult);
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private String normalizeItemName(String itemName) {
+        String compact = itemName.replace(" ", "").trim();
+        return switch (compact) {
+            case "木剑" -> "wooden_sword";
+            case "木镐" -> "wooden_pickaxe";
+            case "木棍" -> "stick";
+            case "木板" -> "oak_planks";
+            case "工作台" -> "crafting_table";
+            case "石剑" -> "stone_sword";
+            case "石镐" -> "stone_pickaxe";
+            default -> compact;
+        };
     }
 
     // ── Break Tasks ──
