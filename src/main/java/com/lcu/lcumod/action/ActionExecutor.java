@@ -1625,7 +1625,7 @@ public class ActionExecutor {
         for (Entity entity : mc.level.getEntities(mc.player, searchBox)) {
             if (!(entity instanceof ItemEntity itemEntity)) continue;
             String dropId = BuiltInRegistries.ITEM.getKey(itemEntity.getItem().getItem()).toString();
-            if (!CraftingPlanner.matchesRegistryId(dropId, itemId)) continue;
+            if (!matchesCollectTargetId(dropId, itemId)) continue;
             double distance = mc.player.distanceToSqr(itemEntity);
             if (distance < nearestDistance) {
                 nearest = itemEntity;
@@ -1661,11 +1661,55 @@ public class ActionExecutor {
             return false;
         }
         String blockId = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
-        if (CraftingPlanner.matchesRegistryId(blockId, itemId)) {
+        if (matchesCollectTargetId(blockId, itemId)) {
             return true;
         }
         String itemFromBlock = BuiltInRegistries.ITEM.getKey(state.getBlock().asItem()).toString();
-        return CraftingPlanner.matchesRegistryId(itemFromBlock, itemId);
+        return matchesCollectTargetId(itemFromBlock, itemId);
+    }
+
+    private boolean matchesCollectTargetId(String candidateId, String targetId) {
+        if (CraftingPlanner.matchesRegistryId(candidateId, targetId)) {
+            return true;
+        }
+
+        String candidatePath = resourcePath(candidateId);
+        String targetPath = resourcePath(targetId);
+        if (candidatePath.isBlank() || targetPath.isBlank()) {
+            return false;
+        }
+
+        if (candidatePath.contains(targetPath) || targetPath.contains(candidatePath)) {
+            return true;
+        }
+
+        String targetToken = resourceToken(targetPath);
+        return !targetToken.isBlank() && candidatePath.contains(targetToken);
+    }
+
+    private String resourcePath(String registryId) {
+        if (registryId == null || registryId.isBlank()) {
+            return "";
+        }
+        int separator = registryId.indexOf(':');
+        return (separator >= 0 ? registryId.substring(separator + 1) : registryId).toLowerCase();
+    }
+
+    private String resourceToken(String resourcePath) {
+        String token = resourcePath.toLowerCase();
+        String[] removablePrefixes = {"raw_", "deepslate_", "stripped_"};
+        for (String prefix : removablePrefixes) {
+            if (token.startsWith(prefix)) {
+                token = token.substring(prefix.length());
+            }
+        }
+        String[] removableSuffixes = {"_ore", "_block", "_ingot", "_nugget", "_dust", "_gem"};
+        for (String suffix : removableSuffixes) {
+            if (token.endsWith(suffix)) {
+                token = token.substring(0, token.length() - suffix.length());
+            }
+        }
+        return token;
     }
 
     private void autoEquipForBlock(Minecraft mc, BlockPos blockPos) {
