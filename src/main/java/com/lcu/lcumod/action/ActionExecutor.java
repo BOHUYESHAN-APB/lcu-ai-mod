@@ -73,6 +73,7 @@ public class ActionExecutor {
     private static String pendingStorageTargetItem = null;
     private static int pendingStorageGoalCount = 0;
     private static int pendingStorageTicks = 0;
+    private static final java.util.Set<BlockPos> triedStoragePositions = new java.util.HashSet<>();
     private static String activeTaskKind = "idle";
     private static String activeTaskStatus = "idle";
     private static String activeTaskTarget = "";
@@ -1569,11 +1570,20 @@ public class ActionExecutor {
      */
     private boolean tryStorageSourceForCollect(Minecraft mc) {
         if (pendingCollectItem == null) return false;
-        BlockPos storagePos = PoiMemory.findNearestStorage(mc, PoiMemory.INTERACTION_RADIUS);
+        BlockPos storagePos = null;
+        for (var poi : PoiMemory.snapshot(mc, "storage", PoiMemory.INTERACTION_RADIUS, 16)) {
+            BlockPos candidate = new BlockPos(
+                poi.get("x").getAsInt(),
+                poi.get("y").getAsInt(),
+                poi.get("z").getAsInt()
+            );
+            if (triedStoragePositions.contains(candidate)) {
+                continue;
+            }
+            storagePos = candidate;
+            break;
+        }
         if (storagePos == null) return false;
-
-        // Don't re-try the same position if we already tried it
-        if (storagePos.equals(pendingStoragePos)) return false;
 
         int currentCount = countInventoryItem(mc, pendingCollectItem);
         int stillNeeded = Math.max(1, pendingCollectGoalCount - currentCount);
@@ -1582,6 +1592,7 @@ public class ActionExecutor {
         pendingStorageTargetItem = pendingCollectItem;
         pendingStorageGoalCount = stillNeeded;
         pendingStorageTicks = 0;
+        triedStoragePositions.add(storagePos.immutable());
         return true;
     }
 
@@ -2061,6 +2072,7 @@ public class ActionExecutor {
         pendingCollectTargetPos = null;
         pendingCollectTicks = 0;
         pendingCollectSearchMisses = 0;
+        triedStoragePositions.clear();
         clearPendingStorageTask();
     }
 
