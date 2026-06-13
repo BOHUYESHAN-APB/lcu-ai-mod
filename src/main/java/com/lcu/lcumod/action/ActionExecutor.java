@@ -22,7 +22,9 @@ import net.minecraft.world.phys.Vec3;
 import net.minecraft.core.Direction;
 import net.minecraft.world.level.block.Blocks;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -66,6 +68,11 @@ public class ActionExecutor {
     private static int pendingCollectTicks = 0;
     private static int pendingCollectSearchMisses = 0;
     private static int pendingCraftGoalCount = 1;
+    // Storage retrieval from remembered chests/barrels
+    private static BlockPos pendingStoragePos = null;
+    private static String pendingStorageTargetItem = null;
+    private static int pendingStorageGoalCount = 0;
+    private static int pendingStorageTicks = 0;
     private static String activeTaskKind = "idle";
     private static String activeTaskStatus = "idle";
     private static String activeTaskTarget = "";
@@ -101,6 +108,9 @@ public class ActionExecutor {
 
         // ── Craft controller (stateful crafting) ──
         tickPendingCraft(mc);
+
+        // ── Storage retrieval controller (check chests/barrels before world collect) ──
+        tickPendingStorageRetrieve(mc);
 
         // ── Collect controller (generic resource acquisition) ──
         tickPendingCollect(mc);
@@ -1483,6 +1493,18 @@ public class ActionExecutor {
             return;
         }
 
+        // If storage retrieval is active, let tickPendingStorageRetrieve handle it
+        if (pendingStoragePos != null) {
+            return;
+        }
+
+        // Try storage source before world search (only on early search attempts)
+        if (pendingCollectSearchMisses < 3 && tryStorageSourceForCollect(mc)) {
+            setTaskState(resolveRootTaskKind(), "storage", pendingCollectItem,
+                "checking storage for " + pendingCollectItem, collectProgress(mc));
+            return;
+        }
+
         pendingCollectTicks++;
         if (pendingCollectTicks % 5 != 0) {
             return;
@@ -1537,6 +1559,156 @@ public class ActionExecutor {
             diggingTicks = 0;
         }
         setTaskState(resolveRootTaskKind(), "mining", pendingCollectItem, "mining resource block", collectProgress(mc));
+    }
+
+    // ── Storage Retrieval ─────────────────────────────────────────
+
+    /**
+     * Try to find a remembered storage container for the current collect task.
+     * Sets up pendingStorage fields; tickPendingStorageRetrieve handles the rest.
+     */
+    private boolean tryStorageSourceForCollect(Minecraft mc) {
+        if (pendingCollectItem == null) return false;
+        BlockPos storagePos = PoiMemory.findNearestStorage(mc, PoiMemory.INTERACTION_RADIUS);
+        if (storagePos == null) return false;
+
+        // Don't re-try the same position if we already tried it
+        if (storagePos.equals(pendingStoragePos)) return false;
+
+        int currentCount = countInventoryItem(mc, pendingCollectItem);
+        int stillNeeded = Math.max(1, pendingCollectGoalCount - currentCount);
+
+        pendingStoragePos = storagePos;
+        pendingStorageTargetItem = pendingCollectItem;
+        pendingStorageGoalCount = stillNeeded;
+        pendingStorageTicks = 0;
+        return true;
+    }
+
+    /**
+     * State machine for storage retrieval.
+     * Navigate → right-click → scan & withdraw → close.
+     * Called every tick from onTick() before tickPendingCollect.
+     */
+    private void tickPendingStorageRetrieve(Minecraft mc) {
+        if (pendingStoragePos == null || mc.player == null || mc.level == null || mc.gameMode == null) {
+            return;
+        }
+
+        // Abort if the collect task was cancelled or target changed
+        if (pendingCollectItem == null
+            || !CraftingPlanner.matchesRegistryId(pendingStorageTargetItem, pendingCollectItem)) {
+            clearPendingStorageTask();
+            return;
+        }
+
+        pendingStorageTicks++;
+
+        // Timeout: 100 ticks (5 seconds) — prevent getting stuck
+        if (pendingStorageTicks > 100) {
+            cleanupAndClearStorage(mc);
+            return;
+        }
+
+        double distSq = mc.player.distanceToSqr(Vec3.atCenterOf(pendingStoragePos));
+
+        // ── Phase 1: Not close enough → navigate ──
+        if (distSq > 9.0) {
+            MovementSystem.moveTo(
+                pendingStoragePos.getX() + 0.5, pendingStoragePos.getY(),
+                pendingStoragePos.getZ() + 0.5, 1.0f);
+            setTaskState(resolveRootTaskKind(), "storage", pendingStorageTargetItem,
+                "moving to storage", 0.15);
+            return;
+        }
+
+        boolean containerOpen = mc.player.containerMenu != null
+            && mc.player.containerMenu != mc.player.inventoryMenu;
+
+        // ── Phase 2: Close enough but container not open → right-click ──
+        if (!containerOpen) {
+            // Small settle delay after arriving
+            if (pendingStorageTicks < 6) {
+                setTaskState(resolveRootTaskKind(), "storage", pendingStorageTargetItem,
+                    "arrived at storage", 0.2);
+                return;
+            }
+            Vec3 hitVec = Vec3.atCenterOf(pendingStoragePos);
+            BlockHitResult hitResult = new BlockHitResult(hitVec, Direction.UP, pendingStoragePos, false);
+            mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, hitResult);
+            setTaskState(resolveRootTaskKind(), "storage", pendingStorageTargetItem,
+                "opening storage", 0.3);
+            return;
+        }
+
+        // ── Phase 3: Container is open → scan & withdraw ──
+        int foundStacks = withdrawMatchingFromContainer(mc, pendingStorageTargetItem, pendingStorageGoalCount);
+
+        if (foundStacks > 0 && LCUMod.WIRE != null && pendingCollectReqId != null) {
+            int totalNow = countInventoryItem(mc, pendingStorageTargetItem);
+            int gained = totalNow - pendingCollectBaselineCount;
+            LCUMod.WIRE.sendProgress(pendingCollectReqId, 0.45,
+                "withdrew "
+                + pendingStorageTargetItem + " x" + Math.max(0, gained)
+                + " from storage");
+        }
+
+        // ── Phase 4: Close container and clear state ──
+        mc.player.closeContainer();
+        clearPendingStorageTask();
+    }
+
+    /**
+     * Scan the currently open container menu for items matching itemId,
+     * shift-click each matching stack to transfer to player inventory.
+     * Returns the number of stacks withdrawn.
+     */
+    private int withdrawMatchingFromContainer(Minecraft mc, String itemId, int maxCount) {
+        if (mc.player.containerMenu == null || mc.player.containerMenu == mc.player.inventoryMenu) {
+            return 0;
+        }
+        int totalSlots = mc.player.containerMenu.slots.size();
+        // Player inventory occupies the last ~36 slots (27 main + 9 hotbar).
+        // Container slots are everything before that.
+        int containerEndSlot = Math.max(0, totalSlots - 36);
+
+        // First pass: record matching slot indices
+        List<Integer> matchingSlots = new ArrayList<>();
+        for (int slot = 0; slot < containerEndSlot; slot++) {
+            var stack = mc.player.containerMenu.slots.get(slot).getItem();
+            if (stack.isEmpty()) continue;
+            String stackId = BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
+            if (CraftingPlanner.matchesRegistryId(stackId, itemId)) {
+                matchingSlots.add(slot);
+                if (matchingSlots.size() * 64 >= maxCount) break; // enough potential items
+            }
+        }
+
+        if (matchingSlots.isEmpty()) return 0;
+
+        // Second pass: shift-click each matching slot to withdraw
+        for (int slot : matchingSlots) {
+            mc.gameMode.handleInventoryMouseClick(
+                mc.player.containerMenu.containerId, slot, 0,
+                ClickType.QUICK_MOVE, mc.player);
+        }
+
+        return matchingSlots.size();
+    }
+
+    /** Close open container if any, then clear storage state. */
+    private void cleanupAndClearStorage(Minecraft mc) {
+        if (mc.player.containerMenu != null && mc.player.containerMenu != mc.player.inventoryMenu) {
+            mc.player.closeContainer();
+        }
+        clearPendingStorageTask();
+    }
+
+    private void clearPendingStorageTask() {
+        pendingStoragePos = null;
+        pendingStorageTargetItem = null;
+        pendingStorageGoalCount = 0;
+        pendingStorageTicks = 0;
     }
 
     private boolean hasItem(Minecraft mc, String itemName) {
@@ -1889,6 +2061,7 @@ public class ActionExecutor {
         pendingCollectTargetPos = null;
         pendingCollectTicks = 0;
         pendingCollectSearchMisses = 0;
+        clearPendingStorageTask();
     }
 
     private int countInventoryItem(Minecraft mc, String itemId) {

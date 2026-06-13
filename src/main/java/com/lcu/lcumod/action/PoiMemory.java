@@ -133,6 +133,10 @@ public final class PoiMemory {
         return best;
     }
 
+    public static BlockPos findNearestStorage(Minecraft mc, int maxDistance) {
+        return findNearest(mc, STORAGE, maxDistance);
+    }
+
     public static List<JsonObject> snapshot(Minecraft mc, String category, int maxDistance, int limit) {
         List<JsonObject> result = new ArrayList<>();
         if (mc == null || mc.player == null) {
