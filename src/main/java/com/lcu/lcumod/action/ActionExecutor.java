@@ -1592,7 +1592,34 @@ public class ActionExecutor {
                 }
             }
         }
-        return false;
+        return placeStationFromInventory(mc, "minecraft:crafting_table");
+    }
+
+    private boolean placeStationFromInventory(Minecraft mc, String stationBlockId) {
+        int slot = findHotbarOrInventoryItem(mc, stationBlockId);
+        if (slot < 0) {
+            return false;
+        }
+
+        if (slot >= 9) {
+            int swapHotbar = 0;
+            var current = mc.player.getInventory().getItem(swapHotbar).copy();
+            var target = mc.player.getInventory().getItem(slot).copy();
+            mc.player.getInventory().setItem(slot, current);
+            mc.player.getInventory().setItem(swapHotbar, target);
+            slot = swapHotbar;
+        }
+        mc.player.getInventory().selected = slot;
+
+        BlockPos placePos = findNearbyStationPlacement(mc);
+        if (placePos == null) {
+            return false;
+        }
+        BlockPos supportPos = placePos.below();
+        Vec3 hitVec = Vec3.atCenterOf(supportPos);
+        BlockHitResult hitResult = new BlockHitResult(hitVec, Direction.UP, supportPos, false);
+        mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, hitResult);
+        return true;
     }
 
     private boolean isProcessingStationOpen(Minecraft mc, String mode) {
@@ -1634,7 +1661,40 @@ public class ActionExecutor {
                 }
             }
         }
-        return false;
+        return placeStationFromInventory(mc, stationBlockId);
+    }
+
+    private int findHotbarOrInventoryItem(Minecraft mc, String itemId) {
+        int found = -1;
+        for (int i = 0; i < mc.player.getInventory().getContainerSize(); i++) {
+            var stack = mc.player.getInventory().getItem(i);
+            if (stack.isEmpty()) continue;
+            String stackId = BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
+            if (!CraftingPlanner.matchesRegistryId(stackId, itemId)) continue;
+            if (i < 9) {
+                return i;
+            }
+            if (found < 0) {
+                found = i;
+            }
+        }
+        return found;
+    }
+
+    private BlockPos findNearbyStationPlacement(Minecraft mc) {
+        BlockPos origin = mc.player.blockPosition();
+        for (int radius = 1; radius <= 4; radius++) {
+            for (int dx = -radius; dx <= radius; dx++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    BlockPos pos = origin.offset(dx, 0, dz);
+                    if (!mc.level.getBlockState(pos).isAir()) continue;
+                    BlockPos supportPos = pos.below();
+                    if (mc.level.getBlockState(supportPos).isAir()) continue;
+                    return pos;
+                }
+            }
+        }
+        return null;
     }
 
     private boolean pickupProcessedOutputIfReady(Minecraft mc, String expectedItemId) {
