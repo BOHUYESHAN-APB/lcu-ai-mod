@@ -58,6 +58,8 @@ public final class PoiMemory {
     );
 
     private static final Map<BlockPos, PoiEntry> MEMORY = new HashMap<>();
+    private static final Map<BlockPos, Map<String, Integer>> STORAGE_CONTENTS = new HashMap<>();
+    private static final Map<BlockPos, Integer> CONTENTS_LAST_SEEN = new HashMap<>();
 
     private PoiMemory() {
     }
@@ -135,6 +137,36 @@ public final class PoiMemory {
 
     public static BlockPos findNearestStorage(Minecraft mc, int maxDistance) {
         return findNearest(mc, STORAGE, maxDistance);
+    }
+
+    public static void updateStorageContents(BlockPos pos, Map<String, Integer> contents, int tickCount) {
+        STORAGE_CONTENTS.put(pos.immutable(), new HashMap<>(contents));
+        CONTENTS_LAST_SEEN.put(pos.immutable(), tickCount);
+    }
+
+    public static int getStorageItemCount(BlockPos pos, String itemId) {
+        Map<String, Integer> contents = STORAGE_CONTENTS.get(pos);
+        if (contents == null) return 0;
+        int total = 0;
+        for (Map.Entry<String, Integer> entry : contents.entrySet()) {
+            if (CraftingPlanner.matchesRegistryId(entry.getKey(), itemId)) {
+                total += entry.getValue();
+            }
+        }
+        return total;
+    }
+
+    public static List<JsonObject> snapshotSortedByItemMatch(Minecraft mc, String category, String targetItemId, int maxDistance, int limit) {
+        List<JsonObject> items = snapshot(mc, category, maxDistance, limit);
+        items.sort((a, b) -> {
+            BlockPos posA = new BlockPos(a.get("x").getAsInt(), a.get("y").getAsInt(), a.get("z").getAsInt());
+            BlockPos posB = new BlockPos(b.get("x").getAsInt(), b.get("y").getAsInt(), b.get("z").getAsInt());
+            int countA = getStorageItemCount(posA, targetItemId);
+            int countB = getStorageItemCount(posB, targetItemId);
+            if (countA != countB) return Integer.compare(countB, countA);
+            return Double.compare(a.get("distance").getAsDouble(), b.get("distance").getAsDouble());
+        });
+        return items;
     }
 
     public static List<JsonObject> snapshot(Minecraft mc, String category, int maxDistance, int limit) {

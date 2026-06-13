@@ -1571,7 +1571,7 @@ public class ActionExecutor {
     private boolean tryStorageSourceForCollect(Minecraft mc) {
         if (pendingCollectItem == null) return false;
         BlockPos storagePos = null;
-        for (var poi : PoiMemory.snapshot(mc, "storage", PoiMemory.INTERACTION_RADIUS, 16)) {
+        for (var poi : PoiMemory.snapshotSortedByItemMatch(mc, "storage", pendingCollectItem, PoiMemory.INTERACTION_RADIUS, 16)) {
             BlockPos candidate = new BlockPos(
                 poi.get("x").getAsInt(),
                 poi.get("y").getAsInt(),
@@ -1683,21 +1683,28 @@ public class ActionExecutor {
         // Container slots are everything before that.
         int containerEndSlot = Math.max(0, totalSlots - 36);
 
-        // First pass: record matching slot indices
+        // Scan all container slots and cache contents
+        Map<String, Integer> contents = new java.util.HashMap<>();
         List<Integer> matchingSlots = new ArrayList<>();
         for (int slot = 0; slot < containerEndSlot; slot++) {
             var stack = mc.player.containerMenu.slots.get(slot).getItem();
             if (stack.isEmpty()) continue;
             String stackId = BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
+            contents.merge(stackId, stack.getCount(), Integer::sum);
             if (CraftingPlanner.matchesRegistryId(stackId, itemId)) {
                 matchingSlots.add(slot);
-                if (matchingSlots.size() * 64 >= maxCount) break; // enough potential items
+                if (matchingSlots.size() * 64 >= maxCount) break;
             }
+        }
+
+        // Update POI memory cache with known contents
+        if (pendingStoragePos != null) {
+            PoiMemory.updateStorageContents(pendingStoragePos, contents, tickCount);
         }
 
         if (matchingSlots.isEmpty()) return 0;
 
-        // Second pass: shift-click each matching slot to withdraw
+        // Shift-click each matching slot to withdraw
         for (int slot : matchingSlots) {
             mc.gameMode.handleInventoryMouseClick(
                 mc.player.containerMenu.containerId, slot, 0,
