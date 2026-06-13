@@ -261,7 +261,7 @@ public class StateCollector {
         state.add("nearby_workstations", nearbyWorkstations);
 
         JsonArray nearbyStorage = new JsonArray();
-        for (JsonObject item : PoiMemory.snapshot(mc, "storage", PoiMemory.INTERACTION_RADIUS, 16)) {
+        for (JsonObject item : PoiMemory.snapshotWithContents(mc, "storage", PoiMemory.INTERACTION_RADIUS, 16)) {
             nearbyStorage.add(item);
         }
         state.add("nearby_storage", nearbyStorage);

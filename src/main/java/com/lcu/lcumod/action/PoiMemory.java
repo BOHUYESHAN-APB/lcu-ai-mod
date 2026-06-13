@@ -1,5 +1,6 @@
 package com.lcu.lcumod.action;
 
+import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
@@ -167,6 +168,45 @@ public final class PoiMemory {
             return Double.compare(a.get("distance").getAsDouble(), b.get("distance").getAsDouble());
         });
         return items;
+    }
+
+    public static List<JsonObject> snapshotWithContents(Minecraft mc, String category, int maxDistance, int limit) {
+        List<JsonObject> result = new ArrayList<>();
+        if (mc == null || mc.player == null) {
+            return result;
+        }
+        for (Map.Entry<BlockPos, PoiEntry> entry : MEMORY.entrySet()) {
+            PoiEntry poi = entry.getValue();
+            if (!poi.category.equals(category)) {
+                continue;
+            }
+            double distance = Math.sqrt(entry.getKey().distSqr(mc.player.blockPosition()));
+            if (distance > maxDistance) {
+                continue;
+            }
+            JsonObject item = new JsonObject();
+            item.addProperty("block_id", poi.blockId);
+            item.addProperty("distance", Math.round(distance * 10.0) / 10.0);
+            item.addProperty("x", entry.getKey().getX());
+            item.addProperty("y", entry.getKey().getY());
+            item.addProperty("z", entry.getKey().getZ());
+
+            Map<String, Integer> contents = STORAGE_CONTENTS.get(entry.getKey());
+            if (contents != null && !contents.isEmpty()) {
+                JsonArray contentsArr = new JsonArray();
+                for (var contentEntry : contents.entrySet()) {
+                    JsonObject contentItem = new JsonObject();
+                    contentItem.addProperty("item_id", contentEntry.getKey());
+                    contentItem.addProperty("count", contentEntry.getValue());
+                    contentsArr.add(contentItem);
+                }
+                item.add("contents", contentsArr);
+            }
+
+            result.add(item);
+        }
+        result.sort(Comparator.comparingDouble(item -> item.get("distance").getAsDouble()));
+        return result.size() <= limit ? result : result.subList(0, limit);
     }
 
     public static List<JsonObject> snapshot(Minecraft mc, String category, int maxDistance, int limit) {

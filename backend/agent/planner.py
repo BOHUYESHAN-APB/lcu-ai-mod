@@ -143,6 +143,12 @@ class Planner:
             f"{poi.get('block_id', '?')}@{poi.get('distance', '?')}m"
             for poi in nearby_storage[:8]
         ) or "无"
+        storage_contents_text = "\n".join(
+            f"  - {poi.get('block_id', '?')}@{poi.get('distance', '?')}m: "
+            + ", ".join(f"{c.get('item_id', '?')}x{c.get('count', 1)}" for c in (poi.get('contents') or [])[:6])
+            for poi in nearby_storage[:6]
+            if poi.get('contents')
+        ) or "无"
         
         prompt = f"""你是 {persona_name}，一个正在玩 Minecraft 的玩家。你和服务器里的其他玩家一起玩。
 
@@ -175,6 +181,9 @@ class Planner:
 
 附近仓储：
 {nearby_storage_text}
+
+仓库已知内容：
+{storage_contents_text}
 
 附近实体：
 {nearby_entity_text}
