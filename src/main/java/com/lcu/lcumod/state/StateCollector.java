@@ -2,6 +2,7 @@ package com.lcu.lcumod.state;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
+import com.lcu.lcumod.action.PoiMemory;
 import com.lcu.lcumod.LCUMod;
 import com.lcu.lcumod.config.ModConfig;
 import net.minecraft.client.Minecraft;
@@ -252,6 +253,18 @@ public class StateCollector {
             nearbyBlocksJson.add(nearbyBlocks.get(i));
         }
         state.add("nearby_blocks", nearbyBlocksJson);
+
+        JsonArray nearbyWorkstations = new JsonArray();
+        for (JsonObject item : PoiMemory.snapshot(mc, "workstation", PoiMemory.INTERACTION_RADIUS, 16)) {
+            nearbyWorkstations.add(item);
+        }
+        state.add("nearby_workstations", nearbyWorkstations);
+
+        JsonArray nearbyStorage = new JsonArray();
+        for (JsonObject item : PoiMemory.snapshot(mc, "storage", PoiMemory.INTERACTION_RADIUS, 16)) {
+            nearbyStorage.add(item);
+        }
+        state.add("nearby_storage", nearbyStorage);
 
         LCUMod.WIRE.sendEvent("state_update", state);
     }

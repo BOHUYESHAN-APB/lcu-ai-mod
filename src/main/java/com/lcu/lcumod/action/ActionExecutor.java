@@ -24,6 +24,7 @@ import net.minecraft.world.level.block.Blocks;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Drains command queue from wire and executes commands via CLIENT-SIDE APIs.
@@ -91,6 +92,9 @@ public class ActionExecutor {
 
         // ── Pathfinder (A* navigation) ──
         Pathfinder.tick(mc);
+
+        // ── Remembered workstations/storage POIs ──
+        PoiMemory.tick(mc, tickCount);
 
         // ── Follow controller (persistent follow target) ──
         tickFollowTarget(mc);
@@ -1567,6 +1571,14 @@ public class ActionExecutor {
     }
 
     private boolean openNearbyCraftingTable(Minecraft mc) {
+        BlockPos remembered = PoiMemory.findNearest(mc, Set.of("minecraft:crafting_table"), PoiMemory.INTERACTION_RADIUS);
+        if (remembered != null && mc.level.getBlockState(remembered).is(Blocks.CRAFTING_TABLE)) {
+            Vec3 hitVec = Vec3.atCenterOf(remembered);
+            BlockHitResult hitResult = new BlockHitResult(hitVec, Direction.UP, remembered, false);
+            mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, hitResult);
+            return true;
+        }
+
         BlockPos playerPos = mc.player.blockPosition();
         for (int dx = -4; dx <= 4; dx++) {
             for (int dy = -2; dy <= 2; dy++) {
@@ -1597,6 +1609,17 @@ public class ActionExecutor {
     }
 
     private boolean openNearbyProcessingStation(Minecraft mc, String stationBlockId) {
+        BlockPos remembered = PoiMemory.findNearest(mc, Set.of(stationBlockId), PoiMemory.INTERACTION_RADIUS);
+        if (remembered != null) {
+            String rememberedId = BuiltInRegistries.BLOCK.getKey(mc.level.getBlockState(remembered).getBlock()).toString();
+            if (rememberedId.equals(stationBlockId)) {
+                Vec3 hitVec = Vec3.atCenterOf(remembered);
+                BlockHitResult hitResult = new BlockHitResult(hitVec, Direction.UP, remembered, false);
+                mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, hitResult);
+                return true;
+            }
+        }
+
         BlockPos playerPos = mc.player.blockPosition();
         for (int dx = -4; dx <= 4; dx++) {
             for (int dy = -2; dy <= 2; dy++) {

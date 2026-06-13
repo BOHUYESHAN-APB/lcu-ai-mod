@@ -116,6 +116,8 @@ class Planner:
         nearby_blocks = context.get("nearby_blocks", []) if isinstance(context, dict) else []
         nearby_entities = context.get("entities", []) if isinstance(context, dict) else []
         inventory = context.get("inventory", []) if isinstance(context, dict) else []
+        nearby_workstations = context.get("nearby_workstations", []) if isinstance(context, dict) else []
+        nearby_storage = context.get("nearby_storage", []) if isinstance(context, dict) else []
         inventory_text = ", ".join(
             f"{item.get('name', '?')}x{item.get('count', 1)}"
             for item in inventory[:12]
@@ -132,6 +134,14 @@ class Planner:
             f"{entity.get('item_id', entity.get('name', '?'))}x{entity.get('item_count', 1)}@{entity.get('distance', '?')}m"
             for entity in nearby_entities
             if entity.get("type") == "item"
+        ) or "无"
+        nearby_station_text = ", ".join(
+            f"{poi.get('block_id', '?')}@{poi.get('distance', '?')}m"
+            for poi in nearby_workstations[:8]
+        ) or "无"
+        nearby_storage_text = ", ".join(
+            f"{poi.get('block_id', '?')}@{poi.get('distance', '?')}m"
+            for poi in nearby_storage[:8]
         ) or "无"
         
         prompt = f"""你是 {persona_name}，一个正在玩 Minecraft 的玩家。你和服务器里的其他玩家一起玩。
@@ -159,6 +169,12 @@ class Planner:
 附近资源：
 - 方块：{nearby_block_text}
 - 掉落物：{nearby_item_text}
+
+附近工作站：
+{nearby_station_text}
+
+附近仓储：
+{nearby_storage_text}
 
 附近实体：
 {nearby_entity_text}
