@@ -14,6 +14,8 @@ import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.inventory.ClickType;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.crafting.Ingredient;
 import net.minecraft.world.item.crafting.RecipeHolder;
 import net.minecraft.world.item.crafting.RecipeType;
 import net.minecraft.world.phys.AABB;
@@ -1465,7 +1467,8 @@ public class ActionExecutor {
 
         if (pendingCraftAttempts >= 8 && countInventoryItem(mc, pendingCraftItem) < pendingCraftGoalCount) {
             if (LCUMod.WIRE != null) {
-                LCUMod.WIRE.sendProgress(pendingCraftReqId, 0.0, "craft failed or missing materials: " + pendingCraftItem);
+                String errorMsg = buildCraftFailureReason(mc, pendingCraftItem);
+                LCUMod.WIRE.sendProgress(pendingCraftReqId, 0.0, errorMsg);
             }
             pendingCraftItem = null;
             pendingCraftReqId = null;
@@ -2218,6 +2221,51 @@ public class ActionExecutor {
         if (followTargetName != null) return "follow";
         if (Pathfinder.isNavigating()) return "move";
         return "idle";
+    }
+
+    private String buildCraftFailureReason(Minecraft mc, String itemId) {
+        StringBuilder sb = new StringBuilder("无法合成 ").append(itemId).append("：");
+        boolean first = true;
+
+        // 检查配方是否存在
+        RecipeHolder<?> recipe = findRecipeByResult(mc, itemId);
+        if (recipe == null) {
+            sb.append("无配方");
+            return sb.toString();
+        }
+
+        // 检查是否需要工作台
+        boolean needsTable = !recipe.value().canCraftInDimensions(2, 2);
+        if (needsTable && !isCraftingTableOpen(mc)) {
+            if (!first) sb.append("；");
+            sb.append("需要工作台（附近没有）");
+            first = false;
+        }
+
+        // 检查材料
+        var ingredients = recipe.value().getIngredients();
+        for (Ingredient ingredient : ingredients) {
+            if (ingredient == null || ingredient.isEmpty()) continue;
+            boolean hasAny = false;
+            for (ItemStack stack : ingredient.getItems()) {
+                if (stack.isEmpty()) continue;
+                String stackId = BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
+                if (countInventoryItem(mc, stackId) > 0) {
+                    hasAny = true;
+                    break;
+                }
+            }
+            if (!hasAny) {
+                if (!first) sb.append("；");
+                sb.append("缺材料：").append(ingredient.getItems()[0].getDisplayName().getString());
+                first = false;
+            }
+        }
+
+        if (first) {
+            sb.append("未知原因");
+        }
+        return sb.toString();
     }
 
     private double collectProgress(Minecraft mc) {
