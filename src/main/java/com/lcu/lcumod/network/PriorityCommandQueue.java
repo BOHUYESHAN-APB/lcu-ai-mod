@@ -21,6 +21,13 @@ public class PriorityCommandQueue {
         currentPriority = entry.priority;
     }
 
+    public void submitControl(WireServer.WireCommand cmd) {
+        clear();
+        PriorityEntry entry = new PriorityEntry(CommandPriority.CONTROL, cmd.id(), cmd.cmd(), cmd.args());
+        queue.offer(entry);
+        currentPriority = entry.priority;
+    }
+
     public void submitBehavior(int priority, String id, String action, JsonObject args) {
         queue.offer(new PriorityEntry(priority, id, action, args));
         if (priority < currentPriority) {

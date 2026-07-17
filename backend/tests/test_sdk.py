@@ -58,6 +58,40 @@ class SDKClientTests(unittest.TestCase):
         self.assertEqual(client.get_identity()["companion_id"], "stable-id")
         client.close()
 
+    def test_v2_control_and_skill_run_are_typed(self):
+        requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.url.path.endswith("/leases"):
+                return httpx.Response(200, json={"lease": {
+                    "id": "lease-1", "fencing_token": 7, "mode": "external",
+                }})
+            return httpx.Response(200, json={
+                "run_id": "req-1", "skill_id": "general.craft_item", "status": "accepted",
+            })
+
+        client = LCUClient()
+        client._client.close()
+        client._client = cast(Any, httpx.Client(
+            base_url="http://127.0.0.1:8080",
+            transport=httpx.MockTransport(handler),
+        ))
+
+        lease = client.acquire_control("upstream")
+        run = client.run_skill(
+            "general.craft_item",
+            {"item": "minecraft:torch", "count": 4},
+            lease_id=lease["id"],
+            fencing_token=lease["fencing_token"],
+        )
+        client.close()
+
+        self.assertEqual(run["run_id"], "req-1")
+        self.assertEqual(requests[0].url.path, "/api/v2/control/leases")
+        self.assertEqual(requests[1].url.path, "/api/v2/skills/general.craft_item/runs")
+        self.assertIn(b'"fencing_token":7', requests[1].content)
+
 
 if __name__ == "__main__":
     unittest.main()

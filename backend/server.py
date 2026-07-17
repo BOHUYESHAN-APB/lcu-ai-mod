@@ -9,6 +9,7 @@ import secrets
 import threading
 import time
 import ipaddress
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional, cast
 from urllib.parse import urlparse
@@ -21,11 +22,14 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field, model_validator
 
 from agent import LLMService
+from agent.agent_state import AgentStateDB, LeaseConflictError, LeaseNotFoundError
 from agent.config_store import ConfigStore, DEFAULT_CONFIG_PATH
 from agent.orchestrator import Orchestrator
+from agent.skill_registry import SkillRegistry, SkillValidationError
 from protocol import BodyAdapter, WireClient
 
 SDK_API_VERSION = "1"
+SDK_V2_API_VERSION = "2"
 app = FastAPI(title="LCUMod Backend", version="0.1.0")
 
 CONFIG_PATH = DEFAULT_CONFIG_PATH
@@ -140,6 +144,28 @@ class SDKCommandRequest(BaseModel):
     command: str = Field(min_length=1)
     args: dict[str, Any] = Field(default_factory=dict)
 
+
+class ControlLeaseRequest(BaseModel):
+    owner: str = Field(min_length=1, max_length=128)
+    mode: str = "external"
+    owns: list[str] = Field(default_factory=lambda: ["persona", "memory", "planner", "autonomy", "actions"])
+    ttl_seconds: int = Field(default=30, ge=5, le=300)
+
+
+class ControlLeaseHeartbeat(BaseModel):
+    fencing_token: int = Field(ge=1)
+    ttl_seconds: int = Field(default=30, ge=5, le=300)
+
+
+class ControlLeaseRelease(BaseModel):
+    fencing_token: int = Field(ge=1)
+
+
+class SkillRunRequest(BaseModel):
+    input: dict[str, Any] = Field(default_factory=dict)
+    lease_id: str | None = None
+    fencing_token: int | None = Field(default=None, ge=1)
+
 def create_body(host: str, port: int) -> BodyAdapter:
     """Construct the configured companion body."""
     return WireClient(host, port)
@@ -149,9 +175,73 @@ def create_body(host: str, port: int) -> BodyAdapter:
 body: BodyAdapter | None = None
 orchestrator: Orchestrator | None = None
 llm_service = LLMService()
+skill_registry = SkillRegistry()
+agent_state = AgentStateDB()
+agent_state.sync_skills(skill_registry.list())
 connected_browsers: list[WebSocket] = []
 shutdown_event = threading.Event()
 connection_thread: threading.Thread | None = None
+
+CONTROL_DOMAINS = {"persona", "memory", "planner", "autonomy", "actions"}
+RESERVED_BODY_COMMANDS = {"control_external", "control_builtin"}
+FENCING_FIELD = "__lcu_fencing_token"
+
+
+def _apply_control_mode(mode: str, fencing_token: int = 0, force_body: bool = False) -> bool:
+    active_body = body
+    active_orchestrator = orchestrator
+    changed = force_body
+    if active_orchestrator:
+        with active_orchestrator.session_context() as session:
+            previous_token = session.control_fencing_token
+            changed = changed or session.control_mode != mode \
+                or (mode == "external" and previous_token != fencing_token)
+            token = fencing_token if mode == "external" else previous_token or fencing_token
+            if active_body and active_body.is_connected and changed:
+                try:
+                    command = "control_external" if mode == "external" else "control_builtin"
+                    active_body.send_command(command, {FENCING_FIELD: token})
+                except ConnectionError:
+                    return False
+            session.set_control_mode(mode, fencing_token)
+            return True
+    if active_body and active_body.is_connected and changed:
+        try:
+            command = "control_external" if mode == "external" else "control_builtin"
+            active_body.send_command(command, {FENCING_FIELD: fencing_token})
+        except ConnectionError:
+            return False
+    return True
+
+
+def _reconcile_control_mode(force_body: bool = False) -> dict[str, Any] | None:
+    with agent_state.transition_guard():
+        lease = agent_state.get_active_lease()
+        token = lease["fencing_token"] if lease else agent_state.latest_fencing_token()
+        _apply_control_mode(lease["mode"] if lease else "builtin", token, force_body=force_body)
+    return lease
+
+
+def _fenced_args(args: dict[str, Any], lease: dict[str, Any] | None) -> dict[str, Any]:
+    command_args = dict(args)
+    command_args.pop(FENCING_FIELD, None)
+    if lease:
+        command_args[FENCING_FIELD] = lease["fencing_token"]
+    return command_args
+
+
+def _validate_public_command(command: str, args: dict[str, Any]) -> None:
+    if command in RESERVED_BODY_COMMANDS or FENCING_FIELD in args:
+        raise HTTPException(status_code=403, detail="Reserved control command or argument")
+
+
+@contextmanager
+def _configuration_guard():
+    try:
+        with agent_state.control_guard(None, None):
+            yield
+    except LeaseConflictError as exc:
+        raise HTTPException(status_code=409, detail="Configuration is owned by an active control lease") from exc
 
 
 def _apply_config_to_llm_services():
@@ -211,6 +301,7 @@ async def startup():
     stop_event = shutdown_event
     _apply_config_to_llm_services()
     _apply_persona_to_session()
+    _reconcile_control_mode()
 
     # Store event loop for background thread scheduling
     loop = asyncio.get_event_loop()
@@ -241,16 +332,23 @@ async def startup():
         o = orchestrator
         if active_body is None or o is None:
             return
+        last_control_check = 0.0
         while not stop_event.is_set():
+            _reconcile_control_mode()
             if active_body.connect():
                 if stop_event.is_set():
                     active_body.disconnect()
                     break
                 print(f"[Backend] Companion body connected at {host}:{port}")
                 o.start()
+                _reconcile_control_mode(force_body=True)
                 # Event loop: drain body events and tick orchestrator
                 while active_body.is_connected and not stop_event.is_set():
                     o.tick()
+                    now = time.monotonic()
+                    if now - last_control_check >= 1.0:
+                        _reconcile_control_mode()
+                        last_control_check = now
                     time.sleep(0.05)  # 20Hz loop
                 o.stop()
                 if not stop_event.is_set():
@@ -317,13 +415,16 @@ async def websocket_endpoint(ws: WebSocket):
                 args = msg.get("args", {})
                 if body:
                     try:
-                        request_id = body.send_command(cmd, args)
+                        _validate_public_command(cmd, args)
+                        with agent_state.control_guard(msg.get("lease_id"), msg.get("fencing_token")) as lease:
+                            request_id = body.send_command(cmd, _fenced_args(args, lease))
                         if orchestrator:
                             with orchestrator.session_context() as session:
                                 session.register_external_command(cmd, request_id, args, requester="web")
                         await ws.send_text(json.dumps({"type": "command_accepted", "id": request_id}))
-                    except ConnectionError as exc:
-                        await ws.send_text(json.dumps({"type": "command_rejected", "error": str(exc)}))
+                    except (ConnectionError, LeaseConflictError, HTTPException) as exc:
+                        error = exc.detail if isinstance(exc, HTTPException) else str(exc)
+                        await ws.send_text(json.dumps({"type": "command_rejected", "error": error}))
 
             elif event_type == "chat":
                 message = msg.get("message", "")
@@ -338,8 +439,12 @@ async def websocket_endpoint(ws: WebSocket):
             elif event_type == "llm_config":
                 data = msg.get("data", {})
                 agent = data.get("agent", "default")
-                config_store.set_agent_llm_config(agent, data)
-                _apply_config_to_llm_services()
+                try:
+                    with _configuration_guard():
+                        config_store.set_agent_llm_config(agent, data)
+                        _apply_config_to_llm_services()
+                except HTTPException as exc:
+                    await ws.send_text(json.dumps({"type": "config_rejected", "error": exc.detail}))
 
     except WebSocketDisconnect:
         pass
@@ -380,9 +485,10 @@ async def get_llm_config():
 async def set_llm_config(data: dict):
     """Set LLM configuration."""
     try:
-        agent = data.get("agent", "default")
-        saved = config_store.set_agent_llm_config(agent, data)
-        _apply_config_to_llm_services()
+        with _configuration_guard():
+            agent = data.get("agent", "default")
+            saved = config_store.set_agent_llm_config(agent, data)
+            _apply_config_to_llm_services()
         return {"status": "ok", "agent": agent, "config": saved}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -438,7 +544,8 @@ async def get_config():
 @app.post("/api/config")
 async def set_config(data: dict):
     """Update backend configuration."""
-    config = config_store.set_app_config(data)
+    with _configuration_guard():
+        config = config_store.set_app_config(data)
     return {"status": "ok", "config": config}
 
 
@@ -476,16 +583,18 @@ async def get_persona():
 
 @app.post("/api/persona")
 async def set_persona(data: dict):
-    persona = config_store.set_persona(data)
-    _apply_persona_to_session()
+    with _configuration_guard():
+        persona = config_store.set_persona(data)
+        _apply_persona_to_session()
     return {"status": "ok", "persona": persona}
 
 
 @app.post("/api/sdk/context")
 async def set_sdk_context(data: SDKContextRequest):
     """External SDK endpoint for upstream persona/context injection."""
-    result = config_store.set_integration_context(data.model_dump())
-    _apply_persona_to_session()
+    with _configuration_guard():
+        result = config_store.set_integration_context(data.model_dump())
+        _apply_persona_to_session()
     return {"status": "ok", **result}
 
 
@@ -503,6 +612,114 @@ async def get_sdk_info():
         "api_version": SDK_API_VERSION,
         "auth_required": bool(_sdk_api_token()),
         "interfaces": ["gateway", "actuator", "observer"],
+        "supported_versions": [SDK_API_VERSION, SDK_V2_API_VERSION],
+    }
+
+
+@app.get("/api/v2/info")
+async def get_v2_info():
+    return {
+        "api_version": SDK_V2_API_VERSION,
+        "auth_required": bool(_sdk_api_token()),
+        "interfaces": ["observer", "control", "skills"],
+        "control_modes": ["builtin", "external"],
+        "skill_registry_revision": skill_registry.revision,
+    }
+
+
+@app.get("/api/v2/control")
+async def get_v2_control():
+    lease = agent_state.get_active_lease()
+    public_lease = None if lease is None else {
+        key: value for key, value in lease.items() if key != "fencing_token"
+    }
+    return {"mode": lease["mode"] if lease else "builtin", "lease": public_lease}
+
+
+@app.post("/api/v2/control/leases")
+async def acquire_v2_control(data: ControlLeaseRequest):
+    if data.mode != "external":
+        raise HTTPException(status_code=400, detail="only external leases are currently supported")
+    invalid_domains = sorted(set(data.owns) - CONTROL_DOMAINS)
+    if invalid_domains:
+        raise HTTPException(status_code=400, detail=f"unknown control domains: {', '.join(invalid_domains)}")
+    if not data.owns:
+        raise HTTPException(status_code=400, detail="owns must not be empty")
+    if set(data.owns) != CONTROL_DOMAINS:
+        raise HTTPException(status_code=400, detail="external mode must own all control domains")
+    try:
+        with agent_state.transition_guard():
+            lease = agent_state.acquire_lease(data.owner, data.mode, data.owns, data.ttl_seconds)
+            if not _apply_control_mode(data.mode, lease["fencing_token"]):
+                agent_state.release_lease(lease["id"], lease["fencing_token"])
+                raise HTTPException(status_code=503, detail="Failed to transfer control to the companion body")
+    except LeaseConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    lease_response = {**lease, "runtime_status": "queued" if body and body.is_connected else "pending_connection"}
+    return {"status": "acquired", "lease": lease_response}
+
+
+@app.post("/api/v2/control/leases/{lease_id}/heartbeat")
+async def heartbeat_v2_control(lease_id: str, data: ControlLeaseHeartbeat):
+    try:
+        lease = agent_state.renew_lease(lease_id, data.fencing_token, data.ttl_seconds)
+    except LeaseNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"status": "renewed", "lease": lease}
+
+
+@app.post("/api/v2/control/leases/{lease_id}/release")
+async def release_v2_control(lease_id: str, data: ControlLeaseRelease):
+    try:
+        with agent_state.transition_guard():
+            lease = agent_state.release_lease(lease_id, data.fencing_token)
+            runtime_applied = _apply_control_mode("builtin", lease["fencing_token"])
+    except LeaseNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    runtime_status = "queued" if runtime_applied and body and body.is_connected else "pending_connection"
+    return {"status": "released", "lease": {**lease, "runtime_status": runtime_status}}
+
+
+@app.get("/api/v2/skills")
+async def list_v2_skills(category: str | None = None):
+    skills = skill_registry.list(category)
+    return {"skills": skills, "count": len(skills)}
+
+
+@app.get("/api/v2/skills/{skill_id}")
+async def get_v2_skill(skill_id: str):
+    try:
+        return skill_registry.get(skill_id).public_dict()
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/v2/skills/{skill_id}/runs")
+async def run_v2_skill(skill_id: str, data: SkillRunRequest):
+    if not body or not body.is_connected:
+        raise HTTPException(status_code=503, detail="Companion body is not connected")
+    try:
+        manifest = skill_registry.validate_input(skill_id, data.input)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except SkillValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    try:
+        with agent_state.control_guard(data.lease_id, data.fencing_token) as lease:
+            request_id = body.send_command(manifest.command, _fenced_args(data.input, lease))
+        if orchestrator:
+            requester = f"sdk-v2:{lease['owner']}" if lease else "sdk-v2"
+            with orchestrator.session_context() as session:
+                session.register_external_command(manifest.command, request_id, data.input, requester=requester)
+    except ConnectionError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except LeaseConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "run_id": request_id,
+        "request_id": request_id,
+        "skill_id": manifest.id,
+        "status": "accepted",
     }
 
 
@@ -523,7 +740,8 @@ async def set_sdk_identity(data: dict):
             detail=f"Identity is controlled by environment variables: {', '.join(overrides)}",
         )
     try:
-        companion = config_store.set_companion_config(data)
+        with _configuration_guard():
+            companion = config_store.set_companion_config(data)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     persistence = companion.get("persistence", {})
@@ -541,6 +759,9 @@ async def sdk_chat(data: SDKChatRequest):
     """Send a message through the companion persona, memory, and planner."""
     if not orchestrator:
         raise HTTPException(status_code=503, detail="Companion session is not running")
+    with orchestrator.session_context() as session:
+        if session.control_mode == "external":
+            raise HTTPException(status_code=409, detail="Built-in planner is disabled by external control")
     response = await asyncio.to_thread(orchestrator.handle_chat, data.sender, data.message)
     return {"status": "ok", "response": response or ""}
 
@@ -551,12 +772,16 @@ async def sdk_command(data: SDKCommandRequest):
     if not body or not body.is_connected:
         raise HTTPException(status_code=503, detail="Companion body is not connected")
     try:
-        request_id = body.send_command(data.command, data.args)
+        _validate_public_command(data.command, data.args)
+        with agent_state.control_guard(None, None):
+            request_id = body.send_command(data.command, data.args)
         if orchestrator:
             with orchestrator.session_context() as session:
                 session.register_external_command(data.command, request_id, data.args, requester="sdk")
     except ConnectionError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except LeaseConflictError as exc:
+        raise HTTPException(status_code=409, detail="Use the V2 skill API while a control lease is active") from exc
     return {"status": "accepted", "request_id": request_id}
 
 

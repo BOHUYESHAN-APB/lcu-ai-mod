@@ -11,6 +11,7 @@ Usage:
 """
 
 import json
+import os
 import socket
 import threading
 import logging
@@ -25,9 +26,10 @@ WireMessage = BodyEvent
 class WireClient:
     """Connects to the LCU Mod via TCP and communicates with JSONL."""
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 25568):
+    def __init__(self, host: str = "127.0.0.1", port: int = 25568, token: str | None = None):
         self.host = host
         self.port = port
+        self.token = os.getenv("MOD_WIRE_TOKEN", "") if token is None else token
         self.sock: socket.socket | None = None
         self._event_queue: Queue[BodyEvent] = Queue()
         self._running = False
@@ -44,6 +46,7 @@ class WireClient:
         sock.settimeout(5.0)
         try:
             sock.connect((self.host, self.port))
+            self._authenticate(sock)
             sock.settimeout(None)
             with self._connection_lock:
                 self.sock = sock
@@ -58,6 +61,23 @@ class WireClient:
                 pass
             print(f"[WireClient] Connection failed: {e}")
             return False
+
+    def _authenticate(self, sock: socket.socket) -> None:
+        payload = json.dumps({"type": "auth", "token": self.token}) + "\n"
+        sock.sendall(payload.encode("utf-8"))
+        response = bytearray()
+        while len(response) < 8192:
+            chunk = sock.recv(1)
+            if not chunk:
+                raise ConnectionError("wire authentication connection closed")
+            if chunk == b"\n":
+                break
+            response.extend(chunk)
+        else:
+            raise ConnectionError("wire authentication response is too large")
+        result = json.loads(response.decode("utf-8"))
+        if result.get("type") != "auth" or not result.get("success"):
+            raise ConnectionError("wire authentication failed")
 
     def disconnect(self, expected_socket: socket.socket | None = None):
         with self._connection_lock:

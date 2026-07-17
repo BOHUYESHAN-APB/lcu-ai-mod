@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import quote, urlencode
 
 import httpx
 
@@ -41,6 +42,9 @@ class LCUClient:
 
     def get_sdk_info(self) -> dict[str, Any]:
         return self._get("/api/sdk/info")
+
+    def get_v2_info(self) -> dict[str, Any]:
+        return self._get("/api/v2/info")
 
     def get_session(self) -> dict[str, Any]:
         return self._get("/api/session")
@@ -84,6 +88,45 @@ class LCUClient:
     def send_command(self, command: str, args: dict[str, Any] | None = None) -> str:
         result = self._post("/api/sdk/command", {"command": command, "args": args or {}})
         return str(result["request_id"])
+
+    def list_skills(self, category: str | None = None) -> list[dict[str, Any]]:
+        suffix = f"?{urlencode({'category': category})}" if category else ""
+        return self._get(f"/api/v2/skills{suffix}").get("skills", [])
+
+    def get_skill(self, skill_id: str) -> dict[str, Any]:
+        return self._get(f"/api/v2/skills/{quote(skill_id, safe='')}")
+
+    def get_control(self) -> dict[str, Any]:
+        return self._get("/api/v2/control")
+
+    def acquire_control(self, owner: str, mode: str = "external", *,
+                        owns: list[str] | None = None, ttl_seconds: int = 30) -> dict[str, Any]:
+        payload: dict[str, Any] = {"owner": owner, "mode": mode, "ttl_seconds": ttl_seconds}
+        if owns is not None:
+            payload["owns"] = owns
+        return self._post("/api/v2/control/leases", payload)["lease"]
+
+    def heartbeat_control(self, lease_id: str, fencing_token: int,
+                          ttl_seconds: int = 30) -> dict[str, Any]:
+        return self._post(
+            f"/api/v2/control/leases/{lease_id}/heartbeat",
+            {"fencing_token": fencing_token, "ttl_seconds": ttl_seconds},
+        )["lease"]
+
+    def release_control(self, lease_id: str, fencing_token: int) -> dict[str, Any]:
+        return self._post(
+            f"/api/v2/control/leases/{lease_id}/release",
+            {"fencing_token": fencing_token},
+        )["lease"]
+
+    def run_skill(self, skill_id: str, input: dict[str, Any] | None = None, *,
+                  lease_id: str | None = None, fencing_token: int | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {"input": input or {}}
+        if lease_id is not None:
+            payload["lease_id"] = lease_id
+        if fencing_token is not None:
+            payload["fencing_token"] = fencing_token
+        return self._post(f"/api/v2/skills/{quote(skill_id, safe='')}/runs", payload)
 
     def get_runtime_config(self) -> dict[str, Any]:
         return self._get("/api/config")

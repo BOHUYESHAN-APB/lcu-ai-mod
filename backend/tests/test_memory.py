@@ -229,6 +229,24 @@ class MemoryTests(unittest.TestCase):
             self.assertEqual(session.memory.recent_messages[-1]["message"], "hello")
             session.stop()
 
+    def test_external_control_leaves_player_chat_to_upstream_owner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = Session(FakeBody(), companion_id="memory-test", storage_root=Path(tmp), legacy_root=None)
+            session.set_control_mode("external")
+
+            with patch.object(session, "handle_chat") as local_planner:
+                session.handle_event("player_chat", {
+                    "sender": "Alice",
+                    "uuid": "uuid-a",
+                    "message": "come with me",
+                    "is_system": False,
+                })
+
+            local_planner.assert_not_called()
+            self.assertEqual(session.memory.player_relationships, {})
+            self.assertEqual(session.memory.recent_messages, [])
+            session.stop()
+
     def test_external_actuator_command_is_recorded_on_response(self):
         with tempfile.TemporaryDirectory() as tmp:
             session = Session(FakeBody(), companion_id="memory-test", storage_root=Path(tmp), legacy_root=None)

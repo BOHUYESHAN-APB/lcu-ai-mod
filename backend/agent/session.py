@@ -102,6 +102,8 @@ class Session:
         self._stopped = False
         self._current_requester: tuple[str, str] | None = None
         self._pending_commands: dict[str, dict] = {}
+        self.control_mode = "builtin"
+        self.control_fencing_token = 0
 
     # ── Event handlers ──
 
@@ -110,9 +112,11 @@ class Session:
         match event_type:
             case "state_update":
                 self.runtime.update(data)
-                if hasattr(self, "memory"):
+                if hasattr(self, "memory") and self.control_mode != "external":
                     self.memory.observe_world(self.runtime)
             case "player_chat":
+                if self.control_mode == "external":
+                    return
                 sender = data.get("sender", "?")
                 message = data.get("message", "")
                 is_system = data.get("is_system", False)
@@ -191,9 +195,10 @@ class Session:
                     logger.error("[Chat] LLM error: %s", e)
             case "player_death":
                 logger.info("[Session] Player died at %s", data.get("position"))
-                self.memory.add_interaction("system", "Player died", action="death")
-                self.memory.record_death("玩家死亡")
-                self.message_db.add_event("death", "玩家死亡")
+                if self.control_mode != "external":
+                    self.memory.add_interaction("system", "Player died", action="death")
+                    self.memory.record_death("玩家死亡")
+                    self.message_db.add_event("death", "玩家死亡")
             case "command_response":
                 req_id = data.get("id", "?")
                 success = data.get("success", False)
@@ -298,6 +303,8 @@ class Session:
         Process a chat message through the LLM.
         Uses Planner for intelligent action planning.
         """
+        if self.control_mode == "external":
+            return None
         if record_interaction:
             self.memory.add_interaction(sender=sender, message=message)
             self.memory.observe_player(sender, sender_id, message)
@@ -378,7 +385,8 @@ class Session:
         # Modes engine (priority behaviors that don't need LLM)
         behavior_state = self.runtime.get("behavior_state", {}) if isinstance(self.runtime.get("behavior_state"), dict) else {}
         control_state = self.runtime.get("control_state", {}) if isinstance(self.runtime.get("control_state"), dict) else {}
-        autonomy_enabled = control_state.get("ai_controlled", True) and behavior_state.get("behaviors_enabled", True)
+        autonomy_enabled = self.control_mode != "external" \
+            and control_state.get("ai_controlled", True) and behavior_state.get("behaviors_enabled", True)
         manual_override_active = time.time() < self._manual_command_until or self._manual_behavior_active()
         mode_action = None
         if autonomy_enabled and not manual_override_active:
@@ -470,7 +478,22 @@ class Session:
             "world": self.runtime.get("world", {}),
             "task_state": self.runtime.get("task_state", {}),
             "llm_usage": self.llm.get_usage(),
+            "control_mode": self.control_mode,
         }
+
+    def set_control_mode(self, mode: str, fencing_token: int = 0) -> None:
+        if mode not in {"builtin", "hybrid", "external"}:
+            raise ValueError("invalid control mode")
+        if self.control_mode == mode and (mode != "external" or self.control_fencing_token == fencing_token):
+            return
+        self.control_mode = mode
+        self.control_fencing_token = fencing_token if mode == "external" else 0
+        if mode == "external":
+            self.modes_engine.reset()
+            self.self_prompter.disable()
+        else:
+            self.self_prompter.enable()
+        logger.info("[Session] Control mode changed to %s", mode)
 
     def _on_skill_command(self, cmd: str, req_id: str, context: str, args: dict):
         self.self_prompter.mark_action()
@@ -526,15 +549,16 @@ class Session:
             args.get("item") or args.get("block_type") or args.get("player")
             or args.get("structure") or ""
         )
-        self.memory.record_task_outcome(
-            pending["command"],
-            outcome,
-            target=target,
-            requester=pending.get("requester", ""),
-            requester_id=pending.get("requester_id", ""),
-            detail=detail,
-            duration=time.time() - pending.get("started_at", time.time()),
-        )
+        if self.control_mode != "external":
+            self.memory.record_task_outcome(
+                pending["command"],
+                outcome,
+                target=target,
+                requester=pending.get("requester", ""),
+                requester_id=pending.get("requester_id", ""),
+                detail=detail,
+                duration=time.time() - pending.get("started_at", time.time()),
+            )
 
     def _manual_behavior_active(self) -> bool:
         behavior = self.runtime.get("behavior_state", {})

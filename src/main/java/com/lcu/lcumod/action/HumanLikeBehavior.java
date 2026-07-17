@@ -85,6 +85,13 @@ public class HumanLikeBehavior {
         }
     }
 
+    public static void reset() {
+        hasTarget = false;
+        targetYaw = Double.NaN;
+        targetPitch = Double.NaN;
+        lookCooldownTicks = 0;
+    }
+
     /**
      * Smooth rotation toward target — like mineflayer's bot.lookAt().
      * Clamps rotation speed to MAX_YAW_PER_TICK / MAX_PITCH_PER_TICK.

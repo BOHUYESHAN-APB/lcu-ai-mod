@@ -1,5 +1,6 @@
 import unittest
 import threading
+import json
 
 from protocol.wire_client import WireClient
 
@@ -29,7 +30,35 @@ class RecordingSocket:
         pass
 
 
+class AuthSocket(RecordingSocket):
+    def __init__(self, success=True):
+        super().__init__()
+        self.response = bytearray((json.dumps({"type": "auth", "success": success}) + "\n").encode())
+
+    def recv(self, _size):
+        if not self.response:
+            return b""
+        value = bytes(self.response[:1])
+        del self.response[:1]
+        return value
+
+
 class WireClientTests(unittest.TestCase):
+    def test_wire_authentication_sends_configured_token(self):
+        wire = WireClient(token="shared-secret")
+        socket = AuthSocket()
+
+        wire._authenticate(socket)
+
+        payload = json.loads(socket.payloads[0].decode())
+        self.assertEqual(payload, {"type": "auth", "token": "shared-secret"})
+
+    def test_wire_authentication_rejects_denial(self):
+        wire = WireClient(token="wrong")
+
+        with self.assertRaisesRegex(ConnectionError, "authentication failed"):
+            wire._authenticate(AuthSocket(False))
+
     def test_concurrent_commands_have_unique_ids_and_complete_frames(self):
         wire = WireClient()
         socket = RecordingSocket()

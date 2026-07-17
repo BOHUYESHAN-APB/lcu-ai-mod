@@ -49,7 +49,7 @@ public class LCUMod {
 
     private void commonSetup(FMLCommonSetupEvent event) {
         LOGGER.info("[LCUMod] Initializing...");
-        WIRE = new WireServer(ModConfig.WIRE_PORT.getAsInt());
+        WIRE = new WireServer(ModConfig.WIRE_PORT.getAsInt(), ModConfig.WIRE_TOKEN.get());
         WIRE.start();
         LOGGER.info("[LCUMod] Ready. Wire server listening on port {}", ModConfig.WIRE_PORT.getAsInt());
     }

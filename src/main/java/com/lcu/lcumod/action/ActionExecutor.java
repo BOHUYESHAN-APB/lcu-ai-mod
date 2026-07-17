@@ -79,6 +79,9 @@ public class ActionExecutor {
     private static String activeTaskTarget = "";
     private static String activeTaskDetail = "";
     private static double activeTaskProgress = 0.0;
+    private static boolean externalControlActive = false;
+    private static boolean behaviorEnabledBeforeExternal = true;
+    private static long activeFencingToken = 0;
     private int tickCount = 0;
 
     public static void notifyInterrupted(String reason) {
@@ -122,8 +125,10 @@ public class ActionExecutor {
         // ── Movement system (packet-based) ──
         MovementSystem.tick(mc);
 
+        boolean optionalAutonomy = LCUMod.BEHAVIORS == null || LCUMod.BEHAVIORS.isEnabled();
+
         // ── Java-side autonomous behavior (works without backend) ──
-        if (InputIsolation.isAiControlled()) {
+        if (InputIsolation.isAiControlled() && optionalAutonomy) {
             boolean behaviorActive = JavaAutonomousBehavior.tick(mc);
             // If behavior is active and no backend command is pending, skip other actions
             if (behaviorActive && WireServer.commandQueue.isEmpty()) {
@@ -138,6 +143,7 @@ public class ActionExecutor {
 
         // ── Human-like idle behavior (head tracking) ──
         if (InputIsolation.isAiControlled()
+                && optionalAutonomy
                 && JavaAutonomousBehavior.getState() == JavaAutonomousBehavior.BehaviorState.IDLE
                 && !MovementSystem.isMoving()
                 && !Pathfinder.isNavigating()) {
@@ -145,7 +151,9 @@ public class ActionExecutor {
         }
 
         // ── Anti-AFK subtle activity pulses ──
-        ActivitySignalController.tick(mc, runtimeBusy);
+        if (optionalAutonomy) {
+            ActivitySignalController.tick(mc, runtimeBusy);
+        }
 
         // ── Auto-respawn ──
         if (mc.player.isDeadOrDying()) {
@@ -275,7 +283,14 @@ public class ActionExecutor {
         }
 
         try {
+            if (!"control_external".equals(cmd.cmd()) && !"control_builtin".equals(cmd.cmd())
+                    && externalControlActive && commandFencingToken(cmd) != activeFencingToken) {
+                sendResponse(cmd.id(), false, "Stale or missing control fencing token");
+                return;
+            }
             switch (cmd.cmd()) {
+                case "control_external" -> handleControlExternal(cmd);
+                case "control_builtin" -> handleControlBuiltin(cmd);
                 case "move_to" -> handleMoveTo(cmd);
                 case "look_at" -> handleLookAt(cmd);
                 case "jump" -> {
@@ -313,21 +328,31 @@ public class ActionExecutor {
                 case "close_container" -> handleCloseContainer(cmd);
                 case "look_at_entity" -> handleLookAtEntity(cmd);
                 case "use_on_entity" -> handleUseOnEntity(cmd);
-                case "behavior_enable", "toggle_behavior" -> { 
+                case "behavior_enable" -> {
+                    if (LCUMod.BEHAVIORS != null) {
+                        LCUMod.BEHAVIORS.setEnabled(true);
+                    }
+                    JavaAutonomousBehavior.setEnabled(true);
+                    sendResponse(cmd.id(), true, "behaviors=true");
+                    sendBehaviorState(true);
+                }
+                case "toggle_behavior" -> {
                     if (LCUMod.BEHAVIORS != null) { 
                         boolean newState = !LCUMod.BEHAVIORS.isEnabled();
-                        LCUMod.BEHAVIORS.setEnabled(newState); 
+                        LCUMod.BEHAVIORS.setEnabled(newState);
+                        JavaAutonomousBehavior.setEnabled(newState);
                         sendResponse(cmd.id(), true, "behaviors=" + newState);
                         // Send state update to backend
                         sendBehaviorState(newState);
                     }
                 }
                 case "behavior_disable" -> { 
-                    if (LCUMod.BEHAVIORS != null) { 
-                        LCUMod.BEHAVIORS.setEnabled(false); 
-                        sendResponse(cmd.id(), true, "behaviors=false");
-                        sendBehaviorState(false);
+                    if (LCUMod.BEHAVIORS != null) {
+                        LCUMod.BEHAVIORS.setEnabled(false);
                     }
+                    JavaAutonomousBehavior.setEnabled(false);
+                    sendResponse(cmd.id(), true, "behaviors=false");
+                    sendBehaviorState(false);
                 }
                 // Aliases
                 case "attack_entity" -> handleAttack(cmd);
@@ -548,7 +573,8 @@ public class ActionExecutor {
 
         // AI control and behavior state
         state.addProperty("ai_controlled", isAiControlled());
-        state.addProperty("behaviors_enabled", LCUMod.BEHAVIORS != null ? LCUMod.BEHAVIORS.isEnabled() : false);
+        state.addProperty("behaviors_enabled", JavaAutonomousBehavior.isEnabled()
+                && (LCUMod.BEHAVIORS == null || LCUMod.BEHAVIORS.isEnabled()));
 
         sendResponse(cmd.id(), true, state);
     }
@@ -817,6 +843,54 @@ public class ActionExecutor {
         clearTaskState();
         sendBehaviorSnapshot();
         sendResponse(cmd.id(), true, "All stopped");
+    }
+
+    private long commandFencingToken(WireServer.WireCommand cmd) {
+        var args = cmd.args();
+        if (args == null || !args.has("__lcu_fencing_token")) return 0;
+        try {
+            return args.get("__lcu_fencing_token").getAsLong();
+        } catch (Exception ignored) {
+            return 0;
+        }
+    }
+
+    private void handleControlExternal(WireServer.WireCommand cmd) {
+        long token = commandFencingToken(cmd);
+        if (token <= 0 || token < activeFencingToken) {
+            sendResponse(cmd.id(), false, "Stale control fencing token");
+            return;
+        }
+        if (!externalControlActive || token > activeFencingToken) {
+            behaviorEnabledBeforeExternal = JavaAutonomousBehavior.isEnabled()
+                    && (LCUMod.BEHAVIORS == null || LCUMod.BEHAVIORS.isEnabled());
+        }
+        activeFencingToken = token;
+        externalControlActive = true;
+        if (LCUMod.BEHAVIORS != null) LCUMod.BEHAVIORS.setEnabled(false);
+        JavaAutonomousBehavior.setEnabled(false);
+        HumanLikeBehavior.reset();
+        ActivitySignalController.reset();
+        handleStopAll(cmd);
+    }
+
+    private void handleControlBuiltin(WireServer.WireCommand cmd) {
+        long token = commandFencingToken(cmd);
+        if (!externalControlActive) {
+            sendResponse(cmd.id(), true, "Built-in control already active");
+            return;
+        }
+        if (token != activeFencingToken) {
+            sendResponse(cmd.id(), false, "Stale control fencing token");
+            return;
+        }
+        handleStopAll(cmd);
+        externalControlActive = false;
+        if (LCUMod.BEHAVIORS != null) LCUMod.BEHAVIORS.setEnabled(behaviorEnabledBeforeExternal);
+        JavaAutonomousBehavior.setEnabled(behaviorEnabledBeforeExternal);
+        HumanLikeBehavior.reset();
+        ActivitySignalController.reset();
+        sendBehaviorSnapshot();
     }
 
     // ── Container Interaction (mineflayer-style) ───────────────
@@ -1234,7 +1308,8 @@ public class ActionExecutor {
             return;
         }
         JsonObject data = new JsonObject();
-        data.addProperty("behaviors_enabled", LCUMod.BEHAVIORS == null || LCUMod.BEHAVIORS.isEnabled());
+        data.addProperty("behaviors_enabled", JavaAutonomousBehavior.isEnabled()
+                && (LCUMod.BEHAVIORS == null || LCUMod.BEHAVIORS.isEnabled()));
         data.addProperty("follow_target", followTargetName == null ? "" : followTargetName);
         data.addProperty("pending_craft_item", pendingCraftItem == null ? "" : pendingCraftItem);
         data.addProperty("pending_eat", pendingEatReqId != null);

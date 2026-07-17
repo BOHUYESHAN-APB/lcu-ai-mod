@@ -1,0 +1,132 @@
+"""Typed manifests for built-in and contributed companion skills."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+from dataclasses import asdict, dataclass
+from typing import Any
+
+
+class SkillValidationError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class SkillManifest:
+    id: str
+    version: str
+    category: str
+    command: str
+    description: str
+    input_schema: dict[str, Any]
+    source: str = "builtin"
+    safety_class: str = "standard"
+    duration: str = "immediate"
+    cancellable: bool = False
+
+    def public_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def _object_schema(properties: dict[str, dict[str, Any]], required: list[str] | None = None) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": required or [],
+        "additionalProperties": False,
+    }
+
+
+NUMBER = {"type": "number", "minimum": -30_000_000, "maximum": 30_000_000}
+INTEGER = {"type": "integer"}
+STRING = {"type": "string", "minLength": 1}
+
+
+BUILTIN_SKILLS = [
+    SkillManifest("core.move_to", "1.0.0", "core", "move_to", "Move to world coordinates.",
+                  _object_schema({"x": NUMBER, "y": NUMBER, "z": NUMBER}, ["x", "y", "z"]),
+                  duration="long_running", cancellable=True),
+    SkillManifest("core.look_at", "1.0.0", "core", "look_at", "Look at world coordinates.",
+                  _object_schema({"x": NUMBER, "y": NUMBER, "z": NUMBER}, ["x", "y", "z"])),
+    SkillManifest("core.jump", "1.0.0", "core", "jump", "Jump once.", _object_schema({})),
+    SkillManifest("core.attack", "1.0.0", "core", "attack", "Attack the targeted entity.", _object_schema({}), safety_class="combat"),
+    SkillManifest("core.mine_block", "1.0.0", "core", "mine_block", "Mine the targeted block.", _object_schema({}), duration="long_running", cancellable=True),
+    SkillManifest("core.use_on", "1.0.0", "core", "use_on", "Use the held item on the current target.", _object_schema({})),
+    SkillManifest("core.send_chat", "1.0.0", "core", "send_chat", "Send a Minecraft chat message.",
+                  _object_schema({"message": STRING}, ["message"]), safety_class="social"),
+    SkillManifest("core.stop", "1.0.0", "core", "stop_all", "Stop current movement and actions.", _object_schema({}), safety_class="safety"),
+    SkillManifest("general.follow_player", "1.0.0", "general", "follow_player", "Follow a named player.",
+                  _object_schema({"player": STRING}, ["player"]), duration="long_running", cancellable=True),
+    SkillManifest("general.collect_blocks", "1.0.0", "general", "collect_blocks", "Collect blocks by registry ID.",
+                  _object_schema({"block_type": STRING, "count": {"type": "integer", "minimum": 1, "maximum": 2304}}, ["block_type", "count"]),
+                  duration="long_running", cancellable=True),
+    SkillManifest("general.craft_item", "1.0.0", "general", "craft_item", "Craft an item and resolve vanilla dependencies.",
+                  _object_schema({"item": STRING, "count": {"type": "integer", "minimum": 1, "maximum": 2304}}, ["item", "count"]),
+                  duration="long_running", cancellable=True),
+    SkillManifest("general.explore", "1.0.0", "general", "explore", "Explore within a radius.",
+                  _object_schema({"radius": {"type": "integer", "minimum": 1, "maximum": 256}}, ["radius"]),
+                  duration="long_running", cancellable=True),
+    SkillManifest("general.eat", "1.0.0", "general", "eat", "Eat suitable food from inventory.", _object_schema({}), duration="long_running"),
+]
+
+
+class SkillRegistry:
+    def __init__(self, manifests: list[SkillManifest] | None = None):
+        items = manifests or BUILTIN_SKILLS
+        self._skills = {item.id: item for item in items}
+        if len(self._skills) != len(items):
+            raise ValueError("duplicate skill id")
+
+    def list(self, category: str | None = None) -> list[dict[str, Any]]:
+        items = self._skills.values()
+        if category:
+            items = [item for item in items if item.category == category]
+        return [item.public_dict() for item in sorted(items, key=lambda item: item.id)]
+
+    @property
+    def revision(self) -> str:
+        encoded = json.dumps(self.list(), ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("ascii")).hexdigest()[:16]
+
+    def get(self, skill_id: str) -> SkillManifest:
+        try:
+            return self._skills[skill_id]
+        except KeyError as exc:
+            raise KeyError(f"unknown skill: {skill_id}") from exc
+
+    def validate_input(self, skill_id: str, payload: dict[str, Any]) -> SkillManifest:
+        manifest = self.get(skill_id)
+        schema = manifest.input_schema
+        properties = schema["properties"]
+        unknown = sorted(set(payload) - set(properties))
+        if unknown:
+            raise SkillValidationError(f"unknown fields: {', '.join(unknown)}")
+        missing = [name for name in schema.get("required", []) if name not in payload]
+        if missing:
+            raise SkillValidationError(f"missing fields: {', '.join(missing)}")
+        for name, value in payload.items():
+            self._validate_value(name, value, properties[name])
+        return manifest
+
+    @staticmethod
+    def _validate_value(name: str, value: Any, schema: dict[str, Any]) -> None:
+        expected = schema["type"]
+        valid = (
+            (expected == "string" and isinstance(value, str))
+            or (expected == "integer" and isinstance(value, int) and not isinstance(value, bool))
+            or (expected == "number" and isinstance(value, (int, float)) and not isinstance(value, bool))
+            or (expected == "boolean" and isinstance(value, bool))
+        )
+        if not valid:
+            raise SkillValidationError(f"{name} must be {expected}")
+        if expected == "string" and len(value) < schema.get("minLength", 0):
+            raise SkillValidationError(f"{name} is too short")
+        if expected in {"integer", "number"}:
+            if isinstance(value, float) and not math.isfinite(value):
+                raise SkillValidationError(f"{name} must be finite")
+            if "minimum" in schema and value < schema["minimum"]:
+                raise SkillValidationError(f"{name} must be >= {schema['minimum']}")
+            if "maximum" in schema and value > schema["maximum"]:
+                raise SkillValidationError(f"{name} must be <= {schema['maximum']}")

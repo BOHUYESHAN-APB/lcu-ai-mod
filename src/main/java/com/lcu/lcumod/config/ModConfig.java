@@ -10,6 +10,10 @@ public class ModConfig {
             .comment("TCP port for the JSONL wire protocol (backend connects here)")
             .defineInRange("wirePort", 25568, 1024, 65535);
 
+    public static final ModConfigSpec.ConfigValue<String> WIRE_TOKEN = BUILDER
+            .comment("Shared wire authentication token; set MOD_WIRE_TOKEN to the same value in the backend")
+            .define("wireToken", "");
+
     // State push interval in ticks (20 ticks = 1 second)
     public static final ModConfigSpec.IntValue STATE_INTERVAL = BUILDER
             .comment("How often (in ticks) to push full state snapshot to backend")

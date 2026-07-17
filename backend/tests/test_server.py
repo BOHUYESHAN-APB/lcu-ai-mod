@@ -1,14 +1,17 @@
 import asyncio
 import os
+import tempfile
 import threading
 import unittest
 from contextlib import contextmanager
+from pathlib import Path
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 import server
+from agent.agent_state import AgentStateDB
 
 
 class FakeBody:
@@ -39,12 +42,18 @@ class FakeSession:
     def __init__(self):
         self.commands = []
         self.stop_calls = 0
+        self.control_mode = "builtin"
+        self.control_fencing_token = 0
 
     def register_external_command(self, command, request_id, args, requester):
         self.commands.append((command, request_id, args, requester))
 
     def stop(self):
         self.stop_calls += 1
+
+    def set_control_mode(self, mode, fencing_token=0):
+        self.control_mode = mode
+        self.control_fencing_token = fencing_token if mode == "external" else 0
 
 
 class FakeOrchestrator:
@@ -232,6 +241,94 @@ class ServerSDKTests(unittest.TestCase):
         self.assertGreater(orchestrators[0].tick_calls, 0)
         self.assertEqual(orchestrators[0].stop_calls, 1)
         self.assertEqual(orchestrators[0].session.stop_calls, 1)
+
+    def test_v2_external_lease_fences_actions_and_runs_typed_skill(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = AgentStateDB(Path(tmp) / "agent_state.db")
+            body = FakeBody()
+            orchestrator = FakeOrchestrator(body)
+            with (
+                patch.dict(os.environ, {"SDK_API_TOKEN": ""}),
+                patch.object(server, "agent_state", state),
+                patch.object(server, "body", body),
+                patch.object(server, "orchestrator", orchestrator),
+            ):
+                client = TestClient(
+                    server.app,
+                    base_url="http://127.0.0.1:8080",
+                    client=("127.0.0.1", 50000),
+                )
+                skills = client.get("/api/v2/skills?category=general")
+                acquired = client.post("/api/v2/control/leases", json={
+                    "owner": "roleplay-agent",
+                    "mode": "external",
+                    "ttl_seconds": 30,
+                })
+                lease = acquired.json()["lease"]
+                mode_during_lease = orchestrator.session.control_mode
+                legacy = client.post("/api/sdk/command", json={"command": "jump"})
+                reserved = client.post("/api/sdk/command", json={
+                    "command": "control_external",
+                    "args": {"__lcu_fencing_token": 999999},
+                })
+                persona = client.post("/api/persona", json={"name": "intruder"})
+                unfenced = client.post("/api/v2/skills/core.jump/runs", json={"input": {}})
+                run = client.post("/api/v2/skills/general.craft_item/runs", json={
+                    "input": {"item": "minecraft:torch", "count": 8},
+                    "lease_id": lease["id"],
+                    "fencing_token": lease["fencing_token"],
+                })
+                released = client.post(
+                    f"/api/v2/control/leases/{lease['id']}/release",
+                    json={"fencing_token": lease["fencing_token"]},
+                )
+            state.close()
+
+        self.assertEqual(skills.status_code, 200)
+        self.assertGreater(skills.json()["count"], 0)
+        self.assertEqual(acquired.status_code, 200)
+        self.assertEqual(mode_during_lease, "external")
+        self.assertEqual(orchestrator.session.control_mode, "builtin")
+        self.assertEqual(legacy.status_code, 409)
+        self.assertEqual(reserved.status_code, 403)
+        self.assertEqual(persona.status_code, 409)
+        self.assertEqual(unfenced.status_code, 409)
+        self.assertEqual(run.status_code, 200)
+        self.assertEqual(run.json()["skill_id"], "general.craft_item")
+        self.assertEqual(released.status_code, 200)
+        self.assertEqual(body.commands, [
+            ("control_external", {"__lcu_fencing_token": lease["fencing_token"]}),
+            ("craft_item", {
+                "item": "minecraft:torch",
+                "count": 8,
+                "__lcu_fencing_token": lease["fencing_token"],
+            }),
+            ("control_builtin", {"__lcu_fencing_token": lease["fencing_token"]}),
+        ])
+
+    def test_expired_lease_restores_session_while_body_is_disconnected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = AgentStateDB(Path(tmp) / "agent_state.db")
+            lease = state.acquire_lease(
+                "roleplay-agent",
+                "external",
+                ["persona", "memory", "planner", "autonomy", "actions"],
+                30,
+            )
+            body = FakeBody(False)
+            orchestrator = FakeOrchestrator(body)
+            with (
+                patch.object(server, "agent_state", state),
+                patch.object(server, "body", body),
+                patch.object(server, "orchestrator", orchestrator),
+            ):
+                server._reconcile_control_mode()
+                self.assertEqual(orchestrator.session.control_mode, "external")
+                with patch("agent.agent_state.time.time", return_value=lease["expires_at"] + 1):
+                    server._reconcile_control_mode()
+            state.close()
+
+        self.assertEqual(orchestrator.session.control_mode, "builtin")
 
 
 if __name__ == "__main__":

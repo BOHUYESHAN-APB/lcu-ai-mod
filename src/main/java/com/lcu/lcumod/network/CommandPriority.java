@@ -5,6 +5,8 @@ package com.lcu.lcumod.network;
  * Higher priority commands can cancel lower priority ones.
  */
 public final class CommandPriority {
+    /** Control ownership transition — clears all queued work. */
+    public static final int CONTROL = -1;
     /** Flee from danger — highest, cannot be interrupted */
     public static final int FLEE = 0;
     /** Combat reflex — attacked, immediate counter-attack */

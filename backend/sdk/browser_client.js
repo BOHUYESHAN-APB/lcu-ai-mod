@@ -30,6 +30,10 @@ export class LCUClient {
     return this.request('/api/sdk/info');
   }
 
+  getV2Info() {
+    return this.request('/api/v2/info');
+  }
+
   getSession() {
     return this.request('/api/session');
   }
@@ -112,6 +116,56 @@ export class LCUClient {
       body: JSON.stringify({ command, args }),
     });
     return result.request_id;
+  }
+
+  async listSkills(category = '') {
+    const suffix = category ? `?category=${encodeURIComponent(category)}` : '';
+    const result = await this.request(`/api/v2/skills${suffix}`);
+    return result.skills || [];
+  }
+
+  getSkill(skillId) {
+    return this.request(`/api/v2/skills/${encodeURIComponent(skillId)}`);
+  }
+
+  getControl() {
+    return this.request('/api/v2/control');
+  }
+
+  async acquireControl(owner, { mode = 'external', owns, ttlSeconds = 30 } = {}) {
+    const payload = { owner, mode, ttl_seconds: ttlSeconds };
+    if (owns) payload.owns = owns;
+    const result = await this.request('/api/v2/control/leases', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    return result.lease;
+  }
+
+  async heartbeatControl(leaseId, fencingToken, ttlSeconds = 30) {
+    const result = await this.request(`/api/v2/control/leases/${leaseId}/heartbeat`, {
+      method: 'POST',
+      body: JSON.stringify({ fencing_token: fencingToken, ttl_seconds: ttlSeconds }),
+    });
+    return result.lease;
+  }
+
+  async releaseControl(leaseId, fencingToken) {
+    const result = await this.request(`/api/v2/control/leases/${leaseId}/release`, {
+      method: 'POST',
+      body: JSON.stringify({ fencing_token: fencingToken }),
+    });
+    return result.lease;
+  }
+
+  runSkill(skillId, input = {}, { leaseId, fencingToken } = {}) {
+    const payload = { input };
+    if (leaseId) payload.lease_id = leaseId;
+    if (fencingToken) payload.fencing_token = fencingToken;
+    return this.request(`/api/v2/skills/${encodeURIComponent(skillId)}/runs`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
   }
 
   getRuntimeConfig() {

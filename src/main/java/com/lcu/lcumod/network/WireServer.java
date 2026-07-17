@@ -6,6 +6,9 @@ import com.lcu.lcumod.LCUMod;
 import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.InetAddress;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -14,6 +17,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 public class WireServer {
     private final int port;
+    private final String authToken;
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final Gson gson = new Gson();
     private Thread serverThread;
@@ -23,8 +27,9 @@ public class WireServer {
 
     public static final PriorityCommandQueue commandQueue = new PriorityCommandQueue();
 
-    public WireServer(int port) {
+    public WireServer(int port, String authToken) {
         this.port = port;
+        this.authToken = authToken == null ? "" : authToken;
     }
 
     public void start() {
@@ -110,15 +115,12 @@ public class WireServer {
     }
 
     private void runServer() {
-        try (ServerSocket ss = new ServerSocket(port)) {
+        try (ServerSocket ss = new ServerSocket(port, 50, InetAddress.getByName("127.0.0.1"))) {
             while (running.get()) {
                 try {
                     Socket sock = ss.accept();
-                    LCUMod.LOGGER.info("[WireServer] Backend connected from {}", sock.getRemoteSocketAddress());
+                    LCUMod.LOGGER.info("[WireServer] Backend connection pending from {}", sock.getRemoteSocketAddress());
                     Connection conn = new Connection(sock);
-                    Connection old = activeConnection;
-                    if (old != null) old.close();
-                    activeConnection = conn;
                     conn.startReader();
                 } catch (IOException e) {
                     if (running.get()) {
@@ -129,6 +131,20 @@ public class WireServer {
         } catch (IOException e) {
             LCUMod.LOGGER.error("[WireServer] Failed to start on port {}: {}", port, e.getMessage());
         }
+    }
+
+    private synchronized void activate(Connection conn) {
+        Connection old = activeConnection;
+        activeConnection = conn;
+        if (old != null && old != conn) old.close();
+        LCUMod.LOGGER.info("[WireServer] Authenticated backend connected from {}", conn.socket.getRemoteSocketAddress());
+    }
+
+    private boolean validToken(String candidate) {
+        return MessageDigest.isEqual(
+                authToken.getBytes(StandardCharsets.UTF_8),
+                (candidate == null ? "" : candidate).getBytes(StandardCharsets.UTF_8)
+        );
     }
 
     class Connection {
@@ -162,6 +178,24 @@ public class WireServer {
         void startReader() {
             Thread readerThread = new Thread(() -> {
                 try {
+                    String authLine = reader.readLine();
+                    if (authLine == null) return;
+                    JsonObject auth = gson.fromJson(authLine, JsonObject.class);
+                    String type = auth != null && auth.has("type") ? auth.get("type").getAsString() : "";
+                    String token = auth != null && auth.has("token") ? auth.get("token").getAsString() : "";
+                    if (!"auth".equals(type) || !validToken(token)) {
+                        JsonObject denied = new JsonObject();
+                        denied.addProperty("type", "auth");
+                        denied.addProperty("success", false);
+                        send(gson.toJson(denied));
+                        return;
+                    }
+                    JsonObject accepted = new JsonObject();
+                    accepted.addProperty("type", "auth");
+                    accepted.addProperty("success", true);
+                    send(gson.toJson(accepted));
+                    activate(this);
+
                     String line;
                     while (open.get() && (line = reader.readLine()) != null) {
                         if (line.isBlank()) continue;
@@ -175,7 +209,11 @@ public class WireServer {
                                 );
                                 if (cmd.cmd() != null) {
                                     LCUMod.LOGGER.info("[WireServer] Received command: {} id={}", cmd.cmd(), cmd.id());
-                                    commandQueue.submitBackend(cmd);
+                                    if ("control_external".equals(cmd.cmd()) || "control_builtin".equals(cmd.cmd())) {
+                                        commandQueue.submitControl(cmd);
+                                    } else {
+                                        commandQueue.submitBackend(cmd);
+                                    }
                                 }
                             }
                         } catch (Exception e) {
