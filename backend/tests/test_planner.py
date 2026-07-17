@@ -26,6 +26,25 @@ class DummySkills:
 
 
 class PlannerTests(unittest.TestCase):
+    def test_external_context_is_included_in_main_planner_prompt(self):
+        planner = Planner(llm_service=None, memory=DummyMemory(), skills=DummySkills())
+
+        prompt = planner._build_planner_prompt(
+            sender="owner",
+            message="hello",
+            context={
+                "persona": {
+                    "name": "Maid",
+                    "external_context": {"stream": "live", "mood": "focused"},
+                }
+            },
+            bot_name="AI",
+        )
+
+        self.assertIn("上游集成上下文", prompt)
+        self.assertIn("stream", prompt)
+        self.assertIn("focused", prompt)
+
     def test_duplicate_active_craft_is_not_redispatched(self):
         skills = DummySkills()
         planner = Planner(llm_service=None, memory=DummyMemory(), skills=skills)

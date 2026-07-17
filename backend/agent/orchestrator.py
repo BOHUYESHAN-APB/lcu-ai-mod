@@ -4,11 +4,13 @@ Routes mod events to Session, drives tick cycle, manages lifecycle.
 """
 
 import asyncio
+from contextlib import contextmanager
 import logging
+import threading
 import time
 from typing import Optional
 
-from protocol import WireClient
+from protocol import BodyAdapter
 from .session import Session
 
 logger = logging.getLogger("orchestrator")
@@ -27,12 +29,14 @@ class Orchestrator:
         on_chat: callable(sender, message, is_system) — for WebSocket broadcast
     """
 
-    def __init__(self, wire: WireClient, session_id: str | None = None):
-        self.wire = wire
-        self.session = Session(wire, session_id=session_id)
+    def __init__(self, body: BodyAdapter, session_id: str | None = None, **session_options):
+        self.body = body
+        self.wire = body
+        self.session = Session(body, session_id=session_id, **session_options)
         self.running = False
         self._tick_count = 0
         self._last_stats = time.monotonic()
+        self._session_lock = threading.RLock()
         self.on_chat = None  # type: ignore  # set by server.py
 
     def start(self):
@@ -50,13 +54,14 @@ class Orchestrator:
         if not self.running:
             return
 
-        self._tick_count += 1
+        with self._session_lock:
+            self._tick_count += 1
 
-        # Process incoming wire messages
-        self._drain_wire()
+            # Process incoming wire messages
+            self._drain_wire()
 
-        # Session tick (action manager, modes, tasks, auto-save)
-        self.session.tick()
+            # Session tick (action manager, modes, tasks, auto-save)
+            self.session.tick()
 
         # Periodic stats
         now = time.monotonic()
@@ -87,7 +92,14 @@ class Orchestrator:
 
     def handle_chat(self, sender: str, message: str) -> Optional[str]:
         """Process a chat message through the session's LLM pipeline."""
-        return self.session.handle_chat(sender, message)
+        with self._session_lock:
+            return self.session.handle_chat(sender, message)
+
+    @contextmanager
+    def session_context(self):
+        """Serialize external reads and writes with the session tick loop."""
+        with self._session_lock:
+            yield self.session
 
     def _handle_progress(self, data: dict):
         req_id = data.get("id", "?")
@@ -98,7 +110,8 @@ class Orchestrator:
             logger.debug("[Orch] Progress %s: %.0f%% - %s", req_id, progress * 100, message)
 
     def _log_stats(self):
-        status = self.session.get_status()
+        with self._session_lock:
+            status = self.session.get_status()
         action = status.get("action", {})
         logger.info(
             "[Orch] Stats — action=%s modes=%s memory=%d tasks=%d tokens=%d",
@@ -110,8 +123,9 @@ class Orchestrator:
         )
 
     def get_status(self) -> dict:
-        return {
-            "running": self.running,
-            "ticks": self._tick_count,
-            "session": self.session.get_status(),
-        }
+        with self._session_lock:
+            return {
+                "running": self.running,
+                "ticks": self._tick_count,
+                "session": self.session.get_status(),
+            }

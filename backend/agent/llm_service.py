@@ -185,13 +185,13 @@ class LLMService:
         return models
 
     def _build_payload(self, messages: list[dict], stream: bool = False,
-                       config: dict[str, Any] | None = None, **kwargs) -> dict:
+                        config: dict[str, Any] | None = None, **kwargs) -> dict:
         resolved = config or self._resolve_config(None)
         return {
             "model": kwargs.get("model", resolved["model"]),
             "messages": messages,
-            "temperature": kwargs.get("temperature", 0.7),
-            "max_tokens": kwargs.get("max_tokens", 2048),
+            "temperature": kwargs.get("temperature", resolved.get("temperature", 0.7)),
+            "max_tokens": kwargs.get("max_tokens", resolved.get("max_tokens", 2048)),
             "stream": stream,
         }
 
@@ -225,6 +225,8 @@ class LLMService:
             "base_url": str(config.get("base_url") or self.base_url).rstrip("/"),
             "model": config.get("model") or self.model,
             "api_key": config.get("api_key", self.api_key),
+            "temperature": config.get("temperature", 0.7),
+            "max_tokens": config.get("max_tokens", 2048),
         }
 
     @staticmethod

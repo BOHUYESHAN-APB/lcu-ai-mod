@@ -1,0 +1,14 @@
+{
+  "name": "@lcu-ai/companion-sdk",
+  "version": "0.1.0",
+  "description": "Browser and Electron SDK for an LCU Minecraft AI companion",
+  "type": "module",
+  "exports": "./browser_client.js",
+  "files": [
+    "browser_client.js",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "license": "Apache-2.0"
+}

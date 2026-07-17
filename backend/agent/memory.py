@@ -29,7 +29,7 @@ class Memory:
     4. 位置记忆（命名位置）— 记住重要坐标
     """
     
-    def __init__(self, path: str = "data/memory.json"):
+    def __init__(self, path: str | Path = "data/memory.json"):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         
@@ -265,6 +265,8 @@ class Memory:
             "interaction_count": self.interaction_count,
             "total_actions": self.total_actions,
         }
-        self.path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+        temporary.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(self.path)
         logger.debug("[Memory] 保存了 %d 条消息、%d 个事件", 
                     len(self.recent_messages), len(self.events))

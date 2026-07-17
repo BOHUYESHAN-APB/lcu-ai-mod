@@ -22,7 +22,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
-from protocol import WireClient
+from protocol import BodyAdapter
 from .config_store import DEFAULT_CONFIG_PATH
 from .action_manager import ActionManager
 from .memory import Memory
@@ -32,6 +32,7 @@ from .commands import Commands
 from .llm_service import LLMService
 from .self_prompter import SelfPrompter
 from .message_db import MessageDB
+from .identity import CompanionIdentity, DEFAULT_LEGACY_ROOT, DEFAULT_STORAGE_ROOT, migrate_legacy_sessions
 
 logger = logging.getLogger("session")
 
@@ -41,21 +42,30 @@ class Session:
     Central session that manages an AI instance.
     """
 
-    def __init__(self, wire: WireClient, session_id: str | None = None):
+    def __init__(self, body: BodyAdapter, session_id: str | None = None, *,
+                 companion_id: str = "default", persistence_scope: str = "global",
+                 server_id: str = "default", world_id: str = "default",
+                 storage_root: Path = DEFAULT_STORAGE_ROOT, legacy_root: Path | None = DEFAULT_LEGACY_ROOT):
         self.id = session_id or str(uuid.uuid4())[:8]
-        self.wire = wire
+        self.body = body
+        self.wire = body
+        self.identity = CompanionIdentity(companion_id, persistence_scope, server_id, world_id)
+        self.storage_dir = self.identity.storage_dir(storage_root)
+        if legacy_root is not None and persistence_scope == "global":
+            migrate_legacy_sessions(self.storage_dir, legacy_root)
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
 
         # Core subsystems
         self.action_manager = ActionManager()
-        self.skills = Skills(wire)
+        self.skills = Skills(body)
         self.skills.set_command_observer(self._on_skill_command)
-        self.memory = Memory(path=f"data/memory/session_{self.id}.json")
+        self.memory = Memory(path=self.storage_dir / "memory.json")
         self.commands = Commands(self.skills)
         self.modes_engine = ModesEngine(self.skills, self.memory)
         self.llm = LLMService()
 
         # Message database (SQLite persistence)
-        self.message_db = MessageDB(db_path=f"data/messages_{self.id}.db")
+        self.message_db = MessageDB(db_path=self.storage_dir / "messages.db")
 
         # Register default modes
         self.modes_engine.add_defaults()
@@ -88,6 +98,7 @@ class Session:
         self._manual_command_until = 0.0
         self._manual_action_reqs: set[str] = set()
         self._manual_task_kind: Optional[str] = None
+        self._stopped = False
 
     # ── Event handlers ──
 
@@ -400,6 +411,9 @@ class Session:
 
     def stop(self):
         """Gracefully stop the session."""
+        if self._stopped:
+            return
+        self._stopped = True
         self.action_manager.stop()
         self.modes_engine.reset()
         self.memory.save()
@@ -411,6 +425,7 @@ class Session:
     def get_status(self) -> dict:
         return {
             "id": self.id,
+            "identity": self.identity.public_dict(),
             "action": self.action_manager.get_status(),
             "modes": self.modes_engine.get_status(),
             "self_prompter": self.self_prompter.get_status(),

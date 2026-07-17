@@ -106,6 +106,8 @@ class Planner:
         persona_name = persona.get("name", bot_name)
         personality = persona.get("personality", "友好、自然")
         speaking_style = persona.get("speaking_style", "口语化、简短")
+        external_context = persona.get("external_context", {})
+        external_context_text = json.dumps(external_context, ensure_ascii=False, default=str) if external_context else "无"
         
         # 获取最近对话
         recent = self.memory.get_recent_context(5)
@@ -165,6 +167,7 @@ class Planner:
 当前人设：
 - 性格：{personality}
 - 说话风格：{speaking_style}
+- 上游集成上下文：{external_context_text}
 
 当前任务状态：
 {context.get('task_state', {'kind': 'idle', 'status': 'idle'})}
@@ -227,7 +230,7 @@ class Planner:
 回复格式：
 reply(你的回复内容)
 或
-tool(动作名, {"key":"value"})
+tool(动作名, {{"key":"value"}})
 或
 finish()
 

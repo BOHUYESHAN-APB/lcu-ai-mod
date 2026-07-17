@@ -5,33 +5,148 @@ Serves dashboard, WebSocket, and REST API for the Session-based architecture.
 
 import json
 import os
+import secrets
 import threading
 import time
+import ipaddress
 from pathlib import Path
 from typing import Any, Optional, cast
+from urllib.parse import urlparse
 
 import asyncio
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel, Field, model_validator
 
 from agent import LLMService
 from agent.config_store import ConfigStore, DEFAULT_CONFIG_PATH
 from agent.orchestrator import Orchestrator
 from protocol import WireClient
 
-app = FastAPI(title="LCUMod Backend")
+SDK_API_VERSION = "1"
+app = FastAPI(title="LCUMod Backend", version="0.1.0")
 
 CONFIG_PATH = DEFAULT_CONFIG_PATH
 config_store = ConfigStore(CONFIG_PATH)
-app_config = config_store.raw(redact=True)
+
+
+def _sdk_api_token() -> str:
+    return os.getenv("SDK_API_TOKEN", "").strip()
+
+
+def _allowed_origins() -> list[str]:
+    configured = os.getenv("SDK_ALLOWED_ORIGINS", "")
+    if configured.strip():
+        return [origin.strip() for origin in configured.split(",") if origin.strip()]
+    integration = config_store.raw(redact=True).get("integration", {})
+    return list(integration.get("allowed_origins", []))
+
+
+def _is_loopback(host: str | None) -> bool:
+    if not host:
+        return False
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host.lower() == "localhost"
+
+
+def _local_authority(authority: str | None) -> bool:
+    if not authority:
+        return False
+    return _is_loopback(urlparse(f"//{authority}").hostname)
+
+
+def _valid_token(candidate: str | None, client_host: str | None = None,
+                 request_host: str | None = None) -> bool:
+    expected = _sdk_api_token()
+    if not expected:
+        return _is_loopback(client_host) and _local_authority(request_host)
+    return bool(candidate) and secrets.compare_digest(candidate, expected)
+
+
+def _request_token(request: Request) -> str | None:
+    authorization = request.headers.get("authorization", "")
+    if authorization.lower().startswith("bearer "):
+        return authorization[7:].strip()
+    return None
+
+
+def _origin_allowed(origin: str | None, server_url: str | None = None) -> bool:
+    if not origin:
+        return True
+    if origin in _allowed_origins():
+        return True
+    if not server_url:
+        return False
+    parsed_origin = urlparse(origin)
+    parsed_server = urlparse(server_url)
+    origin_port = parsed_origin.port or (443 if parsed_origin.scheme == "https" else 80)
+    server_port = parsed_server.port or (443 if parsed_server.scheme == "wss" else 80)
+    expected_origin_scheme = "https" if parsed_server.scheme == "wss" else "http"
+    return (
+        parsed_origin.scheme == expected_origin_scheme
+        and parsed_origin.hostname == parsed_server.hostname
+        and origin_port == server_port
+    )
+
+
+def _unauthorized_response(request: Request) -> JSONResponse:
+    response = JSONResponse({"detail": "Invalid or missing SDK token"}, status_code=401)
+    origin = request.headers.get("origin")
+    if origin and origin in _allowed_origins():
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
+    return response
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins(),
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+
+
+@app.middleware("http")
+async def sdk_authentication(request: Request, call_next):
+    if request.method != "OPTIONS" and request.url.path.startswith("/api/"):
+        client_host = request.client.host if request.client else None
+        if not _valid_token(_request_token(request), client_host, request.headers.get("host")):
+            return _unauthorized_response(request)
+    return await call_next(request)
+
+
+class SDKContextRequest(BaseModel):
+    external_context: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_legacy_raw_context(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "external_context" not in data:
+            return {"external_context": data}
+        return data
+
+
+class SDKChatRequest(BaseModel):
+    message: str = Field(min_length=1)
+    sender: str = "sdk"
+
+
+class SDKCommandRequest(BaseModel):
+    command: str = Field(min_length=1)
+    args: dict[str, Any] = Field(default_factory=dict)
 
 # Global state
 wire: WireClient | None = None
 orchestrator: Orchestrator | None = None
 llm_service = LLMService()
 connected_browsers: list[WebSocket] = []
+shutdown_event = threading.Event()
+connection_thread: threading.Thread | None = None
 
 
 def _apply_config_to_llm_services():
@@ -41,15 +156,28 @@ def _apply_config_to_llm_services():
     for agent_name, config in config_store.raw(redact=False).get("llm", {}).get("agents", {}).items():
         llm_service.set_agent_config(agent_name, config)
     if orchestrator and orchestrator.session:
-        for agent_name, config in config_store.raw(redact=False).get("llm", {}).get("agents", {}).items():
-            orchestrator.session.llm.set_agent_config(agent_name, config)
+        with orchestrator.session_context() as session:
+            for agent_name, config in config_store.raw(redact=False).get("llm", {}).get("agents", {}).items():
+                session.llm.set_agent_config(agent_name, config)
 
 
 def _apply_persona_to_session():
     if not orchestrator or not orchestrator.session:
         return
     persona = config_store.get_persona()
-    orchestrator.session.runtime["persona"] = persona
+    with orchestrator.session_context() as session:
+        session.runtime["persona"] = persona
+
+
+def _configured_identity() -> dict[str, str]:
+    companion = config_store.get_companion_config()
+    persistence = companion.get("persistence", {})
+    return {
+        "companion_id": companion["id"],
+        "scope": persistence.get("scope", "global"),
+        "server_id": persistence.get("server_id", "default"),
+        "world_id": persistence.get("world_id", "default"),
+    }
 
 # Static files
 STATIC_DIR = Path(__file__).parent / "web" / "static"
@@ -59,13 +187,23 @@ STATIC_DIR.mkdir(parents=True, exist_ok=True)
 @app.on_event("startup")
 async def startup():
     """Start wire client and orchestrator on startup."""
-    global wire, orchestrator
+    global wire, orchestrator, shutdown_event, connection_thread
 
     host = os.getenv("MOD_HOST", "127.0.0.1")
     port = int(os.getenv("MOD_PORT", "25568"))
+    companion = config_store.get_companion_config()
+    persistence = companion.get("persistence", {})
 
     wire = WireClient(host, port)
-    orchestrator = Orchestrator(wire)
+    orchestrator = Orchestrator(
+        wire,
+        companion_id=os.getenv("COMPANION_ID", companion["id"]),
+        persistence_scope=os.getenv("MEMORY_SCOPE", persistence.get("scope", "global")),
+        server_id=os.getenv("SERVER_ID", persistence.get("server_id", "default")),
+        world_id=os.getenv("WORLD_ID", persistence.get("world_id", "default")),
+    )
+    shutdown_event = threading.Event()
+    stop_event = shutdown_event
     _apply_config_to_llm_services()
     _apply_persona_to_session()
 
@@ -98,22 +236,40 @@ async def startup():
         o = orchestrator
         if w is None or o is None:
             return
-        while True:
+        while not stop_event.is_set():
             if w.connect():
+                if stop_event.is_set():
+                    w.disconnect()
+                    break
                 print(f"[Backend] Connected to mod at {host}:{port}")
                 o.start()
                 # Event loop: drain wire + tick orchestrator
-                while w.sock:
+                while w.is_connected and not stop_event.is_set():
                     o.tick()
                     time.sleep(0.05)  # 20Hz loop
                 o.stop()
-                print("[Backend] Disconnected. Reconnecting...")
+                if not stop_event.is_set():
+                    print("[Backend] Disconnected. Reconnecting...")
             else:
-                print(f"[Backend] Mod not available at {host}:{port}. Retry in 5s...")
-                time.sleep(5)
+                if not stop_event.is_set():
+                    print(f"[Backend] Mod not available at {host}:{port}. Retry in 5s...")
+                    stop_event.wait(5)
 
-    t = threading.Thread(target=_connect_loop, daemon=True)
-    t.start()
+    connection_thread = threading.Thread(target=_connect_loop, daemon=True)
+    connection_thread.start()
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    """Persist companion state and stop the active body connection."""
+    shutdown_event.set()
+    if wire:
+        wire.disconnect()
+    if connection_thread and connection_thread.is_alive():
+        await asyncio.to_thread(connection_thread.join, 6.0)
+    if orchestrator:
+        with orchestrator.session_context() as session:
+            session.stop()
 
 
 # ── Routes ──
@@ -131,7 +287,19 @@ async def get_dashboard():
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     """Browser WebSocket: send commands, receive status."""
-    await ws.accept()
+    authorization = ws.headers.get("authorization", "")
+    header_token = authorization[7:].strip() if authorization.lower().startswith("bearer ") else None
+    protocols = [item.strip() for item in ws.headers.get("sec-websocket-protocol", "").split(",") if item.strip()]
+    token_protocol = next((item for item in protocols if item.startswith("lcu-token.")), None)
+    protocol_token = token_protocol.removeprefix("lcu-token.") if token_protocol else None
+    client_host = ws.client.host if ws.client else None
+    if not _valid_token(header_token or protocol_token, client_host, ws.headers.get("host")):
+        await ws.close(code=1008, reason="Invalid or missing SDK token")
+        return
+    if not _origin_allowed(ws.headers.get("origin"), str(ws.url)):
+        await ws.close(code=1008, reason="WebSocket origin is not allowed")
+        return
+    await ws.accept(subprotocol=token_protocol)
     connected_browsers.append(ws)
     try:
         while True:
@@ -143,13 +311,17 @@ async def websocket_endpoint(ws: WebSocket):
                 cmd = msg.get("cmd", "")
                 args = msg.get("args", {})
                 if wire:
-                    wire.send_command(cmd, args)
+                    try:
+                        request_id = wire.send_command(cmd, args)
+                        await ws.send_text(json.dumps({"type": "command_accepted", "id": request_id}))
+                    except ConnectionError as exc:
+                        await ws.send_text(json.dumps({"type": "command_rejected", "error": str(exc)}))
 
             elif event_type == "chat":
                 message = msg.get("message", "")
                 sender = msg.get("sender", "web")
                 if orchestrator:
-                    response = orchestrator.handle_chat(sender, message)
+                    response = await asyncio.to_thread(orchestrator.handle_chat, sender, message)
                     await ws.send_text(json.dumps({
                         "type": "chat_response",
                         "data": {"response": response or ""},
@@ -184,7 +356,7 @@ async def get_session():
     """REST endpoint for session details."""
     global orchestrator
     if orchestrator and orchestrator.session:
-        return orchestrator.session.get_status()
+        return orchestrator.get_status()["session"]
     return {"session": None}
 
 
@@ -219,13 +391,14 @@ async def get_memory():
     """REST endpoint for memory summary."""
     global orchestrator
     if orchestrator and orchestrator.session:
-        mem = orchestrator.session.memory
-        return {
-            "interactions": len(mem.recent_messages),
-            "actions": mem.total_actions,
-            "locations": list(mem.locations.keys()),
-            "recent": mem.build_context(),
-        }
+        with orchestrator.session_context() as session:
+            mem = session.memory
+            return {
+                "interactions": len(mem.recent_messages),
+                "actions": mem.total_actions,
+                "locations": list(mem.locations.keys()),
+                "recent": mem.build_context(),
+            }
     return {"interactions": 0}
 
 
@@ -234,7 +407,8 @@ async def get_tokens():
     """REST endpoint for token usage (backward compat)."""
     global orchestrator
     if orchestrator and orchestrator.session:
-        usage = orchestrator.session.llm.get_usage()
+        with orchestrator.session_context() as session:
+            usage = session.llm.get_usage()
         return {
             "total_tokens": usage.get("total_tokens", 0),
             "total_cost": 0,
@@ -247,15 +421,14 @@ async def get_tokens():
 @app.get("/api/config")
 async def get_config():
     """Get current backend configuration."""
-    return app_config
+    return config_store.raw(redact=True)
 
 
 @app.post("/api/config")
 async def set_config(data: dict):
     """Update backend configuration."""
-    global app_config
-    app_config = config_store.set_app_config(data)
-    return {"status": "ok", "config": app_config}
+    config = config_store.set_app_config(data)
+    return {"status": "ok", "config": config}
 
 
 @app.get("/api/llm/models")
@@ -277,7 +450,8 @@ async def fetch_llm_models(data: dict):
         agent = data.get("agent", "default")
         config = config_store.get_agent_llm_config(agent, redact=False)
         base_url = data.get("base_url") or config.get("base_url")
-        api_key = data.get("api_key") if "api_key" in data else config.get("api_key")
+        explicit_base_url = data.get("base_url")
+        api_key = data.get("api_key") if "api_key" in data else None if explicit_base_url else config.get("api_key")
         models = llm_service.fetch_models(agent=agent, base_url=base_url, api_key=api_key)
         return {"models": models, "source": "remote"}
     except Exception as e:
@@ -297,9 +471,9 @@ async def set_persona(data: dict):
 
 
 @app.post("/api/sdk/context")
-async def set_sdk_context(data: dict):
+async def set_sdk_context(data: SDKContextRequest):
     """External SDK endpoint for upstream persona/context injection."""
-    result = config_store.set_integration_context(data)
+    result = config_store.set_integration_context(data.model_dump())
     _apply_persona_to_session()
     return {"status": "ok", **result}
 
@@ -312,20 +486,81 @@ async def get_sdk_context():
     }
 
 
+@app.get("/api/sdk/info")
+async def get_sdk_info():
+    return {
+        "api_version": SDK_API_VERSION,
+        "auth_required": bool(_sdk_api_token()),
+        "interfaces": ["gateway", "actuator", "observer"],
+    }
+
+
+@app.get("/api/sdk/identity")
+async def get_sdk_identity():
+    if orchestrator:
+        return {"identity": orchestrator.get_status()["session"]["identity"]}
+    return {"identity": _configured_identity()}
+
+
+@app.post("/api/sdk/identity")
+async def set_sdk_identity(data: dict):
+    """Update stable identity settings; changes apply after backend restart."""
+    overrides = [name for name in ("COMPANION_ID", "MEMORY_SCOPE", "SERVER_ID", "WORLD_ID") if os.getenv(name)]
+    if overrides:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Identity is controlled by environment variables: {', '.join(overrides)}",
+        )
+    try:
+        companion = config_store.set_companion_config(data)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    persistence = companion.get("persistence", {})
+    identity = {
+        "companion_id": companion["id"],
+        "scope": persistence.get("scope", "global"),
+        "server_id": persistence.get("server_id", "default"),
+        "world_id": persistence.get("world_id", "default"),
+    }
+    return {"status": "ok", "restart_required": True, "identity": identity}
+
+
+@app.post("/api/sdk/chat")
+async def sdk_chat(data: SDKChatRequest):
+    """Send a message through the companion persona, memory, and planner."""
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Companion session is not running")
+    response = await asyncio.to_thread(orchestrator.handle_chat, data.sender, data.message)
+    return {"status": "ok", "response": response or ""}
+
+
+@app.post("/api/sdk/command")
+async def sdk_command(data: SDKCommandRequest):
+    """Send an authorized low-level command to the active client body."""
+    if not wire or not wire.is_connected:
+        raise HTTPException(status_code=503, detail="Minecraft client body is not connected")
+    try:
+        request_id = wire.send_command(data.command, data.args)
+    except ConnectionError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"status": "accepted", "request_id": request_id}
+
+
 @app.get("/api/database")
 async def get_database():
     """Get message database statistics and recent messages."""
     global orchestrator
     if orchestrator and orchestrator.session:
-        db = orchestrator.session.message_db
-        stats = db.get_stats()
-        recent = db.get_recent_messages(limit=20)
-        players = db.get_all_players()
-        return {
-            "stats": stats,
-            "recent_messages": recent,
-            "players": players,
-        }
+        with orchestrator.session_context() as session:
+            db = session.message_db
+            stats = db.get_stats()
+            recent = db.get_recent_messages(limit=20)
+            players = db.get_all_players()
+            return {
+                "stats": stats,
+                "recent_messages": recent,
+                "players": players,
+            }
     return {"stats": {}, "recent_messages": [], "players": []}
 
 
@@ -334,9 +569,9 @@ async def get_database_messages(limit: int = 50, sender: Optional[str] = None):
     """Get messages from database with optional filtering."""
     global orchestrator
     if orchestrator and orchestrator.session:
-        db = orchestrator.session.message_db
-        messages = db.get_recent_messages(limit=limit, sender=sender)
-        return {"messages": messages}
+        with orchestrator.session_context() as session:
+            messages = session.message_db.get_recent_messages(limit=limit, sender=sender)
+            return {"messages": messages}
     return {"messages": []}
 
 
@@ -345,7 +580,7 @@ async def search_database_messages(q: str, limit: int = 50):
     """Search messages in database."""
     global orchestrator
     if orchestrator and orchestrator.session:
-        db = orchestrator.session.message_db
-        messages = db.search_messages(query=q, limit=limit)
-        return {"messages": messages}
+        with orchestrator.session_context() as session:
+            messages = session.message_db.search_messages(query=q, limit=limit)
+            return {"messages": messages}
     return {"messages": []}

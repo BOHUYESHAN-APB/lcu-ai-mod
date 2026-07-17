@@ -266,6 +266,21 @@ body{font-family:'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;backgroun
 <script>
 // ── WebSocket ──
 const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+const fragmentParams = new URLSearchParams(location.hash.replace(/^#/, ''));
+const fragmentToken = fragmentParams.get('token') || '';
+if (fragmentToken) {
+  sessionStorage.setItem('lcu.sdkToken', fragmentToken);
+  history.replaceState(null, '', `${location.pathname}${location.search}`);
+}
+const sdkToken = fragmentToken || sessionStorage.getItem('lcu.sdkToken') || '';
+const nativeFetch = window.fetch.bind(window);
+window.fetch = (input, init = {}) => {
+  const url = typeof input === 'string' ? input : input.url;
+  if (sdkToken && (url.startsWith('/api/') || url.startsWith(location.origin + '/api/'))) {
+    init.headers = { ...(init.headers || {}), Authorization: `Bearer ${sdkToken}` };
+  }
+  return nativeFetch(input, init);
+};
 let ws = null;
 let reconnectTimer = null;
 let providerPresets = [];
@@ -273,7 +288,8 @@ let llmConfig = null;
 let sessionPollInFlight = false;
 
 function connectWS() {
-  ws = new WebSocket(`${wsProto}//${location.host}/ws`);
+  const protocols = sdkToken ? [`lcu-token.${sdkToken}`] : [];
+  ws = new WebSocket(`${wsProto}//${location.host}/ws`, protocols);
   ws.onopen = () => {
     document.getElementById('connectionStatus').className = 'status online';
     document.getElementById('connectionStatus').textContent = '● 已连接';

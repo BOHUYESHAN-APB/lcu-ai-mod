@@ -28,11 +28,18 @@ class LLMServiceTests(unittest.TestCase):
     def test_agent_config_overrides_default_model_and_base_url(self):
         service = LLMService()
         service.set_agent_config("default", {"base_url": "https://default.test/v1", "model": "default-model"})
-        service.set_agent_config("planner", {"base_url": "https://planner.test/v1/", "model": "planner-model"})
+        service.set_agent_config("planner", {
+            "base_url": "https://planner.test/v1/",
+            "model": "planner-model",
+            "temperature": 1.1,
+            "max_tokens": 4096,
+        })
 
         payload = service._build_payload([{"role": "user", "content": "hi"}], config=service._resolve_config("planner"))
 
         self.assertEqual(payload["model"], "planner-model")
+        self.assertEqual(payload["temperature"], 1.1)
+        self.assertEqual(payload["max_tokens"], 4096)
         self.assertEqual(service._resolve_config("planner")["base_url"], "https://planner.test/v1")
 
     def test_fetch_models_uses_agent_base_url_and_bearer_key(self):

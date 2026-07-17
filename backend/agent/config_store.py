@@ -12,6 +12,7 @@ import copy
 import json
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -152,6 +153,14 @@ def _default_config() -> dict[str, Any]:
             "allowed_origins": ["http://127.0.0.1", "http://localhost"],
             "updated_at": None,
         },
+        "companion": {
+            "id": "",
+            "persistence": {
+                "scope": "global",
+                "server_id": "default",
+                "world_id": "default",
+            },
+        },
         "whitelist": [],
         "listen_public": True,
         "patrol_radius": 8,
@@ -166,6 +175,14 @@ class ConfigStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._data = self._load()
+        self._ensure_companion_identity()
+
+    def _ensure_companion_identity(self) -> None:
+        companion = self._data.setdefault("companion", {})
+        if not companion.get("id"):
+            companion["id"] = str(uuid.uuid4())
+            companion.setdefault("persistence", _default_config()["companion"]["persistence"])
+            self.save()
 
     def _load(self) -> dict[str, Any]:
         defaults = _default_config()
@@ -184,10 +201,12 @@ class ConfigStore:
 
     def save(self) -> None:
         with self._lock:
-            self.path.write_text(
+            temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+            temporary.write_text(
                 json.dumps(self._data, indent=2, ensure_ascii=False),
                 encoding="utf-8",
             )
+            temporary.replace(self.path)
 
     def raw(self, redact: bool = True) -> dict[str, Any]:
         with self._lock:
@@ -227,6 +246,27 @@ class ConfigStore:
                 if key in payload and payload[key] is not None:
                     current[key] = payload[key]
 
+            raw_temperature = current.get("temperature", 0.7)
+            raw_max_tokens = current.get("max_tokens", 2048)
+            try:
+                if isinstance(raw_temperature, bool):
+                    raise ValueError
+                current["temperature"] = float(raw_temperature)
+                if isinstance(raw_max_tokens, bool):
+                    raise ValueError
+                if isinstance(raw_max_tokens, int):
+                    current["max_tokens"] = raw_max_tokens
+                elif isinstance(raw_max_tokens, str) and raw_max_tokens.strip().isdigit():
+                    current["max_tokens"] = int(raw_max_tokens.strip())
+                else:
+                    raise ValueError
+            except (TypeError, ValueError) as exc:
+                raise ValueError("temperature must be numeric and max_tokens must be an integer") from exc
+            if not 0 <= current["temperature"] <= 2:
+                raise ValueError("temperature must be between 0 and 2")
+            if current["max_tokens"] <= 0:
+                raise ValueError("max_tokens must be greater than 0")
+
             if current.get("base_url"):
                 current["base_url"] = str(current["base_url"]).rstrip("/")
 
@@ -239,6 +279,30 @@ class ConfigStore:
     def get_persona(self) -> dict[str, Any]:
         with self._lock:
             return copy.deepcopy(self._data.setdefault("persona", _default_config()["persona"]))
+
+    def get_companion_config(self) -> dict[str, Any]:
+        with self._lock:
+            return copy.deepcopy(self._data["companion"])
+
+    def set_companion_config(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            companion = copy.deepcopy(self._data["companion"])
+            requested_id = payload.get("companion_id", payload.get("id"))
+            if requested_id is not None:
+                companion_id = str(requested_id).strip()
+                if not companion_id:
+                    raise ValueError("companion id must not be empty")
+                companion["id"] = companion_id
+            persistence = companion.setdefault("persistence", {})
+            update = payload.get("persistence", payload)
+            for key in ("scope", "server_id", "world_id"):
+                if key in update:
+                    persistence[key] = str(update[key]).strip()
+            if persistence.get("scope", "global") not in {"global", "server", "world"}:
+                raise ValueError("scope must be global, server, or world")
+            self._data["companion"] = companion
+            self.save()
+            return copy.deepcopy(companion)
 
     def set_persona(self, payload: dict[str, Any]) -> dict[str, Any]:
         allowed = {"name", "wake_names", "personality", "speaking_style", "external_context"}

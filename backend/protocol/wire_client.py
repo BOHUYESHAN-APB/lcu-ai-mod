@@ -35,45 +35,76 @@ class WireClient:
         self.host = host
         self.port = port
         self.sock: socket.socket | None = None
-        self._buffer = ""
         self._event_queue: Queue[WireMessage] = Queue()
         self._running = False
         self._reader_thread: threading.Thread | None = None
         self._id_counter = 0
+        self._connection_lock = threading.RLock()
+        self._send_lock = threading.Lock()
+        self._id_lock = threading.Lock()
 
     def connect(self) -> bool:
         """Connect to the mod's wire server."""
+        self.disconnect()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(5.0)
         try:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.connect((self.host, self.port))
-            self._running = True
-            self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
+            sock.connect((self.host, self.port))
+            sock.settimeout(None)
+            with self._connection_lock:
+                self.sock = sock
+                self._running = True
+            self._reader_thread = threading.Thread(target=self._read_loop, args=(sock,), daemon=True)
             self._reader_thread.start()
             return True
         except Exception as e:
+            try:
+                sock.close()
+            except OSError:
+                pass
             print(f"[WireClient] Connection failed: {e}")
             return False
 
-    def disconnect(self):
-        self._running = False
-        if self.sock:
+    def disconnect(self, expected_socket: socket.socket | None = None):
+        with self._connection_lock:
+            if expected_socket is not None and self.sock is not expected_socket:
+                return
+            self._running = False
+            sock = self.sock
+            self.sock = None
+            reader_thread = self._reader_thread
+            self._reader_thread = None
+        if sock:
             try:
-                self.sock.close()
-            except:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
                 pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+        if reader_thread and reader_thread is not threading.current_thread() and reader_thread.is_alive():
+            reader_thread.join(timeout=1.0)
 
-    def send_command(self, cmd: str, args: dict | None = None) -> str:
+    @property
+    def is_connected(self) -> bool:
+        with self._connection_lock:
+            return self._running and self.sock is not None
+
+    def send_command(self, command: str, args: dict | None = None) -> str:
         """Send a command to the mod. Returns the request ID."""
-        self._id_counter += 1
-        req_id = f"req_{self._id_counter}"
+        with self._id_lock:
+            self._id_counter += 1
+            req_id = f"req_{self._id_counter}"
         msg = {
             "type": "command",
-            "cmd": cmd,
+            "cmd": command,
             "args": args or {},
             "id": req_id,
         }
-        self._send_line(json.dumps(msg))
-        logger.debug(f"→ {cmd} {args} [{req_id}]")
+        if not self._send_line(json.dumps(msg)):
+            raise ConnectionError("Minecraft client body is not connected")
+        logger.debug(f"→ {command} {args} [{req_id}]")
         return req_id
 
     def send_chat(self, message: str):
@@ -114,23 +145,29 @@ class WireClient:
                 continue
         return None
 
-    def _send_line(self, line: str):
-        if self.sock:
-            try:
-                self.sock.sendall((line + "\n").encode("utf-8"))
-            except Exception as e:
-                print(f"[WireClient] Send error: {e}")
-                self.disconnect()
+    def _send_line(self, line: str) -> bool:
+        with self._send_lock:
+            with self._connection_lock:
+                sock = self.sock if self._running else None
+            if sock:
+                try:
+                    sock.sendall((line + "\n").encode("utf-8"))
+                    return True
+                except Exception as e:
+                    print(f"[WireClient] Send error: {e}")
+                    self.disconnect(expected_socket=sock)
+        return False
 
-    def _read_loop(self):
-        while self._running and self.sock:
+    def _read_loop(self, sock: socket.socket):
+        buffer = ""
+        while self.is_connected and self.sock is sock:
             try:
-                data = self.sock.recv(65536).decode("utf-8")
+                data = sock.recv(65536).decode("utf-8")
                 if not data:
                     break
-                self._buffer += data
-                while "\n" in self._buffer:
-                    line, self._buffer = self._buffer.split("\n", 1)
+                buffer += data
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
                     line = line.strip()
                     if line:
                         try:
@@ -146,4 +183,4 @@ class WireClient:
             except Exception as e:
                 print(f"[WireClient] Read error: {e}")
                 break
-        self._running = False
+        self.disconnect(expected_socket=sock)

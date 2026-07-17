@@ -1,6 +1,10 @@
-# LCU Mod — AI-Powered Minecraft Companion
+# LCU Mod - Minecraft AI Companion Client
 
-一个基于 NeoForge 的 Minecraft 模组，配合 Python 后端实现 AI 驱动的自主行为系统。
+LCU 是运行在独立真实 Minecraft 客户端上的 AI 陪玩平台。AI 使用一个实际登录游戏的客户端账号，拥有渲染窗口和第一人称主视角，可以在多人服务器中聊天、行动、直播和长期维持自己的角色身份。
+
+项目同时提供可独立运行的人格、记忆与规划后端，以及面向第三方系统的 SDK。外部系统既可以向同伴注入人设和上下文，也可以在明确授权后读取状态或驱动游戏动作。
+
+未来会增加服务端假玩家作为第二种可选身体，但真实有头客户端仍是直播和主视角场景的核心。
 
 ## 项目结构
 
@@ -11,14 +15,21 @@ lcumod/
 │       ├── action/         # 动作执行器、寻路、POI 记忆
 │       ├── state/          # 状态收集器
 │       └── network/        # 网络通信 (WireServer)
-├── backend/                # AI 后端 (Python, FastAPI)
+├── backend/                # AI 大脑与集成后端 (Python, FastAPI)
 │   ├── agent/              # 会话管理、规划器、模式引擎
 │   ├── protocol/           # 通信协议
-│   └── web/                # Web UI
+│   ├── sdk/                # Python / Browser SDK
+│   └── web/                # 本地控制台
 └── docs/                   # 文档
 ```
 
 ## 核心能力
+
+### 真实客户端身体
+- 以真实 Minecraft 客户端账号加入单人或多人游戏
+- 保留渲染窗口和第一人称主视角，适合直播与录像
+- Java 模组负责感知、寻路、输入隔离和动作执行
+- Python 后端负责人格、记忆、聊天、规划和外部集成
 
 ### 通用任务协议
 - 递归配方分析（crafting + smelting + blasting + smoking）
@@ -40,25 +51,39 @@ lcumod/
 - 炉子/高炉/烟熏炉状态管理
 - 处理中不重复放 recipe
 
-## 协议
+## SDK 与集成
 
-本项目采用**双协议**结构：
+SDK 分为三类接口：
+
+- **Gateway**：把外部消息、人设和上下文送入同伴自己的决策链
+- **Observer**：读取会话、状态、记忆和配置
+- **Actuator**：在授权后直接向当前客户端身体发送低层动作
+
+后端默认只监听 `127.0.0.1`。对局域网或远程地址开放时必须设置 `SDK_API_TOKEN`，浏览器跨域接入还需设置 `SDK_ALLOWED_ORIGINS`。详见 [SDK 文档](docs/sdk.md)。
+
+同伴拥有跨重启稳定身份，记忆可配置为全局、按服务器或按世界隔离。运行期 Session ID 仅用于诊断，不再决定记忆文件位置。
+
+## 许可证
+
+本项目按模块采用不同许可证：
 
 | 部分 | 协议 | 说明 |
 |------|------|------|
-| Minecraft 模组 (`src/`) | **MIT** | 前端模组代码，自由使用 |
-| Python 后端 (`backend/`) | **AGPL-3.0** | 后端服务代码，修改后需开源 |
+| Minecraft 客户端模组 (`src/`) | **MIT** | 便于整合包、客户端和兼容项目采用 |
+| Python 后端 (`backend/`，不含 `sdk/`) | **AGPL-3.0** | 人格、记忆、规划和服务端实现 |
+| 集成 SDK (`backend/sdk/`) | **Apache-2.0** | 面向第三方 Python、Browser 和 Electron 集成 |
 
 详见：
 - [MIT License](LICENSE) — 模组部分
 - [AGPL License](backend/LICENSE) — 后端部分
+- [Apache-2.0 License](backend/sdk/LICENSE) — SDK 部分
 
 ## 快速开始
 
 ### 前置要求
 - Java 21+
 - Python 3.11+
-- Minecraft 1.20.2 (NeoForge)
+- Minecraft 1.21.1 (NeoForge)
 
 ### 构建模组
 ```bash
@@ -68,9 +93,12 @@ lcumod/
 ### 启动后端
 ```bash
 cd backend
-pip install -r requirements.txt
-python main.py
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe main.py
 ```
+
+默认地址为 `http://127.0.0.1:8080`。不要在未配置 `SDK_API_TOKEN` 时监听非回环地址。
 
 ### 配置
 后端配置文件位于 `backend/.local/config.json`（自动生成，已加入 .gitignore）。
@@ -90,7 +118,7 @@ python main.py
 ### 测试
 ```bash
 cd backend
-python -m unittest discover -s tests
+.venv\Scripts\python.exe -m unittest discover -s tests
 ```
 
 ### 代码结构

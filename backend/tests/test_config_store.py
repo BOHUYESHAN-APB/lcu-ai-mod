@@ -54,6 +54,51 @@ class ConfigStoreTests(unittest.TestCase):
             self.assertEqual(config["model"], "mimo-v2.5")
             self.assertIn("小A", persona["wake_names"])
 
+    def test_invalid_generation_limits_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConfigStore(Path(tmp) / "config.json")
+
+            with self.assertRaisesRegex(ValueError, "temperature"):
+                store.set_agent_llm_config("planner", {"temperature": 3})
+            with self.assertRaisesRegex(ValueError, "max_tokens"):
+                store.set_agent_llm_config("planner", {"max_tokens": 0})
+
+    def test_companion_identity_is_generated_once_and_persisted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+
+            first = ConfigStore(path).get_companion_config()
+            second = ConfigStore(path).get_companion_config()
+
+            self.assertTrue(first["id"])
+            self.assertEqual(first["id"], second["id"])
+            self.assertEqual(first["persistence"]["scope"], "global")
+
+    def test_companion_scope_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConfigStore(Path(tmp) / "config.json")
+            before = store.get_companion_config()
+
+            with self.assertRaisesRegex(ValueError, "scope"):
+                store.set_companion_config({"scope": "dimension"})
+
+            self.assertEqual(store.get_companion_config(), before)
+
+    def test_companion_config_accepts_public_identity_field_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConfigStore(Path(tmp) / "config.json")
+
+            result = store.set_companion_config({
+                "companion_id": "streamer-one",
+                "scope": "world",
+                "server_id": "example.org",
+                "world_id": "survival",
+            })
+
+            self.assertEqual(result["id"], "streamer-one")
+            self.assertEqual(result["persistence"]["scope"], "world")
+            self.assertEqual(result["persistence"]["server_id"], "example.org")
+
 
 if __name__ == "__main__":
     unittest.main()
