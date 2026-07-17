@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from agent.memory import Memory
 from agent.session import Session
@@ -95,6 +96,66 @@ class MemoryTests(unittest.TestCase):
             self.assertEqual(relationship["message_count"], 1)
             self.assertEqual(relationship["task_outcomes"]["success"], 1)
             self.assertEqual(restored.task_outcomes[-1]["target"], "stone_pickaxe")
+
+    def test_dirty_memory_is_flushed_once_after_bounded_interval(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "memory.json"
+            memory = Memory(path)
+            memory.observe_player("Alice", "uuid-a", "hello")
+
+            self.assertTrue(memory.is_dirty)
+            self.assertFalse(memory.flush_if_due(interval=60.0))
+            self.assertFalse(path.exists())
+
+            memory._last_save -= 61.0
+            self.assertTrue(memory.flush_if_due(interval=60.0))
+            self.assertFalse(memory.is_dirty)
+            first_contents = path.read_text(encoding="utf-8")
+
+            self.assertFalse(memory.flush_if_due(interval=0.0))
+            self.assertEqual(path.read_text(encoding="utf-8"), first_contents)
+
+    def test_high_value_memory_shortens_world_flush_deadline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            memory = Memory(Path(tmp) / "memory.json")
+            memory.observe_world({"player": {}, "entities": []})
+            world_deadline = memory._flush_deadline
+
+            memory.observe_player("Alice", "uuid-a", "hello")
+
+            self.assertIsNotNone(world_deadline)
+            self.assertLess(memory._flush_deadline, world_deadline)
+            self.assertLessEqual(memory._flush_deadline - memory._last_save, memory.FLUSH_INTERVAL + 0.1)
+
+    def test_blocked_memory_does_not_retry_scheduled_flush(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "memory.json"
+            path.write_text(json.dumps({"schema_version": 99}), encoding="utf-8")
+            memory = Memory(path)
+            memory.observe_player("Alice", "uuid-a", "hello")
+            memory._flush_deadline = 0.0
+
+            with patch("agent.memory.logger.error") as error_log:
+                self.assertFalse(memory.flush_if_due())
+                self.assertFalse(memory.flush_if_due())
+
+            error_log.assert_not_called()
+
+    def test_session_tick_flushes_terminal_task_outcome_when_due(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session = Session(FakeBody(), companion_id="memory-test", storage_root=root, legacy_root=None)
+            session.runtime["control_state"] = {"ai_controlled": False}
+            session.register_external_command("jump", "req-sdk", {}, requester="sdk")
+            session.handle_event("command_response", {"id": "req-sdk", "success": True})
+            session.memory._flush_deadline = 0.0
+
+            session.tick()
+
+            restored = Memory(session.memory.path)
+            self.assertEqual(restored.task_outcomes[-1]["command"], "jump")
+            self.assertEqual(restored.task_outcomes[-1]["outcome"], "success")
+            session.stop()
 
     def test_context_is_deterministic_bounded_and_prioritizes_current_player(self):
         with tempfile.TemporaryDirectory() as tmp:

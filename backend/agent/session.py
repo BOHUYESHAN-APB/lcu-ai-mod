@@ -96,8 +96,6 @@ class Session:
         # Self-prompter (mindcraft-style autonomous prompting)
         self.self_prompter = SelfPrompter(cooldown=15.0, max_idle_cycles=3)
 
-        # Auto-save
-        self._last_save = time.monotonic()
         self._manual_command_until = 0.0
         self._manual_action_reqs: set[str] = set()
         self._manual_task_kind: Optional[str] = None
@@ -404,11 +402,7 @@ class Session:
             if pending.get("started_at", 0) < cutoff:
                 self._finish_pending_command(req_id, "unknown", "no terminal event")
 
-        # Auto-save
-        now = time.monotonic()
-        if now - self._last_save > 120:
-            self._last_save = now
-            self.memory.save()
+        self.memory.flush_if_due()
 
     def _handle_self_prompt(self, prompt: str):
         """Handle a self-prompt by routing through LLM to generate actions."""

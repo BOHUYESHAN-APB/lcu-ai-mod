@@ -30,6 +30,8 @@ class Memory:
     """
     
     SCHEMA_VERSION = 3
+    FLUSH_INTERVAL = 5.0
+    WORLD_FLUSH_INTERVAL = 120.0
 
     def __init__(self, path: str | Path = "data/memory.json", *,
                  server_id: str = "default", world_id: str = "default"):
@@ -58,6 +60,9 @@ class Memory:
         self.task_outcomes: list[dict] = []
         self.max_task_outcomes = 100
         self._save_blocked_reason: str | None = None
+        self._dirty = False
+        self._last_save = time.monotonic()
+        self._flush_deadline: float | None = None
         
         # 统计
         self.interaction_count = 0
@@ -88,6 +93,7 @@ class Memory:
         # 更新玩家画像
         if sender and sender != "system":
             self._update_player_profile(sender, message)
+        self._mark_dirty()
     
     def get_recent_context(self, n: int = 10) -> list[dict]:
         """获取最近 N 条消息。"""
@@ -97,6 +103,7 @@ class Memory:
         for entry in reversed(self.recent_messages):
             if entry.get("sender") == sender and entry.get("message") == message:
                 entry["response"] = response
+                self._mark_dirty()
                 return
     
     # ── 长期记忆 ──
@@ -130,6 +137,7 @@ class Memory:
         self.events.append(event)
         if len(self.events) > self.max_events:
             del self.events[:-self.max_events]
+        self._mark_dirty()
 
     def observe_player(self, name: str, player_id: str = "", message: str = "") -> None:
         """Update durable relationship facts without guessing sentiment."""
@@ -149,6 +157,7 @@ class Memory:
         relationship["last_seen"] = now
         if message:
             relationship["message_count"] += 1
+        self._mark_dirty()
 
     def observe_world(self, state: dict) -> None:
         """Aggregate world experience without appending high-frequency events."""
@@ -176,6 +185,7 @@ class Memory:
             world["last_position"] = {
                 "x": player["x"], "y": player["y"], "z": player["z"], "dimension": dimension,
             }
+        self._mark_dirty(self.WORLD_FLUSH_INTERVAL)
 
     def record_task_outcome(self, command: str, outcome: str, *, target: str = "",
                             requester: str = "", requester_id: str = "", detail: str = "",
@@ -275,6 +285,7 @@ class Memory:
             "description": description,
             "saved_at": time.time(),
         }
+        self._mark_dirty()
         logger.info("[Memory] 保存位置: %s (%.0f, %.0f, %.0f)", name, x, y, z)
     
     def get_location(self, name: str) -> Optional[dict]:
@@ -452,17 +463,41 @@ class Memory:
             self.events = self.events[-self.max_events:]
             self.interaction_count = data.get("interaction_count", 0)
             self.total_actions = data.get("total_actions", 0)
+            if version < self.SCHEMA_VERSION:
+                self._mark_dirty()
             logger.info("[Memory] 加载了 %d 条消息、%d 个事件、%d 个玩家画像",
                        len(self.recent_messages), len(self.events), len(self.player_profiles))
         except Exception as e:
             self._save_blocked_reason = str(e)
             logger.warning("[Memory] 加载失败: %s", e)
     
-    def save(self):
+    @property
+    def is_dirty(self) -> bool:
+        return self._dirty
+
+    def _mark_dirty(self, interval: float = FLUSH_INTERVAL) -> None:
+        self._dirty = True
+        deadline = time.monotonic() + max(0.0, interval)
+        if self._flush_deadline is None or deadline < self._flush_deadline:
+            self._flush_deadline = deadline
+
+    def flush_if_due(self, interval: float | None = None) -> bool:
+        """Persist dirty memory after a bounded coalescing interval."""
+        if self._save_blocked_reason or not self._dirty:
+            return False
+        now = time.monotonic()
+        if interval is not None:
+            if now - self._last_save < max(0.0, interval):
+                return False
+        elif self._flush_deadline is not None and now < self._flush_deadline:
+            return False
+        return self.save()
+
+    def save(self) -> bool:
         """保存持久化数据。"""
         if self._save_blocked_reason:
             logger.error("[Memory] 为保护原文件跳过保存: %s", self._save_blocked_reason)
-            return
+            return False
         data = {
             "schema_version": self.SCHEMA_VERSION,
             "recent_messages": self.recent_messages,
@@ -478,5 +513,9 @@ class Memory:
         temporary = self.path.with_suffix(self.path.suffix + ".tmp")
         temporary.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         temporary.replace(self.path)
+        self._dirty = False
+        self._last_save = time.monotonic()
+        self._flush_deadline = None
         logger.debug("[Memory] 保存了 %d 条消息、%d 个事件", 
-                    len(self.recent_messages), len(self.events))
+                     len(self.recent_messages), len(self.events))
+        return True
