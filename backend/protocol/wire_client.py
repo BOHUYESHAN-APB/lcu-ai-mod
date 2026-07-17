@@ -15,17 +15,11 @@ import socket
 import threading
 import logging
 from queue import Queue
-from dataclasses import dataclass
-from typing import Any
+
+from .body import BodyEvent
 
 logger = logging.getLogger("wire")
-
-
-@dataclass
-class WireMessage:
-    """A message from the mod (event, response, or progress)."""
-    type: str           # "event" | "response" | "progress"
-    data: dict
+WireMessage = BodyEvent
 
 
 class WireClient:
@@ -35,7 +29,7 @@ class WireClient:
         self.host = host
         self.port = port
         self.sock: socket.socket | None = None
-        self._event_queue: Queue[WireMessage] = Queue()
+        self._event_queue: Queue[BodyEvent] = Queue()
         self._running = False
         self._reader_thread: threading.Thread | None = None
         self._id_counter = 0
@@ -121,7 +115,7 @@ class WireClient:
                 # Timeout — just continue waiting, don't break
                 continue
 
-    def drain(self) -> list:
+    def drain(self) -> list[BodyEvent]:
         """Return all pending events without blocking (non-blocking drain)."""
         msgs = []
         while self._running:
@@ -174,7 +168,7 @@ class WireClient:
                             obj = json.loads(line)
                             msg_type = obj.get("type", "unknown")
                             logger.debug(f"← {msg_type}: {obj.get('event') or obj.get('id') or '?'}")
-                            self._event_queue.put(WireMessage(
+                            self._event_queue.put(BodyEvent(
                                 type=msg_type,
                                 data=obj,
                             ))

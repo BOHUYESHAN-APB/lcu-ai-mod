@@ -21,7 +21,7 @@ class Orchestrator:
     Main event loop coordinator.
 
     - Creates and manages a Session
-    - Routes wire events to the session
+    - Routes body events to the session
     - Drives the session tick cycle
     - Handles startup/shutdown
 
@@ -31,7 +31,6 @@ class Orchestrator:
 
     def __init__(self, body: BodyAdapter, session_id: str | None = None, **session_options):
         self.body = body
-        self.wire = body
         self.session = Session(body, session_id=session_id, **session_options)
         self.running = False
         self._tick_count = 0
@@ -57,8 +56,8 @@ class Orchestrator:
         with self._session_lock:
             self._tick_count += 1
 
-            # Process incoming wire messages
-            self._drain_wire()
+            # Process incoming body events
+            self._drain_body()
 
             # Session tick (action manager, modes, tasks, auto-save)
             self.session.tick()
@@ -69,11 +68,9 @@ class Orchestrator:
             self._last_stats = now
             self._log_stats()
 
-    def _drain_wire(self):
-        """Process all pending wire messages."""
-        if not self.wire:
-            return
-        for msg in self.wire.drain():
+    def _drain_body(self):
+        """Process all pending body events."""
+        for msg in self.body.drain():
             if msg.type == "event":
                 event_type = msg.data.get("event", "unknown")
                 event_data = msg.data.get("data", {})

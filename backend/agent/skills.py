@@ -14,6 +14,8 @@ import time
 from contextlib import contextmanager
 from typing import Any, Optional
 
+from protocol import BodyAdapter
+
 logger = logging.getLogger("skills")
 
 
@@ -25,13 +27,13 @@ class Skills:
     Each method returns dict: {"success": bool, "message": str, "req_id": str}
     """
 
-    def __init__(self, wire=None):
-        self.wire = wire
+    def __init__(self, body: BodyAdapter | None = None):
+        self.body = body
         self._command_observer = None
         self._command_context = "default"
 
-    def set_wire(self, wire):
-        self.wire = wire
+    def set_body(self, body: BodyAdapter):
+        self.body = body
 
     def set_command_observer(self, observer):
         self._command_observer = observer
@@ -233,11 +235,11 @@ class Skills:
     # ── Internal ────────────────────────────────────────────────
 
     def _send_cmd(self, cmd: str, args: dict) -> dict:
-        """Send a command via wire and return immediately (async)."""
-        if not self.wire:
-            logger.warning("[Skills] No wire, skipping %s", cmd)
-            return {"success": False, "message": "No wire connection"}
-        req_id = self.wire.send_command(cmd, args)
+        """Send a command to the active body and return immediately."""
+        if not self.body:
+            logger.warning("[Skills] No body, skipping %s", cmd)
+            return {"success": False, "message": "No body connection"}
+        req_id = self.body.send_command(cmd, args)
         if self._command_observer:
             try:
                 self._command_observer(cmd, req_id, self._command_context, args)

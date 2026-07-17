@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field, model_validator
 from agent import LLMService
 from agent.config_store import ConfigStore, DEFAULT_CONFIG_PATH
 from agent.orchestrator import Orchestrator
-from protocol import WireClient
+from protocol import BodyAdapter, WireClient
 
 SDK_API_VERSION = "1"
 app = FastAPI(title="LCUMod Backend", version="0.1.0")
@@ -140,8 +140,13 @@ class SDKCommandRequest(BaseModel):
     command: str = Field(min_length=1)
     args: dict[str, Any] = Field(default_factory=dict)
 
+def create_body(host: str, port: int) -> BodyAdapter:
+    """Construct the configured companion body."""
+    return WireClient(host, port)
+
+
 # Global state
-wire: WireClient | None = None
+body: BodyAdapter | None = None
 orchestrator: Orchestrator | None = None
 llm_service = LLMService()
 connected_browsers: list[WebSocket] = []
@@ -186,17 +191,17 @@ STATIC_DIR.mkdir(parents=True, exist_ok=True)
 
 @app.on_event("startup")
 async def startup():
-    """Start wire client and orchestrator on startup."""
-    global wire, orchestrator, shutdown_event, connection_thread
+    """Start the companion body and orchestrator on startup."""
+    global body, orchestrator, shutdown_event, connection_thread
 
     host = os.getenv("MOD_HOST", "127.0.0.1")
     port = int(os.getenv("MOD_PORT", "25568"))
     companion = config_store.get_companion_config()
     persistence = companion.get("persistence", {})
 
-    wire = WireClient(host, port)
+    body = create_body(host, port)
     orchestrator = Orchestrator(
-        wire,
+        body,
         companion_id=os.getenv("COMPANION_ID", companion["id"]),
         persistence_scope=os.getenv("MEMORY_SCOPE", persistence.get("scope", "global")),
         server_id=os.getenv("SERVER_ID", persistence.get("server_id", "default")),
@@ -232,19 +237,19 @@ async def startup():
 
     # Connect in background thread with auto-reconnect
     def _connect_loop():
-        w = wire
+        active_body = body
         o = orchestrator
-        if w is None or o is None:
+        if active_body is None or o is None:
             return
         while not stop_event.is_set():
-            if w.connect():
+            if active_body.connect():
                 if stop_event.is_set():
-                    w.disconnect()
+                    active_body.disconnect()
                     break
-                print(f"[Backend] Connected to mod at {host}:{port}")
+                print(f"[Backend] Companion body connected at {host}:{port}")
                 o.start()
-                # Event loop: drain wire + tick orchestrator
-                while w.is_connected and not stop_event.is_set():
+                # Event loop: drain body events and tick orchestrator
+                while active_body.is_connected and not stop_event.is_set():
                     o.tick()
                     time.sleep(0.05)  # 20Hz loop
                 o.stop()
@@ -263,8 +268,8 @@ async def startup():
 async def shutdown():
     """Persist companion state and stop the active body connection."""
     shutdown_event.set()
-    if wire:
-        wire.disconnect()
+    if body:
+        body.disconnect()
     if connection_thread and connection_thread.is_alive():
         await asyncio.to_thread(connection_thread.join, 6.0)
     if orchestrator:
@@ -310,9 +315,9 @@ async def websocket_endpoint(ws: WebSocket):
             if event_type == "command":
                 cmd = msg.get("cmd", "")
                 args = msg.get("args", {})
-                if wire:
+                if body:
                     try:
-                        request_id = wire.send_command(cmd, args)
+                        request_id = body.send_command(cmd, args)
                         if orchestrator:
                             with orchestrator.session_context() as session:
                                 session.register_external_command(cmd, request_id, args, requester="web")
@@ -543,10 +548,10 @@ async def sdk_chat(data: SDKChatRequest):
 @app.post("/api/sdk/command")
 async def sdk_command(data: SDKCommandRequest):
     """Send an authorized low-level command to the active client body."""
-    if not wire or not wire.is_connected:
-        raise HTTPException(status_code=503, detail="Minecraft client body is not connected")
+    if not body or not body.is_connected:
+        raise HTTPException(status_code=503, detail="Companion body is not connected")
     try:
-        request_id = wire.send_command(data.command, data.args)
+        request_id = body.send_command(data.command, data.args)
         if orchestrator:
             with orchestrator.session_context() as session:
                 session.register_external_command(data.command, request_id, data.args, requester="sdk")

@@ -48,7 +48,6 @@ class Session:
                  storage_root: Path = DEFAULT_STORAGE_ROOT, legacy_root: Path | None = DEFAULT_LEGACY_ROOT):
         self.id = session_id or str(uuid.uuid4())[:8]
         self.body = body
-        self.wire = body
         self.identity = CompanionIdentity(companion_id, persistence_scope, server_id, world_id)
         self.storage_dir = self.identity.storage_dir(storage_root)
         if legacy_root is not None and persistence_scope == "global":

@@ -1,11 +1,76 @@
+import asyncio
 import os
+import threading
 import unittest
+from contextlib import contextmanager
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 import server
+
+
+class FakeBody:
+    def __init__(self, connected=True):
+        self.is_connected = connected
+        self.commands = []
+        self.connect_calls = 0
+        self.disconnect_calls = 0
+
+    def connect(self):
+        self.connect_calls += 1
+        self.is_connected = True
+        return True
+
+    def disconnect(self):
+        self.disconnect_calls += 1
+        self.is_connected = False
+
+    def send_command(self, command, args=None):
+        self.commands.append((command, args or {}))
+        return f"fake-{len(self.commands)}"
+
+    def drain(self):
+        return []
+
+
+class FakeSession:
+    def __init__(self):
+        self.commands = []
+        self.stop_calls = 0
+
+    def register_external_command(self, command, request_id, args, requester):
+        self.commands.append((command, request_id, args, requester))
+
+    def stop(self):
+        self.stop_calls += 1
+
+
+class FakeOrchestrator:
+    def __init__(self, body=None, **_options):
+        self.body = body
+        self.session = FakeSession()
+        self.started = threading.Event()
+        self.ticked = threading.Event()
+        self.start_calls = 0
+        self.stop_calls = 0
+        self.tick_calls = 0
+
+    def start(self):
+        self.start_calls += 1
+        self.started.set()
+
+    def stop(self):
+        self.stop_calls += 1
+
+    def tick(self):
+        self.tick_calls += 1
+        self.ticked.set()
+
+    @contextmanager
+    def session_context(self):
+        yield self.session
 
 
 class ServerSDKTests(unittest.TestCase):
@@ -110,6 +175,63 @@ class ServerSDKTests(unittest.TestCase):
         data = server.SDKContextRequest.model_validate({"source": "legacy", "mood": "calm"})
 
         self.assertEqual(data.external_context, {"source": "legacy", "mood": "calm"})
+
+    def test_sdk_command_uses_body_adapter_and_tracks_request(self):
+        body = FakeBody()
+        orchestrator = FakeOrchestrator()
+        with (
+            patch.dict(os.environ, {"SDK_API_TOKEN": ""}),
+            patch.object(server, "body", body),
+            patch.object(server, "orchestrator", orchestrator),
+        ):
+            client = TestClient(server.app, base_url="http://127.0.0.1:8080", client=("127.0.0.1", 50000))
+            response = client.post("/api/sdk/command", json={"command": "jump", "args": {}})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["request_id"], "fake-1")
+        self.assertEqual(body.commands, [("jump", {})])
+        self.assertEqual(orchestrator.session.commands, [("jump", "fake-1", {}, "sdk")])
+
+    def test_sdk_command_rejects_disconnected_body(self):
+        with (
+            patch.dict(os.environ, {"SDK_API_TOKEN": ""}),
+            patch.object(server, "body", FakeBody(False)),
+        ):
+            client = TestClient(server.app, base_url="http://127.0.0.1:8080", client=("127.0.0.1", 50000))
+            response = client.post("/api/sdk/command", json={"command": "jump"})
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "Companion body is not connected")
+
+    def test_server_lifecycle_uses_only_body_adapter_methods(self):
+        body = FakeBody(False)
+        orchestrators = []
+
+        def create_orchestrator(active_body, **options):
+            instance = FakeOrchestrator(active_body, **options)
+            orchestrators.append(instance)
+            return instance
+
+        with (
+            patch.object(server, "body", None),
+            patch.object(server, "orchestrator", None),
+            patch.object(server, "connection_thread", None),
+            patch.object(server, "create_body", return_value=body) as factory,
+            patch.object(server, "Orchestrator", side_effect=create_orchestrator),
+            patch.object(server, "_apply_config_to_llm_services"),
+            patch.object(server, "_apply_persona_to_session"),
+        ):
+            asyncio.run(server.startup())
+            self.assertTrue(orchestrators[0].started.wait(1.0))
+            self.assertTrue(orchestrators[0].ticked.wait(1.0))
+            asyncio.run(server.shutdown())
+
+        factory.assert_called_once_with("127.0.0.1", 25568)
+        self.assertEqual(body.connect_calls, 1)
+        self.assertEqual(body.disconnect_calls, 1)
+        self.assertGreater(orchestrators[0].tick_calls, 0)
+        self.assertEqual(orchestrators[0].stop_calls, 1)
+        self.assertEqual(orchestrators[0].session.stop_calls, 1)
 
 
 if __name__ == "__main__":
