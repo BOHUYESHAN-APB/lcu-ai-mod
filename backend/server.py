@@ -313,6 +313,9 @@ async def websocket_endpoint(ws: WebSocket):
                 if wire:
                     try:
                         request_id = wire.send_command(cmd, args)
+                        if orchestrator:
+                            with orchestrator.session_context() as session:
+                                session.register_external_command(cmd, request_id, args, requester="web")
                         await ws.send_text(json.dumps({"type": "command_accepted", "id": request_id}))
                     except ConnectionError as exc:
                         await ws.send_text(json.dumps({"type": "command_rejected", "error": str(exc)}))
@@ -397,6 +400,9 @@ async def get_memory():
                 "interactions": len(mem.recent_messages),
                 "actions": mem.total_actions,
                 "locations": list(mem.locations.keys()),
+                "relationships": mem.player_relationships,
+                "experiences": mem.experiences,
+                "task_outcomes": mem.task_outcomes[-20:],
                 "recent": mem.build_context(),
             }
     return {"interactions": 0}
@@ -541,6 +547,9 @@ async def sdk_command(data: SDKCommandRequest):
         raise HTTPException(status_code=503, detail="Minecraft client body is not connected")
     try:
         request_id = wire.send_command(data.command, data.args)
+        if orchestrator:
+            with orchestrator.session_context() as session:
+                session.register_external_command(data.command, request_id, data.args, requester="sdk")
     except ConnectionError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {"status": "accepted", "request_id": request_id}

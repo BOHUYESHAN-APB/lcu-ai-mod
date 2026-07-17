@@ -59,7 +59,11 @@ class Session:
         self.action_manager = ActionManager()
         self.skills = Skills(body)
         self.skills.set_command_observer(self._on_skill_command)
-        self.memory = Memory(path=self.storage_dir / "memory.json")
+        self.memory = Memory(
+            path=self.storage_dir / "memory.json",
+            server_id=self.identity.server_id,
+            world_id=self.identity.world_id,
+        )
         self.commands = Commands(self.skills)
         self.modes_engine = ModesEngine(self.skills, self.memory)
         self.llm = LLMService()
@@ -99,6 +103,8 @@ class Session:
         self._manual_action_reqs: set[str] = set()
         self._manual_task_kind: Optional[str] = None
         self._stopped = False
+        self._current_requester: tuple[str, str] | None = None
+        self._pending_commands: dict[str, dict] = {}
 
     # ── Event handlers ──
 
@@ -107,10 +113,13 @@ class Session:
         match event_type:
             case "state_update":
                 self.runtime.update(data)
+                if hasattr(self, "memory"):
+                    self.memory.observe_world(self.runtime)
             case "player_chat":
                 sender = data.get("sender", "?")
                 message = data.get("message", "")
                 is_system = data.get("is_system", False)
+                sender_id = str(data.get("uuid", ""))
 
                 # Chat permission check (whitelist)
                 if not self._check_chat_permission(sender, is_system):
@@ -132,6 +141,7 @@ class Session:
                     message=message,
                     response=data.get("response", ""),
                 )
+                self.memory.observe_player(sender, sender_id, message)
 
                 # Timing Gate: 判断是否应该回复（参考 MaiBot）
                 should_respond, reason = self.timing_gate.should_respond(
@@ -157,7 +167,13 @@ class Session:
                 
                 # 使用 Planner 规划回复
                 try:
-                    response = self.handle_chat(sender, message, command_context=planner_context)
+                    response = self.handle_chat(
+                        sender,
+                        message,
+                        command_context=planner_context,
+                        sender_id=sender_id,
+                        record_interaction=False,
+                    )
                     if response:
                         logger.info("[Chat] AI response: %s", response[:80])
                         # Send response as chat message
@@ -179,12 +195,15 @@ class Session:
             case "player_death":
                 logger.info("[Session] Player died at %s", data.get("position"))
                 self.memory.add_interaction("system", "Player died", action="death")
-                self.memory.record_event("death", "玩家死亡")
+                self.memory.record_death("玩家死亡")
                 self.message_db.add_event("death", "玩家死亡")
             case "command_response":
                 req_id = data.get("id", "?")
                 success = data.get("success", False)
                 self.action_manager.handle_response(req_id, success)
+                pending = self._pending_commands.get(req_id)
+                if pending and (not success or pending["command"] not in self._terminal_progress_commands()):
+                    self._finish_pending_command(req_id, "success" if success else "failed", str(data.get("error", "")))
                 if req_id in self._manual_action_reqs:
                     if success and self._manual_task_kind in {"follow_player", "craft_item", "eat", "collect_blocks", "move_to", "explore", "build"}:
                         self._manual_command_until = max(self._manual_command_until, time.time() + 30.0)
@@ -197,6 +216,10 @@ class Session:
                 progress = float(data.get("progress", 0.0) or 0.0)
                 message = data.get("message", "")
                 self.action_manager.handle_progress(req_id, progress, message)
+                if progress >= 1.0:
+                    self._finish_pending_command(req_id, "success", message)
+                elif progress <= 0.0 and message:
+                    self._finish_pending_command(req_id, "failed", message)
                 if req_id in self._manual_action_reqs:
                     self._manual_command_until = max(self._manual_command_until, time.time() + 15.0)
                     if progress <= 0.0 or progress >= 1.0:
@@ -211,6 +234,10 @@ class Session:
                 self.runtime["task_state"] = data
                 if self._manual_behavior_active():
                     self._manual_command_until = max(self._manual_command_until, time.time() + 8.0)
+            case "command_interrupted":
+                reason = str(data.get("reason", "interrupted"))
+                for req_id in list(self._pending_commands):
+                    self._finish_pending_command(req_id, "cancelled", reason)
             case "control_state":
                 self.runtime["control_state"] = data
             case _:
@@ -268,13 +295,19 @@ class Session:
 
         return False
 
-    def handle_chat(self, sender: str, message: str, command_context: str = "chat") -> Optional[str]:
+    def handle_chat(self, sender: str, message: str, command_context: str = "chat",
+                    sender_id: str = "", record_interaction: bool = True) -> Optional[str]:
         """
         Process a chat message through the LLM.
         Uses Planner for intelligent action planning.
         """
+        if record_interaction:
+            self.memory.add_interaction(sender=sender, message=message)
+            self.memory.observe_player(sender, sender_id, message)
+            self.message_db.add_message(sender=sender, message=message, is_ai=False)
+
         # Get context
-        context = self.memory.build_context()
+        context = self.memory.build_context(current_player=sender)
         context["persona"] = self.runtime.get("persona", {})
         context["task_state"] = self.runtime.get("task_state", {})
         context["behavior_state"] = self.runtime.get("behavior_state", {})
@@ -288,18 +321,19 @@ class Session:
         context["nearby_storage"] = self.runtime.get("nearby_storage", [])
         
         # Use Planner to plan and execute
-        with self.skills.command_context(command_context):
-            response = self.planner.plan_and_execute(
-                sender, message, context, bot_name=self._get_bot_name()
-            )
+        previous_requester = self._current_requester
+        self._current_requester = (sender, sender_id)
+        try:
+            with self.skills.command_context(command_context):
+                response = self.planner.plan_and_execute(
+                    sender, message, context, bot_name=self._get_bot_name()
+                )
+        finally:
+            self._current_requester = previous_requester
         
-        if response:
-            # Record interaction
-            self.memory.add_interaction(
-                sender=sender,
-                message=message,
-                response=response,
-            )
+        if response and record_interaction:
+            self.memory.attach_response(sender, message, response)
+            self.message_db.add_message(sender="AI", message=response, is_ai=True)
         
         return response
 
@@ -366,6 +400,11 @@ class Session:
         # Task queue
         self.tick_tasks()
 
+        cutoff = time.time() - 600
+        for req_id, pending in list(self._pending_commands.items()):
+            if pending.get("started_at", 0) < cutoff:
+                self._finish_pending_command(req_id, "unknown", "no terminal event")
+
         # Auto-save
         now = time.monotonic()
         if now - self._last_save > 120:
@@ -416,6 +455,8 @@ class Session:
         self._stopped = True
         self.action_manager.stop()
         self.modes_engine.reset()
+        for req_id in list(self._pending_commands):
+            self._finish_pending_command(req_id, "unknown", "backend stopped before terminal event")
         self.memory.save()
         self.message_db.close()
         logger.info("[Session] Stopped: %s", self.id)
@@ -440,6 +481,19 @@ class Session:
 
     def _on_skill_command(self, cmd: str, req_id: str, context: str, args: dict):
         self.self_prompter.mark_action()
+        if cmd == "stop_all":
+            for pending_id in list(self._pending_commands):
+                self._finish_pending_command(pending_id, "cancelled", "stopped by command")
+        requester, requester_id = self._current_requester or ("", "")
+        if cmd not in {"send_chat", "get_state", "get_inventory"}:
+            self._pending_commands[req_id] = {
+                "command": cmd,
+                "args": dict(args),
+                "requester": requester,
+                "requester_id": requester_id,
+                "started_at": time.time(),
+                "context": context,
+            }
         if context != "manual_chat" or cmd == "send_chat":
             return
         self._manual_action_reqs.add(req_id)
@@ -452,6 +506,42 @@ class Session:
             self._manual_task_kind = None
             extension = 6.0
         self._manual_command_until = max(self._manual_command_until, time.time() + extension)
+
+    @staticmethod
+    def _terminal_progress_commands() -> set[str]:
+        return {"craft_item", "eat", "collect_blocks", "move_to"}
+
+    def register_external_command(self, command: str, req_id: str, args: dict,
+                                  requester: str = "sdk") -> None:
+        if command in {"send_chat", "get_state", "get_inventory"}:
+            return
+        self._pending_commands[req_id] = {
+            "command": command,
+            "args": dict(args),
+            "requester": requester,
+            "requester_id": "",
+            "started_at": time.time(),
+            "context": "actuator",
+        }
+
+    def _finish_pending_command(self, req_id: str, outcome: str, detail: str = "") -> None:
+        pending = self._pending_commands.pop(req_id, None)
+        if not pending:
+            return
+        args = pending.get("args", {})
+        target = str(
+            args.get("item") or args.get("block_type") or args.get("player")
+            or args.get("structure") or ""
+        )
+        self.memory.record_task_outcome(
+            pending["command"],
+            outcome,
+            target=target,
+            requester=pending.get("requester", ""),
+            requester_id=pending.get("requester_id", ""),
+            detail=detail,
+            duration=time.time() - pending.get("started_at", time.time()),
+        )
 
     def _manual_behavior_active(self) -> bool:
         behavior = self.runtime.get("behavior_state", {})

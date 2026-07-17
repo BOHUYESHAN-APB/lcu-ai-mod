@@ -45,6 +45,44 @@ class PlannerTests(unittest.TestCase):
         self.assertIn("stream", prompt)
         self.assertIn("focused", prompt)
 
+    def test_structured_memory_context_is_included_in_prompt(self):
+        planner = Planner(llm_service=None, memory=DummyMemory(), skills=DummySkills())
+
+        prompt = planner._build_planner_prompt(
+            sender="Alice",
+            message="继续",
+            context={
+                "relationship_summary": "Alice: tasks=2, success=1",
+                "task_outcomes": "craft_item stone_pickaxe -> success",
+                "world_experience": "server=example.org, world=survival",
+            },
+            bot_name="AI",
+        )
+
+        self.assertIn("Alice: tasks=2", prompt)
+        self.assertIn("craft_item stone_pickaxe -> success", prompt)
+        self.assertIn("server=example.org", prompt)
+
+    def test_prompt_clips_untrusted_message_and_memory_sections(self):
+        planner = Planner(llm_service=None, memory=DummyMemory(), skills=DummySkills())
+
+        prompt = planner._build_planner_prompt(
+            sender="A" * 500,
+            message="M" * 10000,
+            context={
+                "interaction_summary": "R" * 10000,
+                "relationship_summary": "P" * 10000,
+                "task_outcomes": "T" * 10000,
+                "world_experience": "W" * 10000,
+                "persona": {"external_context": {"payload": "X" * 10000}},
+            },
+            bot_name="AI",
+        )
+
+        self.assertLess(len(prompt), 20000)
+        self.assertNotIn("M" * 1001, prompt)
+        self.assertNotIn("R" * 1501, prompt)
+
     def test_duplicate_active_craft_is_not_redispatched(self):
         skills = DummySkills()
         planner = Planner(llm_service=None, memory=DummyMemory(), skills=skills)

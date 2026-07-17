@@ -42,6 +42,11 @@ BLOCK_ALIASES = {
 }
 
 
+def _clip(value: Any, limit: int) -> str:
+    text = str(value).replace("\x00", "")
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
 class Planner:
     """
     规划器：决定 AI 应该做什么。
@@ -101,20 +106,24 @@ class Planner:
                                context: dict, bot_name: str) -> str:
         """构建规划提示。"""
         # 获取记忆上下文
-        memory_context = self.memory.build_context()
+        memory_context = context
         persona = context.get("persona", {}) if isinstance(context, dict) else {}
         persona_name = persona.get("name", bot_name)
         personality = persona.get("personality", "友好、自然")
         speaking_style = persona.get("speaking_style", "口语化、简短")
         external_context = persona.get("external_context", {})
-        external_context_text = json.dumps(external_context, ensure_ascii=False, default=str) if external_context else "无"
-        
-        # 获取最近对话
-        recent = self.memory.get_recent_context(5)
-        recent_text = "\n".join([
-            f"{msg.get('sender', '?')}: {msg.get('message', '')}" 
-            for msg in recent
-        ])
+        external_context_text = _clip(
+            json.dumps(external_context, ensure_ascii=False, default=str) if external_context else "无",
+            1000,
+        )
+
+        recent_text = _clip(memory_context.get("interaction_summary", "暂无对话记录"), 1500)
+        relationship_text = _clip(memory_context.get("relationship_summary", "无"), 1000)
+        task_outcome_text = _clip(memory_context.get("task_outcomes", "无"), 1000)
+        world_experience_text = _clip(memory_context.get("world_experience", "无"), 1000)
+        task_state_text = _clip(context.get("task_state", {"kind": "idle", "status": "idle"}), 500)
+        sender_text = _clip(sender, 128)
+        message_text = _clip(message, 1000)
         nearby_blocks = context.get("nearby_blocks", []) if isinstance(context, dict) else []
         nearby_entities = context.get("entities", []) if isinstance(context, dict) else []
         inventory = context.get("inventory", []) if isinstance(context, dict) else []
@@ -155,14 +164,20 @@ class Planner:
         prompt = f"""你是 {persona_name}，一个正在玩 Minecraft 的玩家。你和服务器里的其他玩家一起玩。
 
 当前状态：
-- 发送者：{sender}
-- 消息：{message}
+- 发送者：{sender_text}
+- 消息：{message_text}
 
 最近对话：
 {recent_text}
 
-记忆上下文：
-{memory_context.get('interaction_summary', '无')}
+玩家关系：
+{relationship_text}
+
+最近任务结果：
+{task_outcome_text}
+
+服务器与世界经验：
+{world_experience_text}
 
 当前人设：
 - 性格：{personality}
@@ -170,7 +185,7 @@ class Planner:
 - 上游集成上下文：{external_context_text}
 
 当前任务状态：
-{context.get('task_state', {'kind': 'idle', 'status': 'idle'})}
+{task_state_text}
 
 当前库存摘要：
 {inventory_text}

@@ -1,0 +1,184 @@
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+from agent.memory import Memory
+from agent.session import Session
+
+
+class FakeBody:
+    is_connected = False
+
+    def connect(self):
+        return False
+
+    def disconnect(self):
+        pass
+
+    def send_command(self, command, args=None):
+        return f"req-{command}"
+
+    def drain(self):
+        return []
+
+
+class MemoryTests(unittest.TestCase):
+    def test_old_schema_loads_with_structured_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "memory.json"
+            path.write_text(json.dumps({"recent_messages": [{"message": "legacy"}]}), encoding="utf-8")
+
+            memory = Memory(path)
+            memory.save()
+            saved = json.loads(path.read_text(encoding="utf-8"))
+
+            self.assertEqual(saved["schema_version"], 3)
+            self.assertEqual(memory.recent_messages[0]["message"], "legacy")
+            self.assertEqual(memory.player_relationships, {})
+            self.assertEqual(memory.task_outcomes, [])
+
+    def test_invalid_structured_fields_fall_back_to_safe_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "memory.json"
+            path.write_text(json.dumps({"schema_version": 3, "experiences": None}), encoding="utf-8")
+
+            memory = Memory(path)
+            memory.observe_world({"player": {}, "entities": []})
+            original = path.read_text(encoding="utf-8")
+            memory.save()
+
+            self.assertIsInstance(memory.experiences, dict)
+            self.assertIn("worlds", memory.experiences)
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
+
+    def test_future_schema_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "memory.json"
+            original = json.dumps({"schema_version": 99, "future_data": {"keep": True}})
+            path.write_text(original, encoding="utf-8")
+
+            memory = Memory(path)
+            memory.add_interaction("Alice", "runtime only")
+            memory.save()
+
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
+
+    def test_world_observation_aggregates_without_creating_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            memory = Memory(Path(tmp) / "memory.json", server_id="server-a", world_id="world-a")
+            state = {
+                "player": {"x": 1, "y": 64, "z": 2, "dimension": "minecraft:overworld"},
+                "entities": [{"type": "player", "name": "Alice"}],
+            }
+
+            memory.observe_world(state)
+            memory.observe_world(state)
+
+            world = memory.experiences["worlds"]["server-a\u0000world-a"]
+            self.assertEqual(world["last_position"]["x"], 1)
+            self.assertEqual(memory.experiences["servers"]["server-a"]["known_players"], ["Alice"])
+            self.assertEqual(memory.events, [])
+
+    def test_relationship_and_task_outcome_are_persistent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "memory.json"
+            memory = Memory(path, server_id="server-a", world_id="world-a")
+            memory.observe_player("Alice", "uuid-a", "hello")
+            memory.record_task_outcome(
+                "craft_item", "success", target="stone_pickaxe", requester="Alice", requester_id="uuid-a",
+            )
+            memory.save()
+
+            restored = Memory(path, server_id="server-a", world_id="world-a")
+            relationship = restored.player_relationships["uuid:uuid-a"]
+            self.assertEqual(relationship["message_count"], 1)
+            self.assertEqual(relationship["task_outcomes"]["success"], 1)
+            self.assertEqual(restored.task_outcomes[-1]["target"], "stone_pickaxe")
+
+    def test_context_is_deterministic_bounded_and_prioritizes_current_player(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            memory = Memory(Path(tmp) / "memory.json")
+            memory.observe_player("Bob", "uuid-b", "b" * 200)
+            memory.observe_player("Alice", "uuid-a", "a" * 200)
+
+            first = memory.build_context(current_player="Alice", max_chars=120)
+            second = memory.build_context(current_player="Alice", max_chars=120)
+
+            self.assertEqual(first, second)
+            self.assertLessEqual(sum(len(value) for value in first.values()), 120)
+            self.assertTrue(first["relationship_summary"].startswith("Alice:"))
+
+    def test_long_task_is_only_recorded_after_terminal_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = Session(FakeBody(), companion_id="memory-test", storage_root=Path(tmp), legacy_root=None)
+            session._current_requester = ("Alice", "uuid-a")
+            session._on_skill_command("craft_item", "req-1", "manual_chat", {"item": "stone_pickaxe"})
+
+            session.handle_event("command_response", {"id": "req-1", "success": True})
+            self.assertEqual(session.memory.task_outcomes, [])
+
+            session.handle_event("command_progress", {"id": "req-1", "progress": 1.0, "message": "crafted"})
+            self.assertEqual(session.memory.task_outcomes[-1]["outcome"], "success")
+            self.assertEqual(session.memory.task_outcomes[-1]["requester"], "Alice")
+            session.stop()
+
+    def test_response_finalizes_command_without_terminal_progress_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = Session(FakeBody(), companion_id="memory-test", storage_root=Path(tmp), legacy_root=None)
+            session._current_requester = ("Alice", "uuid-a")
+            session._on_skill_command("explore", "req-2", "manual_chat", {"radius": 16})
+
+            session.handle_event("command_response", {"id": "req-2", "success": True})
+
+            self.assertEqual(session.memory.task_outcomes[-1]["command"], "explore")
+            self.assertEqual(session.memory.task_outcomes[-1]["outcome"], "success")
+            session.stop()
+
+    def test_move_to_waits_for_pathfinder_terminal_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = Session(FakeBody(), companion_id="memory-test", storage_root=Path(tmp), legacy_root=None)
+            session._on_skill_command("move_to", "req-move", "manual_chat", {"x": 10, "y": 64, "z": 10})
+
+            session.handle_event("command_response", {"id": "req-move", "success": True})
+            self.assertEqual(session.memory.task_outcomes, [])
+            session.handle_event("command_progress", {"id": "req-move", "progress": 0.0, "message": "no path"})
+
+            self.assertEqual(session.memory.task_outcomes[-1]["outcome"], "failed")
+            session.stop()
+
+    def test_shutdown_finalizes_pending_task_as_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = Session(FakeBody(), companion_id="memory-test", storage_root=Path(tmp), legacy_root=None)
+            session._on_skill_command("follow_player", "req-follow", "manual_chat", {"player": "Alice"})
+
+            session.stop()
+
+            self.assertEqual(session.memory.task_outcomes[-1]["outcome"], "unknown")
+            self.assertIn("backend stopped", session.memory.task_outcomes[-1]["detail"])
+
+    def test_direct_sdk_chat_updates_relationship_even_without_llm(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = Session(FakeBody(), companion_id="memory-test", storage_root=Path(tmp), legacy_root=None)
+
+            response = session.handle_chat("LauncherUser", "hello", sender_id="sdk-user")
+
+            self.assertIsNone(response)
+            self.assertEqual(session.memory.player_relationships["uuid:sdk-user"]["message_count"], 1)
+            self.assertEqual(session.memory.recent_messages[-1]["message"], "hello")
+            session.stop()
+
+    def test_external_actuator_command_is_recorded_on_response(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = Session(FakeBody(), companion_id="memory-test", storage_root=Path(tmp), legacy_root=None)
+            session.register_external_command("jump", "req-sdk", {}, requester="sdk")
+
+            session.handle_event("command_response", {"id": "req-sdk", "success": True})
+
+            self.assertEqual(session.memory.task_outcomes[-1]["requester"], "sdk")
+            self.assertEqual(session.memory.task_outcomes[-1]["command"], "jump")
+            session.stop()
+
+
+if __name__ == "__main__":
+    unittest.main()

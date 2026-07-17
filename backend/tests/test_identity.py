@@ -62,6 +62,20 @@ class CompanionIdentityTests(unittest.TestCase):
             memory_source = legacy / "memory" / "session_deadbeef.json"
             memory_source.parent.mkdir(parents=True)
             memory_source.write_text(json.dumps({"recent_messages": [{"message": "old"}]}), encoding="utf-8")
+            second_memory_source = legacy / "memory" / "session_cafebabe.json"
+            memory_source.write_text(json.dumps({
+                "recent_messages": [{"message": "old"}],
+                "player_relationships": {
+                    "uuid:alice": {"names": ["Alice"], "message_count": 2, "tasks_requested": 1,
+                                     "task_outcomes": {"success": 1}, "first_seen": 1, "last_seen": 2}
+                },
+            }), encoding="utf-8")
+            second_memory_source.write_text(json.dumps({
+                "player_relationships": {
+                    "uuid:alice": {"names": ["Alice2"], "message_count": 3, "tasks_requested": 2,
+                                     "task_outcomes": {"success": 2}, "first_seen": 0, "last_seen": 3}
+                },
+            }), encoding="utf-8")
             db_source = legacy / "messages_deadbeef.db"
             db = MessageDB(db_source)
             db.add_message("owner", "old db")
@@ -87,6 +101,11 @@ class CompanionIdentityTests(unittest.TestCase):
             merged_db = MessageDB(target / "messages.db")
             self.assertEqual(len(merged_db.get_recent_messages()), 2)
             merged_db.close()
+            merged_memory = json.loads((target / "memory.json").read_text(encoding="utf-8"))
+            relationship = merged_memory["player_relationships"]["uuid:alice"]
+            self.assertEqual(relationship["message_count"], 5)
+            self.assertEqual(relationship["task_outcomes"]["success"], 3)
+            self.assertEqual(relationship["names"], ["Alice", "Alice2"])
 
     def test_wire_compatible_body_satisfies_adapter_contract(self):
         self.assertIsInstance(FakeBody(), BodyAdapter)

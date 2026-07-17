@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import copy
 import json
 import shutil
 import sqlite3
@@ -62,6 +63,9 @@ def _merge_legacy_memory(files: list[Path], destination: Path) -> None:
         "locations": {},
         "interaction_count": 0,
         "total_actions": 0,
+        "player_relationships": {},
+        "experiences": {"servers": {}, "worlds": {}},
+        "task_outcomes": [],
     }
     for path in sorted(files, key=lambda item: item.stat().st_mtime):
         try:
@@ -74,8 +78,50 @@ def _merge_legacy_memory(files: list[Path], destination: Path) -> None:
         merged["locations"].update(data.get("locations", {}))
         merged["interaction_count"] += int(data.get("interaction_count", 0))
         merged["total_actions"] += int(data.get("total_actions", 0))
+        for key, incoming in data.get("player_relationships", {}).items():
+            if key not in merged["player_relationships"]:
+                merged["player_relationships"][key] = copy.deepcopy(incoming)
+                continue
+            current = merged["player_relationships"][key]
+            current["names"] = sorted(set(current.get("names", [])) | set(incoming.get("names", [])))
+            current["first_seen"] = min(current.get("first_seen", float("inf")), incoming.get("first_seen", float("inf")))
+            current["last_seen"] = max(current.get("last_seen", 0), incoming.get("last_seen", 0))
+            current["message_count"] = current.get("message_count", 0) + incoming.get("message_count", 0)
+            current["tasks_requested"] = current.get("tasks_requested", 0) + incoming.get("tasks_requested", 0)
+            current_outcomes = current.setdefault("task_outcomes", {})
+            for outcome, count in incoming.get("task_outcomes", {}).items():
+                current_outcomes[outcome] = current_outcomes.get(outcome, 0) + count
+            if incoming.get("last_task", {}).get("time", 0) >= current.get("last_task", {}).get("time", 0):
+                current["last_task"] = copy.deepcopy(incoming.get("last_task", {}))
+        experiences = data.get("experiences", {})
+        for key, incoming in experiences.get("servers", {}).items():
+            current = merged["experiences"]["servers"].setdefault(key, copy.deepcopy(incoming))
+            if current is incoming:
+                continue
+            current["first_seen"] = min(current.get("first_seen", float("inf")), incoming.get("first_seen", float("inf")))
+            current["last_seen"] = max(current.get("last_seen", 0), incoming.get("last_seen", 0))
+            current["known_players"] = sorted(set(current.get("known_players", [])) | set(incoming.get("known_players", [])))
+        for key, incoming in experiences.get("worlds", {}).items():
+            if key not in merged["experiences"]["worlds"]:
+                merged["experiences"]["worlds"][key] = copy.deepcopy(incoming)
+                continue
+            current = merged["experiences"]["worlds"][key]
+            current["first_seen"] = min(current.get("first_seen", float("inf")), incoming.get("first_seen", float("inf")))
+            current["last_seen"] = max(current.get("last_seen", 0), incoming.get("last_seen", 0))
+            current["deaths"] = current.get("deaths", 0) + incoming.get("deaths", 0)
+            current.setdefault("dimensions", {}).update(incoming.get("dimensions", {}))
+            if incoming.get("last_seen", 0) >= current.get("last_seen", 0):
+                current["last_position"] = copy.deepcopy(incoming.get("last_position", {}))
+            current_stats = current.setdefault("task_stats", {})
+            for command, outcomes in incoming.get("task_stats", {}).items():
+                command_stats = current_stats.setdefault(command, {})
+                for outcome, count in outcomes.items():
+                    command_stats[outcome] = command_stats.get(outcome, 0) + count
+        merged["task_outcomes"].extend(data.get("task_outcomes", []))
     merged["recent_messages"] = sorted(merged["recent_messages"], key=lambda item: item.get("time", 0))[-50:]
     merged["events"] = sorted(merged["events"], key=lambda item: item.get("time", 0))[-500:]
+    merged["task_outcomes"] = sorted(merged["task_outcomes"], key=lambda item: item.get("time", 0))[-100:]
+    merged["schema_version"] = 3
     temporary = destination.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(merged, indent=2, ensure_ascii=False), encoding="utf-8")
     temporary.replace(destination)
