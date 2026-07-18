@@ -15,12 +15,15 @@ import os
 import socket
 import threading
 import logging
+import codecs
 from queue import Queue
+from typing import Callable
 
 from .body import BodyEvent
 
 logger = logging.getLogger("wire")
 WireMessage = BodyEvent
+MAX_WIRE_FRAME_BYTES = 1024 * 1024
 
 
 class WireClient:
@@ -38,6 +41,8 @@ class WireClient:
         self._connection_lock = threading.RLock()
         self._send_lock = threading.Lock()
         self._id_lock = threading.Lock()
+        self._event_callback: Callable[[BodyEvent], None] | None = None
+        self.peer_info: dict = {}
 
     def connect(self) -> bool:
         """Connect to the mod's wire server."""
@@ -46,11 +51,13 @@ class WireClient:
         sock.settimeout(5.0)
         try:
             sock.connect((self.host, self.port))
-            self._authenticate(sock)
+            peer_info = self._authenticate(sock)
             sock.settimeout(None)
             with self._connection_lock:
+                self._clear_event_queue()
                 self.sock = sock
                 self._running = True
+                self.peer_info = peer_info
             self._reader_thread = threading.Thread(target=self._read_loop, args=(sock,), daemon=True)
             self._reader_thread.start()
             return True
@@ -62,7 +69,7 @@ class WireClient:
             print(f"[WireClient] Connection failed: {e}")
             return False
 
-    def _authenticate(self, sock: socket.socket) -> None:
+    def _authenticate(self, sock: socket.socket) -> dict:
         payload = json.dumps({"type": "auth", "token": self.token}) + "\n"
         sock.sendall(payload.encode("utf-8"))
         response = bytearray()
@@ -78,6 +85,7 @@ class WireClient:
         result = json.loads(response.decode("utf-8"))
         if result.get("type") != "auth" or not result.get("success"):
             raise ConnectionError("wire authentication failed")
+        return result
 
     def disconnect(self, expected_socket: socket.socket | None = None):
         with self._connection_lock:
@@ -88,6 +96,7 @@ class WireClient:
             self.sock = None
             reader_thread = self._reader_thread
             self._reader_thread = None
+            self.peer_info = {}
         if sock:
             try:
                 sock.shutdown(socket.SHUT_RDWR)
@@ -105,11 +114,14 @@ class WireClient:
         with self._connection_lock:
             return self._running and self.sock is not None
 
-    def send_command(self, command: str, args: dict | None = None) -> str:
+    def send_command(self, command: str, args: dict | None = None, request_id: str | None = None) -> str:
         """Send a command to the mod. Returns the request ID."""
-        with self._id_lock:
-            self._id_counter += 1
-            req_id = f"req_{self._id_counter}"
+        if request_id is None:
+            with self._id_lock:
+                self._id_counter += 1
+                req_id = f"req_{self._id_counter}"
+        else:
+            req_id = request_id
         msg = {
             "type": "command",
             "cmd": command,
@@ -125,6 +137,9 @@ class WireClient:
         """Send a chat message as the AI player."""
         self.send_command("send_chat", {"message": message})
 
+    def set_event_callback(self, callback: Callable[[BodyEvent], None] | None) -> None:
+        self._event_callback = callback
+
     def events(self, timeout: float = 0.5):
         """Yield incoming messages from the mod. Blocks up to `timeout` seconds."""
         while self._running:
@@ -138,7 +153,7 @@ class WireClient:
     def drain(self) -> list[BodyEvent]:
         """Return all pending events without blocking (non-blocking drain)."""
         msgs = []
-        while self._running:
+        while True:
             try:
                 msg = self._event_queue.get_nowait()
                 msgs.append(msg)
@@ -150,14 +165,20 @@ class WireClient:
         """Wait for a response with a matching ID."""
         import time
         deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                msg = self._event_queue.get(timeout=0.1)
-                if msg.type == "response" and msg.data.get("id") == req_id:
-                    return msg.data
-            except:
-                continue
-        return None
+        deferred: list[BodyEvent] = []
+        try:
+            while time.time() < deadline:
+                try:
+                    msg = self._event_queue.get(timeout=min(0.1, max(0.0, deadline - time.time())))
+                    if msg.type == "response" and msg.data.get("id") == req_id:
+                        return msg.data
+                    deferred.append(msg)
+                except Exception:
+                    continue
+            return None
+        finally:
+            for msg in deferred:
+                self._event_queue.put(msg)
 
     def _send_line(self, line: str) -> bool:
         with self._send_lock:
@@ -174,27 +195,50 @@ class WireClient:
 
     def _read_loop(self, sock: socket.socket):
         buffer = ""
+        decoder = codecs.getincrementaldecoder("utf-8")()
         while self.is_connected and self.sock is sock:
             try:
-                data = sock.recv(65536).decode("utf-8")
+                raw = sock.recv(65536)
+                data = decoder.decode(raw, final=not raw)
                 if not data:
                     break
                 buffer += data
+                if len(buffer.encode("utf-8")) > MAX_WIRE_FRAME_BYTES and "\n" not in buffer:
+                    raise ConnectionError("wire frame exceeds maximum size")
                 while "\n" in buffer:
                     line, buffer = buffer.split("\n", 1)
+                    if len(line.encode("utf-8")) > MAX_WIRE_FRAME_BYTES:
+                        raise ConnectionError("wire frame exceeds maximum size")
                     line = line.strip()
                     if line:
                         try:
                             obj = json.loads(line)
                             msg_type = obj.get("type", "unknown")
                             logger.debug(f"← {msg_type}: {obj.get('event') or obj.get('id') or '?'}")
-                            self._event_queue.put(BodyEvent(
+                            event = BodyEvent(
                                 type=msg_type,
                                 data=obj,
-                            ))
+                            )
+                            callback = self._event_callback
+                            if callback:
+                                try:
+                                    callback(event)
+                                except Exception:
+                                    logger.exception("Body event callback failed")
+                            self._event_queue.put(event)
                         except json.JSONDecodeError:
                             pass
             except Exception as e:
-                print(f"[WireClient] Read error: {e}")
+                with self._connection_lock:
+                    active = self._running and self.sock is sock
+                if active:
+                    print(f"[WireClient] Read error: {e}")
                 break
         self.disconnect(expected_socket=sock)
+
+    def _clear_event_queue(self) -> None:
+        while True:
+            try:
+                self._event_queue.get_nowait()
+            except Exception:
+                return

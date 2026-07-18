@@ -294,19 +294,13 @@ public final class CraftingPlanner {
     }
 
     private static String canonicalVisitKey(String itemId) {
-        int idx = itemId.indexOf(':');
-        return idx >= 0 ? itemId.substring(idx + 1) : itemId;
+        return itemId.contains(":") ? itemId : "minecraft:" + itemId;
     }
 
     public static boolean matchesRegistryId(String actualId, String targetId) {
         if (actualId == null || targetId == null) {
             return false;
         }
-        if (actualId.equals(targetId)) {
-            return true;
-        }
-        String actualPath = canonicalVisitKey(actualId);
-        String targetPath = canonicalVisitKey(targetId);
-        return actualPath.equals(targetPath);
+        return canonicalVisitKey(actualId).equals(canonicalVisitKey(targetId));
     }
 }

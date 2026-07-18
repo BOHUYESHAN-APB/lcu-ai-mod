@@ -1,8 +1,7 @@
 package com.lcu.lcumod.action;
 
 import com.lcu.lcumod.LCUMod;
-import net.minecraft.client.Minecraft;
-import net.minecraft.server.MinecraftServer;
+import com.lcu.lcumod.client.ClientBodyRuntime;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
 import net.neoforged.neoforge.client.event.ClientTickEvent;
@@ -16,8 +15,8 @@ public class ActionExecutorBridge {
 
     @SubscribeEvent
     public static void onClientTick(ClientTickEvent.Post event) {
-        if (LCUMod.ACTION != null) {
-            LCUMod.ACTION.onTick();
+        if (ClientBodyRuntime.ACTION != null) {
+            ClientBodyRuntime.ACTION.onTick();
         }
     }
 }

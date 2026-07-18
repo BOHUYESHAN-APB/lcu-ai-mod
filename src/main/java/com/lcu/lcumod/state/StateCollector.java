@@ -5,6 +5,7 @@ import com.google.gson.JsonObject;
 import com.lcu.lcumod.action.PoiMemory;
 import com.lcu.lcumod.LCUMod;
 import com.lcu.lcumod.config.ModConfig;
+import com.lcu.lcumod.client.ClientBodyRuntime;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -40,6 +41,7 @@ public class StateCollector {
     private static float lastHealth = Float.NaN;
     private static int lastHunger = -1;
     private static int updateCounter = 0;
+    private static long lastGameTime = Long.MIN_VALUE;
     
     // Thresholds for change detection
     private static final double POSITION_THRESHOLD = 0.1;  // 0.1 blocks
@@ -49,6 +51,7 @@ public class StateCollector {
 
     @SubscribeEvent
     public static void onClientTick(ClientTickEvent.Post event) {
+        if (!ClientBodyRuntime.isBodyClient()) return;
         tickCounter++;
         
         // Check if config is loaded before accessing it
@@ -101,6 +104,12 @@ public class StateCollector {
             hasChanged = true;
             updateCounter = 0;
         }
+
+        // Keep game-clock schedules responsive even while the player is idle.
+        long gameTime = mc.level.getGameTime();
+        if (lastGameTime == Long.MIN_VALUE || gameTime / 20L != lastGameTime / 20L) {
+            hasChanged = true;
+        }
         
         // Skip if no significant change
         if (!hasChanged) return;
@@ -113,6 +122,7 @@ public class StateCollector {
         lastPitch = p.getXRot();
         lastHealth = p.getHealth();
         lastHunger = p.getFoodData().getFoodLevel();
+        lastGameTime = gameTime;
 
         JsonObject state = new JsonObject();
 
@@ -141,6 +151,10 @@ public class StateCollector {
         // World
         JsonObject world = new JsonObject();
         world.addProperty("time", mc.level.getDayTime());
+        world.addProperty("game_time", mc.level.getGameTime());
+        world.addProperty("day_time", mc.level.getDayTime());
+        world.addProperty("day_index", Math.floorDiv(mc.level.getDayTime(), 24000L));
+        world.addProperty("time_of_day", Math.floorMod(mc.level.getDayTime(), 24000L));
         world.addProperty("is_day", mc.level.isDay());
         world.addProperty("is_raining", mc.level.isRaining());
         world.addProperty("light_level", mc.level.getMaxLocalRawBrightness(p.blockPosition()));
@@ -174,6 +188,27 @@ public class StateCollector {
             e.addProperty("type", "player");
             entities.add(e);
         }
+
+        JsonArray onlinePlayers = new JsonArray();
+        if (mc.getConnection() != null) {
+            for (var info : mc.getConnection().getOnlinePlayers()) {
+                JsonObject online = new JsonObject();
+                online.addProperty("name", info.getProfile().getName());
+                online.addProperty("uuid", info.getProfile().getId().toString());
+                online.addProperty("latency", info.getLatency());
+                if (info.getGameMode() != null) {
+                    online.addProperty("game_mode", info.getGameMode().getName());
+                }
+                var loadedPlayer = mc.level.getPlayerByUUID(info.getProfile().getId());
+                boolean loaded = loadedPlayer != null;
+                online.addProperty("loaded", loaded);
+                if (loaded && loadedPlayer != p) {
+                    online.addProperty("distance", p.distanceTo(loadedPlayer));
+                }
+                onlinePlayers.add(online);
+            }
+        }
+        state.add("online_players", onlinePlayers);
 
         // Scan for nearby mobs and items within 16 blocks
         var searchBox = p.getBoundingBox().inflate(16);

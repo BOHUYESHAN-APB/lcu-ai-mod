@@ -10,7 +10,6 @@ import net.minecraft.client.Minecraft;
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
-import net.neoforged.neoforge.client.event.RegisterKeyMappingsEvent;
 import net.neoforged.neoforge.client.event.InputEvent;
 import org.lwjgl.glfw.GLFW;
 
@@ -32,12 +31,8 @@ public class AIKeyHandler {
     );
 
     @SubscribeEvent
-    public static void onRegisterKey(RegisterKeyMappingsEvent event) {
-        event.register(TOGGLE_AI);
-    }
-
-    @SubscribeEvent
     public static void onKeyPress(InputEvent.Key event) {
+        if (!ClientBodyRuntime.isBodyClient()) return;
         if (TOGGLE_AI.consumeClick()) {
             // Toggle control mode
             ActionExecutor.toggleAiControl();

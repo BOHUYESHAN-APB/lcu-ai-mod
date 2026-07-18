@@ -25,6 +25,13 @@ class SkillManifest:
     safety_class: str = "standard"
     duration: str = "immediate"
     cancellable: bool = False
+    completion: str = "response"
+    schedulable: bool = True
+    durable: bool = True
+    executor: str = "deterministic"
+    offline: bool = True
+    requires: tuple[str, ...] = ()
+    effects: tuple[str, ...] = ()
 
     def public_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -47,28 +54,31 @@ STRING = {"type": "string", "minLength": 1}
 BUILTIN_SKILLS = [
     SkillManifest("core.move_to", "1.0.0", "core", "move_to", "Move to world coordinates.",
                   _object_schema({"x": NUMBER, "y": NUMBER, "z": NUMBER}, ["x", "y", "z"]),
-                  duration="long_running", cancellable=True),
+                  duration="long_running", cancellable=True, completion="progress", effects=("body.move",)),
     SkillManifest("core.look_at", "1.0.0", "core", "look_at", "Look at world coordinates.",
-                  _object_schema({"x": NUMBER, "y": NUMBER, "z": NUMBER}, ["x", "y", "z"])),
-    SkillManifest("core.jump", "1.0.0", "core", "jump", "Jump once.", _object_schema({})),
-    SkillManifest("core.attack", "1.0.0", "core", "attack", "Attack the targeted entity.", _object_schema({}), safety_class="combat"),
-    SkillManifest("core.mine_block", "1.0.0", "core", "mine_block", "Mine the targeted block.", _object_schema({}), duration="long_running", cancellable=True),
-    SkillManifest("core.use_on", "1.0.0", "core", "use_on", "Use the held item on the current target.", _object_schema({})),
+                  _object_schema({"x": NUMBER, "y": NUMBER, "z": NUMBER}, ["x", "y", "z"]), effects=("camera.move",)),
+    SkillManifest("core.jump", "1.0.0", "core", "jump", "Jump once.", _object_schema({}), effects=("body.move",)),
+    SkillManifest("core.attack", "1.0.0", "core", "attack", "Attack the targeted entity.", _object_schema({}), safety_class="combat", schedulable=False, effects=("entity.attack",)),
+    SkillManifest("core.mine_block", "1.0.0", "core", "mine_block", "Mine the targeted block.", _object_schema({}), duration="long_running", cancellable=True, schedulable=False, durable=False),
+    SkillManifest("core.use_on", "1.0.0", "core", "use_on", "Use the held item on the current target.", _object_schema({}), schedulable=False, effects=("world.interact",)),
     SkillManifest("core.send_chat", "1.0.0", "core", "send_chat", "Send a Minecraft chat message.",
-                  _object_schema({"message": STRING}, ["message"]), safety_class="social"),
-    SkillManifest("core.stop", "1.0.0", "core", "stop_all", "Stop current movement and actions.", _object_schema({}), safety_class="safety"),
+                  _object_schema({"message": STRING}, ["message"]), safety_class="social", schedulable=False, effects=("chat.send",)),
+    SkillManifest("core.stop", "1.0.0", "core", "stop_all", "Stop current movement and actions.", _object_schema({}), safety_class="safety", schedulable=False),
     SkillManifest("general.follow_player", "1.0.0", "general", "follow_player", "Follow a named player.",
-                  _object_schema({"player": STRING}, ["player"]), duration="long_running", cancellable=True),
+                  _object_schema({"player": STRING}, ["player"]), duration="long_running", cancellable=True, schedulable=False, durable=False),
     SkillManifest("general.collect_blocks", "1.0.0", "general", "collect_blocks", "Collect blocks by registry ID.",
                   _object_schema({"block_type": STRING, "count": {"type": "integer", "minimum": 1, "maximum": 2304}}, ["block_type", "count"]),
-                  duration="long_running", cancellable=True),
-    SkillManifest("general.craft_item", "1.0.0", "general", "craft_item", "Craft an item and resolve vanilla dependencies.",
+                  safety_class="resource_mutation", duration="long_running", cancellable=True, completion="progress",
+                  requires=("inventory.read", "world.collect",), effects=("inventory.produce", "world.break")),
+    SkillManifest("general.craft_item", "1.1.0", "general", "craft_item", "Craft an item and resolve supported recipe dependencies locally.",
                   _object_schema({"item": STRING, "count": {"type": "integer", "minimum": 1, "maximum": 2304}}, ["item", "count"]),
-                  duration="long_running", cancellable=True),
+                  safety_class="resource_mutation", duration="long_running", cancellable=True, completion="progress",
+                  requires=("inventory.read", "recipes.query", "recipe.execute"),
+                  effects=("inventory.consume", "inventory.produce", "world.interact")),
     SkillManifest("general.explore", "1.0.0", "general", "explore", "Explore within a radius.",
                   _object_schema({"radius": {"type": "integer", "minimum": 1, "maximum": 256}}, ["radius"]),
-                  duration="long_running", cancellable=True),
-    SkillManifest("general.eat", "1.0.0", "general", "eat", "Eat suitable food from inventory.", _object_schema({}), duration="long_running"),
+                  duration="long_running", cancellable=True, schedulable=False, durable=False),
+    SkillManifest("general.eat", "1.0.0", "general", "eat", "Eat suitable food from inventory.", _object_schema({}), duration="long_running", completion="progress", effects=("inventory.consume",)),
 ]
 
 

@@ -29,6 +29,7 @@ public class AIControlOverlay {
 
     @SubscribeEvent
     public static void onRenderGui(RenderGuiLayerEvent.Post event) {
+        if (!ClientBodyRuntime.isBodyClient()) return;
         Minecraft mc = Minecraft.getInstance();
         if (mc.player == null || mc.level == null) return;
 
@@ -65,6 +66,7 @@ public class AIControlOverlay {
      */
     @SubscribeEvent
     public static void onMouseClick(InputEvent.MouseButton.Pre event) {
+        if (!ClientBodyRuntime.isBodyClient()) return;
         Minecraft mc = Minecraft.getInstance();
         if (mc.player == null) return;
 
@@ -101,6 +103,7 @@ public class AIControlOverlay {
      */
     @SubscribeEvent
     public static void onKeyPress(InputEvent.Key event) {
+        if (!ClientBodyRuntime.isBodyClient()) return;
         if (!InputIsolation.isAiControlled() && event.getAction() == 1) {
             InputIsolation.recordUserActivity();
         }
@@ -112,6 +115,7 @@ public class AIControlOverlay {
      */
     @SubscribeEvent
     public static void onMouseScroll(InputEvent.MouseScrollingEvent event) {
+        if (!ClientBodyRuntime.isBodyClient()) return;
         if (InputIsolation.isAiControlled()) {
             event.setCanceled(true);
         } else {

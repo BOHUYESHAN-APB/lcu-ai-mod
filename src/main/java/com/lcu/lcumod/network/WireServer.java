@@ -1,8 +1,9 @@
 package com.lcu.lcumod.network;
 
 import com.google.gson.Gson;
+import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
-import com.lcu.lcumod.LCUMod;
+import com.lcu.lcumod.action.ActionExecutor;
 import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -16,24 +17,45 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * TCP JSONL wire protocol server.
  */
 public class WireServer {
+    private static final System.Logger LOGGER = System.getLogger(WireServer.class.getName());
+    public static final int PROTOCOL_VERSION = 2;
+    private static final int MAX_FRAME_CHARS = 1024 * 1024;
+    private static final int AUTH_TIMEOUT_MILLIS = 5000;
+    private static final int START_TIMEOUT_MILLIS = 5000;
+    private static final int SEND_QUEUE_CAPACITY = 1024;
     private final int port;
     private final String authToken;
+    private final String role;
+    private final Runnable disconnectHandler;
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final Gson gson = new Gson();
     private Thread serverThread;
+    private volatile ServerSocket serverSocket;
+    private volatile int boundPort = -1;
+    private volatile Throwable startupError;
+    private volatile CountDownLatch readyLatch = new CountDownLatch(1);
     private volatile Connection activeConnection;
     private Thread sendThread;
-    private final BlockingQueue<String> sendQueue = new LinkedBlockingQueue<>();
+    private final BlockingQueue<String> sendQueue = new ArrayBlockingQueue<>(SEND_QUEUE_CAPACITY);
 
     public static final PriorityCommandQueue commandQueue = new PriorityCommandQueue();
 
     public WireServer(int port, String authToken) {
-        this.port = port;
-        this.authToken = authToken == null ? "" : authToken;
+        this(port, authToken, "body_client", ActionExecutor::requestBackendDisconnectStop);
     }
 
-    public void start() {
+    public WireServer(int port, String authToken, String role, Runnable disconnectHandler) {
+        this.port = port;
+        this.authToken = authToken == null ? "" : authToken;
+        this.role = role == null || role.isBlank() ? "body_client" : role;
+        this.disconnectHandler = disconnectHandler == null ? () -> {} : disconnectHandler;
+    }
+
+    public synchronized void start() {
         if (running.getAndSet(true)) return;
+        startupError = null;
+        boundPort = -1;
+        readyLatch = new CountDownLatch(1);
         serverThread = new Thread(this::runServer, "LCU-WireServer");
         serverThread.setDaemon(true);
         serverThread.start();
@@ -41,15 +63,56 @@ public class WireServer {
         sendThread = new Thread(this::sendLoop, "LCU-WireSend");
         sendThread.setDaemon(true);
         sendThread.start();
-        LCUMod.LOGGER.info("[WireServer] Started on port {}", port);
+        try {
+            if (!readyLatch.await(START_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)) {
+                stop();
+                throw new IllegalStateException("Timed out binding wire server on port " + port);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            stop();
+            throw new IllegalStateException("Interrupted while starting wire server", e);
+        }
+        if (startupError != null || boundPort < 0) {
+            stop();
+            throw new IllegalStateException("Failed to bind wire server on port " + port, startupError);
+        }
+        LOGGER.log(System.Logger.Level.INFO, "[WireServer] Started on port {0}", boundPort);
     }
 
-    public void stop() {
+    public synchronized void stop() {
         running.set(false);
+        ServerSocket listener = serverSocket;
+        if (listener != null) {
+            try { listener.close(); } catch (IOException ignored) {}
+        }
+        Connection connection = activeConnection;
+        if (connection != null) connection.close();
+        activeConnection = null;
+        commandQueue.clear();
+        sendQueue.clear();
         if (sendThread != null) sendThread.interrupt();
         if (serverThread != null) serverThread.interrupt();
-        if (activeConnection != null) activeConnection.close();
+        joinThread(serverThread);
+        joinThread(sendThread);
+        serverSocket = null;
+        serverThread = null;
+        sendThread = null;
+        boundPort = -1;
     }
+
+    private static void joinThread(Thread thread) {
+        if (thread == null || thread == Thread.currentThread()) return;
+        try {
+            thread.join(1000);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    public int getBoundPort() { return boundPort; }
+
+    public boolean isRunning() { return running.get() && boundPort >= 0; }
 
     public boolean isConnected() {
         return activeConnection != null && activeConnection.isOpen();
@@ -57,7 +120,9 @@ public class WireServer {
 
     /** Async send — queues message, returns immediately. NEVER blocks the calling thread. */
     public void send(JsonObject msg) {
-        sendQueue.offer(gson.toJson(msg));
+        if (!sendQueue.offer(gson.toJson(msg))) {
+            LOGGER.log(System.Logger.Level.WARNING, "[WireServer] Dropped outbound frame because the send queue is full");
+        }
     }
 
     /** Background thread that drains the send queue and writes to TCP. */
@@ -75,7 +140,7 @@ public class WireServer {
                 Thread.currentThread().interrupt();
                 break;
             } catch (Exception e) {
-                LCUMod.LOGGER.warn("[WireServer] Send error: {}", e.getMessage());
+                LOGGER.log(System.Logger.Level.WARNING, "[WireServer] Send error: {0}", e.getMessage());
             }
         }
     }
@@ -116,28 +181,43 @@ public class WireServer {
 
     private void runServer() {
         try (ServerSocket ss = new ServerSocket(port, 50, InetAddress.getByName("127.0.0.1"))) {
+            serverSocket = ss;
+            boundPort = ss.getLocalPort();
+            readyLatch.countDown();
             while (running.get()) {
                 try {
                     Socket sock = ss.accept();
-                    LCUMod.LOGGER.info("[WireServer] Backend connection pending from {}", sock.getRemoteSocketAddress());
+                    LOGGER.log(System.Logger.Level.INFO, "[WireServer] Backend connection pending from {0}", sock.getRemoteSocketAddress());
                     Connection conn = new Connection(sock);
                     conn.startReader();
                 } catch (IOException e) {
                     if (running.get()) {
-                        LCUMod.LOGGER.error("[WireServer] Accept error: {}", e.getMessage());
+                        LOGGER.log(System.Logger.Level.ERROR, "[WireServer] Accept error: {0}", e.getMessage());
                     }
                 }
             }
         } catch (IOException e) {
-            LCUMod.LOGGER.error("[WireServer] Failed to start on port {}: {}", port, e.getMessage());
+            if (boundPort < 0) {
+                startupError = e;
+                readyLatch.countDown();
+            } else if (running.get()) {
+                LOGGER.log(System.Logger.Level.ERROR, "[WireServer] Failed on port {0}: {1}", boundPort, e.getMessage());
+            }
+        } finally {
+            serverSocket = null;
+            if (running.getAndSet(false)) readyLatch.countDown();
         }
     }
 
     private synchronized void activate(Connection conn) {
         Connection old = activeConnection;
+        if (old != null && old != conn) {
+            commandQueue.clear();
+            disconnectHandler.run();
+            old.close();
+        }
         activeConnection = conn;
-        if (old != null && old != conn) old.close();
-        LCUMod.LOGGER.info("[WireServer] Authenticated backend connected from {}", conn.socket.getRemoteSocketAddress());
+        LOGGER.log(System.Logger.Level.INFO, "[WireServer] Authenticated backend connected from {0}", conn.socket.getRemoteSocketAddress());
     }
 
     private boolean validToken(String candidate) {
@@ -155,8 +235,9 @@ public class WireServer {
 
         Connection(Socket socket) throws IOException {
             this.socket = socket;
-            this.reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-            this.writer = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream()));
+            socket.setSoTimeout(AUTH_TIMEOUT_MILLIS);
+            this.reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+            this.writer = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8));
         }
 
         boolean isOpen() { return open.get(); }
@@ -170,7 +251,7 @@ public class WireServer {
                     writer.flush();
                 }
             } catch (IOException e) {
-                LCUMod.LOGGER.warn("[WireServer] Send error: {}", e.getMessage());
+                LOGGER.log(System.Logger.Level.WARNING, "[WireServer] Send error: {0}", e.getMessage());
                 close();
             }
         }
@@ -178,7 +259,7 @@ public class WireServer {
         void startReader() {
             Thread readerThread = new Thread(() -> {
                 try {
-                    String authLine = reader.readLine();
+                    String authLine = readLineLimited();
                     if (authLine == null) return;
                     JsonObject auth = gson.fromJson(authLine, JsonObject.class);
                     String type = auth != null && auth.has("type") ? auth.get("type").getAsString() : "";
@@ -193,11 +274,19 @@ public class WireServer {
                     JsonObject accepted = new JsonObject();
                     accepted.addProperty("type", "auth");
                     accepted.addProperty("success", true);
+                    accepted.addProperty("protocol_version", PROTOCOL_VERSION);
+                    accepted.addProperty("role", role);
+                    JsonArray capabilities = new JsonArray();
+                    capabilities.add("state");
+                    capabilities.add("actions");
+                    capabilities.add("progress");
+                    accepted.add("capabilities", capabilities);
                     send(gson.toJson(accepted));
                     activate(this);
+                    socket.setSoTimeout(0);
 
                     String line;
-                    while (open.get() && (line = reader.readLine()) != null) {
+                    while (open.get() && (line = readLineLimited()) != null) {
                         if (line.isBlank()) continue;
                         try {
                             JsonObject msg = gson.fromJson(line, JsonObject.class);
@@ -208,7 +297,7 @@ public class WireServer {
                                         msg.get("args") != null ? msg.get("args").getAsJsonObject() : null
                                 );
                                 if (cmd.cmd() != null) {
-                                    LCUMod.LOGGER.info("[WireServer] Received command: {} id={}", cmd.cmd(), cmd.id());
+                                    LOGGER.log(System.Logger.Level.INFO, "[WireServer] Received command: {0} id={1}", cmd.cmd(), cmd.id());
                                     if ("control_external".equals(cmd.cmd()) || "control_builtin".equals(cmd.cmd())) {
                                         commandQueue.submitControl(cmd);
                                     } else {
@@ -217,12 +306,12 @@ public class WireServer {
                                 }
                             }
                         } catch (Exception e) {
-                            LCUMod.LOGGER.warn("[WireServer] Invalid JSON: {}", e.getMessage());
+                            LOGGER.log(System.Logger.Level.WARNING, "[WireServer] Invalid JSON: {0}", e.getMessage());
                         }
                     }
                 } catch (IOException e) {
                     if (open.get()) {
-                        LCUMod.LOGGER.info("[WireServer] Backend disconnected: {}", e.getMessage());
+                        LOGGER.log(System.Logger.Level.INFO, "[WireServer] Backend disconnected: {0}", e.getMessage());
                     }
                 } finally {
                     close();
@@ -232,12 +321,28 @@ public class WireServer {
             readerThread.start();
         }
 
+        String readLineLimited() throws IOException {
+            StringBuilder line = new StringBuilder();
+            int value;
+            while ((value = reader.read()) != -1) {
+                if (value == '\n') break;
+                if (value != '\r') line.append((char) value);
+                if (line.length() > MAX_FRAME_CHARS) {
+                    throw new IOException("wire frame exceeds maximum size");
+                }
+            }
+            if (value == -1 && line.isEmpty()) return null;
+            return line.toString();
+        }
+
         void close() {
             if (!open.getAndSet(false)) return;
             try { socket.close(); } catch (IOException ignored) {}
-            LCUMod.LOGGER.info("[WireServer] Connection closed");
+            LOGGER.log(System.Logger.Level.INFO, "[WireServer] Connection closed");
             if (activeConnection == this) {
                 activeConnection = null;
+                commandQueue.clear();
+                disconnectHandler.run();
             }
         }
     }

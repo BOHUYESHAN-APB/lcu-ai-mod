@@ -205,7 +205,7 @@ class ConversationAgent:
     
     async def _generate_response(self, context: ConversationContext) -> Optional[str]:
         """生成回复（异步 LLM 调用）"""
-        if not self.llm or not self.llm.api_key:
+        if not self.llm or not self.llm.is_configured("conversation"):
             logger.warning("[ConvAgent] LLM 未配置")
             return None
         

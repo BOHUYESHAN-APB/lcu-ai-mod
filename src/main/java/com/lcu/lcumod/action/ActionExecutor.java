@@ -3,6 +3,7 @@ package com.lcu.lcumod.action;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.lcu.lcumod.LCUMod;
+import com.lcu.lcumod.client.ClientBodyRuntime;
 import com.lcu.lcumod.network.WireServer;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
@@ -45,7 +46,7 @@ public class ActionExecutor {
     private static int jumpCooldown = 0;
     private static final int JUMP_COOLDOWN_TICKS = 25;
     // AI/User control
-    private static boolean aiControlled = true;
+    private static boolean aiControlled = false;
     private static boolean wasDead = false;
     private static int respawnRetryTicks = 0;
     private static int respawnAttempts = 0;
@@ -73,6 +74,7 @@ public class ActionExecutor {
     private static String pendingStorageTargetItem = null;
     private static int pendingStorageGoalCount = 0;
     private static int pendingStorageTicks = 0;
+    private static int pendingStorageMenuOpenTick = -1;
     private static final java.util.Set<BlockPos> triedStoragePositions = new java.util.HashSet<>();
     private static String activeTaskKind = "idle";
     private static String activeTaskStatus = "idle";
@@ -82,21 +84,22 @@ public class ActionExecutor {
     private static boolean externalControlActive = false;
     private static boolean behaviorEnabledBeforeExternal = true;
     private static long activeFencingToken = 0;
+    private static volatile boolean backendDisconnectStopRequested = false;
     private int tickCount = 0;
-
-    public static void notifyInterrupted(String reason) {
-        if (LCUMod.WIRE != null) {
-            JsonObject data = new JsonObject();
-            data.addProperty("type", "interrupted");
-            data.addProperty("reason", reason);
-            LCUMod.WIRE.sendEvent("command_interrupted", data);
-        }
-    }
 
     /** Called every client tick via ActionExecutorBridge (ClientTickEvent.Post). */
     public void onTick() {
         var mc = Minecraft.getInstance();
         if (mc == null || mc.level == null || mc.player == null) return;
+
+        if (backendDisconnectStopRequested) {
+            backendDisconnectStopRequested = false;
+            if (InputIsolation.isAiControlled()) {
+                InputIsolation.toggleControl();
+                sendControlStateToBackend();
+            }
+            handleStopAll(new WireServer.WireCommand("backend-disconnect", "stop_all", new JsonObject()));
+        }
 
         // ── Input isolation (core control system) ──
         InputIsolation.tick(mc);
@@ -125,7 +128,7 @@ public class ActionExecutor {
         // ── Movement system (packet-based) ──
         MovementSystem.tick(mc);
 
-        boolean optionalAutonomy = LCUMod.BEHAVIORS == null || LCUMod.BEHAVIORS.isEnabled();
+        boolean optionalAutonomy = ClientBodyRuntime.BEHAVIORS == null || ClientBodyRuntime.BEHAVIORS.isEnabled();
 
         // ── Java-side autonomous behavior (works without backend) ──
         if (InputIsolation.isAiControlled() && optionalAutonomy) {
@@ -225,6 +228,7 @@ public class ActionExecutor {
             MovementSystem.stop();
             Pathfinder.stop();
             followTargetName = null;
+            backendDisconnectStopRequested = true;
         } else {
             InputIsolation.clearUserControls();
         }
@@ -273,6 +277,10 @@ public class ActionExecutor {
         moveRight = false;
     }
 
+    public static void requestBackendDisconnectStop() {
+        backendDisconnectStopRequested = true;
+    }
+
     // ── Command Execution ──
 
     private void executeCommand(WireServer.WireCommand cmd) {
@@ -286,6 +294,10 @@ public class ActionExecutor {
             if (!"control_external".equals(cmd.cmd()) && !"control_builtin".equals(cmd.cmd())
                     && externalControlActive && commandFencingToken(cmd) != activeFencingToken) {
                 sendResponse(cmd.id(), false, "Stale or missing control fencing token");
+                return;
+            }
+            if (!isAiControlled() && requiresArmedBody(cmd.cmd())) {
+                sendResponse(cmd.id(), false, "BODY_DISARMED: press F12 or explicitly arm this body before actions");
                 return;
             }
             switch (cmd.cmd()) {
@@ -329,17 +341,17 @@ public class ActionExecutor {
                 case "look_at_entity" -> handleLookAtEntity(cmd);
                 case "use_on_entity" -> handleUseOnEntity(cmd);
                 case "behavior_enable" -> {
-                    if (LCUMod.BEHAVIORS != null) {
-                        LCUMod.BEHAVIORS.setEnabled(true);
+                    if (ClientBodyRuntime.BEHAVIORS != null) {
+                        ClientBodyRuntime.BEHAVIORS.setEnabled(true);
                     }
                     JavaAutonomousBehavior.setEnabled(true);
                     sendResponse(cmd.id(), true, "behaviors=true");
                     sendBehaviorState(true);
                 }
                 case "toggle_behavior" -> {
-                    if (LCUMod.BEHAVIORS != null) { 
-                        boolean newState = !LCUMod.BEHAVIORS.isEnabled();
-                        LCUMod.BEHAVIORS.setEnabled(newState);
+                    if (ClientBodyRuntime.BEHAVIORS != null) {
+                        boolean newState = !ClientBodyRuntime.BEHAVIORS.isEnabled();
+                        ClientBodyRuntime.BEHAVIORS.setEnabled(newState);
                         JavaAutonomousBehavior.setEnabled(newState);
                         sendResponse(cmd.id(), true, "behaviors=" + newState);
                         // Send state update to backend
@@ -347,8 +359,8 @@ public class ActionExecutor {
                     }
                 }
                 case "behavior_disable" -> { 
-                    if (LCUMod.BEHAVIORS != null) {
-                        LCUMod.BEHAVIORS.setEnabled(false);
+                    if (ClientBodyRuntime.BEHAVIORS != null) {
+                        ClientBodyRuntime.BEHAVIORS.setEnabled(false);
                     }
                     JavaAutonomousBehavior.setEnabled(false);
                     sendResponse(cmd.id(), true, "behaviors=false");
@@ -574,7 +586,7 @@ public class ActionExecutor {
         // AI control and behavior state
         state.addProperty("ai_controlled", isAiControlled());
         state.addProperty("behaviors_enabled", JavaAutonomousBehavior.isEnabled()
-                && (LCUMod.BEHAVIORS == null || LCUMod.BEHAVIORS.isEnabled()));
+                && (ClientBodyRuntime.BEHAVIORS == null || ClientBodyRuntime.BEHAVIORS.isEnabled()));
 
         sendResponse(cmd.id(), true, state);
     }
@@ -845,6 +857,14 @@ public class ActionExecutor {
         sendResponse(cmd.id(), true, "All stopped");
     }
 
+    private boolean requiresArmedBody(String command) {
+        return switch (command) {
+            case "control_external", "control_builtin", "get_state", "get_inventory", "get_container",
+                 "stop_all", "toggle_ai", "behavior_disable", "send_chat" -> false;
+            default -> true;
+        };
+    }
+
     private long commandFencingToken(WireServer.WireCommand cmd) {
         var args = cmd.args();
         if (args == null || !args.has("__lcu_fencing_token")) return 0;
@@ -863,11 +883,11 @@ public class ActionExecutor {
         }
         if (!externalControlActive || token > activeFencingToken) {
             behaviorEnabledBeforeExternal = JavaAutonomousBehavior.isEnabled()
-                    && (LCUMod.BEHAVIORS == null || LCUMod.BEHAVIORS.isEnabled());
+                    && (ClientBodyRuntime.BEHAVIORS == null || ClientBodyRuntime.BEHAVIORS.isEnabled());
         }
         activeFencingToken = token;
         externalControlActive = true;
-        if (LCUMod.BEHAVIORS != null) LCUMod.BEHAVIORS.setEnabled(false);
+        if (ClientBodyRuntime.BEHAVIORS != null) ClientBodyRuntime.BEHAVIORS.setEnabled(false);
         JavaAutonomousBehavior.setEnabled(false);
         HumanLikeBehavior.reset();
         ActivitySignalController.reset();
@@ -886,7 +906,7 @@ public class ActionExecutor {
         }
         handleStopAll(cmd);
         externalControlActive = false;
-        if (LCUMod.BEHAVIORS != null) LCUMod.BEHAVIORS.setEnabled(behaviorEnabledBeforeExternal);
+        if (ClientBodyRuntime.BEHAVIORS != null) ClientBodyRuntime.BEHAVIORS.setEnabled(behaviorEnabledBeforeExternal);
         JavaAutonomousBehavior.setEnabled(behaviorEnabledBeforeExternal);
         HumanLikeBehavior.reset();
         ActivitySignalController.reset();
@@ -1119,13 +1139,8 @@ public class ActionExecutor {
         pendingCraftReqId = cmd.id();
         pendingCraftTicks = 0;
         pendingCraftAttempts = 0;
-        pendingCraftGoalCount = Math.max(countInventoryItem(mc, itemName), requestedCount);
-        if (pendingCraftGoalCount < requestedCount) {
-            pendingCraftGoalCount = requestedCount;
-        }
-        if (countInventoryItem(mc, itemName) >= requestedCount) {
-            pendingCraftGoalCount = countInventoryItem(mc, itemName);
-        }
+        int baselineCount = countInventoryItem(mc, itemName);
+        pendingCraftGoalCount = (int) Math.min(Integer.MAX_VALUE, (long) baselineCount + requestedCount);
         clearPendingCollectTask();
         setTaskState("craft", "planning", itemName, "analyzing recipe graph", 0.02);
         sendBehaviorSnapshot();
@@ -1309,7 +1324,7 @@ public class ActionExecutor {
         }
         JsonObject data = new JsonObject();
         data.addProperty("behaviors_enabled", JavaAutonomousBehavior.isEnabled()
-                && (LCUMod.BEHAVIORS == null || LCUMod.BEHAVIORS.isEnabled()));
+                && (ClientBodyRuntime.BEHAVIORS == null || ClientBodyRuntime.BEHAVIORS.isEnabled()));
         data.addProperty("follow_target", followTargetName == null ? "" : followTargetName);
         data.addProperty("pending_craft_item", pendingCraftItem == null ? "" : pendingCraftItem);
         data.addProperty("pending_eat", pendingEatReqId != null);
@@ -1401,7 +1416,7 @@ public class ActionExecutor {
             return;
         }
 
-        if (hasItem(mc, pendingCraftItem)) {
+        if (countInventoryItem(mc, pendingCraftItem) >= pendingCraftGoalCount) {
             if (LCUMod.WIRE != null) {
                 LCUMod.WIRE.sendProgress(pendingCraftReqId, 1.0, "crafted: " + pendingCraftItem);
             }
@@ -1424,9 +1439,7 @@ public class ActionExecutor {
             return;
         }
 
-        int currentCount = countInventoryItem(mc, pendingCraftItem);
-        int missingCount = Math.max(0, pendingCraftGoalCount - currentCount);
-        CraftingPlanner.CraftPlan plan = CraftingPlanner.plan(mc, pendingCraftItem, missingCount);
+        CraftingPlanner.CraftPlan plan = CraftingPlanner.plan(mc, pendingCraftItem, pendingCraftGoalCount);
         if (!plan.missingRaw.isEmpty()) {
             Map.Entry<String, Integer> firstMissing = plan.missingRaw.entrySet().iterator().next();
             startCollectTask(mc, pendingCraftReqId, firstMissing.getKey(), firstMissing.getValue());
@@ -1655,6 +1668,9 @@ public class ActionExecutor {
             if (triedStoragePositions.contains(candidate)) {
                 continue;
             }
+            if (PoiMemory.getStorageItemCount(candidate, pendingCollectItem) <= 0) {
+                continue;
+            }
             storagePos = candidate;
             break;
         }
@@ -1721,13 +1737,24 @@ public class ActionExecutor {
             }
             Vec3 hitVec = Vec3.atCenterOf(pendingStoragePos);
             BlockHitResult hitResult = new BlockHitResult(hitVec, Direction.UP, pendingStoragePos, false);
-            mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, hitResult);
+            if ((pendingStorageTicks - 6) % 10 == 0) {
+                mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, hitResult);
+            }
             setTaskState(resolveRootTaskKind(), "storage", pendingStorageTargetItem,
                 "opening storage", 0.3);
             return;
         }
 
         // ── Phase 3: Container is open → scan & withdraw ──
+        if (pendingStorageMenuOpenTick < 0) {
+            pendingStorageMenuOpenTick = pendingStorageTicks;
+            setTaskState(resolveRootTaskKind(), "storage", pendingStorageTargetItem,
+                "inspecting storage", 0.35);
+            return;
+        }
+        if (pendingStorageTicks - pendingStorageMenuOpenTick < 12) {
+            return;
+        }
         int foundStacks = withdrawMatchingFromContainer(mc, pendingStorageTargetItem, pendingStorageGoalCount);
 
         if (foundStacks > 0 && LCUMod.WIRE != null && pendingCollectReqId != null) {
@@ -1802,6 +1829,7 @@ public class ActionExecutor {
         pendingStorageTargetItem = null;
         pendingStorageGoalCount = 0;
         pendingStorageTicks = 0;
+        pendingStorageMenuOpenTick = -1;
     }
 
     private boolean hasItem(Minecraft mc, String itemName) {
@@ -1809,7 +1837,7 @@ public class ActionExecutor {
             var stack = mc.player.getInventory().getItem(i);
             if (stack.isEmpty()) continue;
             String id = BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
-            if (id.equals(itemName) || id.endsWith(":" + itemName)) {
+            if (CraftingPlanner.matchesRegistryId(id, itemName)) {
                 return true;
             }
         }
@@ -1822,7 +1850,7 @@ public class ActionExecutor {
             var result = recipe.value().getResultItem(mc.level.registryAccess());
             if (result.isEmpty()) continue;
             String id = BuiltInRegistries.ITEM.getKey(result.getItem()).toString();
-            if (id.equals(itemName) || id.endsWith(":" + itemName)) {
+            if (CraftingPlanner.matchesRegistryId(id, itemName)) {
                 return recipe;
             }
         }
@@ -2079,16 +2107,17 @@ public class ActionExecutor {
 
     private String normalizeItemName(String itemName) {
         String compact = itemName.replace(" ", "").trim();
-        return switch (compact) {
-            case "木剑" -> "wooden_sword";
-            case "木镐" -> "wooden_pickaxe";
-            case "木棍" -> "stick";
-            case "木板" -> "oak_planks";
-            case "工作台" -> "crafting_table";
-            case "石剑" -> "stone_sword";
-            case "石镐" -> "stone_pickaxe";
+        String normalized = switch (compact) {
+            case "木剑" -> "minecraft:wooden_sword";
+            case "木镐" -> "minecraft:wooden_pickaxe";
+            case "木棍" -> "minecraft:stick";
+            case "木板" -> "minecraft:oak_planks";
+            case "工作台" -> "minecraft:crafting_table";
+            case "石剑" -> "minecraft:stone_sword";
+            case "石镐" -> "minecraft:stone_pickaxe";
             default -> compact;
         };
+        return normalized.contains(":") ? normalized : "minecraft:" + normalized;
     }
 
     private void tickPendingEat(Minecraft mc) {

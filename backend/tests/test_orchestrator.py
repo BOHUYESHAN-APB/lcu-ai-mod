@@ -19,9 +19,9 @@ class FakeBody:
     def disconnect(self):
         self.is_connected = False
 
-    def send_command(self, command, args=None):
+    def send_command(self, command, args=None, request_id=None):
         self.commands.append((command, args or {}))
-        return f"fake-{len(self.commands)}"
+        return request_id or f"fake-{len(self.commands)}"
 
     def drain(self):
         events, self.pending = self.pending, []
@@ -42,11 +42,17 @@ class OrchestratorBodyTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             orchestrator = Orchestrator(body, storage_root=Path(tmp), legacy_root=None)
+            published = []
+            orchestrator.on_event = lambda event_type, data, occurred_at: published.append((event_type, data))
             orchestrator.start()
             orchestrator.tick()
 
             self.assertEqual(orchestrator.session.runtime["player"]["health"], 18)
             self.assertEqual(body.pending, [])
+            self.assertEqual([event[0] for event in published], ["body.connection", "state_update"])
+            self.assertTrue(orchestrator.session.get_status()["body"]["connected"])
+            orchestrator.on_body_disconnect()
+            self.assertFalse(orchestrator.session.get_status()["body"]["connected"])
             orchestrator.session.stop()
 
     def test_response_and_progress_finalize_fake_body_command(self):

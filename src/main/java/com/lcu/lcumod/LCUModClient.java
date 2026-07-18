@@ -1,5 +1,7 @@
 package com.lcu.lcumod;
 
+import com.lcu.lcumod.client.ClientBodyRuntime;
+import com.lcu.lcumod.config.RuntimeRole;
 import net.minecraft.client.Minecraft;
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.SubscribeEvent;
@@ -24,6 +26,11 @@ public class LCUModClient {
     @SubscribeEvent
     public static void onClientSetup(FMLClientSetupEvent event) {
         event.enqueueWork(() -> {
+            if (RuntimeRole.current() != RuntimeRole.BODY_CLIENT) {
+                LCUMod.LOGGER.info("[LCUMod] Player client role active; actuator runtime is disabled");
+                return;
+            }
+            ClientBodyRuntime.start();
             var options = Minecraft.getInstance().options;
             // Disable pause on lost focus — AI keeps running in background
             options.pauseOnLostFocus = false;

@@ -66,6 +66,7 @@ def _merge_legacy_memory(files: list[Path], destination: Path) -> None:
         "player_relationships": {},
         "experiences": {"servers": {}, "worlds": {}},
         "task_outcomes": [],
+        "summaries": [],
     }
     for path in sorted(files, key=lambda item: item.stat().st_mtime):
         try:
@@ -118,10 +119,15 @@ def _merge_legacy_memory(files: list[Path], destination: Path) -> None:
                 for outcome, count in outcomes.items():
                     command_stats[outcome] = command_stats.get(outcome, 0) + count
         merged["task_outcomes"].extend(data.get("task_outcomes", []))
+        merged["summaries"].extend(data.get("summaries", []))
     merged["recent_messages"] = sorted(merged["recent_messages"], key=lambda item: item.get("time", 0))[-50:]
     merged["events"] = sorted(merged["events"], key=lambda item: item.get("time", 0))[-500:]
     merged["task_outcomes"] = sorted(merged["task_outcomes"], key=lambda item: item.get("time", 0))[-100:]
-    merged["schema_version"] = 3
+    summaries_by_id = {str(item.get("id")): item for item in merged["summaries"] if item.get("id")}
+    merged["summaries"] = sorted(
+        summaries_by_id.values(), key=lambda item: item.get("created_at", 0),
+    )[-100:]
+    merged["schema_version"] = 4
     temporary = destination.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(merged, indent=2, ensure_ascii=False), encoding="utf-8")
     temporary.replace(destination)

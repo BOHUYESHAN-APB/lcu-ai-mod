@@ -34,6 +34,16 @@ class LCUClient:
         response.raise_for_status()
         return response.json()
 
+    def _patch(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        response = self._client.patch(path, json=payload)
+        response.raise_for_status()
+        return response.json()
+
+    def _delete(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        response = self._client.request("DELETE", path, json=payload)
+        response.raise_for_status()
+        return response.json()
+
     def close(self) -> None:
         self._client.close()
 
@@ -127,6 +137,59 @@ class LCUClient:
         if fencing_token is not None:
             payload["fencing_token"] = fencing_token
         return self._post(f"/api/v2/skills/{quote(skill_id, safe='')}/runs", payload)
+
+    def list_runs(self, limit: int = 50, status: str | None = None) -> list[dict[str, Any]]:
+        query: dict[str, Any] = {"limit": limit}
+        if status:
+            query["status"] = status
+        return self._get(f"/api/v2/runs?{urlencode(query)}").get("runs", [])
+
+    def get_run(self, run_id: str) -> dict[str, Any]:
+        return self._get(f"/api/v2/runs/{quote(run_id, safe='')}")
+
+    def cancel_run(self, run_id: str, *, lease_id: str | None = None,
+                   fencing_token: int | None = None) -> dict[str, Any]:
+        payload = self._lease_payload(lease_id, fencing_token)
+        return self._post(f"/api/v2/runs/{quote(run_id, safe='')}/cancel", payload)
+
+    def resume_run(self, run_id: str, *, lease_id: str | None = None,
+                   fencing_token: int | None = None) -> dict[str, Any]:
+        payload = self._lease_payload(lease_id, fencing_token)
+        return self._post(f"/api/v2/runs/{quote(run_id, safe='')}/resume", payload)
+
+    def list_events(self, after: int = 0, limit: int = 100, latest: bool = False) -> dict[str, Any]:
+        return self._get(f"/api/v2/events?{urlencode({'after': after, 'limit': limit, 'latest': str(latest).lower()})}")
+
+    def list_schedules(self) -> list[dict[str, Any]]:
+        return self._get("/api/v2/schedules").get("schedules", [])
+
+    def create_schedule(self, schedule: dict[str, Any], *, lease_id: str | None = None,
+                        fencing_token: int | None = None) -> dict[str, Any]:
+        return self._post("/api/v2/schedules", {
+            **schedule, **self._lease_payload(lease_id, fencing_token),
+        })
+
+    def set_schedule_enabled(self, schedule_id: str, enabled: bool, *,
+                             lease_id: str | None = None, fencing_token: int | None = None) -> dict[str, Any]:
+        return self._patch(f"/api/v2/schedules/{quote(schedule_id, safe='')}", {
+            "enabled": enabled, **self._lease_payload(lease_id, fencing_token),
+        })
+
+    def delete_schedule(self, schedule_id: str, *, lease_id: str | None = None,
+                        fencing_token: int | None = None) -> dict[str, Any]:
+        return self._delete(
+            f"/api/v2/schedules/{quote(schedule_id, safe='')}",
+            self._lease_payload(lease_id, fencing_token),
+        )
+
+    @staticmethod
+    def _lease_payload(lease_id: str | None, fencing_token: int | None) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if lease_id is not None:
+            payload["lease_id"] = lease_id
+        if fencing_token is not None:
+            payload["fencing_token"] = fencing_token
+        return payload
 
     def get_runtime_config(self) -> dict[str, Any]:
         return self._get("/api/config")

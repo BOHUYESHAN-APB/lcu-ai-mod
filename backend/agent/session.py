@@ -26,6 +26,7 @@ from protocol import BodyAdapter
 from .config_store import DEFAULT_CONFIG_PATH
 from .action_manager import ActionManager
 from .memory import Memory
+from .memory_overlay import MemoryOverlayStore
 from .skills import Skills
 from .modes_engine import ModesEngine
 from .commands import Commands
@@ -69,6 +70,7 @@ class Session:
 
         # Message database (SQLite persistence)
         self.message_db = MessageDB(db_path=self.storage_dir / "messages.db")
+        self.memory_overlay = MemoryOverlayStore(self.storage_dir / "memory_management.db")
 
         # Register default modes
         self.modes_engine.add_defaults()
@@ -104,6 +106,10 @@ class Session:
         self._pending_commands: dict[str, dict] = {}
         self.control_mode = "builtin"
         self.control_fencing_token = 0
+        self._external_task_busy = False
+        self._body_connected = False
+        self._last_state_at: float | None = None
+        self._state_sequence = 0
 
     # ── Event handlers ──
 
@@ -112,6 +118,8 @@ class Session:
         match event_type:
             case "state_update":
                 self.runtime.update(data)
+                self._last_state_at = time.time()
+                self._state_sequence = getattr(self, "_state_sequence", 0) + 1
                 if hasattr(self, "memory") and self.control_mode != "external":
                     self.memory.observe_world(self.runtime)
             case "player_chat":
@@ -143,6 +151,9 @@ class Session:
                     response=data.get("response", ""),
                 )
                 self.memory.observe_player(sender, sender_id, message)
+
+                if self._external_task_busy:
+                    return
 
                 # Timing Gate: 判断是否应该回复（参考 MaiBot）
                 should_respond, reason = self.timing_gate.should_respond(
@@ -303,7 +314,7 @@ class Session:
         Process a chat message through the LLM.
         Uses Planner for intelligent action planning.
         """
-        if self.control_mode == "external":
+        if self.control_mode == "external" or self._external_task_busy:
             return None
         if record_interaction:
             self.memory.add_interaction(sender=sender, message=message)
@@ -358,8 +369,9 @@ class Session:
 
     # ── Lifecycle ──
 
-    def tick(self):
+    def tick(self, external_task_busy: bool = False):
         """Called every event loop cycle."""
+        self._external_task_busy = external_task_busy
         # Action manager tick (check timeouts, process completions)
         self.action_manager.tick()
 
@@ -375,7 +387,7 @@ class Session:
         # Determine if we're in idle state (no active mode, no task, no busy action)
         active_mode = self.modes_engine._active_mode
         task_state = self.runtime.get("task_state", {}) if isinstance(self.runtime.get("task_state"), dict) else {}
-        task_active = bool(task_state) and str(task_state.get("kind", "idle")).strip().lower() != "idle" \
+        task_active = external_task_busy or bool(task_state) and str(task_state.get("kind", "idle")).strip().lower() != "idle" \
             and str(task_state.get("status", "idle")).strip().lower() not in {"", "idle", "done", "failed", "cancelled"}
         is_idle = (active_mode is None
                    and not self.task_queue
@@ -386,7 +398,8 @@ class Session:
         behavior_state = self.runtime.get("behavior_state", {}) if isinstance(self.runtime.get("behavior_state"), dict) else {}
         control_state = self.runtime.get("control_state", {}) if isinstance(self.runtime.get("control_state"), dict) else {}
         autonomy_enabled = self.control_mode != "external" \
-            and control_state.get("ai_controlled", True) and behavior_state.get("behaviors_enabled", True)
+            and control_state.get("ai_controlled") is True \
+            and behavior_state.get("behaviors_enabled") is True
         manual_override_active = time.time() < self._manual_command_until or self._manual_behavior_active()
         mode_action = None
         if autonomy_enabled and not manual_override_active:
@@ -460,11 +473,16 @@ class Session:
             self._finish_pending_command(req_id, "unknown", "backend stopped before terminal event")
         self.memory.save()
         self.message_db.close()
+        self.memory_overlay.close()
         logger.info("[Session] Stopped: %s", self.id)
 
     # ── Status ──
 
     def get_status(self) -> dict:
+        now = time.time()
+        state_age = None if self._last_state_at is None else max(0.0, now - self._last_state_at)
+        control_state = self.runtime.get("control_state", {})
+        armed = isinstance(control_state, dict) and control_state.get("ai_controlled") is True
         return {
             "id": self.id,
             "identity": self.identity.public_dict(),
@@ -476,10 +494,36 @@ class Session:
             "database": self.message_db.get_stats(),
             "player": self.runtime.get("player", {}),
             "world": self.runtime.get("world", {}),
+            "inventory": self.runtime.get("inventory", []),
+            "entities": self.runtime.get("entities", []),
+            "online_players": self.runtime.get("online_players", []),
+            "control_state": control_state,
+            "behavior_state": self.runtime.get("behavior_state", {}),
             "task_state": self.runtime.get("task_state", {}),
             "llm_usage": self.llm.get_usage(),
             "control_mode": self.control_mode,
+            "body": {
+                "connected": self._body_connected,
+                "armed": armed,
+                "observed_at": self._last_state_at,
+                "state_age_seconds": state_age,
+                "stale": not self._body_connected or state_age is None or state_age > 3.0,
+                "sequence": self._state_sequence,
+            },
         }
+
+    def set_body_connected(self, connected: bool) -> None:
+        self._body_connected = connected
+
+    def is_busy_for_external_task(self) -> bool:
+        task_state = self.runtime.get("task_state", {})
+        task_status = str(task_state.get("status", "idle")).lower() if isinstance(task_state, dict) else "idle"
+        return self.action_manager.is_busy or self.modes_engine._active_mode is not None \
+            or task_status not in {"", "idle", "done", "failed", "cancelled"} \
+            or self._manual_behavior_active()
+
+    def set_external_task_busy(self, busy: bool) -> None:
+        self._external_task_busy = busy
 
     def set_control_mode(self, mode: str, fencing_token: int = 0) -> None:
         if mode not in {"builtin", "hybrid", "external"}:
@@ -539,6 +583,9 @@ class Session:
             "started_at": time.time(),
             "context": "actuator",
         }
+
+    def unregister_external_command(self, req_id: str) -> None:
+        self._pending_commands.pop(req_id, None)
 
     def _finish_pending_command(self, req_id: str, outcome: str, detail: str = "") -> None:
         pending = self._pending_commands.pop(req_id, None)

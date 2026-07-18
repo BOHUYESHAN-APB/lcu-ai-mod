@@ -23,7 +23,7 @@ class AgentStateTests(unittest.TestCase):
             state.close()
             conn = sqlite3.connect(path)
             try:
-                self.assertEqual(conn.execute("SELECT version FROM schema_migrations").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 5)
             finally:
                 conn.close()
 
@@ -42,6 +42,9 @@ class AgentStateTests(unittest.TestCase):
 
             released = state.release_lease(lease["id"], lease["fencing_token"])
             self.assertIsNotNone(released["released_at"])
+            with self.assertRaises(LeaseConflictError):
+                with state.control_guard(lease["id"], lease["fencing_token"]):
+                    pass
             next_lease = state.acquire_lease("other-agent", "external", ["actions"], 30)
             self.assertGreater(next_lease["fencing_token"], lease["fencing_token"])
             state.close()
@@ -54,6 +57,8 @@ class SkillRegistryTests(unittest.TestCase):
         manifest = registry.validate_input("general.craft_item", {"item": "minecraft:torch", "count": 8})
 
         self.assertEqual(manifest.command, "craft_item")
+        self.assertTrue(manifest.offline)
+        self.assertEqual(manifest.executor, "deterministic")
         with self.assertRaisesRegex(SkillValidationError, "missing fields"):
             registry.validate_input("general.craft_item", {"item": "minecraft:torch"})
         with self.assertRaisesRegex(SkillValidationError, "must be <="):

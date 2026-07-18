@@ -1,0 +1,10 @@
+{
+  "key.lcumod.toggle_ai": "切换 AI 身体控制",
+  "key.lcumod.open_conversation": "打开 AI 对话",
+  "key.categories.lcumod": "LCU AI 同伴",
+  "screen.lcumod.conversation.title": "AI 对话",
+  "screen.lcumod.conversation.input": "输入消息",
+  "screen.lcumod.conversation.send": "发送",
+  "screen.lcumod.conversation.sending": "发送中...",
+  "screen.lcumod.conversation.failed": "消息发送失败"
+}

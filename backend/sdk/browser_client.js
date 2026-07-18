@@ -158,14 +158,76 @@ export class LCUClient {
     return result.lease;
   }
 
-  runSkill(skillId, input = {}, { leaseId, fencingToken } = {}) {
-    const payload = { input };
-    if (leaseId) payload.lease_id = leaseId;
-    if (fencingToken) payload.fencing_token = fencingToken;
+  runSkill(skillId, input = {}, lease = {}) {
+    const payload = { input, ...this.leasePayload(lease) };
     return this.request(`/api/v2/skills/${encodeURIComponent(skillId)}/runs`, {
       method: 'POST',
       body: JSON.stringify(payload),
     });
+  }
+
+  async listRuns({ limit = 50, status = '' } = {}) {
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (status) query.set('status', status);
+    const result = await this.request(`/api/v2/runs?${query}`);
+    return result.runs || [];
+  }
+
+  getRun(runId) {
+    return this.request(`/api/v2/runs/${encodeURIComponent(runId)}`);
+  }
+
+  cancelRun(runId, lease = {}) {
+    return this.request(`/api/v2/runs/${encodeURIComponent(runId)}/cancel`, {
+      method: 'POST',
+      body: JSON.stringify(this.leasePayload(lease)),
+    });
+  }
+
+  resumeRun(runId, lease = {}) {
+    return this.request(`/api/v2/runs/${encodeURIComponent(runId)}/resume`, {
+      method: 'POST',
+      body: JSON.stringify(this.leasePayload(lease)),
+    });
+  }
+
+  listEvents(after = 0, limit = 100, { latest = false } = {}) {
+    return this.request(`/api/v2/events?after=${after}&limit=${limit}&latest=${latest}`);
+  }
+
+  async listSchedules() {
+    const result = await this.request('/api/v2/schedules');
+    return result.schedules || [];
+  }
+
+  createSchedule(schedule, lease = {}) {
+    return this.request('/api/v2/schedules', {
+      method: 'POST',
+      body: JSON.stringify({ ...schedule, ...this.leasePayload(lease) }),
+    });
+  }
+
+  setScheduleEnabled(scheduleId, enabled, lease = {}) {
+    return this.request(`/api/v2/schedules/${encodeURIComponent(scheduleId)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ enabled, ...this.leasePayload(lease) }),
+    });
+  }
+
+  deleteSchedule(scheduleId, lease = {}) {
+    return this.request(`/api/v2/schedules/${encodeURIComponent(scheduleId)}`, {
+      method: 'DELETE',
+      body: JSON.stringify(this.leasePayload(lease)),
+    });
+  }
+
+  leasePayload(lease = {}) {
+    const payload = {};
+    const leaseId = lease.leaseId || lease.id;
+    const fencingToken = lease.fencingToken || lease.fencing_token;
+    if (leaseId) payload.lease_id = leaseId;
+    if (fencingToken) payload.fencing_token = fencingToken;
+    return payload;
   }
 
   getRuntimeConfig() {

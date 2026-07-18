@@ -31,7 +31,7 @@ public class JavaAutonomousBehavior {
     private static final Random random = new Random();
     
     // State
-    private static boolean enabled = true;
+    private static boolean enabled = false;
     private static BehaviorState currentState = BehaviorState.IDLE;
     private static int stateTicks = 0;
     private static int idleTicks = 0;

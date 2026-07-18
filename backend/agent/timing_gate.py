@@ -111,7 +111,7 @@ class TimingGate:
                 return False, "user_conversation"
         
         # 7. 使用 LLM 判断是否应该回复（可选，需要 LLM 可用）
-        if self.llm and self.llm.api_key:
+        if self.llm and self.llm.is_configured("timing_gate"):
             try:
                 llm_decision = self._ask_llm_should_respond(sender, message, recent_messages, bot_name)
                 if llm_decision:

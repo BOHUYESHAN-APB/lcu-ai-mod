@@ -29,7 +29,7 @@ class Memory:
     4. 位置记忆（命名位置）— 记住重要坐标
     """
     
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 4
     FLUSH_INTERVAL = 5.0
     WORLD_FLUSH_INTERVAL = 120.0
 
@@ -59,6 +59,8 @@ class Memory:
         self.experiences: dict[str, dict] = {"servers": {}, "worlds": {}}
         self.task_outcomes: list[dict] = []
         self.max_task_outcomes = 100
+        self.summaries: list[dict] = []
+        self.max_summaries = 100
         self._save_blocked_reason: str | None = None
         self._dirty = False
         self._last_save = time.monotonic()
@@ -239,6 +241,24 @@ class Memory:
         })
         world["deaths"] = int(world.get("deaths", 0)) + 1
         self.record_event("death", description)
+
+    def add_summary(self, summary: dict[str, Any]) -> None:
+        """Persist a validated immutable summary while retaining all source records."""
+        summary_id = str(summary.get("id", "")).strip()
+        content = str(summary.get("content", "")).strip()
+        if not summary_id or not content:
+            raise ValueError("summary id and content are required")
+        if any(item.get("id") == summary_id for item in self.summaries):
+            return
+        stored = dict(summary)
+        stored["id"] = summary_id
+        stored["content"] = content
+        stored.setdefault("created_at", time.time())
+        stored.setdefault("state", "active")
+        self.summaries.append(stored)
+        if len(self.summaries) > self.max_summaries:
+            del self.summaries[:-self.max_summaries]
+        self._mark_dirty()
     
     # ── 人物画像 ──
     
@@ -300,6 +320,7 @@ class Memory:
             "relationship_summary": self._build_relationship_summary(current_player),
             "task_outcomes": self._build_task_outcomes_summary(),
             "world_experience": self._build_world_experience_summary(),
+            "durable_summaries": self._build_durable_summaries(),
             "interaction_summary": self._build_interaction_summary(),
             "recent_events": self._build_recent_events(),
             "player_profiles": self._build_player_profiles_summary(),
@@ -355,6 +376,15 @@ class Memory:
             f"server={self.server_id}, world={self.world_id}, known_players={server.get('known_players', [])}, "
             f"last_position={position}, task_stats={stats}"
         )
+
+    def _build_durable_summaries(self) -> str:
+        lines = []
+        for summary in self.summaries[-3:]:
+            title = str(summary.get("title") or "Memory summary")
+            content = str(summary.get("content") or "")
+            if content:
+                lines.append(f"{title}: {content}")
+        return "\n".join(lines) or "暂无持久摘要"
     
     def _build_interaction_summary(self) -> str:
         """构建最近交互摘要。"""
@@ -442,7 +472,8 @@ class Memory:
             player_relationships = data.get("player_relationships", {})
             experiences = data.get("experiences", {"servers": {}, "worlds": {}})
             task_outcomes = data.get("task_outcomes", [])
-            if not isinstance(recent_messages, list) or not isinstance(events, list) or not isinstance(task_outcomes, list):
+            summaries = data.get("summaries", [])
+            if not all(isinstance(value, list) for value in (recent_messages, events, task_outcomes, summaries)):
                 raise ValueError("memory list fields are invalid")
             if not all(isinstance(item, dict) for item in (player_profiles, locations, player_relationships, experiences)):
                 raise ValueError("memory object fields are invalid")
@@ -459,6 +490,7 @@ class Memory:
             self.player_relationships = player_relationships
             self.experiences = experiences
             self.task_outcomes = task_outcomes[-self.max_task_outcomes:]
+            self.summaries = summaries[-self.max_summaries:]
             self.recent_messages = self.recent_messages[-self.max_recent:]
             self.events = self.events[-self.max_events:]
             self.interaction_count = data.get("interaction_count", 0)
@@ -507,6 +539,7 @@ class Memory:
             "player_relationships": self.player_relationships,
             "experiences": self.experiences,
             "task_outcomes": self.task_outcomes,
+            "summaries": self.summaries,
             "interaction_count": self.interaction_count,
             "total_actions": self.total_actions,
         }

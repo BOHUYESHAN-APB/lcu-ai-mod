@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -60,8 +61,83 @@ class ConfigStoreTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "temperature"):
                 store.set_agent_llm_config("planner", {"temperature": 3})
-            with self.assertRaisesRegex(ValueError, "max_tokens"):
-                store.set_agent_llm_config("planner", {"max_tokens": 0})
+            with self.assertRaisesRegex(ValueError, "max_output_tokens"):
+                store.set_agent_llm_config("planner", {"max_output_tokens": 0})
+
+    def test_default_model_budget_is_complete_and_consistent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConfigStore(Path(tmp) / "config.json")
+
+            config = store.get_agent_llm_config("default", redact=False)
+
+            self.assertEqual(config["context_window_tokens"], 32768)
+            self.assertEqual(config["max_output_tokens"], 2048)
+            self.assertLessEqual(
+                config["max_input_tokens"] + config["reserved_output_tokens"],
+                config["context_window_tokens"],
+            )
+            self.assertLess(config["compression_target_tokens"], config["compression_trigger_tokens"])
+            self.assertNotIn("max_tokens", config)
+
+    def test_legacy_max_tokens_is_migrated_and_rewritten(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps({
+                "version": 1,
+                "llm": {"agents": {"default": {"max_tokens": 777}}},
+            }), encoding="utf-8")
+
+            store = ConfigStore(path)
+            config = store.get_agent_llm_config("default", redact=False)
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+
+            self.assertEqual(config["max_output_tokens"], 777)
+            self.assertNotIn("max_tokens", persisted["llm"]["agents"]["default"])
+            self.assertEqual(persisted["version"], 2)
+
+    def test_model_budget_cross_field_validation_is_atomic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConfigStore(Path(tmp) / "config.json")
+            before = store.get_agent_llm_config("planner", redact=False)
+
+            with self.assertRaisesRegex(ValueError, "max_input_tokens plus reserved_output_tokens"):
+                store.set_agent_llm_config("planner", {
+                    "context_window_tokens": 100,
+                    "max_input_tokens": 90,
+                    "max_output_tokens": 10,
+                    "reserved_output_tokens": 20,
+                })
+            with self.assertRaisesRegex(ValueError, "compression_target_tokens"):
+                store.set_agent_llm_config("planner", {
+                    "compression_target_tokens": 25000,
+                })
+            with self.assertRaisesRegex(ValueError, "compression_enabled"):
+                store.set_agent_llm_config("planner", {"compression_enabled": "true"})
+
+            self.assertEqual(store.get_agent_llm_config("planner", redact=False), before)
+
+    def test_model_budget_round_trips_canonical_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConfigStore(Path(tmp) / "config.json")
+
+            config = store.set_agent_llm_config("planner", {
+                "context_window_tokens": "8192",
+                "max_input_tokens": "6144",
+                "max_output_tokens": "1024",
+                "reserved_output_tokens": "1024",
+                "max_request_bytes": "262144",
+                "compression_enabled": False,
+                "compression_trigger_tokens": "5000",
+                "compression_target_tokens": "3000",
+                "recent_messages_to_keep": "8",
+                "summary_model_agent": "default",
+                "summary_max_output_tokens": "512",
+            })
+
+            self.assertEqual(config["context_window_tokens"], 8192)
+            self.assertEqual(config["max_output_tokens"], 1024)
+            self.assertIs(config["compression_enabled"], False)
+            self.assertNotIn("max_tokens", config)
 
     def test_companion_identity_is_generated_once_and_persisted(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -11,6 +11,7 @@ import sqlite3
 import time
 import json
 import logging
+import hashlib
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
@@ -91,6 +92,18 @@ class MessageDB:
                 metadata TEXT
             )
         """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS player_message_receipts (
+                client_message_id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                response_text TEXT,
+                error TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+        """)
         
         # Create indexes
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)")
@@ -118,7 +131,7 @@ class MessageDB:
             1 if is_system else 0,
             1 if is_ai else 0,
             conversation_id,
-            json.dumps(metadata) if metadata else None
+            json.dumps(metadata) if metadata is not None else None
         ))
         self.conn.commit()
         
@@ -209,6 +222,76 @@ class MessageDB:
         ))
         self.conn.commit()
         return conv_id
+
+    def get_or_create_direct_conversation(self, contact_id: str, display_name: str) -> str:
+        """Return a stable direct conversation for one verified transport identity."""
+        digest = hashlib.sha256(contact_id.encode("utf-8")).hexdigest()[:24]
+        conversation_id = f"direct_{digest}"
+        now = time.time()
+        participants = json.dumps([contact_id, "companion"], ensure_ascii=False)
+        with self.conn:
+            self.conn.execute("""
+                INSERT OR IGNORE INTO conversations
+                    (id, started_at, last_activity, participants, message_count, topic)
+                VALUES (?, ?, ?, ?, 0, ?)
+            """, (conversation_id, now, now, participants, display_name))
+            self.conn.execute("""
+                UPDATE conversations SET topic = ?, last_activity = MAX(last_activity, ?)
+                WHERE id = ?
+            """, (display_name, now, conversation_id))
+        return conversation_id
+
+    def get_conversation(self, conversation_id: str) -> Optional[Dict]:
+        row = self.conn.execute(
+            "SELECT * FROM conversations WHERE id = ?", (conversation_id,),
+        ).fetchone()
+        return self._decode_conversation(row) if row else None
+
+    def list_conversations(self, limit: int = 100) -> List[Dict]:
+        rows = self.conn.execute("""
+            SELECT * FROM conversations
+            ORDER BY last_activity DESC, id ASC LIMIT ?
+        """, (limit,)).fetchall()
+        return [self._decode_conversation(row) for row in rows]
+
+    def claim_player_message(self, client_message_id: str, conversation_id: str) -> tuple[bool, Dict]:
+        now = time.time()
+        with self.conn:
+            cursor = self.conn.execute("""
+                INSERT OR IGNORE INTO player_message_receipts
+                    (client_message_id, conversation_id, status, created_at, updated_at)
+                VALUES (?, ?, 'processing', ?, ?)
+            """, (client_message_id, conversation_id, now, now))
+            row = self.conn.execute(
+                "SELECT * FROM player_message_receipts WHERE client_message_id = ?",
+                (client_message_id,),
+            ).fetchone()
+        return cursor.rowcount == 1, dict(row)
+
+    def complete_player_message(self, client_message_id: str, response_text: str) -> None:
+        with self.conn:
+            self.conn.execute("""
+                UPDATE player_message_receipts
+                SET status = 'completed', response_text = ?, error = NULL, updated_at = ?
+                WHERE client_message_id = ?
+            """, (response_text, time.time(), client_message_id))
+
+    def fail_player_message(self, client_message_id: str, error: str) -> None:
+        with self.conn:
+            self.conn.execute("""
+                UPDATE player_message_receipts
+                SET status = 'failed', error = ?, updated_at = ?
+                WHERE client_message_id = ?
+            """, (error[:1000], time.time(), client_message_id))
+
+    @staticmethod
+    def _decode_conversation(row) -> Dict:
+        result = dict(row)
+        try:
+            result["participants"] = json.loads(result.get("participants") or "[]")
+        except json.JSONDecodeError:
+            result["participants"] = []
+        return result
     
     def _update_conversation(self, conv_id: str, sender: str):
         """Update conversation activity."""
@@ -293,7 +376,7 @@ class MessageDB:
             description,
             player_involved,
             location,
-            json.dumps(metadata) if metadata else None
+            json.dumps(metadata) if metadata is not None else None
         ))
         self.conn.commit()
         return cursor.lastrowid

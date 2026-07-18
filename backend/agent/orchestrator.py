@@ -37,10 +37,15 @@ class Orchestrator:
         self._last_stats = time.monotonic()
         self._session_lock = threading.RLock()
         self.on_chat = None  # type: ignore  # set by server.py
+        self.on_event = None  # type: ignore  # set by server.py
+        self.task_coordinator = None
 
     def start(self):
         """Start the orchestrator."""
         self.running = True
+        with self._session_lock:
+            self.session.set_body_connected(True)
+        self._publish_event("body.connection", {"connected": True})
         logger.info("[Orch] Started (session=%s)", self.session.id)
 
     def stop(self):
@@ -53,14 +58,28 @@ class Orchestrator:
         if not self.running:
             return
 
+        external_task_busy = self.task_coordinator.is_busy() if self.task_coordinator else False
         with self._session_lock:
+            self.session.set_external_task_busy(external_task_busy)
             self._tick_count += 1
 
             # Process incoming body events
             self._drain_body()
 
             # Session tick (action manager, modes, tasks, auto-save)
-            self.session.tick()
+            self.session.tick(external_task_busy=external_task_busy)
+            if self.task_coordinator:
+                self.task_coordinator.set_session_busy(self.session.is_busy_for_external_task())
+                control_state = self.session.runtime.get("control_state", {})
+                self.task_coordinator.set_body_armed(
+                    isinstance(control_state, dict) and control_state.get("ai_controlled") is True,
+                )
+            runtime = dict(self.session.runtime)
+            control_mode = self.session.control_mode
+            clock_scope = f"{self.session.identity.server_id}\0{self.session.identity.world_id}"
+
+        if self.task_coordinator:
+            self.task_coordinator.tick(runtime, control_mode, clock_scope)
 
         # Periodic stats
         now = time.monotonic()
@@ -75,6 +94,8 @@ class Orchestrator:
                 event_type = msg.data.get("event", "unknown")
                 event_data = msg.data.get("data", {})
                 self.session.handle_event(event_type, event_data)
+                if event_type != "player_chat":
+                    self._publish_event(event_type, event_data, msg.data.get("ts"))
                 # Broadcast chat events to WebSocket clients
                 if event_type == "player_chat" and self.on_chat:
                     self.on_chat(
@@ -86,10 +107,36 @@ class Orchestrator:
                 self.session.handle_event("command_response", msg.data)
             elif msg.type == "progress":
                 self._handle_progress(msg.data)
+            if self.task_coordinator:
+                self.task_coordinator.handle_body_message(msg)
+
+    def set_task_coordinator(self, coordinator) -> None:
+        self.task_coordinator = coordinator
+
+    def on_body_disconnect(self) -> None:
+        with self._session_lock:
+            self.session.set_body_connected(False)
+            self.session.runtime["control_state"] = {
+                "ai_controlled": False,
+                "connected": False,
+            }
+            self.session.set_external_task_busy(False)
+            if self.task_coordinator:
+                self.task_coordinator.on_disconnect()
+        self._publish_event("body.connection", {"connected": False})
+
+    def _publish_event(self, event_type: str, data: dict, occurred_at: float | None = None) -> None:
+        if self.on_event:
+            timestamp = float(occurred_at) if occurred_at is not None else time.time()
+            if timestamp > 100_000_000_000:
+                timestamp /= 1000.0
+            self.on_event(event_type, data, timestamp)
 
     def handle_chat(self, sender: str, message: str) -> Optional[str]:
         """Process a chat message through the session's LLM pipeline."""
         with self._session_lock:
+            if self.task_coordinator and self.task_coordinator.is_busy():
+                return None
             return self.session.handle_chat(sender, message)
 
     @contextmanager

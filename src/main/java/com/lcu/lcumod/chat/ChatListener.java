@@ -2,6 +2,7 @@ package com.lcu.lcumod.chat;
 
 import com.google.gson.JsonObject;
 import com.lcu.lcumod.LCUMod;
+import com.lcu.lcumod.client.ClientBodyRuntime;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.chat.Component;
 import net.neoforged.bus.api.SubscribeEvent;
@@ -24,6 +25,7 @@ public class ChatListener {
     @SubscribeEvent
     public static void onClientChat(ClientChatReceivedEvent event) {
         try {
+            if (!ClientBodyRuntime.isBodyClient()) return;
             if (LCUMod.WIRE == null || !LCUMod.WIRE.isConnected()) return;
 
             // Skip system messages (death, teleport, etc.) to avoid backend noise

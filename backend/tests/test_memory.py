@@ -17,8 +17,8 @@ class FakeBody:
     def disconnect(self):
         pass
 
-    def send_command(self, command, args=None):
-        return f"req-{command}"
+    def send_command(self, command, args=None, request_id=None):
+        return request_id or f"req-{command}"
 
     def drain(self):
         return []
@@ -34,7 +34,7 @@ class MemoryTests(unittest.TestCase):
             memory.save()
             saved = json.loads(path.read_text(encoding="utf-8"))
 
-            self.assertEqual(saved["schema_version"], 3)
+            self.assertEqual(saved["schema_version"], 4)
             self.assertEqual(memory.recent_messages[0]["message"], "legacy")
             self.assertEqual(memory.player_relationships, {})
             self.assertEqual(memory.task_outcomes, [])
@@ -42,7 +42,7 @@ class MemoryTests(unittest.TestCase):
     def test_invalid_structured_fields_fall_back_to_safe_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "memory.json"
-            path.write_text(json.dumps({"schema_version": 3, "experiences": None}), encoding="utf-8")
+            path.write_text(json.dumps({"schema_version": 4, "experiences": None}), encoding="utf-8")
 
             memory = Memory(path)
             memory.observe_world({"player": {}, "entities": []})
@@ -170,6 +170,24 @@ class MemoryTests(unittest.TestCase):
             self.assertLessEqual(sum(len(value) for value in first.values()), 120)
             self.assertTrue(first["relationship_summary"].startswith("Alice:"))
 
+    def test_durable_summary_is_persistent_and_injected_into_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "memory.json"
+            memory = Memory(path)
+            memory.add_summary({
+                "id": "summary-one",
+                "title": "Mining plan",
+                "content": "Alice needs diamonds near the saved mine.",
+                "source_ids": ["message:1"],
+            })
+            memory.save()
+
+            restored = Memory(path)
+            context = restored.build_context(max_chars=1000)
+
+            self.assertEqual(restored.summaries[0]["id"], "summary-one")
+            self.assertIn("Alice needs diamonds", context["durable_summaries"])
+
     def test_long_task_is_only_recorded_after_terminal_progress(self):
         with tempfile.TemporaryDirectory() as tmp:
             session = Session(FakeBody(), companion_id="memory-test", storage_root=Path(tmp), legacy_root=None)
@@ -245,6 +263,18 @@ class MemoryTests(unittest.TestCase):
             local_planner.assert_not_called()
             self.assertEqual(session.memory.player_relationships, {})
             self.assertEqual(session.memory.recent_messages, [])
+            session.stop()
+
+    def test_durable_task_busy_blocks_local_chat_planner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = Session(FakeBody(), companion_id="memory-test", storage_root=Path(tmp), legacy_root=None)
+            session.set_external_task_busy(True)
+
+            with patch.object(session.planner, "plan_and_execute") as planner:
+                response = session.handle_chat("Alice", "do something")
+
+            self.assertIsNone(response)
+            planner.assert_not_called()
             session.stop()
 
     def test_external_actuator_command_is_recorded_on_response(self):

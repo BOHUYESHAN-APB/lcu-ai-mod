@@ -25,10 +25,10 @@ public class InputIsolation {
     private static boolean aiSprint = false;
 
     // Control mode
-    private static boolean aiControlled = true;
+    private static boolean aiControlled = false;
     private static long lastUserActivity = 0;
     private static final long USER_TIMEOUT_MS = 10000;  // 10 seconds
-    private static boolean autoReturnEnabled = true;
+    private static boolean autoReturnEnabled = false;
 
     // Mouse control
     private static float aiYaw = 0;

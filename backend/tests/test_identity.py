@@ -18,8 +18,8 @@ class FakeBody:
     def disconnect(self):
         pass
 
-    def send_command(self, command, args=None):
-        return f"req-{command}"
+    def send_command(self, command, args=None, request_id=None):
+        return request_id or f"req-{command}"
 
     def drain(self):
         return []

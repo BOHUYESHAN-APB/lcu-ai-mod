@@ -70,7 +70,7 @@ class Planner:
         
         返回: 回复文本，或 None（如果不回复）
         """
-        if not self.llm or not self.llm.api_key:
+        if not self.llm or not self.llm.is_configured("planner"):
             logger.warning("[Planner] LLM 未配置，无法规划")
             return None
         

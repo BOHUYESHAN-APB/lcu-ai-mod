@@ -12,4 +12,7 @@ V2 adds typed Skill discovery/execution and renewable `external` control
 leases. External controllers should prefer Skill runs over
 raw actuator commands.
 
+Skill runs are durable UUID resources with response/progress terminal states.
+V2 also exposes cursor-based events and persistent wall/game-clock schedules.
+
 The companion backend remains a separate AGPL-3.0 program. See `../../docs/sdk.md` for API, authentication and browser CORS setup.

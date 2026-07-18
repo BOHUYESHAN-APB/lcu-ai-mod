@@ -20,6 +20,19 @@ from typing import Any
 DEFAULT_AGENT = "default"
 DEFAULT_CONFIG_PATH = Path(__file__).parent.parent / ".local" / "config.json"
 LEGACY_CONFIG_PATH = Path(__file__).parent.parent / "config.json"
+CONFIG_VERSION = 2
+
+LLM_INTEGER_FIELDS = (
+    "context_window_tokens",
+    "max_input_tokens",
+    "max_output_tokens",
+    "reserved_output_tokens",
+    "max_request_bytes",
+    "compression_trigger_tokens",
+    "compression_target_tokens",
+    "recent_messages_to_keep",
+    "summary_max_output_tokens",
+)
 
 
 PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
@@ -127,7 +140,7 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 def _default_config() -> dict[str, Any]:
     preset = PROVIDER_PRESETS["mimo"]
     return {
-        "version": 1,
+        "version": CONFIG_VERSION,
         "llm": {
             "default_agent": DEFAULT_AGENT,
             "agents": {
@@ -137,7 +150,17 @@ def _default_config() -> dict[str, Any]:
                     "model": preset["default_model"],
                     "api_key": "",
                     "temperature": 0.7,
-                    "max_tokens": 2048,
+                    "context_window_tokens": 32768,
+                    "max_input_tokens": 28672,
+                    "max_output_tokens": 2048,
+                    "reserved_output_tokens": 2048,
+                    "max_request_bytes": 1048576,
+                    "compression_enabled": True,
+                    "compression_trigger_tokens": 24576,
+                    "compression_target_tokens": 16384,
+                    "recent_messages_to_keep": 12,
+                    "summary_model_agent": DEFAULT_AGENT,
+                    "summary_max_output_tokens": 1024,
                 }
             },
         },
@@ -174,8 +197,11 @@ class ConfigStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._migration_pending = False
         self._data = self._load()
         self._ensure_companion_identity()
+        if self._migration_pending:
+            self.save()
 
     def _ensure_companion_identity(self) -> None:
         companion = self._data.setdefault("companion", {})
@@ -195,6 +221,19 @@ class ConfigStore:
             loaded = json.loads(source_path.read_text(encoding="utf-8"))
             if not isinstance(loaded, dict):
                 return defaults
+            agents = loaded.get("llm", {}).get("agents", {})
+            if isinstance(agents, dict):
+                for config in agents.values():
+                    if not isinstance(config, dict):
+                        continue
+                    if "max_tokens" in config and "max_output_tokens" not in config:
+                        config["max_output_tokens"] = config["max_tokens"]
+                    if "max_tokens" in config:
+                        config.pop("max_tokens")
+                        self._migration_pending = True
+            if loaded.get("version") != CONFIG_VERSION:
+                loaded["version"] = CONFIG_VERSION
+                self._migration_pending = True
             return _deep_merge(defaults, loaded)
         except Exception:
             return defaults
@@ -207,6 +246,7 @@ class ConfigStore:
                 encoding="utf-8",
             )
             temporary.replace(self.path)
+            self._migration_pending = False
 
     def raw(self, redact: bool = True) -> dict[str, Any]:
         with self._lock:
@@ -232,6 +272,10 @@ class ConfigStore:
             agents = self._data.setdefault("llm", {}).setdefault("agents", {})
             current = copy.deepcopy(agents.get(agent_name) or agents.get(DEFAULT_AGENT) or _default_config()["llm"]["agents"][DEFAULT_AGENT])
 
+            normalized_payload = dict(payload)
+            if "max_tokens" in normalized_payload and "max_output_tokens" not in normalized_payload:
+                normalized_payload["max_output_tokens"] = normalized_payload["max_tokens"]
+
             if provider_id:
                 preset = PROVIDER_PRESETS.get(provider_id)
                 if not preset:
@@ -242,30 +286,56 @@ class ConfigStore:
                 if not payload.get("model") and preset.get("default_model"):
                     current["model"] = preset["default_model"]
 
-            for key in ("base_url", "api_key", "model", "temperature", "max_tokens"):
-                if key in payload and payload[key] is not None:
-                    current[key] = payload[key]
+            for key in (
+                "base_url", "api_key", "model", "temperature",
+                *LLM_INTEGER_FIELDS, "compression_enabled", "summary_model_agent",
+            ):
+                if key in normalized_payload and normalized_payload[key] is not None:
+                    current[key] = normalized_payload[key]
+
+            current.pop("max_tokens", None)
 
             raw_temperature = current.get("temperature", 0.7)
-            raw_max_tokens = current.get("max_tokens", 2048)
             try:
                 if isinstance(raw_temperature, bool):
                     raise ValueError
                 current["temperature"] = float(raw_temperature)
-                if isinstance(raw_max_tokens, bool):
-                    raise ValueError
-                if isinstance(raw_max_tokens, int):
-                    current["max_tokens"] = raw_max_tokens
-                elif isinstance(raw_max_tokens, str) and raw_max_tokens.strip().isdigit():
-                    current["max_tokens"] = int(raw_max_tokens.strip())
-                else:
-                    raise ValueError
             except (TypeError, ValueError) as exc:
-                raise ValueError("temperature must be numeric and max_tokens must be an integer") from exc
+                raise ValueError("temperature must be numeric") from exc
             if not 0 <= current["temperature"] <= 2:
                 raise ValueError("temperature must be between 0 and 2")
-            if current["max_tokens"] <= 0:
-                raise ValueError("max_tokens must be greater than 0")
+
+            for key in LLM_INTEGER_FIELDS:
+                raw_value = current.get(key)
+                if isinstance(raw_value, bool):
+                    raise ValueError(f"{key} must be a positive integer")
+                try:
+                    value = int(raw_value)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"{key} must be a positive integer") from exc
+                if value <= 0 or isinstance(raw_value, float) and not raw_value.is_integer():
+                    raise ValueError(f"{key} must be a positive integer")
+                current[key] = value
+
+            compression_enabled = current.get("compression_enabled", True)
+            if not isinstance(compression_enabled, bool):
+                raise ValueError("compression_enabled must be a boolean")
+
+            summary_agent = str(current.get("summary_model_agent", DEFAULT_AGENT)).strip()
+            if not summary_agent:
+                raise ValueError("summary_model_agent must not be empty")
+            if summary_agent not in agents and summary_agent not in {DEFAULT_AGENT, agent_name}:
+                raise ValueError("summary_model_agent must reference a configured agent")
+            current["summary_model_agent"] = summary_agent
+
+            if current["max_output_tokens"] > current["reserved_output_tokens"]:
+                raise ValueError("max_output_tokens must not exceed reserved_output_tokens")
+            if current["max_input_tokens"] + current["reserved_output_tokens"] > current["context_window_tokens"]:
+                raise ValueError("max_input_tokens plus reserved_output_tokens must not exceed context_window_tokens")
+            if current["compression_target_tokens"] >= current["compression_trigger_tokens"]:
+                raise ValueError("compression_target_tokens must be less than compression_trigger_tokens")
+            if current["compression_trigger_tokens"] > current["max_input_tokens"]:
+                raise ValueError("compression_trigger_tokens must not exceed max_input_tokens")
 
             if current.get("base_url"):
                 current["base_url"] = str(current["base_url"]).rstrip("/")
