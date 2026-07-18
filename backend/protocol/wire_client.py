@@ -24,6 +24,7 @@ from .body import BodyEvent
 logger = logging.getLogger("wire")
 WireMessage = BodyEvent
 MAX_WIRE_FRAME_BYTES = 1024 * 1024
+MAX_AUTH_FRAME_BYTES = 64 * 1024
 
 
 class WireClient:
@@ -73,7 +74,7 @@ class WireClient:
         payload = json.dumps({"type": "auth", "token": self.token}) + "\n"
         sock.sendall(payload.encode("utf-8"))
         response = bytearray()
-        while len(response) < 8192:
+        while len(response) < MAX_AUTH_FRAME_BYTES:
             chunk = sock.recv(1)
             if not chunk:
                 raise ConnectionError("wire authentication connection closed")
@@ -86,6 +87,11 @@ class WireClient:
         if result.get("type") != "auth" or not result.get("success"):
             raise ConnectionError("wire authentication failed")
         return result
+
+    @property
+    def tool_catalog(self) -> list[dict]:
+        tools = self.peer_info.get("tools", [])
+        return [tool for tool in tools if isinstance(tool, dict)] if isinstance(tools, list) else []
 
     def disconnect(self, expected_socket: socket.socket | None = None):
         with self._connection_lock:

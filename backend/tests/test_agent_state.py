@@ -70,6 +70,16 @@ class SkillRegistryTests(unittest.TestCase):
         with self.assertRaisesRegex(SkillValidationError, "must be <="):
             registry.validate_input("general.craft_item", {"item": "minecraft:torch", "count": 10 ** 10000})
 
+    def test_registry_reconciles_connected_body_capabilities(self):
+        registry = SkillRegistry()
+        registry.set_body_tools([{"command": "jump", "available": True}])
+
+        self.assertTrue(next(item for item in registry.list() if item["id"] == "core.jump")["available"])
+        self.assertFalse(next(item for item in registry.list() if item["id"] == "general.craft_item")["available"])
+        registry.validate_input("core.jump", {})
+        with self.assertRaisesRegex(SkillValidationError, "capability unavailable"):
+            registry.validate_input("general.craft_item", {"item": "minecraft:torch", "count": 1})
+
 
 if __name__ == "__main__":
     unittest.main()

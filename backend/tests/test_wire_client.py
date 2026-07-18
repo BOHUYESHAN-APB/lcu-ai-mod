@@ -59,6 +59,12 @@ class WireClientTests(unittest.TestCase):
         with self.assertRaisesRegex(ConnectionError, "authentication failed"):
             wire._authenticate(AuthSocket(False))
 
+    def test_tool_catalog_exposes_only_object_descriptors(self):
+        wire = WireClient()
+        wire.peer_info = {"tools": [{"command": "jump"}, "bad", None]}
+
+        self.assertEqual(wire.tool_catalog, [{"command": "jump"}])
+
     def test_concurrent_commands_have_unique_ids_and_complete_frames(self):
         wire = WireClient()
         socket = RecordingSocket()

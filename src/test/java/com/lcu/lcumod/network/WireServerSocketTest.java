@@ -34,6 +34,9 @@ class WireServerSocketTest {
             assertTrue(auth.get("success").getAsBoolean());
             assertEquals(WireServer.PROTOCOL_VERSION, auth.get("protocol_version").getAsInt());
             assertEquals("body_client", auth.get("role").getAsString());
+            assertTrue(auth.getAsJsonArray("tools").size() >= 10);
+            assertTrue(auth.getAsJsonArray("tools").asList().stream()
+                .anyMatch(tool -> tool.getAsJsonObject().get("command").getAsString().equals("craft_item")));
 
             peer.send("""
                     {"type":"command","id":"req-1","cmd":"jump","args":{"message":"你好"}}

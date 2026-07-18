@@ -18,7 +18,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 public class WireServer {
     private static final System.Logger LOGGER = System.getLogger(WireServer.class.getName());
-    public static final int PROTOCOL_VERSION = 2;
+    public static final int PROTOCOL_VERSION = 3;
     private static final int MAX_FRAME_CHARS = 1024 * 1024;
     private static final int AUTH_TIMEOUT_MILLIS = 5000;
     private static final int START_TIMEOUT_MILLIS = 5000;
@@ -281,6 +281,7 @@ public class WireServer {
                     capabilities.add("actions");
                     capabilities.add("progress");
                     accepted.add("capabilities", capabilities);
+                    accepted.add("tools", ToolCatalog.describe());
                     send(gson.toJson(accepted));
                     activate(this);
                     socket.setSoTimeout(0);

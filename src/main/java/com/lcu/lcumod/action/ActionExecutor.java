@@ -16,6 +16,7 @@ import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.inventory.ClickType;
+import net.minecraft.world.inventory.CraftingMenu;
 import net.minecraft.world.item.crafting.RecipeHolder;
 import net.minecraft.world.item.crafting.RecipeType;
 import net.minecraft.world.phys.AABB;
@@ -52,11 +53,23 @@ public class ActionExecutor {
     private static int respawnRetryTicks = 0;
     private static int respawnAttempts = 0;
     private static String followTargetName = null;
+    private static String suspendedFollowTargetName = null;
     private static int followRefreshTicks = 0;
     private static String pendingCraftItem = null;
     private static String pendingCraftReqId = null;
     private static int pendingCraftTicks = 0;
     private static int pendingCraftAttempts = 0;
+    private static int pendingCraftNoProgressAttempts = 0;
+    private static boolean pendingCraftAwaitingOutput = false;
+    private static boolean pendingCraftOutputClicked = false;
+    private static int pendingCraftOutputWaitTicks = 0;
+    private static int pendingCraftOutputMenuId = -1;
+    private static int pendingCraftOutputBaseline = 0;
+    private static String pendingCraftExpectedOutput = null;
+    private static int pendingCraftProcessingStallTicks = 0;
+    private static BlockPos pendingCraftStationPos = null;
+    private static Vec3 pendingCraftStationStandPos = null;
+    private static int pendingCraftStationUseAttempts = 0;
     private static String pendingEatReqId = null;
     private static int pendingEatTicks = 0;
     private static int pendingEatAttempts = 0;
@@ -70,12 +83,22 @@ public class ActionExecutor {
     private static int pendingCollectTicks = 0;
     private static int pendingCollectSearchMisses = 0;
     private static int pendingCraftGoalCount = 1;
+    private static String lastCraftPlanDetail = "";
     // Storage retrieval from remembered chests/barrels
     private static BlockPos pendingStoragePos = null;
+    private static BlockPos pendingStorageInteractionPos = null;
+    private static Vec3 pendingStorageStandPos = null;
     private static String pendingStorageTargetItem = null;
     private static int pendingStorageGoalCount = 0;
+    private static int pendingStorageStartCount = 0;
     private static int pendingStorageTicks = 0;
+    private static int pendingStorageOpenSentTick = -1;
+    private static int pendingStorageOpenAttempts = 0;
+    private static int pendingStorageOwnedMenuId = -1;
     private static int pendingStorageMenuOpenTick = -1;
+    private static int pendingStorageClickTick = -1;
+    private static int pendingStorageClickBaseline = 0;
+    private static int pendingStorageClickAttempts = 0;
     private static final java.util.Set<BlockPos> triedStoragePositions = new java.util.HashSet<>();
     private static String activeTaskKind = "idle";
     private static String activeTaskStatus = "idle";
@@ -841,21 +864,20 @@ public class ActionExecutor {
     private void stopAllRuntime() {
         var mc = Minecraft.getInstance();
         followTargetName = null;
+        suspendedFollowTargetName = null;
         pendingCraftItem = null;
         pendingCraftReqId = null;
         pendingCraftTicks = 0;
         pendingCraftAttempts = 0;
+        pendingCraftNoProgressAttempts = 0;
+        clearPendingCraftOutput();
+        pendingCraftProcessingStallTicks = 0;
+        clearPendingCraftStation();
         pendingCraftGoalCount = 1;
         pendingEatReqId = null;
         pendingEatTicks = 0;
         pendingEatAttempts = 0;
-        pendingCollectItem = null;
-        pendingCollectReqId = null;
-        pendingCollectGoalCount = 0;
-        pendingCollectBaselineCount = 0;
-        pendingCollectTargetPos = null;
-        pendingCollectTicks = 0;
-        pendingCollectSearchMisses = 0;
+        clearPendingCollectTask();
         Pathfinder.stop();
         MovementSystem.stop();
         JavaAutonomousBehavior.resetCurrentState();
@@ -958,7 +980,7 @@ public class ActionExecutor {
         if (mc.player == null) { sendResponse(cmd.id(), false, "No player"); return; }
 
         var menu = mc.player.containerMenu;
-        if (menu == null) { sendResponse(cmd.id(), false, "No container open"); return; }
+        if (menu == null || menu == mc.player.inventoryMenu) { sendResponse(cmd.id(), false, "No container open"); return; }
 
         // Send the container's items in the response
         JsonObject result = new JsonObject();
@@ -971,6 +993,7 @@ public class ActionExecutor {
             if (stack.isEmpty()) continue;
             JsonObject item = new JsonObject();
             item.addProperty("slot", i);
+            item.addProperty("scope", menu.slots.get(i).container == mc.player.getInventory() ? "player" : "storage");
             item.addProperty("name", stack.getItem().toString());
             item.addProperty("count", stack.getCount());
             item.addProperty("display", stack.getDisplayName().getString());
@@ -983,8 +1006,8 @@ public class ActionExecutor {
     private void handleTakeItem(WireServer.WireCommand cmd) {
         // Take item from container slot (shift-click to player inventory)
         var args = cmd.args();
-        if (args == null || !args.has("slot")) {
-            sendResponse(cmd.id(), false, "Need slot number");
+        if (args == null || !args.has("container_id") || !args.has("slot")) {
+            sendResponse(cmd.id(), false, "Need container_id and slot number");
             return;
         }
         var mc = Minecraft.getInstance();
@@ -993,10 +1016,17 @@ public class ActionExecutor {
             return;
         }
         var menu = mc.player.containerMenu;
-        if (menu == null) { sendResponse(cmd.id(), false, "No container open"); return; }
+        if (menu == null || menu == mc.player.inventoryMenu) { sendResponse(cmd.id(), false, "No container open"); return; }
 
+        int containerId = args.get("container_id").getAsInt();
         int slot = args.get("slot").getAsInt();
-        if (slot < 0 || slot >= menu.slots.size()) {
+        if (containerId != menu.containerId) {
+            sendResponse(cmd.id(), false, "Stale container id");
+            return;
+        }
+        if (slot < 0 || slot >= menu.slots.size()
+            || menu.slots.get(slot).container == mc.player.getInventory()
+            || !menu.slots.get(slot).mayPickup(mc.player)) {
             sendResponse(cmd.id(), false, "Invalid slot " + slot);
             return;
         }
@@ -1010,8 +1040,8 @@ public class ActionExecutor {
     private void handlePutItem(WireServer.WireCommand cmd) {
         // Put item from player inventory into container (shift-click)
         var args = cmd.args();
-        if (args == null || !args.has("slot")) {
-            sendResponse(cmd.id(), false, "Need slot number");
+        if (args == null || !args.has("container_id") || !args.has("slot")) {
+            sendResponse(cmd.id(), false, "Need container_id and slot number");
             return;
         }
         var mc = Minecraft.getInstance();
@@ -1020,10 +1050,17 @@ public class ActionExecutor {
             return;
         }
         var menu = mc.player.containerMenu;
-        if (menu == null) { sendResponse(cmd.id(), false, "No container open"); return; }
+        if (menu == null || menu == mc.player.inventoryMenu) { sendResponse(cmd.id(), false, "No container open"); return; }
 
+        int containerId = args.get("container_id").getAsInt();
         int slot = args.get("slot").getAsInt();
-        if (slot < 0 || slot >= menu.slots.size()) {
+        if (containerId != menu.containerId) {
+            sendResponse(cmd.id(), false, "Stale container id");
+            return;
+        }
+        if (slot < 0 || slot >= menu.slots.size()
+            || menu.slots.get(slot).container != mc.player.getInventory()
+            || !menu.slots.get(slot).mayPickup(mc.player)) {
             sendResponse(cmd.id(), false, "Invalid slot " + slot);
             return;
         }
@@ -1109,13 +1146,13 @@ public class ActionExecutor {
             return;
         }
         String playerName = args.get("player").getAsString();
+        if (pendingCraftItem != null) {
+            sendResponse(cmd.id(), false, "CONFLICT: craft operation currently owns movement and inventory");
+            return;
+        }
         Pathfinder.stop();
         MovementSystem.stop();
         JavaAutonomousBehavior.resetCurrentState();
-        pendingCraftItem = null;
-        pendingCraftReqId = null;
-        pendingCraftTicks = 0;
-        pendingCraftAttempts = 0;
         pendingEatReqId = null;
         pendingEatTicks = 0;
         pendingEatAttempts = 0;
@@ -1149,15 +1186,34 @@ public class ActionExecutor {
             sendResponse(cmd.id(), false, "No player");
             return;
         }
-        String itemName = normalizeItemName(args.get("item").getAsString());
+        String itemName = normalizeCraftItemName(args.get("item").getAsString());
         int requestedCount = args.has("count") ? Math.max(1, args.get("count").getAsInt()) : 1;
 
-        followTargetName = null;
+        if (pendingCraftItem != null && countInventoryItem(mc, pendingCraftItem) < pendingCraftGoalCount) {
+            if (CraftingPlanner.matchesRegistryId(pendingCraftItem, itemName)) {
+                sendResponse(cmd.id(), true, "Already crafting " + pendingCraftItem);
+            } else {
+                sendResponse(cmd.id(), false, "CONFLICT: already crafting " + pendingCraftItem);
+            }
+            return;
+        }
+
+        if (followTargetName != null) {
+            suspendedFollowTargetName = followTargetName;
+            followTargetName = null;
+            Pathfinder.stop();
+            MovementSystem.stop();
+        }
 
         pendingCraftItem = itemName;
         pendingCraftReqId = cmd.id();
         pendingCraftTicks = 0;
         pendingCraftAttempts = 0;
+        pendingCraftNoProgressAttempts = 0;
+        clearPendingCraftOutput();
+        pendingCraftProcessingStallTicks = 0;
+        clearPendingCraftStation();
+        lastCraftPlanDetail = "queued";
         int baselineCount = countInventoryItem(mc, itemName);
         pendingCraftGoalCount = (int) Math.min(Integer.MAX_VALUE, (long) baselineCount + requestedCount);
         clearPendingCollectTask();
@@ -1303,9 +1359,16 @@ public class ActionExecutor {
         data.addProperty("behaviors_enabled", JavaAutonomousBehavior.isEnabled()
                 && (ClientBodyRuntime.BEHAVIORS == null || ClientBodyRuntime.BEHAVIORS.isEnabled()));
         data.addProperty("follow_target", followTargetName == null ? "" : followTargetName);
+        data.addProperty("suspended_follow_target", suspendedFollowTargetName == null ? "" : suspendedFollowTargetName);
         data.addProperty("pending_craft_item", pendingCraftItem == null ? "" : pendingCraftItem);
         data.addProperty("pending_eat", pendingEatReqId != null);
         data.addProperty("pending_collect_item", pendingCollectItem == null ? "" : pendingCollectItem);
+        data.addProperty("pending_craft_goal_count", pendingCraftGoalCount);
+        data.addProperty("pending_craft_current_count", pendingCraftItem == null ? 0 : countInventoryItem(Minecraft.getInstance(), pendingCraftItem));
+        data.addProperty("pending_collect_baseline_count", pendingCollectBaselineCount);
+        data.addProperty("pending_collect_goal_count", pendingCollectGoalCount);
+        data.addProperty("pending_collect_current_count", pendingCollectItem == null ? 0 : countInventoryItem(Minecraft.getInstance(), pendingCollectItem));
+        data.addProperty("last_craft_plan", lastCraftPlanDetail);
         data.addProperty("navigating", Pathfinder.isNavigating());
         data.addProperty("active_behavior", JavaAutonomousBehavior.getState().name().toLowerCase());
         data.addProperty("movement_owner", currentMovementOwner());
@@ -1415,13 +1478,19 @@ public class ActionExecutor {
             if (LCUMod.WIRE != null) {
                 LCUMod.WIRE.sendProgress(pendingCraftReqId, 1.0, "crafted: " + pendingCraftItem);
             }
-            pendingCraftItem = null;
-            pendingCraftReqId = null;
-            pendingCraftTicks = 0;
-            pendingCraftAttempts = 0;
-            pendingCraftGoalCount = 1;
-            clearTaskState();
-            sendBehaviorSnapshot();
+            finishCraftTask();
+            return;
+        }
+
+        if (pendingCraftAwaitingOutput) {
+            tickPendingCraftOutput(mc);
+            return;
+        }
+        if (pendingCraftNoProgressAttempts >= 3) {
+            if (LCUMod.WIRE != null) {
+                LCUMod.WIRE.sendProgress(pendingCraftReqId, 0.0, "craft made no inventory progress: " + pendingCraftItem);
+            }
+            finishCraftTask();
             return;
         }
 
@@ -1435,6 +1504,7 @@ public class ActionExecutor {
         }
 
         CraftingPlanner.CraftPlan plan = CraftingPlanner.plan(mc, pendingCraftItem, pendingCraftGoalCount);
+        lastCraftPlanDetail = plan.describe();
         if (!plan.missingRaw.isEmpty()) {
             Map.Entry<String, Integer> firstMissing = plan.missingRaw.entrySet().iterator().next();
             startCollectTask(mc, pendingCraftReqId, firstMissing.getKey(), firstMissing.getValue());
@@ -1451,11 +1521,7 @@ public class ActionExecutor {
             if (LCUMod.WIRE != null) {
                 LCUMod.WIRE.sendProgress(pendingCraftReqId, 0.0, plan.failureReason.isBlank() ? "no craft path for " + pendingCraftItem : plan.failureReason);
             }
-            pendingCraftItem = null;
-            pendingCraftReqId = null;
-            pendingCraftGoalCount = 1;
-            clearTaskState();
-            sendBehaviorSnapshot();
+            finishCraftTask();
             return;
         }
 
@@ -1468,18 +1534,25 @@ public class ActionExecutor {
                     if (LCUMod.WIRE != null) {
                         LCUMod.WIRE.sendProgress(pendingCraftReqId, 0.0, "need nearby crafting table for " + pendingCraftItem);
                     }
-                    pendingCraftItem = null;
-                    pendingCraftReqId = null;
-                    pendingCraftGoalCount = 1;
-                    clearTaskState();
-                    sendBehaviorSnapshot();
+                    finishCraftTask();
                 }
+                return;
+            }
+
+            if (!needsTable
+                && mc.player.containerMenu != mc.player.inventoryMenu
+                && !(mc.player.containerMenu instanceof CraftingMenu)) {
+                mc.player.closeContainer();
                 return;
             }
 
             pendingCraftAttempts++;
             mc.gameMode.handlePlaceRecipe(mc.player.containerMenu.containerId, step.recipe, false);
-            mc.gameMode.handleInventoryMouseClick(mc.player.containerMenu.containerId, 0, 0, ClickType.QUICK_MOVE, mc.player);
+            pendingCraftAwaitingOutput = true;
+            pendingCraftOutputClicked = false;
+            pendingCraftOutputWaitTicks = 0;
+            pendingCraftOutputMenuId = mc.player.containerMenu.containerId;
+            pendingCraftExpectedOutput = step.itemId;
             String detail = "craft step " + pendingCraftAttempts + ": " + step.itemId + " x" + step.craftOperations;
             setTaskState("craft", "crafting", pendingCraftItem, detail, Math.min(0.9, 0.35 + pendingCraftAttempts * 0.12));
             if (LCUMod.WIRE != null) {
@@ -1495,16 +1568,13 @@ public class ActionExecutor {
                     if (LCUMod.WIRE != null) {
                         LCUMod.WIRE.sendProgress(pendingCraftReqId, 0.0, "need nearby " + step.stationBlockId + " for " + pendingCraftItem);
                     }
-                    pendingCraftItem = null;
-                    pendingCraftReqId = null;
-                    pendingCraftGoalCount = 1;
-                    clearTaskState();
-                    sendBehaviorSnapshot();
+                    finishCraftTask();
                 }
                 return;
             }
 
             if (pickupProcessedOutputIfReady(mc, step.itemId)) {
+                pendingCraftProcessingStallTicks = 0;
                 setTaskState("craft", "processing", pendingCraftItem, "collecting processed output", Math.min(0.95, 0.55 + pendingCraftAttempts * 0.05));
                 return;
             }
@@ -1521,6 +1591,14 @@ public class ActionExecutor {
             }
 
             if (isProcessingStationBusy(mc)) {
+                pendingCraftProcessingStallTicks += 10;
+                if (pendingCraftProcessingStallTicks > 400) {
+                    if (LCUMod.WIRE != null) {
+                        LCUMod.WIRE.sendProgress(pendingCraftReqId, 0.0, "processing station blocked by unrelated or stalled contents");
+                    }
+                    finishCraftTask();
+                    return;
+                }
                 String detail = step.mode + " in progress for " + pendingCraftItem;
                 setTaskState("craft", "processing", pendingCraftItem, detail, Math.min(0.88, 0.45 + pendingCraftAttempts * 0.06));
                 if (LCUMod.WIRE != null) {
@@ -1534,6 +1612,7 @@ public class ActionExecutor {
             }
 
             pendingCraftAttempts++;
+            pendingCraftProcessingStallTicks = 0;
             mc.gameMode.handlePlaceRecipe(mc.player.containerMenu.containerId, step.recipe, false);
             String detail = step.mode + " step " + pendingCraftAttempts + ": " + step.itemId + " x" + step.craftOperations;
             setTaskState("craft", "processing", pendingCraftItem, detail, Math.min(0.9, 0.45 + pendingCraftAttempts * 0.08));
@@ -1546,16 +1625,71 @@ public class ActionExecutor {
             }
         }
 
-        if (pendingCraftAttempts >= 8 && countInventoryItem(mc, pendingCraftItem) < pendingCraftGoalCount) {
-            if (LCUMod.WIRE != null) {
-                LCUMod.WIRE.sendProgress(pendingCraftReqId, 0.0, "craft failed or missing materials: " + pendingCraftItem);
-            }
-            pendingCraftItem = null;
-            pendingCraftReqId = null;
-            pendingCraftGoalCount = 1;
-            clearTaskState();
-            sendBehaviorSnapshot();
+    }
+
+    private void tickPendingCraftOutput(Minecraft mc) {
+        pendingCraftOutputWaitTicks++;
+        var menu = mc.player.containerMenu;
+        if (menu == null || menu.containerId != pendingCraftOutputMenuId || menu.slots.isEmpty()) {
+            pendingCraftNoProgressAttempts++;
+            clearPendingCraftOutput();
+            return;
         }
+
+        if (!pendingCraftOutputClicked) {
+            var output = menu.slots.get(0).getItem();
+            if (!output.isEmpty()) {
+                String outputId = BuiltInRegistries.ITEM.getKey(output.getItem()).toString();
+                if (CraftingPlanner.matchesRegistryId(outputId, pendingCraftExpectedOutput)) {
+                    pendingCraftOutputBaseline = countInventoryItem(mc, pendingCraftExpectedOutput);
+                    mc.gameMode.handleInventoryMouseClick(menu.containerId, 0, 0, ClickType.QUICK_MOVE, mc.player);
+                    pendingCraftOutputClicked = true;
+                    pendingCraftOutputWaitTicks = 0;
+                    return;
+                }
+            }
+        } else if (countInventoryItem(mc, pendingCraftExpectedOutput) > pendingCraftOutputBaseline) {
+            pendingCraftNoProgressAttempts = 0;
+            clearPendingCraftOutput();
+            pendingCraftTicks = 0;
+            return;
+        }
+
+        if (pendingCraftOutputWaitTicks > 30) {
+            pendingCraftNoProgressAttempts++;
+            clearPendingCraftOutput();
+        }
+    }
+
+    private void clearPendingCraftOutput() {
+        pendingCraftAwaitingOutput = false;
+        pendingCraftOutputClicked = false;
+        pendingCraftOutputWaitTicks = 0;
+        pendingCraftOutputMenuId = -1;
+        pendingCraftOutputBaseline = 0;
+        pendingCraftExpectedOutput = null;
+    }
+
+    private void finishCraftTask() {
+        pendingCraftItem = null;
+        pendingCraftReqId = null;
+        pendingCraftTicks = 0;
+        pendingCraftAttempts = 0;
+        pendingCraftNoProgressAttempts = 0;
+        clearPendingCraftOutput();
+        pendingCraftProcessingStallTicks = 0;
+        clearPendingCraftStation();
+        pendingCraftGoalCount = 1;
+        clearPendingCollectTask();
+        if (suspendedFollowTargetName != null) {
+            followTargetName = suspendedFollowTargetName;
+            suspendedFollowTargetName = null;
+            followRefreshTicks = 0;
+            setTaskState("follow", "running", followTargetName, "resumed after craft", 0.1);
+        } else {
+            clearTaskState();
+        }
+        sendBehaviorSnapshot();
     }
 
     private void tickPendingCollect(Minecraft mc) {
@@ -1612,11 +1746,14 @@ public class ActionExecutor {
                 pendingCollectSearchMisses++;
                 setTaskState(resolveRootTaskKind(), "searching", pendingCollectItem, "searching for collectible block or drop", collectProgress(mc));
                 if (pendingCollectSearchMisses >= 12) {
+                    boolean parentCraft = pendingCraftReqId != null && pendingCraftReqId.equals(pendingCollectReqId);
                     if (LCUMod.WIRE != null) {
                         LCUMod.WIRE.sendProgress(pendingCollectReqId, 0.0, "no collectible source found for " + pendingCollectItem);
                     }
                     clearPendingCollectTask();
-                    if (pendingCraftReqId == null) {
+                    if (parentCraft) {
+                        finishCraftTask();
+                    } else {
                         clearTaskState();
                     }
                     sendBehaviorSnapshot();
@@ -1654,6 +1791,8 @@ public class ActionExecutor {
     private boolean tryStorageSourceForCollect(Minecraft mc) {
         if (pendingCollectItem == null) return false;
         BlockPos storagePos = null;
+        BlockPos storageInteractionPos = null;
+        Vec3 storageStandPos = null;
         for (var poi : PoiMemory.snapshotSortedByItemMatch(mc, "storage", pendingCollectItem, PoiMemory.INTERACTION_RADIUS, 16)) {
             BlockPos candidate = new BlockPos(
                 poi.get("x").getAsInt(),
@@ -1666,7 +1805,14 @@ public class ActionExecutor {
             if (PoiMemory.getStorageItemCount(candidate, pendingCollectItem) <= 0) {
                 continue;
             }
+            StorageApproach approach = findStorageApproach(mc, candidate);
+            if (approach == null) {
+                triedStoragePositions.add(candidate.immutable());
+                return true;
+            }
             storagePos = candidate;
+            storageInteractionPos = approach.interactionPos;
+            storageStandPos = approach.standPos;
             break;
         }
         if (storagePos == null) {
@@ -1676,10 +1822,16 @@ public class ActionExecutor {
                     poi.get("y").getAsInt(),
                     poi.get("z").getAsInt()
                 );
-                if (!triedStoragePositions.contains(candidate) && !PoiMemory.hasKnownContents(candidate)) {
-                    storagePos = candidate;
-                    break;
+                if (triedStoragePositions.contains(candidate) || PoiMemory.hasKnownContents(candidate)) continue;
+                StorageApproach approach = findStorageApproach(mc, candidate);
+                if (approach == null) {
+                    triedStoragePositions.add(candidate.immutable());
+                    return true;
                 }
+                storagePos = candidate;
+                storageInteractionPos = approach.interactionPos;
+                storageStandPos = approach.standPos;
+                break;
             }
         }
         if (storagePos == null) return false;
@@ -1688,11 +1840,29 @@ public class ActionExecutor {
         int stillNeeded = Math.max(1, pendingCollectGoalCount - currentCount);
 
         pendingStoragePos = storagePos;
+        pendingStorageInteractionPos = storageInteractionPos;
+        pendingStorageStandPos = storageStandPos;
         pendingStorageTargetItem = pendingCollectItem;
         pendingStorageGoalCount = stillNeeded;
+        pendingStorageStartCount = currentCount;
         pendingStorageTicks = 0;
         triedStoragePositions.add(storagePos.immutable());
         return true;
+    }
+
+    private StorageApproach findStorageApproach(Minecraft mc, BlockPos storagePos) {
+        StorageApproach best = null;
+        double bestDistance = Double.POSITIVE_INFINITY;
+        for (BlockPos interactionPos : PoiMemory.getStorageInteractionPositions(mc, storagePos)) {
+            Vec3 standPos = Pathfinder.findReachableInteractionPosition(mc, interactionPos, 4.25);
+            if (standPos == null) continue;
+            double distance = standPos.distanceToSqr(mc.player.position());
+            if (distance < bestDistance) {
+                best = new StorageApproach(interactionPos.immutable(), standPos);
+                bestDistance = distance;
+            }
+        }
+        return best;
     }
 
     /**
@@ -1705,139 +1875,204 @@ public class ActionExecutor {
             return;
         }
 
-        // Abort if the collect task was cancelled or target changed
         if (pendingCollectItem == null
             || !CraftingPlanner.matchesRegistryId(pendingStorageTargetItem, pendingCollectItem)) {
             clearPendingStorageTask();
             return;
         }
-
-        pendingStorageTicks++;
-
-        // Timeout: 100 ticks (5 seconds) — prevent getting stuck
-        if (pendingStorageTicks > 100) {
+        if (!InputIsolation.isAiControlled() || mc.player.isDeadOrDying()) {
             cleanupAndClearStorage(mc);
             return;
         }
 
-        double distSq = mc.player.distanceToSqr(Vec3.atCenterOf(pendingStoragePos));
+        pendingStorageTicks++;
+        if (pendingStorageTicks > 400) {
+            cleanupAndClearStorage(mc);
+            return;
+        }
 
-        // ── Phase 1: Not close enough → navigate ──
-        if (distSq > 9.0) {
-            MovementSystem.moveTo(
-                pendingStoragePos.getX() + 0.5, pendingStoragePos.getY(),
-                pendingStoragePos.getZ() + 0.5, 1.0f);
+        if (pendingStorageStandPos == null || pendingStorageInteractionPos == null) {
+            cleanupAndClearStorage(mc);
+            return;
+        }
+
+        double standDistSq = mc.player.position().distanceToSqr(pendingStorageStandPos);
+        if (standDistSq > 1.0) {
+            Vec3 movementTarget = MovementSystem.getTarget();
+            if (!MovementSystem.isMoving()
+                || movementTarget == null
+                || movementTarget.distanceToSqr(pendingStorageStandPos) > 0.25) {
+                boolean started = MovementSystem.moveTo(
+                    pendingStorageStandPos.x, pendingStorageStandPos.y,
+                    pendingStorageStandPos.z, 1.0f);
+                if (!started) {
+                    cleanupAndClearStorage(mc);
+                    return;
+                }
+            }
             setTaskState(resolveRootTaskKind(), "storage", pendingStorageTargetItem,
                 "moving to storage", 0.15);
             return;
         }
+        if (MovementSystem.isMoving()) {
+            MovementSystem.stop();
+        }
 
-        boolean containerOpen = mc.player.containerMenu != null
-            && mc.player.containerMenu != mc.player.inventoryMenu;
-
-        // ── Phase 2: Close enough but container not open → right-click ──
-        if (!containerOpen) {
-            // Small settle delay after arriving
-            if (pendingStorageTicks < 6) {
+        var menu = mc.player.containerMenu;
+        boolean inventoryMenu = menu == null || menu == mc.player.inventoryMenu;
+        if (pendingStorageOwnedMenuId < 0) {
+            if (!inventoryMenu) {
+                if (pendingStorageOpenSentTick < 0) {
+                    clearPendingStorageTask();
+                    return;
+                }
+                if (!isLikelyStorageMenu(mc)) {
+                    clearPendingStorageTask();
+                    return;
+                }
+                pendingStorageOwnedMenuId = menu.containerId;
+                pendingStorageMenuOpenTick = pendingStorageTicks;
                 setTaskState(resolveRootTaskKind(), "storage", pendingStorageTargetItem,
-                    "arrived at storage", 0.2);
+                    "inspecting storage", 0.35);
                 return;
             }
-            Vec3 hitVec = Vec3.atCenterOf(pendingStoragePos);
-            BlockHitResult hitResult = new BlockHitResult(hitVec, Direction.UP, pendingStoragePos, false);
-            if ((pendingStorageTicks - 6) % 10 == 0) {
+
+            if (pendingStorageOpenSentTick < 0) {
+                Vec3 hitVec = Vec3.atCenterOf(pendingStorageInteractionPos);
+                BlockHitResult hitResult = new BlockHitResult(hitVec, Direction.UP, pendingStorageInteractionPos, false);
                 mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, hitResult);
+                pendingStorageOpenSentTick = pendingStorageTicks;
+                pendingStorageOpenAttempts++;
+            } else if (pendingStorageTicks - pendingStorageOpenSentTick > 30) {
+                if (pendingStorageOpenAttempts >= 2) {
+                    clearPendingStorageTask();
+                    return;
+                }
+                pendingStorageOpenSentTick = -1;
             }
             setTaskState(resolveRootTaskKind(), "storage", pendingStorageTargetItem,
                 "opening storage", 0.3);
             return;
         }
 
-        // ── Phase 3: Container is open → scan & withdraw ──
-        if (pendingStorageMenuOpenTick < 0) {
-            pendingStorageMenuOpenTick = pendingStorageTicks;
-            setTaskState(resolveRootTaskKind(), "storage", pendingStorageTargetItem,
-                "inspecting storage", 0.35);
+        if (inventoryMenu || menu.containerId != pendingStorageOwnedMenuId) {
+            clearPendingStorageTask();
             return;
         }
-        if (pendingStorageTicks - pendingStorageMenuOpenTick < 12) {
-            return;
-        }
-        int foundStacks = withdrawMatchingFromContainer(mc, pendingStorageTargetItem, pendingStorageGoalCount);
+        if (pendingStorageTicks - pendingStorageMenuOpenTick < 4) return;
 
-        if (foundStacks > 0 && LCUMod.WIRE != null && pendingCollectReqId != null) {
-            int totalNow = countInventoryItem(mc, pendingStorageTargetItem);
-            int gained = totalNow - pendingCollectBaselineCount;
-            LCUMod.WIRE.sendProgress(pendingCollectReqId, 0.45,
-                "withdrew "
-                + pendingStorageTargetItem + " x" + Math.max(0, gained)
-                + " from storage");
-        }
-
-        // ── Phase 4: Close container and clear state ──
-        mc.player.closeContainer();
-        clearPendingStorageTask();
-    }
-
-    /**
-     * Scan the currently open container menu for items matching itemId,
-     * shift-click each matching stack to transfer to player inventory.
-     * Returns the number of stacks withdrawn.
-     */
-    private int withdrawMatchingFromContainer(Minecraft mc, String itemId, int maxCount) {
-        if (mc.player.containerMenu == null || mc.player.containerMenu == mc.player.inventoryMenu) {
-            return 0;
-        }
-        int totalSlots = mc.player.containerMenu.slots.size();
-        // Player inventory occupies the last ~36 slots (27 main + 9 hotbar).
-        // Container slots are everything before that.
-        int containerEndSlot = Math.max(0, totalSlots - 36);
-
-        // Scan all container slots and cache contents
-        Map<String, Integer> contents = new java.util.HashMap<>();
-        List<Integer> matchingSlots = new ArrayList<>();
-        for (int slot = 0; slot < containerEndSlot; slot++) {
-            var stack = mc.player.containerMenu.slots.get(slot).getItem();
-            if (stack.isEmpty()) continue;
-            String stackId = BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
-            contents.merge(stackId, stack.getCount(), Integer::sum);
-            if (CraftingPlanner.matchesRegistryId(stackId, itemId)) {
-                matchingSlots.add(slot);
-                if (matchingSlots.size() * 64 >= maxCount) break;
+        int currentCount = countInventoryItem(mc, pendingStorageTargetItem);
+        if (pendingStorageClickTick >= 0) {
+            if (currentCount > pendingStorageClickBaseline) {
+                pendingStorageClickTick = -1;
+                pendingStorageClickAttempts = 0;
+            } else if (pendingStorageTicks - pendingStorageClickTick <= 20) {
+                return;
+            } else {
+                pendingStorageClickTick = -1;
+                pendingStorageClickAttempts++;
+                if (pendingStorageClickAttempts >= 2) {
+                    closeOwnedStorageMenu(mc);
+                    clearPendingStorageTask();
+                    return;
+                }
             }
         }
 
-        // Update POI memory cache with known contents
+        if (currentCount - pendingStorageStartCount >= pendingStorageGoalCount) {
+            scanStorageMenu(mc, pendingStorageTargetItem);
+            if (LCUMod.WIRE != null && pendingCollectReqId != null) {
+                LCUMod.WIRE.sendProgress(pendingCollectReqId, 0.45,
+                    "withdrew " + pendingStorageTargetItem + " x" + (currentCount - pendingStorageStartCount) + " from storage");
+            }
+            closeOwnedStorageMenu(mc);
+            clearPendingStorageTask();
+            return;
+        }
+
+        StorageScan scan = scanStorageMenu(mc, pendingStorageTargetItem);
+        if (scan.matchingSlot < 0) {
+            closeOwnedStorageMenu(mc);
+            clearPendingStorageTask();
+            return;
+        }
+        pendingStorageClickBaseline = currentCount;
+        pendingStorageClickTick = pendingStorageTicks;
+        mc.gameMode.handleInventoryMouseClick(
+            menu.containerId, scan.matchingSlot, 0,
+            ClickType.QUICK_MOVE, mc.player);
+    }
+
+    private StorageScan scanStorageMenu(Minecraft mc, String itemId) {
+        if (mc.player.containerMenu == null || mc.player.containerMenu == mc.player.inventoryMenu) {
+            return new StorageScan(Map.of(), -1);
+        }
+        Map<String, Integer> contents = new java.util.HashMap<>();
+        int matchingSlot = -1;
+        for (int slot = 0; slot < mc.player.containerMenu.slots.size(); slot++) {
+            var menuSlot = mc.player.containerMenu.slots.get(slot);
+            if (menuSlot.container == mc.player.getInventory() || !menuSlot.mayPickup(mc.player)) continue;
+            var stack = menuSlot.getItem();
+            if (stack.isEmpty()) continue;
+            String stackId = BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
+            contents.merge(stackId, stack.getCount(), Integer::sum);
+            if (matchingSlot < 0 && CraftingPlanner.matchesItemId(stackId, itemId)) {
+                matchingSlot = slot;
+            }
+        }
+
         if (pendingStoragePos != null) {
             PoiMemory.updateStorageContents(pendingStoragePos, contents, tickCount);
         }
-
-        if (matchingSlots.isEmpty()) return 0;
-
-        // Shift-click each matching slot to withdraw
-        for (int slot : matchingSlots) {
-            mc.gameMode.handleInventoryMouseClick(
-                mc.player.containerMenu.containerId, slot, 0,
-                ClickType.QUICK_MOVE, mc.player);
-        }
-
-        return matchingSlots.size();
+        return new StorageScan(contents, matchingSlot);
     }
 
-    /** Close open container if any, then clear storage state. */
-    private void cleanupAndClearStorage(Minecraft mc) {
-        if (mc.player.containerMenu != null && mc.player.containerMenu != mc.player.inventoryMenu) {
+    private boolean isLikelyStorageMenu(Minecraft mc) {
+        var menu = mc.player.containerMenu;
+        if (menu == null || menu == mc.player.inventoryMenu) return false;
+        String name = menu.getClass().getSimpleName().toLowerCase();
+        if (name.contains("craft") || name.contains("furnace") || name.contains("smoker")
+            || name.contains("anvil") || name.contains("enchant") || name.contains("merchant")) {
+            return false;
+        }
+        return menu.slots.stream().anyMatch(slot ->
+            slot.container != mc.player.getInventory() && slot.mayPickup(mc.player));
+    }
+
+    private void closeOwnedStorageMenu(Minecraft mc) {
+        if (mc.player.containerMenu != null
+            && mc.player.containerMenu != mc.player.inventoryMenu
+            && mc.player.containerMenu.containerId == pendingStorageOwnedMenuId) {
             mc.player.closeContainer();
         }
+    }
+
+    private void cleanupAndClearStorage(Minecraft mc) {
+        closeOwnedStorageMenu(mc);
         clearPendingStorageTask();
     }
 
     private void clearPendingStorageTask() {
         pendingStoragePos = null;
+        pendingStorageInteractionPos = null;
+        pendingStorageStandPos = null;
         pendingStorageTargetItem = null;
         pendingStorageGoalCount = 0;
+        pendingStorageStartCount = 0;
         pendingStorageTicks = 0;
+        pendingStorageOpenSentTick = -1;
+        pendingStorageOpenAttempts = 0;
+        pendingStorageOwnedMenuId = -1;
         pendingStorageMenuOpenTick = -1;
+        pendingStorageClickTick = -1;
+        pendingStorageClickBaseline = 0;
+        pendingStorageClickAttempts = 0;
+    }
+
+    private record StorageApproach(BlockPos interactionPos, Vec3 standPos) {
+    }
+
+    private record StorageScan(Map<String, Integer> contents, int matchingSlot) {
     }
 
     private boolean hasItem(Minecraft mc, String itemName) {
@@ -1866,18 +2101,13 @@ public class ActionExecutor {
     }
 
     private boolean isCraftingTableOpen(Minecraft mc) {
-        return mc.player.containerMenu != null
-            && mc.player.containerMenu != mc.player.inventoryMenu
-            && mc.player.containerMenu.slots.size() >= 10;
+        return mc.player.containerMenu instanceof CraftingMenu;
     }
 
     private boolean openNearbyCraftingTable(Minecraft mc) {
         BlockPos remembered = PoiMemory.findNearest(mc, Set.of("minecraft:crafting_table"), PoiMemory.INTERACTION_RADIUS);
         if (remembered != null && mc.level.getBlockState(remembered).is(Blocks.CRAFTING_TABLE)) {
-            Vec3 hitVec = Vec3.atCenterOf(remembered);
-            BlockHitResult hitResult = new BlockHitResult(hitVec, Direction.UP, remembered, false);
-            mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, hitResult);
-            return true;
+            return navigateAndUseStation(mc, remembered);
         }
 
         BlockPos playerPos = mc.player.blockPosition();
@@ -1886,10 +2116,7 @@ public class ActionExecutor {
                 for (int dz = -4; dz <= 4; dz++) {
                     BlockPos pos = playerPos.offset(dx, dy, dz);
                     if (!mc.level.getBlockState(pos).is(Blocks.CRAFTING_TABLE)) continue;
-                    Vec3 hitVec = Vec3.atCenterOf(pos);
-                    BlockHitResult hitResult = new BlockHitResult(hitVec, Direction.UP, pos, false);
-                    mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, hitResult);
-                    return true;
+                    return navigateAndUseStation(mc, pos);
                 }
             }
         }
@@ -1941,10 +2168,7 @@ public class ActionExecutor {
         if (remembered != null) {
             String rememberedId = BuiltInRegistries.BLOCK.getKey(mc.level.getBlockState(remembered).getBlock()).toString();
             if (rememberedId.equals(stationBlockId)) {
-                Vec3 hitVec = Vec3.atCenterOf(remembered);
-                BlockHitResult hitResult = new BlockHitResult(hitVec, Direction.UP, remembered, false);
-                mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, hitResult);
-                return true;
+                return navigateAndUseStation(mc, remembered);
             }
         }
 
@@ -1955,14 +2179,53 @@ public class ActionExecutor {
                     BlockPos pos = playerPos.offset(dx, dy, dz);
                     String blockId = BuiltInRegistries.BLOCK.getKey(mc.level.getBlockState(pos).getBlock()).toString();
                     if (!blockId.equals(stationBlockId)) continue;
-                    Vec3 hitVec = Vec3.atCenterOf(pos);
-                    BlockHitResult hitResult = new BlockHitResult(hitVec, Direction.UP, pos, false);
-                    mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, hitResult);
-                    return true;
+                    return navigateAndUseStation(mc, pos);
                 }
             }
         }
         return placeStationFromInventory(mc, stationBlockId);
+    }
+
+    private boolean navigateAndUseStation(Minecraft mc, BlockPos stationPos) {
+        if (!stationPos.equals(pendingCraftStationPos) || pendingCraftStationStandPos == null) {
+            Vec3 standPos = Pathfinder.findReachableInteractionPosition(mc, stationPos, 4.25);
+            if (standPos == null) return false;
+            pendingCraftStationPos = stationPos.immutable();
+            pendingCraftStationStandPos = standPos;
+            pendingCraftStationUseAttempts = 0;
+        }
+
+        if (mc.player.position().distanceToSqr(pendingCraftStationStandPos) > 1.0) {
+            Vec3 movementTarget = MovementSystem.getTarget();
+            if (!MovementSystem.isMoving()
+                || movementTarget == null
+                || movementTarget.distanceToSqr(pendingCraftStationStandPos) > 0.25) {
+                return MovementSystem.moveTo(
+                    pendingCraftStationStandPos.x,
+                    pendingCraftStationStandPos.y,
+                    pendingCraftStationStandPos.z,
+                    1.0f
+                );
+            }
+            return true;
+        }
+
+        MovementSystem.stop();
+        if (pendingCraftStationUseAttempts >= 3) return false;
+        pendingCraftStationUseAttempts++;
+        mc.player.lookAt(net.minecraft.commands.arguments.EntityAnchorArgument.Anchor.EYES, Vec3.atCenterOf(stationPos));
+        mc.gameMode.useItemOn(
+            mc.player,
+            InteractionHand.MAIN_HAND,
+            new BlockHitResult(Vec3.atCenterOf(stationPos), Direction.UP, stationPos, false)
+        );
+        return true;
+    }
+
+    private void clearPendingCraftStation() {
+        pendingCraftStationPos = null;
+        pendingCraftStationStandPos = null;
+        pendingCraftStationUseAttempts = 0;
     }
 
     private int findHotbarOrInventoryItem(Minecraft mc, String itemId) {
@@ -2119,13 +2382,24 @@ public class ActionExecutor {
             case "木剑" -> "minecraft:wooden_sword";
             case "木镐" -> "minecraft:wooden_pickaxe";
             case "木棍" -> "minecraft:stick";
-            case "木板" -> "minecraft:oak_planks";
+            case "木板" -> "#minecraft:planks";
+            case "原木" -> "#minecraft:logs";
+            case "木头" -> "#lcu:wood";
             case "工作台" -> "minecraft:crafting_table";
             case "石剑" -> "minecraft:stone_sword";
             case "石镐" -> "minecraft:stone_pickaxe";
             default -> compact;
         };
         return normalized.contains(":") ? normalized : "minecraft:" + normalized;
+    }
+
+    private String normalizeCraftItemName(String itemName) {
+        String normalized = normalizeItemName(itemName);
+        return switch (normalized) {
+            case "#minecraft:planks" -> "minecraft:oak_planks";
+            case "#minecraft:logs", "#lcu:wood" -> "minecraft:oak_log";
+            default -> normalized;
+        };
     }
 
     private void tickPendingEat(Minecraft mc) {
@@ -2196,12 +2470,13 @@ public class ActionExecutor {
     }
 
     private int countInventoryItem(Minecraft mc, String itemId) {
+        if (mc == null || mc.player == null || itemId == null) return 0;
         int total = 0;
         for (int i = 0; i < mc.player.getInventory().getContainerSize(); i++) {
             var stack = mc.player.getInventory().getItem(i);
             if (stack.isEmpty()) continue;
             String id = BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
-            if (CraftingPlanner.matchesRegistryId(id, itemId)) {
+            if (CraftingPlanner.matchesItemId(id, itemId)) {
                 total += stack.getCount();
             }
         }
@@ -2255,51 +2530,25 @@ public class ActionExecutor {
             return true;
         }
         String itemFromBlock = BuiltInRegistries.ITEM.getKey(state.getBlock().asItem()).toString();
-        return matchesCollectTargetId(itemFromBlock, itemId);
+        if (matchesCollectTargetId(itemFromBlock, itemId)) {
+            return true;
+        }
+        return switch (itemId) {
+            case "minecraft:raw_iron" -> blockId.equals("minecraft:iron_ore") || blockId.equals("minecraft:deepslate_iron_ore");
+            case "minecraft:raw_gold" -> blockId.equals("minecraft:gold_ore") || blockId.equals("minecraft:deepslate_gold_ore");
+            case "minecraft:raw_copper" -> blockId.equals("minecraft:copper_ore") || blockId.equals("minecraft:deepslate_copper_ore");
+            case "minecraft:coal" -> blockId.equals("minecraft:coal_ore") || blockId.equals("minecraft:deepslate_coal_ore");
+            case "minecraft:diamond" -> blockId.equals("minecraft:diamond_ore") || blockId.equals("minecraft:deepslate_diamond_ore");
+            case "minecraft:emerald" -> blockId.equals("minecraft:emerald_ore") || blockId.equals("minecraft:deepslate_emerald_ore");
+            case "minecraft:redstone" -> blockId.equals("minecraft:redstone_ore") || blockId.equals("minecraft:deepslate_redstone_ore");
+            case "minecraft:lapis_lazuli" -> blockId.equals("minecraft:lapis_ore") || blockId.equals("minecraft:deepslate_lapis_ore");
+            case "minecraft:quartz" -> blockId.equals("minecraft:nether_quartz_ore");
+            default -> false;
+        };
     }
 
     private boolean matchesCollectTargetId(String candidateId, String targetId) {
-        if (CraftingPlanner.matchesRegistryId(candidateId, targetId)) {
-            return true;
-        }
-
-        String candidatePath = resourcePath(candidateId);
-        String targetPath = resourcePath(targetId);
-        if (candidatePath.isBlank() || targetPath.isBlank()) {
-            return false;
-        }
-
-        if (candidatePath.contains(targetPath) || targetPath.contains(candidatePath)) {
-            return true;
-        }
-
-        String targetToken = resourceToken(targetPath);
-        return !targetToken.isBlank() && candidatePath.contains(targetToken);
-    }
-
-    private String resourcePath(String registryId) {
-        if (registryId == null || registryId.isBlank()) {
-            return "";
-        }
-        int separator = registryId.indexOf(':');
-        return (separator >= 0 ? registryId.substring(separator + 1) : registryId).toLowerCase();
-    }
-
-    private String resourceToken(String resourcePath) {
-        String token = resourcePath.toLowerCase();
-        String[] removablePrefixes = {"raw_", "deepslate_", "stripped_"};
-        for (String prefix : removablePrefixes) {
-            if (token.startsWith(prefix)) {
-                token = token.substring(prefix.length());
-            }
-        }
-        String[] removableSuffixes = {"_ore", "_block", "_ingot", "_nugget", "_dust", "_gem"};
-        for (String suffix : removableSuffixes) {
-            if (token.endsWith(suffix)) {
-                token = token.substring(0, token.length() - suffix.length());
-            }
-        }
-        return token;
+        return CraftingPlanner.matchesItemId(candidateId, targetId);
     }
 
     private void autoEquipForBlock(Minecraft mc, BlockPos blockPos) {

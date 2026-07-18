@@ -36,9 +36,9 @@ ITEM_ALIASES = {
 }
 
 BLOCK_ALIASES = {
-    "木头": "oak_log",
-    "原木": "oak_log",
-    "木板": "oak_planks",
+    "木头": "#lcu:wood",
+    "原木": "#minecraft:logs",
+    "木板": "#minecraft:planks",
     "圆石": "cobblestone",
     "煤": "coal_ore",
     "铁": "iron_ore",
@@ -242,7 +242,7 @@ class Planner:
 6. 如果需要多步操作，可以连续执行多个动作
 7. tool()/动作参数必须是可执行的真实参数，不能写“随机位置”“附近”“合适的地方”这种占位词
 8. 如果用户要求停止跟随或停止当前动作，优先使用 stop()
-9. 中文常见物品名要转换成带命名空间的 Minecraft 物品 ID，例如 铁镐=minecraft:iron_pickaxe，木头=minecraft:oak_log
+9. 中文具体物品名转换为 registry ID；类别词使用标签，例如 铁镐=minecraft:iron_pickaxe，原木=#minecraft:logs，木板=#minecraft:planks，木头=#lcu:wood
 10. 如果当前任务状态不是 idle，且用户没有明确改变目标，不要重复下发同一个任务，优先继续或补全当前任务链
 
 请分析情况并决定下一步行动。如果需要回复，使用 reply()。如果需要执行动作，优先使用 tool(动作名, JSON参数)。
@@ -517,6 +517,7 @@ finish()
 
     def _execute_tool_calls(self, text: str, context: dict) -> bool:
         executed = False
+        seen_calls: set[str] = set()
         for match in TOOL_CALL_RE.finditer(text):
             tool_name = match.group(1).strip().lower()
             payload_text = match.group(2).strip()
@@ -526,6 +527,14 @@ finish()
                 logger.warning("[Planner] 无法解析 tool 调用参数: %s", payload_text[:120])
                 continue
 
+            call_key = json.dumps(
+                {"tool": tool_name, "payload": payload},
+                ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+            )
+            if call_key in seen_calls:
+                logger.info("[Planner] 忽略同一规划中的重复工具调用: %s", tool_name)
+                continue
+            seen_calls.add(call_key)
             if self._dispatch_tool_call(tool_name, payload, context):
                 executed = True
         return executed

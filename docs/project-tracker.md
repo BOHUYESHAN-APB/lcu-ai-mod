@@ -1,6 +1,6 @@
 # LCU Project Tracker
 
-Updated: 2026-07-18
+Updated: 2026-07-19
 
 This document is the persistent source of truth for requirements, architecture
 decisions, unresolved questions, delivery order, and verification. It exists so
@@ -41,7 +41,8 @@ required for deterministic crafting, immediate hazard escape, or actuator safety
 - Player control is the default. AI control requires explicit F12 arming.
 - Disconnect, death, control transfer, and fencing-generation changes revoke stale actions.
 - Queued durable runs never resume after reconnect without explicit operator approval.
-- Unknown containers are not opened merely to discover their contents.
+- Unknown containers may be inspected only for an admitted inventory objective, with bounded
+  attempts, menu ownership, snapshot caching, and no unrelated-menu clicks.
 - Immediate safety behavior is deterministic and local to the Java body runtime.
 - Backend tasks, Java autonomy, gaze, navigation, mining, interaction, and reflexes must not write competing inputs directly.
 
@@ -513,6 +514,17 @@ known storage and workstations; acquire materials; upgrade tools when justified;
 verify output; recover or replan on bounded failure. Chat acknowledgement alone is never
 a task completion signal.
 
+Item requests distinguish concrete registry IDs from categories. Concrete craft outputs use
+registry IDs; collection and inventory queries may use item tags such as `#minecraft:logs`
+and `#minecraft:planks`, plus the synthetic `#lcu:wood` union. Recipe `Ingredient` tags remain
+authoritative when choosing interchangeable inputs.
+
+Container contents are temporary world observations keyed by logical container position.
+Opening a container records a complete item-count snapshot and observation age; confirmed
+withdrawals refresh it. Within the five-minute TTL, retrieval ranks containers already known
+to contain the target before inspecting unknown containers. Vanilla double chests share one
+snapshot/retry identity while retaining both halves as possible interaction points.
+
 Combat tools distinguish assessment, target lock, one-hit test, defense, patrol, and sustained
 engagement. Player targeting requires UUID authorization and trusted-player policy. Damage is
 estimated from target armor/toughness, absorption, effects, weapon attributes, enchantments,
@@ -538,6 +550,11 @@ translucency for navigation and dialogs, strong typography, stable controls, com
 density, and responsive split views. Visual modernization must not delay or obscure body safety,
 task state, permissions, audit history, or failure information.
 
+Runtime state, model trigger, multi-agent artifact, dynamic tool discovery, screenshot,
+and verified UI input contracts are specified in `docs/runtime-orchestration.md`. This
+document is normative for future orchestration work: raw tick telemetry must not be copied
+into model history, and no specialist agent may bypass the shared admission/executor path.
+
 ## Existing Verified Foundation
 
 The following foundation already exists and must not regress:
@@ -545,9 +562,9 @@ The following foundation already exists and must not regress:
 - V2 control leases with Java-confirmed ownership and fencing tokens.
 - Durable runs, events, schedules, scope validation, and explicit queued-run resume.
 - Disconnect/disarm behavior and `BODY_DISARMED` action rejection.
-- Offline deterministic Skill metadata and local crafting execution.
-- Strict namespaced item matching and inventory-delta crafting counts.
-- Known-container-only storage behavior.
+- Offline deterministic Skill metadata, Wire v3 body capability discovery, and local crafting execution.
+- Concrete registry matching plus tag-based collection categories and explicit ore-to-drop mappings.
+- Task-bounded storage discovery with world-scoped five-minute content snapshots.
 - Initial body snapshot and normalized state/control/body events.
 - Body freshness, armed state, inventory, entities, and online-player telemetry.
 - Operations console views for leases, Skills, runs, schedules, events, and resume.
@@ -565,8 +582,8 @@ The following foundation already exists and must not regress:
 
 Latest recorded verification:
 
-- Python tests: 136 passed with 1 intentional opt-in integration skip on 2026-07-18.
-- Gradle: `test --no-daemon` passed.
+- Python tests: 140 passed with 1 intentional opt-in integration skip on 2026-07-19.
+- Gradle: `clean build` passed on 2026-07-19.
 - Explicit production Java-to-Python wire integration: 1 passed.
 - NeoForge `runServer` smoke reached `Done` and logged both side-neutral common and
   dedicated-server startup without `ModLoadingException`, client-class loading, or
@@ -579,10 +596,19 @@ Latest recorded verification:
 - Memory V2 status, records, export, summary preview/commit contracts, and local
   production-readiness reporting are covered by tests.
 - Shared-server JAR SHA-256:
-  `3463C1D068B59E577D4F4B57D58FA375FC055607330CFD7E548E19F39784932A`.
+  `1F262640A46AF10A689DC0A95F30BF2515325AA182D06991470314CF7A2A7D6F`.
 
 The recorded JAR is deployed to the external FTB StoneBlock 4 test instance with
 `runtimeRole="body_client"` for headed-body acceptance testing.
+
+Pending headed-body verification, deferred to the next test session:
+
+- A vanilla double chest opens once per logical-container inspection.
+- High or otherwise unreachable storage is skipped without repeated path resets or open attempts.
+- A one-iron-pickaxe request selects a bounded acyclic chain, prefers indexed intermediate
+  materials, and otherwise expands logs to planks to sticks plus supported iron processing.
+- Iron Chests and Sophisticated Storage menus expose real storage slots and permit confirmed
+  one-slot-at-a-time withdrawal without touching player or auxiliary slots.
 
 ## Release Blockers
 
@@ -599,6 +625,8 @@ The recorded JAR is deployed to the external FTB StoneBlock 4 test instance with
   current restricted player API is direct and requires HTTPS outside loopback.
 - Real multiplayer acceptance with LCU installed only on the AI client remains a
   manual test gate; target-server mod policies may independently reject client mods.
+- The 2026-07-19 crafting, storage, and category-target changes have automated coverage
+  and a deployed artifact but still require the headed-body checks listed above.
 
 ## Decision Log
 
@@ -632,3 +660,25 @@ The recorded JAR is deployed to the external FTB StoneBlock 4 test instance with
 - Confirmed and documented that `body_client` and `player_client` do not require
   LCU on the target server; server installation is reserved for the future,
   currently unavailable `server_fake_player` implementation.
+
+### 2026-07-19
+
+- Upgraded the body handshake to Wire protocol v3 with machine-readable tool schemas,
+  execution/completion classes, cancellation metadata, effects, and Python reconciliation.
+- Replaced encounter-order crafting selection with bounded transactional exploration of all
+  supported crafting and furnace recipe alternatives. Cycles reject only their branch;
+  failed branches no longer corrupt the inventory ledger or missing-resource plan.
+- Changed crafting execution to place and confirm one operation at a time, wait for the
+  expected output/inventory delta, bound no-progress and station attempts, and terminate a
+  parent craft when acquisition reaches a terminal failure.
+- Added logical vanilla double-chest identity, reachable/visible interaction positions,
+  owned-menu checks, sequential confirmed withdrawal, world-scoped content snapshots, and
+  five-minute storage observation TTLs. Existing Iron Chests and Sophisticated Storage
+  discovery remains enabled through generic container-slot inspection.
+- Added category targets for logs, planks, and wood; removed fuzzy material-name matching
+  and added explicit vanilla ore-to-drop collection edges.
+- Advertised generic container read/take/put/close and item-drop primitives so Python can
+  compose future retrieval and delivery workflows instead of adding Java scenario scripts.
+- Built and deployed JAR SHA-256
+  `1F262640A46AF10A689DC0A95F30BF2515325AA182D06991470314CF7A2A7D6F`.
+  Headed-body acceptance was intentionally deferred to the next session.

@@ -22,9 +22,9 @@ public class MovementSystem {
         return Pathfinder.getTarget();
     }
 
-    public static void moveTo(double x, double y, double z, float speed) {
+    public static boolean moveTo(double x, double y, double z, float speed) {
         lastSpeed = speed;
-        Pathfinder.navigateTo(null, x, y, z);
+        return Pathfinder.navigateTo(null, x, y, z);
     }
 
     public static void stop() {

@@ -158,6 +158,9 @@ python -m venv .venv
 
 当前整合包的 WATUT、墓碑、背包整理等适配状态见 [模组兼容矩阵](docs/mod-compatibility.md)。
 
+状态同步、模型上下文、多 Agent 通讯、动态工具发现和视觉 UI 操作契约见
+[运行时编排设计](docs/runtime-orchestration.md)。
+
 ### 测试
 ```bash
 cd backend

@@ -5,6 +5,8 @@ import com.google.gson.JsonObject;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.world.level.block.ChestBlock;
+import net.minecraft.world.level.block.state.properties.ChestType;
 
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -36,6 +38,7 @@ public final class PoiMemory {
     public static final int INTERACTION_RADIUS = 32;
     private static final int RESCAN_INTERVAL_TICKS = 40;
     private static final int STALE_TICKS = 20 * 300;
+    private static final int CONTENTS_STALE_TICKS = 20 * 300;
 
     private static final Set<String> WORKSTATIONS = Set.of(
         "minecraft:crafting_table",
@@ -61,6 +64,8 @@ public final class PoiMemory {
     private static final Map<BlockPos, PoiEntry> MEMORY = new HashMap<>();
     private static final Map<BlockPos, Map<String, Integer>> STORAGE_CONTENTS = new HashMap<>();
     private static final Map<BlockPos, Integer> CONTENTS_LAST_SEEN = new HashMap<>();
+    private static Object activeLevel = null;
+    private static int latestTick = 0;
 
     private PoiMemory() {
     }
@@ -81,6 +86,13 @@ public final class PoiMemory {
         if (mc == null || mc.player == null || mc.level == null) {
             return;
         }
+        if (activeLevel != mc.level) {
+            MEMORY.clear();
+            STORAGE_CONTENTS.clear();
+            CONTENTS_LAST_SEEN.clear();
+            activeLevel = mc.level;
+        }
+        latestTick = tickCount;
         if (tickCount % RESCAN_INTERVAL_TICKS != 0) {
             return;
         }
@@ -97,7 +109,13 @@ public final class PoiMemory {
                     if (WORKSTATIONS.contains(blockId)) {
                         MEMORY.put(pos.immutable(), new PoiEntry(blockId, "workstation", tickCount));
                     } else if (isStorageBlock(blockId)) {
-                        MEMORY.put(pos.immutable(), new PoiEntry(blockId, "storage", tickCount));
+                        BlockPos storagePos = canonicalStoragePos(pos, state);
+                        MEMORY.put(storagePos, new PoiEntry(blockId, "storage", tickCount));
+                        if (!storagePos.equals(pos)) {
+                            MEMORY.remove(pos);
+                            STORAGE_CONTENTS.remove(pos);
+                            CONTENTS_LAST_SEEN.remove(pos);
+                        }
                     }
                 }
             }
@@ -106,11 +124,24 @@ public final class PoiMemory {
         MEMORY.entrySet().removeIf(entry -> {
             PoiEntry poi = entry.getValue();
             if (tickCount - poi.lastSeenTick > STALE_TICKS) {
+                STORAGE_CONTENTS.remove(entry.getKey());
+                CONTENTS_LAST_SEEN.remove(entry.getKey());
                 return true;
             }
             var state = mc.level.getBlockState(entry.getKey());
             String currentId = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
-            return !currentId.equals(poi.blockId);
+            if (!currentId.equals(poi.blockId)) {
+                STORAGE_CONTENTS.remove(entry.getKey());
+                CONTENTS_LAST_SEEN.remove(entry.getKey());
+                return true;
+            }
+            return false;
+        });
+
+        CONTENTS_LAST_SEEN.entrySet().removeIf(entry -> {
+            if (tickCount - entry.getValue() <= CONTENTS_STALE_TICKS) return false;
+            STORAGE_CONTENTS.remove(entry.getKey());
+            return true;
         });
     }
 
@@ -149,19 +180,41 @@ public final class PoiMemory {
     }
 
     public static int getStorageItemCount(BlockPos pos, String itemId) {
+        if (!hasKnownContents(pos)) return 0;
         Map<String, Integer> contents = STORAGE_CONTENTS.get(pos);
         if (contents == null) return 0;
         int total = 0;
         for (Map.Entry<String, Integer> entry : contents.entrySet()) {
-            if (CraftingPlanner.matchesRegistryId(entry.getKey(), itemId)) {
+            if (CraftingPlanner.matchesItemId(entry.getKey(), itemId)) {
                 total += entry.getValue();
             }
         }
         return total;
     }
 
+    public static int getKnownStorageItemCount(String itemId) {
+        int total = 0;
+        for (BlockPos pos : STORAGE_CONTENTS.keySet()) {
+            total += getStorageItemCount(pos, itemId);
+        }
+        return total;
+    }
+
     public static boolean hasKnownContents(BlockPos pos) {
-        return STORAGE_CONTENTS.containsKey(pos);
+        Integer seen = CONTENTS_LAST_SEEN.get(pos);
+        return seen != null && latestTick - seen <= CONTENTS_STALE_TICKS && STORAGE_CONTENTS.containsKey(pos);
+    }
+
+    public static List<BlockPos> getStorageInteractionPositions(Minecraft mc, BlockPos storagePos) {
+        if (mc == null || mc.level == null) return List.of(storagePos);
+        var state = mc.level.getBlockState(storagePos);
+        if (!(state.getBlock() instanceof ChestBlock)
+            || !state.hasProperty(ChestBlock.TYPE)
+            || state.getValue(ChestBlock.TYPE) == ChestType.SINGLE) {
+            return List.of(storagePos);
+        }
+        BlockPos connected = storagePos.relative(ChestBlock.getConnectedDirection(state)).immutable();
+        return List.of(storagePos, connected);
     }
 
     public static List<JsonObject> snapshotSortedByItemMatch(Minecraft mc, String category, String targetItemId, int maxDistance, int limit) {
@@ -198,8 +251,12 @@ public final class PoiMemory {
             item.addProperty("y", entry.getKey().getY());
             item.addProperty("z", entry.getKey().getZ());
 
-            Map<String, Integer> contents = STORAGE_CONTENTS.get(entry.getKey());
+            Map<String, Integer> contents = hasKnownContents(entry.getKey()) ? STORAGE_CONTENTS.get(entry.getKey()) : null;
             item.addProperty("contents_known", contents != null);
+            Integer contentsSeen = CONTENTS_LAST_SEEN.get(entry.getKey());
+            if (contentsSeen != null) {
+                item.addProperty("contents_observed_ticks_ago", Math.max(0, latestTick - contentsSeen));
+            }
             if (contents != null && !contents.isEmpty()) {
                 JsonArray contentsArr = new JsonArray();
                 for (var contentEntry : contents.entrySet()) {
@@ -255,5 +312,21 @@ public final class PoiMemory {
             return path.contains("chest") || path.contains("barrel");
         }
         return false;
+    }
+
+    private static BlockPos canonicalStoragePos(BlockPos pos, net.minecraft.world.level.block.state.BlockState state) {
+        if (!(state.getBlock() instanceof ChestBlock)
+            || !state.hasProperty(ChestBlock.TYPE)
+            || state.getValue(ChestBlock.TYPE) == ChestType.SINGLE) {
+            return pos.immutable();
+        }
+
+        BlockPos connected = pos.relative(ChestBlock.getConnectedDirection(state));
+        if (connected.getX() < pos.getX()
+            || connected.getX() == pos.getX() && connected.getY() < pos.getY()
+            || connected.getX() == pos.getX() && connected.getY() == pos.getY() && connected.getZ() < pos.getZ()) {
+            return connected.immutable();
+        }
+        return pos.immutable();
     }
 }

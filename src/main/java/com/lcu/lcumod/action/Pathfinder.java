@@ -9,6 +9,8 @@ import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.AABB;
+import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.shapes.VoxelShape;
 
@@ -64,7 +66,46 @@ public class Pathfinder {
         stuckTicks = 0;
         lastFailureReason = "";
         activeRequestId = requestId;
-        return calculatePath();
+        boolean found = calculatePath();
+        if (!found) stop();
+        return found;
+    }
+
+    public static Vec3 findReachableInteractionPosition(Minecraft mc, BlockPos target, double reach) {
+        if (mc == null || mc.player == null || mc.level == null) return null;
+
+        StandingNode start = findClosestStandingNode(mc.level, mc.player.position(), 2, 4);
+        if (start == null) return null;
+
+        Vec3 targetCenter = Vec3.atCenterOf(target);
+        List<StandingNode> candidates = new ArrayList<>();
+        for (int dx = -2; dx <= 2; dx++) {
+            for (int dz = -2; dz <= 2; dz++) {
+                for (int dy = -3; dy <= 2; dy++) {
+                    StandingNode candidate = createStandingNode(mc.level, target.offset(dx, dy, dz));
+                    if (candidate == null) continue;
+                    Vec3 eyePos = candidate.standingPos.add(0.0, mc.player.getEyeHeight(), 0.0);
+                    if (eyePos.distanceToSqr(targetCenter) <= reach * reach
+                        && hasLineOfSight(mc, eyePos, targetCenter, target)) {
+                        candidates.add(candidate);
+                    }
+                }
+            }
+        }
+
+        candidates.sort(Comparator.comparingDouble(candidate -> candidate.standingPos.distanceToSqr(mc.player.position())));
+        for (StandingNode candidate : candidates.stream().limit(4).toList()) {
+            if (isGoal(start, candidate) || !findPath(mc, start, candidate).isEmpty()) {
+                return candidate.standingPos;
+            }
+        }
+        return null;
+    }
+
+    private static boolean hasLineOfSight(Minecraft mc, Vec3 from, Vec3 to, BlockPos target) {
+        if (mc.level == null || mc.player == null) return false;
+        var hit = mc.level.clip(new ClipContext(from, to, ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, mc.player));
+        return hit.getType() == HitResult.Type.BLOCK && hit.getBlockPos().equals(target);
     }
 
     public static void stop() {

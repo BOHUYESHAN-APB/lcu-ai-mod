@@ -156,13 +156,13 @@ class Skills:
         """Read contents of currently open container."""
         return self._send_cmd("get_container", {})
 
-    def take_item(self, slot: int) -> dict:
+    def take_item(self, container_id: int, slot: int) -> dict:
         """Take item from container slot into player inventory."""
-        return self._send_cmd("take_item", {"slot": slot})
+        return self._send_cmd("take_item", {"container_id": container_id, "slot": slot})
 
-    def put_item(self, slot: int) -> dict:
+    def put_item(self, container_id: int, slot: int) -> dict:
         """Put item from player inventory into container slot."""
-        return self._send_cmd("put_item", {"slot": slot})
+        return self._send_cmd("put_item", {"container_id": container_id, "slot": slot})
 
     def close_container(self) -> dict:
         """Close current container GUI."""

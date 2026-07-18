@@ -554,6 +554,7 @@ async def startup():
                     active_body.disconnect()
                     break
                 print(f"[Backend] Companion body connected at {host}:{port}")
+                skill_registry.set_body_tools(getattr(active_body, "tool_catalog", None))
                 o.start()
                 _reconcile_control_mode(force_body=True)
                 # Event loop: drain body events and tick orchestrator
@@ -567,6 +568,7 @@ async def startup():
                 o.tick()  # Drain terminal messages queued immediately before socket closure.
                 o.stop()
                 o.on_body_disconnect()
+                skill_registry.set_body_tools(None)
                 if not stop_event.is_set():
                     print("[Backend] Disconnected. Reconnecting...")
             else:

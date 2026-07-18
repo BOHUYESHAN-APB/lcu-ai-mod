@@ -120,6 +120,19 @@ class PlannerTests(unittest.TestCase):
 
         self.assertEqual(skills.calls, [("craft_item", "iron_pickaxe", 1)])
 
+    def test_collect_tool_preserves_chinese_item_categories_as_tags(self):
+        skills = DummySkills()
+        planner = Planner(llm_service=None, memory=DummyMemory(), skills=skills)
+
+        planner._execute_plan(
+            'tool(collect_blocks, {"block_type":"木头","count":1})',
+            sender="Alice",
+            message="找一个木头",
+            context={},
+        )
+
+        self.assertEqual(skills.calls, [("collect_blocks", "#lcu:wood", 1)])
+
     def test_legacy_structured_craft_name_and_item_name_remain_executable(self):
         skills = DummySkills()
         planner = Planner(llm_service=None, memory=DummyMemory(), skills=skills)
@@ -143,6 +156,18 @@ class PlannerTests(unittest.TestCase):
         )
 
         self.assertEqual(skills.calls, [("follow_player", "Alice")])
+
+    def test_identical_structured_tools_in_one_model_response_are_deduplicated(self):
+        skills = DummySkills()
+        planner = Planner(llm_service=None, memory=DummyMemory(), skills=skills)
+
+        planner._execute_plan(
+            'tool(craft_item, {"item":"minecraft:iron_pickaxe","count":1})\n'
+            'tool(craft_item, {"count":1,"item":"minecraft:iron_pickaxe"})',
+            sender="Alice", message="做一个铁镐", context={},
+        )
+
+        self.assertEqual(skills.calls, [("craft_item", "minecraft:iron_pickaxe", 1)])
 
     def test_direct_follow_fallback_uses_sender_for_follow_me(self):
         skills = DummySkills()
