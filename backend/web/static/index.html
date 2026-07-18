@@ -50,6 +50,7 @@ body{font-family:'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;backgroun
 .memory-pane{min-width:0;background:#161b22;border:1px solid #30363d;border-radius:8px;overflow:hidden}.memory-pane-header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px 12px;border-bottom:1px solid #30363d}.memory-pane-header h3{font-size:13px;color:#c9d1d9;margin:0}.memory-list{max-height:calc(100dvh - 310px);overflow:auto}.memory-row{width:100%;display:block;text-align:left;background:transparent;color:#c9d1d9;border:0;border-bottom:1px solid #21262d;padding:10px 12px;cursor:pointer}.memory-row:hover,.memory-row.active{background:#21262d}.memory-row-title{font-size:12px;font-weight:600;overflow-wrap:anywhere}.memory-row-meta{font-size:10px;color:#8b949e;margin-top:4px}.memory-row-excerpt{font-size:11px;color:#b1bac4;margin-top:5px;line-height:1.4;overflow-wrap:anywhere}.memory-detail{padding:12px;overflow:auto;max-height:calc(100dvh - 310px)}.memory-detail-grid{display:grid;grid-template-columns:110px minmax(0,1fr);gap:7px 10px;font-size:11px}.memory-detail-key{color:#8b949e}.memory-detail-value{overflow-wrap:anywhere}.memory-json{margin-top:12px;background:#0d1117;border:1px solid #21262d;border-radius:4px;padding:10px;white-space:pre-wrap;overflow-wrap:anywhere;font:11px/1.5 monospace}.memory-status-strip{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px;font-size:11px;color:#8b949e}.memory-status-strip strong{color:#c9d1d9}.memory-pagination{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 12px;border-top:1px solid #30363d;font-size:11px;color:#8b949e}
 dialog{width:min(680px,calc(100vw - 24px));max-height:calc(100dvh - 24px);margin:auto;background:#161b22;color:#c9d1d9;border:1px solid #30363d;border-radius:8px;padding:0;box-shadow:0 20px 60px rgba(0,0,0,.5)}dialog::backdrop{background:rgba(1,4,9,.72)}.dialog-header{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border-bottom:1px solid #30363d}.dialog-header h3{font-size:14px;margin:0}.dialog-body{padding:14px;overflow:auto}.dialog-actions{display:flex;justify-content:flex-end;gap:8px;padding:12px 14px;border-top:1px solid #30363d}.summary-preview{white-space:pre-wrap;line-height:1.55;font-size:12px;background:#0d1117;border:1px solid #21262d;border-radius:4px;padding:11px;margin-top:10px;max-height:45dvh;overflow:auto}
 .inbox-layout{display:grid;grid-template-columns:minmax(240px,.7fr) minmax(360px,1.3fr);gap:16px;min-height:480px}.inbox-contacts,.inbox-messages{overflow:auto;max-height:calc(100dvh - 230px)}.contact-row{width:100%;display:block;text-align:left;background:transparent;color:#c9d1d9;border:0;border-bottom:1px solid #21262d;padding:11px 12px;cursor:pointer}.contact-row:hover,.contact-row.active{background:#21262d}.contact-name{font-size:12px;font-weight:600}.contact-meta{font-size:10px;color:#8b949e;margin-top:4px}.inbox-message{margin:10px 12px;padding:9px 10px;border-left:2px solid #30363d;background:#0d1117}.inbox-message.ai{border-left-color:#3fb950}.inbox-message.player{border-left-color:#58a6ff}.inbox-message-header{font-size:10px;color:#8b949e;margin-bottom:5px}.inbox-message-content{font-size:12px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere}
+.inbox-layout.contacts-hidden{grid-template-columns:1fr}.inbox-layout.contacts-hidden .contact-pane{display:none}.inventory-layout{display:grid;grid-template-columns:minmax(260px,.8fr) minmax(340px,1.2fr);gap:16px;margin-top:16px}.inventory-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:6px}.inventory-item{min-width:0;background:#0d1117;border:1px solid #21262d;border-radius:4px;padding:8px}.inventory-item-name{font-size:11px;font-weight:600;overflow-wrap:anywhere}.inventory-item-meta{font-size:10px;color:#8b949e;margin-top:3px;overflow-wrap:anywhere}
 
 /* Buttons */
 .btn{background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:6px 12px;font-size:12px;cursor:pointer;transition:all .15s}
@@ -96,7 +97,7 @@ dialog{width:min(680px,calc(100vw - 24px));max-height:calc(100dvh - 24px);margin
 .empty{font-size:12px;color:#8b949e;padding:12px 0}.field-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px}.field-grid input{width:100%}
 .debug-actions{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-bottom:12px}.debug-command{display:flex;gap:8px;margin-bottom:12px}.debug-command input{min-width:0}
 textarea{width:100%;min-height:68px;resize:vertical;background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:7px 10px;color:#c9d1d9;font:12px monospace}
-@media(max-width:760px){.topbar{padding:8px 12px}.page{padding:12px}.ops-grid,.responsive-grid,.memory-layout,.inbox-layout{grid-template-columns:1fr!important}.inbox-contacts,.inbox-messages{max-height:none}.memory-toolbar{grid-template-columns:1fr 1fr}.memory-toolbar .compact-field:first-child{grid-column:1/-1}.memory-list,.memory-detail{max-height:none}.form-row{align-items:flex-start;flex-direction:column}.form-row label{min-width:0}.form-row input,.form-row select{width:100%}.field-grid{grid-template-columns:1fr}.usage-strip{grid-template-columns:repeat(2,minmax(0,1fr))}.tabs{scrollbar-width:thin}.tab{padding:10px 14px}.chat-input,.debug-command{flex-wrap:wrap}.debug-actions{grid-template-columns:repeat(2,minmax(0,1fr))}.debug-command input{width:100%!important}}
+@media(max-width:760px){.topbar{padding:8px 12px}.page{padding:12px}.ops-grid,.responsive-grid,.memory-layout,.inbox-layout,.inventory-layout{grid-template-columns:1fr!important}.inbox-contacts,.inbox-messages{max-height:none}.memory-toolbar{grid-template-columns:1fr 1fr}.memory-toolbar .compact-field:first-child{grid-column:1/-1}.memory-list,.memory-detail{max-height:none}.form-row{align-items:flex-start;flex-direction:column}.form-row label{min-width:0}.form-row input,.form-row select{width:100%}.field-grid{grid-template-columns:1fr}.usage-strip{grid-template-columns:repeat(2,minmax(0,1fr))}.tabs{scrollbar-width:thin}.tab{padding:10px 14px}.chat-input,.debug-command{flex-wrap:wrap}.debug-actions{grid-template-columns:repeat(2,minmax(0,1fr))}.debug-command input{width:100%!important}}
 </style>
 </head>
 <body>
@@ -139,6 +140,10 @@ textarea{width:100%;min-height:68px;resize:vertical;background:#0d1117;border:1p
           <div class="value" id="position">-</div>
         </div>
         <div class="stat">
+          <div class="label">维度</div>
+          <div class="value" id="dimension">-</div>
+        </div>
+        <div class="stat">
           <div class="label">控制模式</div>
           <div class="value" id="controlMode">观察</div>
         </div>
@@ -162,6 +167,16 @@ textarea{width:100%;min-height:68px;resize:vertical;background:#0d1117;border:1p
   <div class="card">
     <h3>📋 任务队列</h3>
     <div id="taskQueue">暂无任务</div>
+  </div>
+  <div class="inventory-layout">
+    <section class="memory-pane">
+      <div class="memory-pane-header"><h3>装备与饰品</h3><span id="equipmentSummary" class="hint">等待身体状态</span></div>
+      <div id="equipmentList" class="inventory-list" style="padding:12px"><div class="empty">暂无装备数据</div></div>
+    </section>
+    <section class="memory-pane">
+      <div class="memory-pane-header"><h3>背包</h3><span id="inventorySummary" class="hint">0 项</span></div>
+      <div id="inventoryList" class="inventory-list" style="padding:12px"><div class="empty">暂无背包数据</div></div>
+    </section>
   </div>
 </div>
 
@@ -209,13 +224,13 @@ textarea{width:100%;min-height:68px;resize:vertical;background:#0d1117;border:1p
 
 <!-- Chat Page -->
 <div id="page-chat" class="page">
-  <div class="inbox-layout">
-    <section class="memory-pane">
+  <div id="inboxLayout" class="inbox-layout">
+    <section class="memory-pane contact-pane">
       <div class="memory-pane-header"><h3>通讯录</h3><button class="btn" onclick="loadInbox()">刷新</button></div>
       <div id="inboxContacts" class="inbox-contacts"><div class="empty" style="padding:12px">暂无会话</div></div>
     </section>
     <section class="memory-pane">
-      <div class="memory-pane-header"><h3 id="inboxTitle">选择联系人</h3><span class="hint" id="inboxPresence">-</span></div>
+      <div class="memory-pane-header"><h3 id="inboxTitle">选择联系人</h3><div><span class="hint" id="inboxPresence">-</span> <button id="inboxContactToggle" class="btn" onclick="toggleInboxContacts()">隐藏通讯录</button></div></div>
       <div id="inboxMessages" class="inbox-messages"><div class="empty" style="padding:12px">玩家客户端消息会显示在这里</div></div>
     </section>
   </div>
@@ -575,6 +590,9 @@ function updateDashboard(data) {
   if (p.x !== undefined) {
     document.getElementById('position').textContent = `${Math.round(p.x)},${Math.round(p.y)},${Math.round(p.z)}`;
   }
+  if (p.dimension || data.world?.dimension) {
+    document.getElementById('dimension').textContent = p.dimension || data.world.dimension;
+  }
   
   const roster = data.online_players || (data.entities || []).filter(e => e.type === 'player');
   if (data.online_players || data.entities) {
@@ -588,6 +606,7 @@ function updateDashboard(data) {
       const details = [];
       if (player.distance !== undefined) details.push(`${Number(player.distance).toFixed(1)}m`);
       if (player.latency !== undefined) details.push(`${player.latency}ms`);
+      if (player.dimension) details.push(player.dimension);
       if (player.loaded === false) details.push('远处');
       const meta = document.createElement('div'); meta.className = 'meta'; meta.textContent = details.join(' · ') || '在线';
       info.append(name, meta); row.append(avatar, info); list.append(row);
@@ -605,6 +624,41 @@ function updateDashboard(data) {
     if (llmConfig) llmConfig.usage = data.llm_usage;
     renderLLMTelemetry(document.getElementById('agentSelect')?.value || 'default', data.llm_usage);
   }
+  if (data.equipment || data.inventory) renderEquipment(data.equipment || {}, data.inventory || []);
+}
+
+function renderEquipment(equipment, inventory) {
+  const equipped = [];
+  if (equipment.mainhand && !equipment.mainhand.empty) equipped.push(equipment.mainhand);
+  if (equipment.offhand && !equipment.offhand.empty) equipped.push(equipment.offhand);
+  (equipment.armor || []).filter(item => !item.empty).forEach(item => equipped.push(item));
+  (equipment.curios || []).forEach(item => equipped.push({...item,slot:`${item.slot_type}:${item.slot_index}`}));
+  renderInventoryItems('equipmentList', equipped);
+  renderInventoryItems('inventoryList', inventory);
+  document.getElementById('equipmentSummary').textContent = `护甲 ${equipment.armor_value ?? 0} · 吸收 ${equipment.absorption ?? 0} · 饰品 ${(equipment.curios || []).length}`;
+  document.getElementById('inventorySummary').textContent = `${inventory.length} 项`;
+}
+
+function renderInventoryItems(targetId, items) {
+  const target = document.getElementById(targetId); target.replaceChildren();
+  if (!items.length) {
+    const empty=document.createElement('div'); empty.className='empty'; empty.textContent='暂无物品'; target.append(empty); return;
+  }
+  items.forEach(item => {
+    const row=document.createElement('div'); row.className='inventory-item';
+    const name=document.createElement('div'); name.className='inventory-item-name'; name.textContent=`${item.display || item.name} ×${item.count || 1}`;
+    const meta=document.createElement('div'); meta.className='inventory-item-meta';
+    const location=item.equipment_slot || item.slot || item.section || '?';
+    const durability=item.max_damage ? ` · 耐久 ${Math.max(0,item.max_damage-item.damage)}/${item.max_damage}` : '';
+    meta.textContent=`${location} · ${item.name || '-'}${durability}`;
+    row.append(name,meta); target.append(row);
+  });
+}
+
+function toggleInboxContacts() {
+  const layout = document.getElementById('inboxLayout');
+  const hidden = layout.classList.toggle('contacts-hidden');
+  document.getElementById('inboxContactToggle').textContent = hidden ? '显示通讯录' : '隐藏通讯录';
 }
 
 function setBodyConnection(connected) {
@@ -1283,16 +1337,16 @@ function loadAgentLLMConfig() {
   document.getElementById('baseUrl').value = cfg.base_url || '';
   document.getElementById('modelInput').value = cfg.model || '';
   document.getElementById('temperature').value = cfg.temperature ?? 0.7;
-  document.getElementById('contextWindowTokens').value = cfg.context_window_tokens ?? 32768;
-  document.getElementById('maxInputTokens').value = cfg.max_input_tokens ?? 28672;
-  document.getElementById('maxOutputTokens').value = cfg.max_output_tokens ?? 2048;
-  document.getElementById('reservedOutputTokens').value = cfg.reserved_output_tokens ?? 2048;
-  document.getElementById('maxRequestBytes').value = cfg.max_request_bytes ?? 1048576;
+  document.getElementById('contextWindowTokens').value = cfg.context_window_tokens ?? 200000;
+  document.getElementById('maxInputTokens').value = cfg.max_input_tokens ?? 180000;
+  document.getElementById('maxOutputTokens').value = cfg.max_output_tokens ?? 16384;
+  document.getElementById('reservedOutputTokens').value = cfg.reserved_output_tokens ?? 16384;
+  document.getElementById('maxRequestBytes').value = cfg.max_request_bytes ?? 4194304;
   document.getElementById('compressionEnabled').checked = cfg.compression_enabled !== false;
-  document.getElementById('compressionTriggerTokens').value = cfg.compression_trigger_tokens ?? 24576;
-  document.getElementById('compressionTargetTokens').value = cfg.compression_target_tokens ?? 16384;
-  document.getElementById('recentMessagesToKeep').value = cfg.recent_messages_to_keep ?? 12;
-  document.getElementById('summaryMaxOutputTokens').value = cfg.summary_max_output_tokens ?? 1024;
+  document.getElementById('compressionTriggerTokens').value = cfg.compression_trigger_tokens ?? 160000;
+  document.getElementById('compressionTargetTokens').value = cfg.compression_target_tokens ?? 120000;
+  document.getElementById('recentMessagesToKeep').value = cfg.recent_messages_to_keep ?? 24;
+  document.getElementById('summaryMaxOutputTokens').value = cfg.summary_max_output_tokens ?? 4096;
   const summarySelect = document.getElementById('summaryModelAgent');
   const agents = Object.keys(llmConfig?.agents || {default:{}});
   summarySelect.replaceChildren(...agents.map(name => new Option(name, name)));

@@ -25,17 +25,17 @@ logger = logging.getLogger("llm_service")
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-4o-mini"
 DEFAULT_LIMITS = {
-    "context_window_tokens": 32768,
-    "max_input_tokens": 28672,
-    "max_output_tokens": 2048,
-    "reserved_output_tokens": 2048,
-    "max_request_bytes": 1048576,
+    "context_window_tokens": 200000,
+    "max_input_tokens": 180000,
+    "max_output_tokens": 16384,
+    "reserved_output_tokens": 16384,
+    "max_request_bytes": 4194304,
     "compression_enabled": True,
-    "compression_trigger_tokens": 24576,
-    "compression_target_tokens": 16384,
-    "recent_messages_to_keep": 12,
+    "compression_trigger_tokens": 160000,
+    "compression_target_tokens": 120000,
+    "recent_messages_to_keep": 24,
     "summary_model_agent": "default",
-    "summary_max_output_tokens": 1024,
+    "summary_max_output_tokens": 4096,
 }
 
 
@@ -76,7 +76,7 @@ class LLMService:
 
     def set_api_key(self, key: str):
         self.api_key = key
-        logger.info("[LLM] API key set (prefix: %s)", key[:8] + "..." if len(key) > 8 else "?")
+        logger.info("[LLM] API key configured")
         return self
 
     def set_model(self, model: str):

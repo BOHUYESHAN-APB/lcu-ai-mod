@@ -16,3 +16,8 @@ Skill runs are durable UUID resources with response/progress terminal states.
 V2 also exposes cursor-based events and persistent wall/game-clock schedules.
 
 The companion backend remains a separate AGPL-3.0 program. See `../../docs/sdk.md` for API, authentication and browser CORS setup.
+
+Optional integrations use discoverable, versioned adapter manifests. Adapters must
+declare capabilities, schemas, permission domains, runtime placement, failure semantics,
+source URL, and license obligations. Missing capabilities fail explicitly as unsupported.
+Voice I/O is a deferred adapter surface and is not part of the current SDK release.

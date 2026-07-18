@@ -6,6 +6,7 @@ import com.lcu.lcumod.action.PoiMemory;
 import com.lcu.lcumod.LCUMod;
 import com.lcu.lcumod.config.ModConfig;
 import com.lcu.lcumod.client.ClientBodyRuntime;
+import com.lcu.lcumod.compat.CuriosCompat;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -19,6 +20,7 @@ import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.phys.AABB;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
+import net.neoforged.fml.ModList;
 import net.neoforged.neoforge.client.event.ClientTickEvent;
 
 import java.util.ArrayList;
@@ -158,6 +160,7 @@ public class StateCollector {
         world.addProperty("is_day", mc.level.isDay());
         world.addProperty("is_raining", mc.level.isRaining());
         world.addProperty("light_level", mc.level.getMaxLocalRawBrightness(p.blockPosition()));
+        world.addProperty("dimension", mc.level.dimension().location().toString());
         state.add("world", world);
 
         // Inventory
@@ -168,13 +171,51 @@ public class StateCollector {
             if (!stack.isEmpty()) {
                 JsonObject item = new JsonObject();
                 item.addProperty("slot", i);
-                item.addProperty("name", stack.getItem().toString());
+                item.addProperty("name", BuiltInRegistries.ITEM.getKey(stack.getItem()).toString());
                 item.addProperty("count", stack.getCount());
                 item.addProperty("display", stack.getDisplayName().getString());
+                if (i < 9) {
+                    item.addProperty("section", "hotbar");
+                } else if (i < 36) {
+                    item.addProperty("section", "main");
+                } else if (i < 40) {
+                    item.addProperty("section", "armor");
+                    item.addProperty("equipment_slot", switch (i) {
+                        case 36 -> "feet";
+                        case 37 -> "legs";
+                        case 38 -> "chest";
+                        default -> "head";
+                    });
+                } else {
+                    item.addProperty("section", "offhand");
+                    item.addProperty("equipment_slot", "offhand");
+                }
+                item.addProperty("selected", i == inventory.selected);
                 inv.add(item);
             }
         }
         state.add("inventory", inv);
+
+        JsonObject equipment = new JsonObject();
+        equipment.add("mainhand", serializeEquipmentItem(p.getMainHandItem(), "mainhand"));
+        equipment.add("offhand", serializeEquipmentItem(p.getOffhandItem(), "offhand"));
+        JsonArray armor = new JsonArray();
+        armor.add(serializeEquipmentItem(p.getItemBySlot(EquipmentSlot.HEAD), "head"));
+        armor.add(serializeEquipmentItem(p.getItemBySlot(EquipmentSlot.CHEST), "chest"));
+        armor.add(serializeEquipmentItem(p.getItemBySlot(EquipmentSlot.LEGS), "legs"));
+        armor.add(serializeEquipmentItem(p.getItemBySlot(EquipmentSlot.FEET), "feet"));
+        equipment.add("armor", armor);
+        equipment.addProperty("armor_value", p.getArmorValue());
+        equipment.addProperty("absorption", p.getAbsorptionAmount());
+        JsonArray curios = CuriosCompat.collectEquipped(p);
+        equipment.add("curios", curios);
+        state.add("equipment", equipment);
+
+        JsonObject integrations = new JsonObject();
+        integrations.addProperty("curios_detected", ModList.get().isLoaded("curios"));
+        integrations.addProperty("curios_items_available", CuriosCompat.isAvailable());
+        integrations.addProperty("curios_item_count", curios.size());
+        state.add("integrations", integrations);
 
         // Nearby entities (players, mobs, items)
         JsonArray entities = new JsonArray();
@@ -186,6 +227,9 @@ public class StateCollector {
             e.addProperty("uuid", other.getUUID().toString());
             e.addProperty("distance", p.distanceTo(other));
             e.addProperty("type", "player");
+            e.addProperty("dimension", other.level().dimension().location().toString());
+            e.addProperty("armor_value", other.getArmorValue());
+            e.addProperty("absorption", other.getAbsorptionAmount());
             entities.add(e);
         }
 
@@ -204,6 +248,9 @@ public class StateCollector {
                 online.addProperty("loaded", loaded);
                 if (loaded && loadedPlayer != p) {
                     online.addProperty("distance", p.distanceTo(loadedPlayer));
+                }
+                if (loaded) {
+                    online.addProperty("dimension", loadedPlayer.level().dimension().location().toString());
                 }
                 onlinePlayers.add(online);
             }
@@ -243,6 +290,8 @@ public class StateCollector {
             if (entity instanceof LivingEntity le) {
                 e.addProperty("health", le.getHealth());
                 e.addProperty("max_health", le.getMaxHealth());
+                e.addProperty("armor_value", le.getArmorValue());
+                e.addProperty("absorption", le.getAbsorptionAmount());
             }
 
             entities.add(e);
@@ -302,5 +351,19 @@ public class StateCollector {
         state.add("nearby_storage", nearbyStorage);
 
         LCUMod.WIRE.sendEvent("state_update", state);
+    }
+
+    private static JsonObject serializeEquipmentItem(ItemStack stack, String slot) {
+        JsonObject item = new JsonObject();
+        item.addProperty("slot", slot);
+        item.addProperty("empty", stack.isEmpty());
+        if (!stack.isEmpty()) {
+            item.addProperty("name", BuiltInRegistries.ITEM.getKey(stack.getItem()).toString());
+            item.addProperty("count", stack.getCount());
+            item.addProperty("display", stack.getDisplayName().getString());
+            item.addProperty("damage", stack.getDamageValue());
+            item.addProperty("max_damage", stack.getMaxDamage());
+        }
+        return item;
     }
 }

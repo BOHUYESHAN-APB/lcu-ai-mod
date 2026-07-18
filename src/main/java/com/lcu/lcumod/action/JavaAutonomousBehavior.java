@@ -158,10 +158,18 @@ public class JavaAutonomousBehavior {
     public static void setEnabled(boolean v) {
         enabled = v;
         if (!enabled) {
-            currentState = BehaviorState.IDLE;
-            wanderTarget = null;
-            attackTarget = null;
+            resetCurrentState();
         }
+    }
+
+    public static void resetCurrentState() {
+        currentState = BehaviorState.IDLE;
+        stateTicks = 0;
+        idleTicks = 0;
+        wanderTarget = null;
+        attackTarget = null;
+        trackTarget = null;
+        eatingTicksRemaining = 0;
     }
     
     // ── Survival Logic ──

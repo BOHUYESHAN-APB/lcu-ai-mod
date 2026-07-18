@@ -4,6 +4,7 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.lcu.lcumod.LCUMod;
 import com.lcu.lcumod.client.ClientBodyRuntime;
+import com.lcu.lcumod.compat.WatutCompat;
 import com.lcu.lcumod.network.WireServer;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
@@ -130,13 +131,12 @@ public class ActionExecutor {
 
         boolean optionalAutonomy = ClientBodyRuntime.BEHAVIORS == null || ClientBodyRuntime.BEHAVIORS.isEnabled();
 
+        boolean manualTaskActive = hasManualTask();
+        boolean behaviorActive = false;
+
         // ── Java-side autonomous behavior (works without backend) ──
-        if (InputIsolation.isAiControlled() && optionalAutonomy) {
-            boolean behaviorActive = JavaAutonomousBehavior.tick(mc);
-            // If behavior is active and no backend command is pending, skip other actions
-            if (behaviorActive && WireServer.commandQueue.isEmpty()) {
-                return;
-            }
+        if (InputIsolation.isAiControlled() && optionalAutonomy && !manualTaskActive) {
+            behaviorActive = JavaAutonomousBehavior.tick(mc);
         }
 
         boolean runtimeBusy = Pathfinder.isNavigating()
@@ -144,9 +144,19 @@ public class ActionExecutor {
                 || JavaAutonomousBehavior.getState() != JavaAutonomousBehavior.BehaviorState.IDLE
                 || !WireServer.commandQueue.isEmpty();
 
+        if (InputIsolation.isAiControlled() && runtimeBusy) {
+            WatutCompat.reportProgrammaticAction(mc.player.tickCount);
+        }
+
+        // If behavior is active and no backend command is pending, skip other actions.
+        if (behaviorActive && WireServer.commandQueue.isEmpty()) {
+            return;
+        }
+
         // ── Human-like idle behavior (head tracking) ──
         if (InputIsolation.isAiControlled()
                 && optionalAutonomy
+                && !manualTaskActive
                 && JavaAutonomousBehavior.getState() == JavaAutonomousBehavior.BehaviorState.IDLE
                 && !MovementSystem.isMoving()
                 && !Pathfinder.isNavigating()) {
@@ -359,6 +369,7 @@ public class ActionExecutor {
                     }
                 }
                 case "behavior_disable" -> { 
+                    stopAllRuntime();
                     if (ClientBodyRuntime.BEHAVIORS != null) {
                         ClientBodyRuntime.BEHAVIORS.setEnabled(false);
                     }
@@ -823,6 +834,11 @@ public class ActionExecutor {
     }
 
     private void handleStopAll(WireServer.WireCommand cmd) {
+        stopAllRuntime();
+        sendResponse(cmd.id(), true, "All stopped");
+    }
+
+    private void stopAllRuntime() {
         var mc = Minecraft.getInstance();
         followTargetName = null;
         pendingCraftItem = null;
@@ -842,10 +858,11 @@ public class ActionExecutor {
         pendingCollectSearchMisses = 0;
         Pathfinder.stop();
         MovementSystem.stop();
+        JavaAutonomousBehavior.resetCurrentState();
         releaseAllInputs();
         if (mc.player != null) {
             if (mc.gameMode != null) stopDigging();
-            if (mc.player.isUsingItem()) {
+            if (mc.gameMode != null && mc.player.isUsingItem()) {
                 mc.gameMode.releaseUsingItem(mc.player);
             }
             if (mc.player.containerMenu != null && mc.player.containerMenu != mc.player.inventoryMenu) {
@@ -854,7 +871,6 @@ public class ActionExecutor {
         }
         clearTaskState();
         sendBehaviorSnapshot();
-        sendResponse(cmd.id(), true, "All stopped");
     }
 
     private boolean requiresArmedBody(String command) {
@@ -1093,6 +1109,9 @@ public class ActionExecutor {
             return;
         }
         String playerName = args.get("player").getAsString();
+        Pathfinder.stop();
+        MovementSystem.stop();
+        JavaAutonomousBehavior.resetCurrentState();
         pendingCraftItem = null;
         pendingCraftReqId = null;
         pendingCraftTicks = 0;
@@ -1172,26 +1191,7 @@ public class ActionExecutor {
     }
 
     private void handleExplore(WireServer.WireCommand cmd) {
-        var args = cmd.args();
-        int radius = 16;
-        if (args != null && args.has("radius")) {
-            radius = args.get("radius").getAsInt();
-        }
-        var mc = Minecraft.getInstance();
-        if (mc.player == null) {
-            sendResponse(cmd.id(), false, "No player");
-            return;
-        }
-        
-        // Choose random position within radius
-        double angle = Math.random() * Math.PI * 2;
-        double distance = Math.random() * radius;
-        double targetX = mc.player.getX() + Math.cos(angle) * distance;
-        double targetZ = mc.player.getZ() + Math.sin(angle) * distance;
-        double targetY = mc.player.getY();
-        
-        MovementSystem.moveTo(targetX, targetY, targetZ, 0.8f);
-        sendResponse(cmd.id(), true, "Exploring area");
+        sendResponse(cmd.id(), false, "UNSUPPORTED: safe exploration policy is not implemented");
     }
 
     private void handleTrade(WireServer.WireCommand cmd) {
@@ -1200,20 +1200,11 @@ public class ActionExecutor {
             sendResponse(cmd.id(), false, "Need villager type");
             return;
         }
-        // For now, just send chat
-        var mc = Minecraft.getInstance();
-        if (mc.player != null) {
-            mc.player.connection.sendChat("Looking for " + args.get("villager_type").getAsString() + " villager to trade");
-        }
-        sendResponse(cmd.id(), true, "Looking for villager");
+        sendResponse(cmd.id(), false, "UNSUPPORTED: verified villager trading is not implemented");
     }
 
     private void handleSleep(WireServer.WireCommand cmd) {
-        var mc = Minecraft.getInstance();
-        if (mc.player != null) {
-            mc.player.connection.sendChat("Looking for a bed to sleep");
-        }
-        sendResponse(cmd.id(), true, "Looking for bed");
+        sendResponse(cmd.id(), false, "UNSUPPORTED: verified bed navigation and sleep are not implemented");
     }
 
     private void handleEat(WireServer.WireCommand cmd) {
@@ -1275,8 +1266,7 @@ public class ActionExecutor {
     }
 
     private void handleSortInventory(WireServer.WireCommand cmd) {
-        // For now, just send confirmation
-        sendResponse(cmd.id(), true, "Inventory sorted");
+        sendResponse(cmd.id(), false, "UNSUPPORTED: deterministic inventory sorting is not implemented");
     }
 
     private void handleBuild(WireServer.WireCommand cmd) {
@@ -1285,20 +1275,7 @@ public class ActionExecutor {
             sendResponse(cmd.id(), false, "Need x, y, z, structure");
             return;
         }
-        double x = args.get("x").getAsDouble();
-        double y = args.get("y").getAsDouble();
-        double z = args.get("z").getAsDouble();
-        String structure = args.get("structure").getAsString();
-        
-        // Move to build position
-        MovementSystem.moveTo(x, y, z, 1.0f);
-        
-        // For now, just send chat about building
-        var mc = Minecraft.getInstance();
-        if (mc.player != null) {
-            mc.player.connection.sendChat("Building " + structure + " at " + (int)x + ", " + (int)y + ", " + (int)z);
-        }
-        sendResponse(cmd.id(), true, "Building " + structure);
+        sendResponse(cmd.id(), false, "UNSUPPORTED: protected-region-aware building is not implemented");
     }
 
     private void handleShutdown() {
@@ -1330,7 +1307,25 @@ public class ActionExecutor {
         data.addProperty("pending_eat", pendingEatReqId != null);
         data.addProperty("pending_collect_item", pendingCollectItem == null ? "" : pendingCollectItem);
         data.addProperty("navigating", Pathfinder.isNavigating());
+        data.addProperty("active_behavior", JavaAutonomousBehavior.getState().name().toLowerCase());
+        data.addProperty("movement_owner", currentMovementOwner());
         LCUMod.WIRE.sendEvent("behavior_state", data);
+    }
+
+    private boolean hasManualTask() {
+        return followTargetName != null
+                || pendingCraftItem != null
+                || pendingEatReqId != null
+                || pendingCollectItem != null
+                || pendingStorageTargetItem != null
+                || !"idle".equals(activeTaskKind);
+    }
+
+    private String currentMovementOwner() {
+        if (followTargetName != null) return "follow";
+        if (hasManualTask()) return "task";
+        if (JavaAutonomousBehavior.getState() != JavaAutonomousBehavior.BehaviorState.IDLE) return "autonomy";
+        return "none";
     }
 
     private void sendTaskState() {
@@ -1673,6 +1668,19 @@ public class ActionExecutor {
             }
             storagePos = candidate;
             break;
+        }
+        if (storagePos == null) {
+            for (var poi : PoiMemory.snapshot(mc, "storage", PoiMemory.INTERACTION_RADIUS, 16)) {
+                BlockPos candidate = new BlockPos(
+                    poi.get("x").getAsInt(),
+                    poi.get("y").getAsInt(),
+                    poi.get("z").getAsInt()
+                );
+                if (!triedStoragePositions.contains(candidate) && !PoiMemory.hasKnownContents(candidate)) {
+                    storagePos = candidate;
+                    break;
+                }
+            }
         }
         if (storagePos == null) return false;
 

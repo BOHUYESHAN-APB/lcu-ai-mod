@@ -331,6 +331,7 @@ class Session:
         context["world"] = self.runtime.get("world", {})
         context["inventory"] = self.runtime.get("inventory", [])
         context["entities"] = self.runtime.get("entities", [])
+        context["online_players"] = self.runtime.get("online_players", [])
         context["nearby_blocks"] = self.runtime.get("nearby_blocks", [])
         context["nearby_workstations"] = self.runtime.get("nearby_workstations", [])
         context["nearby_storage"] = self.runtime.get("nearby_storage", [])
@@ -489,12 +490,17 @@ class Session:
             "action": self.action_manager.get_status(),
             "modes": self.modes_engine.get_status(),
             "self_prompter": self.self_prompter.get_status(),
+            "planner": self.planner.get_status(),
             "task_queue_len": len(self.task_queue),
             "memory_size": self.memory.interaction_count,
             "database": self.message_db.get_stats(),
             "player": self.runtime.get("player", {}),
             "world": self.runtime.get("world", {}),
             "inventory": self.runtime.get("inventory", []),
+            "equipment": self.runtime.get("equipment", {}),
+            "integrations": self.runtime.get("integrations", {}),
+            "nearby_workstations": self.runtime.get("nearby_workstations", []),
+            "nearby_storage": self.runtime.get("nearby_storage", []),
             "entities": self.runtime.get("entities", []),
             "online_players": self.runtime.get("online_players", []),
             "control_state": control_state,

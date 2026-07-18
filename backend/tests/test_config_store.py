@@ -70,8 +70,8 @@ class ConfigStoreTests(unittest.TestCase):
 
             config = store.get_agent_llm_config("default", redact=False)
 
-            self.assertEqual(config["context_window_tokens"], 32768)
-            self.assertEqual(config["max_output_tokens"], 2048)
+            self.assertEqual(config["context_window_tokens"], 200000)
+            self.assertEqual(config["max_output_tokens"], 16384)
             self.assertLessEqual(
                 config["max_input_tokens"] + config["reserved_output_tokens"],
                 config["context_window_tokens"],
@@ -109,7 +109,7 @@ class ConfigStoreTests(unittest.TestCase):
                 })
             with self.assertRaisesRegex(ValueError, "compression_target_tokens"):
                 store.set_agent_llm_config("planner", {
-                    "compression_target_tokens": 25000,
+                    "compression_target_tokens": 170000,
                 })
             with self.assertRaisesRegex(ValueError, "compression_enabled"):
                 store.set_agent_llm_config("planner", {"compression_enabled": "true"})

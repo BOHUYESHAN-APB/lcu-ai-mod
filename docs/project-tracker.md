@@ -386,6 +386,158 @@ Acceptance gates:
   attackers, threshold boundaries, target death, line-of-sight loss, and low health.
 - Safety preemption proves no stale navigation, mining, gaze, or inventory input executes.
 
+### Phase 7: Multiplayer Governance And Task Admission
+
+Status: `planned`; current whitelist and command permissions are not sufficient for OP operation.
+
+Required identity groups:
+
+- One configurable `master` identity with the highest normal task authority.
+- Configurable `friends` with scoped conversation and task permissions.
+- Ordinary players default to low-cost, rate-limited replies and cannot assign body tasks.
+- Every identity, group, permission, whitelist change, denial, and task admission has durable history and audit provenance.
+
+Task admission must combine arrival time, requester weight, explicit urgency, safety,
+resource locks, current-task interruption cost, and starvation prevention. The system
+must not hard-code every natural-language task into one fixed priority table. Models
+may classify intent and explain tradeoffs, but deterministic policy owns final admission.
+
+OP safety policy:
+
+- AI may be granted server operator privileges, but player chat is never an arbitrary command channel.
+- Hard-deny `op`, `deop`, permission/group escalation, credential disclosure, command-block
+  privilege escalation, unrestricted `execute`, and equivalent aliases or namespaced forms.
+- `kick` and other bounded moderation actions require an enabled capability, authorized
+  requester/group, structured target/reason, audit record, and configurable confirmation.
+- Prompt injection, impersonation, quoted commands, books, signs, renamed items, and
+  third-party messages cannot elevate permissions.
+- Unknown commands and unknown permission-provider semantics fail closed.
+
+Operations UI requirements:
+
+- Manage `master`, `friends`, ordinary-player reply policy, permission groups, requester
+  weights, rate limits, queue state, audit history, and configuration revisions.
+- Runtime-safe settings may be changed through validated backend APIs. Minecraft config
+  changes must declare whether they apply live, on reconnect, or only after restart.
+- The contacts panel can be collapsed independently from direct backend conversation;
+  the two histories and input targets must never be visually or behaviorally conflated.
+
+### Phase 8: Death Recovery And Mod Compatibility
+
+Status: `active` for discovery and design; no automatic tomb recovery is verified.
+
+Current target adapter is Simple Tomb `1.21.1-1.4.4`. Recovery records the death
+dimension ID, coordinates, death sequence, key binding, inventory baseline, and tomb
+ownership. Modded dimension IDs are first-class strings and are never reduced to the
+three vanilla dimensions.
+
+Recovery policy:
+
+- Automatic tomb teleport is disabled by default and requires an explicit backend setting.
+- If the key and server configuration permit cross-dimension teleport, use the key directly.
+- Otherwise route through a previously confirmed portal into the target dimension before
+  using the key or local navigation. Unknown portals are not guessed.
+- Tomb interaction requires ownership evidence. Inventory/equipment recovery is verified
+  by before/after deltas, followed by deterministic re-equipping and layout restoration.
+- Failure, permission denial, wrong dimension, missing key, stale tomb, or ambiguous
+  ownership stops the workflow; no repeated teleport/use loop is allowed.
+- Other grave/corpse mods use versioned adapters and remain documented as unsupported
+  until encountered and tested.
+
+WATUT compatibility reports successful programmatic game actions to WATUT's own idle
+tracker without synthesizing global hardware input. This does not bypass server AFK policy.
+Inventory Sorter compatibility must prefer a stable API or deterministic inventory clicks;
+it must not blindly synthesize R/middle-click events that affect unrelated screens.
+
+### Phase 9: Safe Navigation, Projects, Farming, And Equipment
+
+Status: `planned`; zero-light and confined-space wandering is a current safety defect.
+
+Default autonomous movement must reject or strongly penalize zero-light cells, deep cave
+descent, hazards, narrow dead ends, unverified drops, and routes without a bounded return
+path. Explicit mining/rescue/project tasks may request a scoped risk lease with target,
+purpose, time limit, retreat conditions, and resource budget.
+
+Navigation quality must add the concepts present in mature game AI: node malus by hazard,
+walk-target ownership, path recomputation limits, stuck detection, home/range restriction,
+random-position scoring, reachable shelter, and safe fallback. LLM output does not directly
+override collision, hazard, building, or retreat checks.
+
+Coordinate and farming workflows:
+
+- Track every online player's dimension and last authoritative coordinates.
+- A request such as “come help me farm” first resolves the authorized requester's current
+  dimension and coordinates, then navigates there and scans a bounded radius up to 128.
+- Detect existing farmland before changing terrain. Use crop-compatible seeds and stable
+  rows/plots; do not mix crops randomly or overwrite another owned plot without permission.
+- Planting has explicit spacing, crop grouping, seed reserve, completion, and cancellation rules.
+
+Large projects and bridging:
+
+- Chunk excavation, slime-chunk excavation, stairs, ladders, scaffolding, and temporary
+  bridges are durable projects with surveyed volume, materials, protected-region checks,
+  egress plan, cleanup policy, checkpoints, and completion criteria.
+- Base areas default to no ad-hoc pillar/bridge placement. Temporary blocks require an
+  approved palette and cleanup ledger so autonomous construction cannot clutter the base.
+- Ladder versus block stair/bridge selection considers available materials, return travel,
+  fall risk, tool access, and project policy rather than model preference alone.
+
+Equipment policy evaluates slot attributes, armor/toughness, enchantments, durability,
+curses, current task, and replacement value deterministically. A model may resolve close
+tradeoffs or social gifting intent, but cannot give protected equipment away without policy.
+Items normally remain with the companion or may be offered to `master`; gifting to friends
+requires explicit group permission and inventory reserve checks.
+
+Persona presets may include optional themed profiles such as a cyber catgirl, but persona
+text cannot alter safety, permissions, task admission, or credential policy.
+
+Composable intents:
+
+- `follow(player)` owns locomotion but may coexist with `guard(player)`. Guard may preempt
+  briefly for a verified threat, then returns locomotion to follow.
+- `hold(position)` anchors patrol/guard to a fixed center; `guard(player)` uses the protected
+  player's current dimension and position as a dynamic center.
+- Observation intents may watch nearby friends feeding animals, farming, building, taking
+  damage, or facing hostile groups, then offer rate-limited assistance or warnings without
+  taking movement ownership.
+- Multiple intents share one arbiter and explicit actuator channels; they are not independent
+  tick loops that overwrite movement, gaze, hands, or inventory.
+
+World projects use protected X/Z regions that apply through all heights by default. Inside
+protected regions, breaking, temporary pillars, bridges, fluid placement, and farm conversion
+require explicit policy. The body reports current chunk X/Z and exact 16 by 16 bounds so a
+request to excavate “this chunk” becomes a surveyed durable project rather than a guessed radius.
+
+Recipe and collection tasks are iterative dependency graphs: inspect recipes, inventory,
+known storage and workstations; acquire materials; upgrade tools when justified; craft;
+verify output; recover or replan on bounded failure. Chat acknowledgement alone is never
+a task completion signal.
+
+Combat tools distinguish assessment, target lock, one-hit test, defense, patrol, and sustained
+engagement. Player targeting requires UUID authorization and trusted-player policy. Damage is
+estimated from target armor/toughness, absorption, effects, weapon attributes, enchantments,
+cooldown and server uncertainty; exact damage is observed after the hit rather than promised.
+
+The operations console must expose hotbar, main inventory, selected/main hand, offhand, armor,
+durability, enchantments, attributes, and optional Curios slots. Equipment decisions and gifts
+must be explainable from this structured state.
+
+### Deferred Voice Adapter
+
+Status: `deferred` to protect the main body/task/safety workstream.
+
+The future voice adapter selects explicit audio input and output devices. Voice-channel playback
+is captured from a configured system/virtual audio input, then VAD, STT, and speaker identification
+produce attributed conversation events. TTS audio is written to a configured virtual microphone
+output consumed by the voice-channel client. Echo cancellation, consent, recording retention,
+speaker confidence, interruption, rate limits, and privacy indicators are mandatory. Voice does
+not bypass `master`/`friends` permissions or task admission and remains separate from public chat.
+
+The operations console visual direction is a quiet macOS-inspired tool surface: restrained
+translucency for navigation and dialogs, strong typography, stable controls, compact information
+density, and responsive split views. Visual modernization must not delay or obscure body safety,
+task state, permissions, audit history, or failure information.
+
 ## Existing Verified Foundation
 
 The following foundation already exists and must not regress:
@@ -413,7 +565,7 @@ The following foundation already exists and must not regress:
 
 Latest recorded verification:
 
-- Python tests: 129 passed with 1 intentional opt-in integration skip on 2026-07-18.
+- Python tests: 136 passed with 1 intentional opt-in integration skip on 2026-07-18.
 - Gradle: `test --no-daemon` passed.
 - Explicit production Java-to-Python wire integration: 1 passed.
 - NeoForge `runServer` smoke reached `Done` and logged both side-neutral common and
@@ -427,7 +579,7 @@ Latest recorded verification:
 - Memory V2 status, records, export, summary preview/commit contracts, and local
   production-readiness reporting are covered by tests.
 - Shared-server JAR SHA-256:
-  `21325CC799DD7A0ECB96E4278832BE00941ACDDF55E8CF141F8813FDB014F8A4`.
+  `3463C1D068B59E577D4F4B57D58FA375FC055607330CFD7E548E19F39784932A`.
 
 The recorded JAR is deployed to the external FTB StoneBlock 4 test instance with
 `runtimeRole="body_client"` for headed-body acceptance testing.

@@ -30,6 +30,9 @@ ITEM_ALIASES = {
     "石剑": "stone_sword",
     "石镐": "stone_pickaxe",
     "木镐": "wooden_pickaxe",
+    "铁镐": "iron_pickaxe",
+    "钻石镐": "diamond_pickaxe",
+    "下界合金镐": "netherite_pickaxe",
 }
 
 BLOCK_ALIASES = {
@@ -62,6 +65,10 @@ class Planner:
         self.skills = skills
         self._is_planning = False
         self._last_plan_time = 0.0
+        self._last_plan_executed_action = False
+        self._last_plan_preview = ""
+        self._last_execution_source = "none"
+        self._last_protocol_error = ""
     
     def plan_and_execute(self, sender: str, message: str, 
                          context: dict, bot_name: str = "AI") -> Optional[str]:
@@ -84,6 +91,7 @@ class Planner:
             # 调用 LLM 规划
             result = self.llm.chat([{"role": "user", "content": prompt}], agent="planner")
             plan_text = result.get("content", "")
+            self._last_plan_preview = str(plan_text)[:500]
             
             if not plan_text:
                 logger.warning("[Planner] LLM 返回空内容")
@@ -93,10 +101,13 @@ class Planner:
             
             # 解析规划结果
             response = self._execute_plan(plan_text, sender, message, context)
+            if not self._last_plan_executed_action:
+                self._execute_direct_intent_fallback(sender, message, context)
             
             return response
             
         except Exception as e:
+            self._last_protocol_error = str(e)
             logger.error("[Planner] 规划失败: %s", e)
             return None
         finally:
@@ -213,17 +224,12 @@ class Planner:
 - attack(): 攻击附近的敌人
 - mine_block(): 挖掘方块
 - place_block(): 放置方块
-- craft(item_name[, count]): 合成一个物品（如 wooden_pickaxe, stone_sword 等），并允许数量参数
-- collect(block_type, count): 收集指定数量的方块
+- tool(craft_item, {{"item":"minecraft:iron_pickaxe","count":1}}): 合成物品；缺少材料时继续执行确定性的取料和制作链
+- tool(collect_blocks, {{"block_type":"minecraft:iron_ore","count":3}}): 收集指定数量的方块
 - equip(slot): 装备物品（mainhand, offhand, head, chest, legs, feet）
 - get_inventory(): 查看背包
-- build(x, y, z, structure): 在指定位置建造结构
-- explore(radius): 探索指定半径内的区域
-- trade(villager_type): 与村民交易
-- sleep(): 睡觉
 - eat(): 吃东西
 - drop(item, count): 丢弃物品
-- sort_inventory(): 整理背包
 - stop(): 停止当前动作（例如停止跟随/停止自动移动）
 - finish(): 结束本轮
 
@@ -231,12 +237,12 @@ class Planner:
 1. 你是一个真实玩家，不是 AI。不要说"作为 AI"、"我是 AI"之类的话
 2. 说话要自然、随意，像真人玩家一样。可以用"哈哈"、"好的"、"来了"、"等下"等口语
 3. 不要过度解释自己在做什么，直接做就行
-4. 如果玩家让你做某事，直接去做，不要问太多问题
+4. 如果玩家让你做某事，必须输出对应的 tool()；可以同时 reply() 简短确认，但不能只答应而不调用工具
 5. 回复要简短，不要长篇大论
 6. 如果需要多步操作，可以连续执行多个动作
 7. tool()/动作参数必须是可执行的真实参数，不能写“随机位置”“附近”“合适的地方”这种占位词
 8. 如果用户要求停止跟随或停止当前动作，优先使用 stop()
-9. 中文常见物品名要转换成 Minecraft 英文物品 ID，例如 木剑=wooden_sword，木头=oak_log
+9. 中文常见物品名要转换成带命名空间的 Minecraft 物品 ID，例如 铁镐=minecraft:iron_pickaxe，木头=minecraft:oak_log
 10. 如果当前任务状态不是 idle，且用户没有明确改变目标，不要重复下发同一个任务，优先继续或补全当前任务链
 
 请分析情况并决定下一步行动。如果需要回复，使用 reply()。如果需要执行动作，优先使用 tool(动作名, JSON参数)。
@@ -260,6 +266,9 @@ finish()
     def _execute_plan(self, plan_text: str, sender: str, message: str, 
                       context: dict) -> Optional[str]:
         """执行规划结果。"""
+        self._last_plan_executed_action = False
+        self._last_execution_source = "none"
+        self._last_protocol_error = ""
         plan_lower = plan_text.lower()
         reply_text: Optional[str] = None
         executed_any_action = self._execute_tool_calls(plan_text, context)
@@ -269,6 +278,11 @@ finish()
             content = self._extract_between(plan_text, "reply(", ")")
             if content:
                 reply_text = content.strip()
+
+        if executed_any_action:
+            self._last_plan_executed_action = True
+            self._last_execution_source = "model_tool"
+            return reply_text
         
         # 移动
         if "move_to(" in plan_lower:
@@ -420,6 +434,8 @@ finish()
             return reply_text
 
         if executed_any_action:
+            self._last_plan_executed_action = True
+            self._last_execution_source = "model_legacy_action"
             return reply_text
 
         if reply_text:
@@ -428,6 +444,54 @@ finish()
         # 如果没有匹配到任何动作，将整个文本作为回复
         logger.info("[Planner] 未匹配到动作，作为回复: %s", plan_text[:50])
         return plan_text
+
+    def _execute_direct_intent_fallback(self, sender: str, message: str, context: dict) -> bool:
+        compact = re.sub(r"\s+", "", message)
+        lowered = compact.casefold()
+        if any(phrase in compact for phrase in ("停下", "停止", "别跟了", "先别做了")):
+            self.skills.stop_all()
+            self._last_plan_executed_action = True
+            self._last_execution_source = "direct_intent_fallback"
+            logger.info("[Planner] 直接意图兜底: stop")
+            return True
+
+        if "跟着" in compact or "跟随" in compact:
+            target = self._resolve_follow_target(sender, compact, lowered, context)
+            if target:
+                self.skills.follow_player(target)
+                self._last_plan_executed_action = True
+                self._last_execution_source = "direct_intent_fallback"
+                logger.info("[Planner] 直接意图兜底: follow %s", target)
+                return True
+
+        if any(verb in compact for verb in ("制作", "合成", "做一个", "做个", "做一把", "做把")):
+            for alias in sorted(ITEM_ALIASES, key=len, reverse=True):
+                if alias in compact:
+                    self.skills.craft_item(self._normalize_item_name(alias), 1)
+                    self._last_plan_executed_action = True
+                    self._last_execution_source = "direct_intent_fallback"
+                    logger.info("[Planner] 直接意图兜底: craft %s", alias)
+                    return True
+        return False
+
+    def _resolve_follow_target(self, sender: str, compact: str, lowered: str, context: dict) -> Optional[str]:
+        if "跟着我" in compact or "跟随我" in compact:
+            return sender
+        roster: list[str] = []
+        for player in context.get("online_players", []):
+            if isinstance(player, dict) and player.get("name"):
+                roster.append(str(player["name"]))
+        for entity in context.get("entities", []):
+            if isinstance(entity, dict) and entity.get("type") == "player" and entity.get("name"):
+                roster.append(str(entity["name"]))
+        for name in dict.fromkeys(roster):
+            if name.casefold() in lowered:
+                return name
+        match = re.search(r"(?:跟着|跟随)([A-Za-z0-9_]{1,32})", compact, re.IGNORECASE)
+        if not match:
+            return None
+        requested = match.group(1)
+        return next((name for name in roster if name.casefold() == requested.casefold()), requested)
     
     def _extract_between(self, text: str, start_marker: str, end_marker: str) -> Optional[str]:
         """提取两个标记之间的内容。"""
@@ -485,13 +549,13 @@ finish()
         elif tool_name == "place_block":
             self.skills.place_block()
             return True
-        elif tool_name == "craft_item":
+        elif tool_name in {"craft", "craft_item"}:
             item = payload.get("item") or payload.get("item_name")
             normalized_item = self._normalize_item_name(str(item)) if item else ""
             if item and not self._is_duplicate_task(context, {"craft"}, normalized_item):
                 self.skills.craft_item(normalized_item, int(payload.get("count", 1)))
                 return True
-        elif tool_name == "collect_blocks":
+        elif tool_name in {"collect", "collect_blocks"}:
             block_type = payload.get("block_type") or payload.get("block")
             normalized_block = self._normalize_block_name(str(block_type)) if block_type else ""
             if block_type and not self._is_duplicate_task(context, {"collect"}, normalized_block):
@@ -561,4 +625,8 @@ finish()
         return {
             "is_planning": self._is_planning,
             "last_plan_time": self._last_plan_time,
+            "last_plan_preview": self._last_plan_preview,
+            "last_plan_executed_action": self._last_plan_executed_action,
+            "last_execution_source": self._last_execution_source,
+            "last_protocol_error": self._last_protocol_error,
         }

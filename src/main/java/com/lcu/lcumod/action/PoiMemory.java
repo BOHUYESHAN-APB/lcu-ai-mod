@@ -96,7 +96,7 @@ public final class PoiMemory {
                     String blockId = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
                     if (WORKSTATIONS.contains(blockId)) {
                         MEMORY.put(pos.immutable(), new PoiEntry(blockId, "workstation", tickCount));
-                    } else if (STORAGE.contains(blockId)) {
+                    } else if (isStorageBlock(blockId)) {
                         MEMORY.put(pos.immutable(), new PoiEntry(blockId, "storage", tickCount));
                     }
                 }
@@ -137,7 +137,10 @@ public final class PoiMemory {
     }
 
     public static BlockPos findNearestStorage(Minecraft mc, int maxDistance) {
-        return findNearest(mc, STORAGE, maxDistance);
+        List<JsonObject> storage = snapshot(mc, "storage", maxDistance, 1);
+        if (storage.isEmpty()) return null;
+        JsonObject nearest = storage.get(0);
+        return new BlockPos(nearest.get("x").getAsInt(), nearest.get("y").getAsInt(), nearest.get("z").getAsInt());
     }
 
     public static void updateStorageContents(BlockPos pos, Map<String, Integer> contents, int tickCount) {
@@ -155,6 +158,10 @@ public final class PoiMemory {
             }
         }
         return total;
+    }
+
+    public static boolean hasKnownContents(BlockPos pos) {
+        return STORAGE_CONTENTS.containsKey(pos);
     }
 
     public static List<JsonObject> snapshotSortedByItemMatch(Minecraft mc, String category, String targetItemId, int maxDistance, int limit) {
@@ -192,6 +199,7 @@ public final class PoiMemory {
             item.addProperty("z", entry.getKey().getZ());
 
             Map<String, Integer> contents = STORAGE_CONTENTS.get(entry.getKey());
+            item.addProperty("contents_known", contents != null);
             if (contents != null && !contents.isEmpty()) {
                 JsonArray contentsArr = new JsonArray();
                 for (var contentEntry : contents.entrySet()) {
@@ -233,5 +241,19 @@ public final class PoiMemory {
         }
         result.sort(Comparator.comparingDouble(item -> item.get("distance").getAsDouble()));
         return result.size() <= limit ? result : result.subList(0, limit);
+    }
+
+    private static boolean isStorageBlock(String blockId) {
+        if (STORAGE.contains(blockId)) return true;
+        int separator = blockId.indexOf(':');
+        String namespace = separator >= 0 ? blockId.substring(0, separator) : "minecraft";
+        String path = separator >= 0 ? blockId.substring(separator + 1) : blockId;
+        if (namespace.equals("ironchest")) {
+            return path.endsWith("chest");
+        }
+        if (namespace.equals("sophisticatedstorage")) {
+            return path.contains("chest") || path.contains("barrel");
+        }
+        return false;
     }
 }

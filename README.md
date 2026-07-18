@@ -156,6 +156,8 @@ python -m venv .venv
 
 当前需求、架构决策、未决问题、实施顺序和发布阻塞项统一记录在 [LCU Project Tracker](docs/project-tracker.md)。长期开发过程中应先更新该文件，避免对话上下文压缩造成需求丢失。
 
+当前整合包的 WATUT、墓碑、背包整理等适配状态见 [模组兼容矩阵](docs/mod-compatibility.md)。
+
 ### 测试
 ```bash
 cd backend

@@ -196,16 +196,29 @@ public final class CraftingPlanner {
             }
             String id = BuiltInRegistries.ITEM.getKey(result.getItem()).toString();
             if (recipe.value().getType() == RecipeType.CRAFTING) {
-                indexes.crafting.putIfAbsent(id, recipe);
+                indexes.crafting.merge(id, recipe, (current, candidate) -> preferredRecipe(current, candidate, id));
             } else if (recipe.value().getType() == RecipeType.SMELTING) {
-                indexes.smelting.putIfAbsent(id, recipe);
+                indexes.smelting.merge(id, recipe, (current, candidate) -> preferredRecipe(current, candidate, id));
             } else if (recipe.value().getType() == RecipeType.BLASTING) {
-                indexes.blasting.putIfAbsent(id, recipe);
+                indexes.blasting.merge(id, recipe, (current, candidate) -> preferredRecipe(current, candidate, id));
             } else if (recipe.value().getType() == RecipeType.SMOKING) {
-                indexes.smoking.putIfAbsent(id, recipe);
+                indexes.smoking.merge(id, recipe, (current, candidate) -> preferredRecipe(current, candidate, id));
             }
         }
         return indexes;
+    }
+
+    private static RecipeHolder<?> preferredRecipe(RecipeHolder<?> current, RecipeHolder<?> candidate, String resultId) {
+        return recipePreference(candidate, resultId) > recipePreference(current, resultId) ? candidate : current;
+    }
+
+    private static int recipePreference(RecipeHolder<?> recipe, String resultId) {
+        var id = recipe.id();
+        int separator = resultId.indexOf(':');
+        String resultPath = separator >= 0 ? resultId.substring(separator + 1) : resultId;
+        int score = id.getNamespace().equals("minecraft") ? 100 : 0;
+        if (id.getPath().equals(resultPath)) score += 50;
+        return score;
     }
 
     private static RecipeHolder<?> findCraftRecipe(RecipeIndexes indexes, String targetItemId) {
