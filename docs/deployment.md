@@ -5,6 +5,8 @@
 LCU 支持仅客户端安装。使用真实有头 AI 身体时，只在 AI 登录所使用的 NeoForge 客户端安装 LCU，目标 Minecraft 服务器、其他普通玩家客户端均不要求安装。
 
 服务器安装 LCU 只用于未来的 `server_fake_player` 形态。该形态当前尚未实现，不能代替真实客户端身体。
+若同时选择 `server_fake_player` 并设置 `fakePlayerEnabled=true`，当前构建会明确拒绝服务端
+启动，不会在没有执行器的情况下静默声称假人可用。
 
 ## 部署矩阵
 
@@ -68,6 +70,24 @@ backend/.local/config.json
 manager 或操作系统凭据存储，并定期轮换密钥。
 
 默认角色为 `player_client`。该默认值用于防止普通玩家客户端意外启动动作执行器；AI 实体实例必须显式改为 `body_client`。
+
+## 玩家手机通讯配对
+
+远程玩家通讯要求后端设置独立强随机 `PLAYER_API_TOKEN` 作为配对签名密钥。该主密钥
+只保存在后端，不分发给玩家。operator 使用 SDK token 为玩家当前 UUID 与服务器地址
+生成受限 token：
+
+```powershell
+$headers = @{ Authorization = "Bearer $env:SDK_API_TOKEN" }
+$pairing = Invoke-RestMethod http://127.0.0.1:8080/api/v2/player-pairings `
+  -Method Post -Headers $headers -ContentType application/json `
+  -Body '{"player_id":"<minecraft-uuid>","server_id":"example.org"}'
+```
+
+把返回的 `token` 写入该玩家客户端的 `playerApiToken`；`playerBackendUrl` 指向 HTTPS
+后端。token 只能访问对应 UUID + server ID 的会话，不能读取其他玩家或其他服务器的
+线程。当前配对仍由 operator 确认 UUID；未来服务端 relay 将从真实 `ServerPlayer`
+签发身份，消除人工配对环节。
 
 ## 纯客户端模式边界
 

@@ -7,7 +7,7 @@ import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.ModContainer;
 import net.neoforged.fml.common.EventBusSubscriber;
 import net.neoforged.fml.common.Mod;
-import net.neoforged.neoforge.event.server.ServerStartedEvent;
+import net.neoforged.neoforge.event.server.ServerAboutToStartEvent;
 
 @Mod(value = LCUMod.MODID, dist = Dist.DEDICATED_SERVER)
 @EventBusSubscriber(modid = LCUMod.MODID, value = Dist.DEDICATED_SERVER)
@@ -15,7 +15,7 @@ public final class LCUModServer {
     public LCUModServer(ModContainer container) {}
 
     @SubscribeEvent
-    public static void onServerStarted(ServerStartedEvent event) {
+    public static void onServerAboutToStart(ServerAboutToStartEvent event) {
         if (RuntimeRole.current() != RuntimeRole.SERVER_FAKE_PLAYER) {
             LCUMod.LOGGER.info("[LCUMod] Dedicated server loaded without fake-player body activation");
             return;
@@ -28,5 +28,7 @@ public final class LCUModServer {
                 "[LCUMod] Server fake-player body is configured for profile {} but its executor is not implemented yet; no wire listener was started",
                 ServerConfig.FAKE_PLAYER_NAME.get()
         );
+        throw new IllegalStateException(
+                "server_fake_player is unavailable in this build; disable fakePlayerEnabled");
     }
 }

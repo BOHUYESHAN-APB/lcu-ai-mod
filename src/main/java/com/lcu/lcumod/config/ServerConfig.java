@@ -6,7 +6,7 @@ public final class ServerConfig {
     private static final ModConfigSpec.Builder BUILDER = new ModConfigSpec.Builder();
 
     public static final ModConfigSpec.BooleanValue FAKE_PLAYER_ENABLED = BUILDER
-            .comment("Enable the future server-side fake-player body runtime")
+            .comment("Reserved for a future server-side body. Enabling it fails startup until the executor is implemented.")
             .define("fakePlayerEnabled", false);
 
     public static final ModConfigSpec.ConfigValue<String> FAKE_PLAYER_NAME = BUILDER

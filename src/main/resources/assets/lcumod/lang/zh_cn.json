@@ -6,5 +6,12 @@
   "screen.lcumod.conversation.input": "输入消息",
   "screen.lcumod.conversation.send": "发送",
   "screen.lcumod.conversation.sending": "发送中...",
-  "screen.lcumod.conversation.failed": "消息发送失败"
+  "screen.lcumod.conversation.failed": "消息发送失败",
+  "screen.lcumod.conversation.failed_detail": "错误：%s",
+  "screen.lcumod.conversation.loading": "正在加载对话...",
+  "screen.lcumod.conversation.refresh": "刷新",
+  "screen.lcumod.conversation.empty": "未选择对话",
+  "screen.lcumod.conversation.no_player": "无法获取玩家身份",
+  "screen.lcumod.conversation.status.available": "在线",
+  "screen.lcumod.conversation.status.unavailable": "不可用"
 }

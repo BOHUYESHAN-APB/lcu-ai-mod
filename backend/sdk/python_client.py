@@ -99,6 +99,9 @@ class LCUClient:
         result = self._post("/api/sdk/command", {"command": command, "args": args or {}})
         return str(result["request_id"])
 
+    def get_body_request(self, request_id: str) -> dict[str, Any]:
+        return self._get(f"/api/v2/body-requests/{quote(request_id, safe='')}")
+
     def list_skills(self, category: str | None = None) -> list[dict[str, Any]]:
         suffix = f"?{urlencode({'category': category})}" if category else ""
         return self._get(f"/api/v2/skills{suffix}").get("skills", [])
@@ -115,6 +118,11 @@ class LCUClient:
 
     def get_control(self) -> dict[str, Any]:
         return self._get("/api/v2/control")
+
+    def create_player_pairing(self, player_id: str, server_id: str) -> dict[str, Any]:
+        return self._post("/api/v2/player-pairings", {
+            "player_id": player_id, "server_id": server_id,
+        })
 
     def acquire_control(self, owner: str, mode: str = "external", *,
                         owns: list[str] | None = None, ttl_seconds: int = 30) -> dict[str, Any]:

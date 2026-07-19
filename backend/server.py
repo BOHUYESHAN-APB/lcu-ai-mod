@@ -3,6 +3,8 @@ FastAPI web server.
 Serves dashboard, WebSocket, and REST API for the Session-based architecture.
 """
 
+import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -34,6 +36,7 @@ from agent.skill_registry import SkillRegistry, SkillValidationError
 from agent.storage_policy import enforce_storage_policy
 from agent.task_coordinator import TaskCoordinator
 from agent.task_preset_registry import TaskPresetRegistry, TaskPresetValidationError
+from body_request_diagnostics import BodyRequestDiagnostics
 from protocol import BodyAdapter, WireClient
 
 SDK_API_VERSION = "1"
@@ -136,7 +139,7 @@ async def sdk_authentication(request: Request, call_next):
             expected = _player_api_token()
             candidate = _request_token(request)
             allowed = (
-                bool(expected) and bool(candidate) and secrets.compare_digest(candidate, expected)
+                bool(expected) and bool(candidate)
             ) or (
                 not expected and _is_loopback(client_host) and _local_authority(request.headers.get("host"))
             )
@@ -170,6 +173,28 @@ class PlayerConversationRequest(BaseModel):
     message: str = Field(min_length=1, max_length=2000)
     client_message_id: str = Field(min_length=1, max_length=128)
     server_id: str = Field(default="unknown", max_length=256)
+
+    @field_validator("player_id", "player_name", "server_id")
+    @classmethod
+    def validate_player_identity(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("player identity fields must not be blank")
+        return value
+
+
+class PlayerPairingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    player_id: str = Field(min_length=1, max_length=128)
+    server_id: str = Field(min_length=1, max_length=256)
+
+    @field_validator("player_id", "server_id")
+    @classmethod
+    def validate_pairing_identity(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("pairing identity fields must not be blank")
+        return value
 
 
 class SDKCommandRequest(BaseModel):
@@ -351,6 +376,7 @@ connection_thread: threading.Thread | None = None
 control_transition_lock = threading.RLock()
 control_response_lock = threading.Lock()
 control_response_waiters: dict[str, tuple[threading.Event, dict[str, Any]]] = {}
+body_request_diagnostics = BodyRequestDiagnostics()
 
 CONTROL_DOMAINS = {"persona", "memory", "planner", "autonomy", "actions"}
 RESERVED_BODY_COMMANDS = {"control_external", "control_builtin"}
@@ -358,6 +384,7 @@ FENCING_FIELD = "__lcu_fencing_token"
 
 
 def _capture_control_response(event) -> None:
+    body_request_diagnostics.capture(event)
     active_orchestrator = orchestrator
     priority_handler = getattr(active_orchestrator, "handle_priority_body_event", None)
     if callable(priority_handler):
@@ -583,6 +610,9 @@ async def startup():
                 o.tick()  # Drain terminal messages queued immediately before socket closure.
                 o.stop()
                 o.on_body_disconnect()
+                body_request_diagnostics.mark_inflight_unknown(
+                    "companion body disconnected before terminal event"
+                )
                 skill_registry.set_body_tools(None)
                 if not stop_event.is_set():
                     print("[Backend] Disconnected. Reconnecting...")
@@ -737,14 +767,65 @@ async def get_session():
     return {"session": None}
 
 
+def _player_contact_id(player_id: str, server_id: str) -> str:
+    player_id = player_id.strip()
+    server_id = server_id.strip()
+    if not player_id or not server_id:
+        raise HTTPException(status_code=422, detail="player_id and server_id must not be blank")
+    identity = f"{server_id}\0{player_id}"
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return f"minecraft-player:{digest}"
+
+
+def _player_scope_token(player_id: str, server_id: str) -> str:
+    secret = _player_api_token()
+    if not secret:
+        return ""
+    scope = f"{server_id.strip()}\0{player_id.strip()}".encode("utf-8")
+    return hmac.new(secret.encode("utf-8"), scope, hashlib.sha256).hexdigest()
+
+
+def _authorize_player_scope(request: Request, player_id: str, server_id: str) -> None:
+    if not _player_api_token():
+        return
+    candidate = _request_token(request)
+    expected = _player_scope_token(player_id, server_id)
+    if not candidate or not secrets.compare_digest(candidate, expected):
+        raise HTTPException(status_code=403, detail="Player token is not valid for this identity scope")
+
+
+def _direct_conversation_id(contact_id: str) -> str:
+    return f"direct_{hashlib.sha256(contact_id.encode('utf-8')).hexdigest()[:24]}"
+
+
 @app.get("/api/player/v1/contacts")
-async def get_player_contacts():
+async def get_player_contacts(
+    request: Request,
+    player_id: str = Query(min_length=1, max_length=128),
+    server_id: str = Query(min_length=1, max_length=256),
+):
+    _authorize_player_scope(request, player_id, server_id)
     if not orchestrator or not orchestrator.session:
         raise HTTPException(status_code=503, detail="Companion session is not available")
+    contact_id = _player_contact_id(player_id, server_id)
     with orchestrator.session_context() as session:
-        conversations = session.message_db.list_conversations(limit=200)
-    contacts = _conversation_contacts(conversations)
-    return {"contacts": contacts}
+        conversation_id = _direct_conversation_id(contact_id)
+        conversation = session.message_db.get_conversation(conversation_id)
+        if conversation is None:
+            conversation_id = session.message_db.get_or_create_direct_conversation(contact_id, "Player")
+            conversation = session.message_db.get_conversation(conversation_id)
+        persona = session.runtime.get("persona", {})
+        llm_available = session.llm.is_configured("conversation")
+    return {"contacts": [{
+        "id": "companion",
+        "display_name": persona.get("name") or "AI Companion",
+        "conversation_id": conversation_id,
+        "last_activity": conversation["last_activity"],
+        "message_count": conversation["message_count"],
+        "unread_count": 0,
+        "presence": "online" if llm_available else "offline",
+        "status": "available" if llm_available else "unavailable",
+    }]}
 
 
 def _conversation_contacts(conversations: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -774,13 +855,19 @@ def _conversation_contacts(conversations: list[dict[str, Any]]) -> list[dict[str
 
 @app.get("/api/player/v1/conversations/{conversation_id}/messages")
 async def get_player_conversation_messages(
-    conversation_id: str, limit: int = Query(default=100, ge=1, le=200),
+    conversation_id: str,
+    request: Request,
+    player_id: str = Query(min_length=1, max_length=128),
+    server_id: str = Query(min_length=1, max_length=256),
+    limit: int = Query(default=100, ge=1, le=200),
 ):
+    _authorize_player_scope(request, player_id, server_id)
     if not orchestrator or not orchestrator.session:
         raise HTTPException(status_code=503, detail="Companion session is not available")
+    contact_id = _player_contact_id(player_id, server_id)
     with orchestrator.session_context() as session:
         conversation = session.message_db.get_conversation(conversation_id)
-        if conversation is None:
+        if conversation is None or set(conversation.get("participants", [])) != {contact_id, "companion"}:
             raise HTTPException(status_code=404, detail="Conversation not found")
         messages = session.message_db.get_conversation_messages(conversation_id, limit)
     return {"conversation": conversation, "messages": messages}
@@ -810,10 +897,11 @@ async def get_operator_inbox_messages(
 
 
 @app.post("/api/player/v1/messages")
-async def send_player_conversation_message(data: PlayerConversationRequest):
+async def send_player_conversation_message(data: PlayerConversationRequest, request: Request):
     if not orchestrator or not orchestrator.session:
         raise HTTPException(status_code=503, detail="Companion session is not available")
-    contact_id = f"minecraft:{data.player_id}"
+    _authorize_player_scope(request, data.player_id, data.server_id)
+    contact_id = _player_contact_id(data.player_id, data.server_id)
     with orchestrator.session_context() as session:
         conversation_id = session.message_db.get_or_create_direct_conversation(contact_id, data.player_name)
         claimed, receipt = session.message_db.claim_player_message(data.client_message_id, conversation_id)
@@ -1306,6 +1394,18 @@ async def get_v2_info():
     }
 
 
+@app.post("/api/v2/player-pairings")
+async def create_player_pairing(data: PlayerPairingRequest):
+    if not _player_api_token():
+        raise HTTPException(status_code=409, detail="PLAYER_API_TOKEN is not configured")
+    return {
+        "player_id": data.player_id,
+        "server_id": data.server_id,
+        "token": _player_scope_token(data.player_id, data.server_id),
+        "token_type": "player_scope",
+    }
+
+
 @app.get("/api/v2/control")
 async def get_v2_control():
     lease = _reconcile_control_mode()
@@ -1688,16 +1788,37 @@ async def sdk_command(data: SDKCommandRequest):
                 with agent_state.control_guard(None, None):
                     if task_coordinator and session:
                         def register_raw(req_id: str) -> None:
+                            body_request_diagnostics.register(
+                                req_id, data.command, data.args, "sdk", _raw_command_completion(data.command),
+                            )
                             session.register_external_command(data.command, req_id, data.args, requester="sdk")
                         def unregister_raw(req_id: str) -> None:
+                            body_request_diagnostics.remove(req_id)
                             session.unregister_external_command(req_id)
                         request_id = task_coordinator.dispatch_raw_command(
                             data.command, data.args, on_reserved=register_raw, on_failed=unregister_raw,
                         )
                     elif task_coordinator:
-                        request_id = task_coordinator.dispatch_raw_command(data.command, data.args)
+                        request_id = task_coordinator.dispatch_raw_command(
+                            data.command, data.args,
+                            on_reserved=lambda req_id: body_request_diagnostics.register(
+                                req_id, data.command, data.args, "sdk", _raw_command_completion(data.command),
+                            ),
+                            on_failed=body_request_diagnostics.remove,
+                        )
                     else:
-                        request_id = body.send_command(data.command, data.args)
+                        request_id = str(uuid.uuid4())
+                        body_request_diagnostics.register(
+                            request_id, data.command, data.args, "sdk", _raw_command_completion(data.command),
+                        )
+                        try:
+                            returned_id = body.send_command(data.command, data.args, request_id=request_id)
+                        except Exception:
+                            body_request_diagnostics.remove(request_id)
+                            raise
+                        if returned_id != request_id:
+                            body_request_diagnostics.remove(request_id)
+                            raise ConnectionError("body did not preserve raw request id")
                 if session and not task_coordinator:
                     session.register_external_command(data.command, request_id, data.args, requester="sdk")
     except ConnectionError as exc:
@@ -1707,6 +1828,21 @@ async def sdk_command(data: SDKCommandRequest):
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"status": "accepted", "request_id": request_id}
+
+
+def _raw_command_completion(command: str) -> str:
+    for manifest in skill_registry.list():
+        if manifest["command"] == command:
+            return str(manifest["completion"])
+    return "response"
+
+
+@app.get("/api/v2/body-requests/{request_id}")
+async def get_v2_body_request(request_id: str):
+    record = body_request_diagnostics.get(request_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Body request not found")
+    return record
 
 
 @app.get("/api/database")

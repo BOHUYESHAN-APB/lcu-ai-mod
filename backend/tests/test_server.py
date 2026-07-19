@@ -16,6 +16,7 @@ from agent.agent_state import AgentStateDB
 from agent.config_store import ConfigStore
 from agent.session import Session
 from agent.task_coordinator import TaskCoordinator
+from body_request_diagnostics import BodyRequestDiagnostics
 from protocol import BodyEvent
 
 
@@ -170,13 +171,20 @@ class ServerSDKTests(unittest.TestCase):
                     patch.object(server, "orchestrator", orchestrator),
                 ):
                     client = TestClient(server.app)
-                    headers = {"Authorization": "Bearer player-secret"}
+                    paired = client.post(
+                        "/api/v2/player-pairings",
+                        json={"player_id": "uuid-alice", "server_id": "example.org"},
+                        headers={"Authorization": "Bearer operator-secret"},
+                    )
+                    headers = {"Authorization": f"Bearer {paired.json()['token']}"}
                     sent = client.post("/api/player/v1/messages", json=payload, headers=headers)
                     duplicate = client.post("/api/player/v1/messages", json=payload, headers=headers)
-                    contacts = client.get("/api/player/v1/contacts", headers=headers)
+                    identity = {"player_id": "uuid-alice", "server_id": "example.org"}
+                    contacts = client.get("/api/player/v1/contacts", params=identity, headers=headers)
                     conversation_id = sent.json()["conversation_id"]
                     history = client.get(
-                        f"/api/player/v1/conversations/{conversation_id}/messages", headers=headers,
+                        f"/api/player/v1/conversations/{conversation_id}/messages",
+                        params=identity, headers=headers,
                     )
                     operator_contacts = client.get(
                         "/api/v2/inbox/contacts",
@@ -188,21 +196,88 @@ class ServerSDKTests(unittest.TestCase):
                     )
                     wrong_token = client.get(
                         "/api/player/v1/contacts",
+                        params=identity,
                         headers={"Authorization": "Bearer operator-secret"},
                     )
             finally:
                 session.stop()
 
         self.assertEqual(sent.status_code, 200)
+        self.assertEqual(paired.status_code, 200)
+        self.assertEqual(paired.json()["token_type"], "player_scope")
         self.assertEqual(sent.json()["reply"], "Alice saved a diamond mining location.")
         self.assertEqual(duplicate.json(), sent.json())
         self.assertEqual(len(contacts.json()["contacts"]), 1)
         self.assertEqual(len(history.json()["messages"]), 2)
-        self.assertEqual(operator_contacts.json()["contacts"], contacts.json()["contacts"])
         self.assertEqual(operator_history.json()["messages"], history.json()["messages"])
         self.assertEqual([item["is_ai"] for item in history.json()["messages"]], [0, 1])
         self.assertEqual(body.commands, [])
-        self.assertEqual(wrong_token.status_code, 401)
+        self.assertEqual(wrong_token.status_code, 403)
+
+    def test_player_conversation_reads_are_scoped_to_player_and_server_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = Session(FakeBody(False), companion_id="scoped-chat", storage_root=Path(tmp), legacy_root=None)
+            session.llm.close()
+            session.llm = FakeLLM()
+            orchestrator = FakeOrchestrator()
+            orchestrator.session = session
+            try:
+                with (
+                    patch.dict(os.environ, {"PLAYER_API_TOKEN": "player-secret"}),
+                    patch.object(server, "orchestrator", orchestrator),
+                ):
+                    client = TestClient(server.app)
+                    def player_headers(player_id, server_id):
+                        token = server._player_scope_token(player_id, server_id)
+                        return {"Authorization": f"Bearer {token}"}
+
+                    alice_headers = player_headers("uuid-alice", "server-a")
+                    alice = client.post("/api/player/v1/messages", headers=alice_headers, json={
+                        "player_id": "uuid-alice", "player_name": "Alice", "server_id": "server-a",
+                        "client_message_id": "alice-1", "message": "Alice private message",
+                    })
+                    bob = client.post("/api/player/v1/messages", headers=player_headers("uuid-bob", "server-a"), json={
+                        "player_id": "uuid-bob", "player_name": "Bob", "server_id": "server-a",
+                        "client_message_id": "bob-1", "message": "Bob private message",
+                    })
+                    alice_other_server = client.post(
+                        "/api/player/v1/messages", headers=player_headers("uuid-alice", "server-b"), json={
+                        "player_id": "uuid-alice", "player_name": "Alice", "server_id": "server-b",
+                        "client_message_id": "alice-2", "message": "Other server message",
+                    })
+                    alice_scope = {"player_id": "uuid-alice", "server_id": "server-a"}
+                    contacts = client.get("/api/player/v1/contacts", params=alice_scope, headers=alice_headers)
+                    own_history = client.get(
+                        f"/api/player/v1/conversations/{alice.json()['conversation_id']}/messages",
+                        params=alice_scope, headers=alice_headers,
+                    )
+                    bob_history = client.get(
+                        f"/api/player/v1/conversations/{bob.json()['conversation_id']}/messages",
+                        params=alice_scope, headers=alice_headers,
+                    )
+                    other_server_history = client.get(
+                        f"/api/player/v1/conversations/{alice_other_server.json()['conversation_id']}/messages",
+                        params=alice_scope, headers=alice_headers,
+                    )
+                    spoofed_scope = client.get(
+                        "/api/player/v1/contacts",
+                        params={"player_id": "uuid-bob", "server_id": "server-a"},
+                        headers=alice_headers,
+                    )
+                    unscoped_contacts = client.get("/api/player/v1/contacts", headers=alice_headers)
+            finally:
+                session.stop()
+
+        self.assertEqual(contacts.status_code, 200)
+        self.assertEqual(len(contacts.json()["contacts"]), 1)
+        self.assertEqual(contacts.json()["contacts"][0]["conversation_id"], alice.json()["conversation_id"])
+        self.assertEqual([message["message"] for message in own_history.json()["messages"]], [
+            "Alice private message", "Alice saved a diamond mining location.",
+        ])
+        self.assertEqual(bob_history.status_code, 404)
+        self.assertEqual(other_server_history.status_code, 404)
+        self.assertEqual(spoofed_scope.status_code, 403)
+        self.assertEqual(unscoped_contacts.status_code, 422)
 
     def test_memory_v2_browse_detail_and_export_use_active_scope(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -520,18 +595,101 @@ class ServerSDKTests(unittest.TestCase):
     def test_sdk_command_uses_body_adapter_and_tracks_request(self):
         body = FakeBody()
         orchestrator = FakeOrchestrator()
+        diagnostics = BodyRequestDiagnostics()
         with (
             patch.dict(os.environ, {"SDK_API_TOKEN": ""}),
             patch.object(server, "body", body),
             patch.object(server, "orchestrator", orchestrator),
+            patch.object(server, "body_request_diagnostics", diagnostics),
         ):
             client = TestClient(server.app, base_url="http://127.0.0.1:8080", client=("127.0.0.1", 50000))
             response = client.post("/api/sdk/command", json={"command": "jump", "args": {}})
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["request_id"], "fake-1")
+        request_id = response.json()["request_id"]
+        self.assertEqual(len(request_id), 36)
         self.assertEqual(body.commands, [("jump", {})])
-        self.assertEqual(orchestrator.session.commands, [("jump", "fake-1", {}, "sdk")])
+        self.assertEqual(orchestrator.session.commands, [("jump", request_id, {}, "sdk")])
+
+    def test_body_request_diagnostics_tracks_events_redacts_and_retains_terminal_record(self):
+        body = FakeBody()
+        diagnostics = BodyRequestDiagnostics()
+        with (
+            patch.dict(os.environ, {"SDK_API_TOKEN": ""}),
+            patch.object(server, "body", body),
+            patch.object(server, "orchestrator", None),
+            patch.object(server, "task_coordinator", None),
+            patch.object(server, "body_request_diagnostics", diagnostics),
+        ):
+            client = TestClient(server.app, base_url="http://127.0.0.1:8080", client=("127.0.0.1", 50000))
+            accepted = client.post("/api/sdk/command", json={
+                "command": "craft_item",
+                "args": {"item": "minecraft:torch", "api_token": "do-not-return"},
+            })
+            request_id = accepted.json()["request_id"]
+            server._capture_control_response(BodyEvent("response", {
+                "id": request_id, "success": True, "data": {"message": "queued", "password": "hidden"},
+            }))
+            server._capture_control_response(BodyEvent("progress", {
+                "id": request_id, "progress": 0.5, "message": "crafting",
+            }))
+            server._capture_control_response(BodyEvent("outcome", {
+                "id": request_id, "status": "succeeded", "message": "crafted", "token": "hidden",
+            }))
+            result = client.get(f"/api/v2/body-requests/{request_id}")
+            missing = client.get("/api/v2/body-requests/missing")
+
+        payload = result.json()
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(payload["command"], "craft_item")
+        self.assertEqual(payload["args"]["api_token"], "[redacted]")
+        self.assertEqual(payload["response"]["data"]["password"], "[redacted]")
+        self.assertEqual(payload["outcome"]["token"], "[redacted]")
+        self.assertEqual(payload["progress"], 0.5)
+        self.assertEqual(payload["status"], "succeeded")
+        self.assertTrue(payload["terminal"])
+        self.assertFalse(payload["durable"])
+        self.assertIsNotNone(payload["completed_at"])
+        self.assertEqual(missing.status_code, 404)
+
+    def test_body_request_diagnostics_captures_immediate_response(self):
+        diagnostics = BodyRequestDiagnostics()
+        body = FakeBody()
+
+        def send_immediately(command, args=None, request_id=None):
+            body.commands.append((command, args or {}))
+            server._capture_control_response(BodyEvent("response", {
+                "id": request_id, "success": True, "data": {"message": "accepted"},
+            }))
+            return request_id
+
+        body.send_command = send_immediately
+        with (
+            patch.dict(os.environ, {"SDK_API_TOKEN": ""}),
+            patch.object(server, "body", body),
+            patch.object(server, "orchestrator", None),
+            patch.object(server, "task_coordinator", None),
+            patch.object(server, "body_request_diagnostics", diagnostics),
+        ):
+            client = TestClient(server.app, base_url="http://127.0.0.1:8080", client=("127.0.0.1", 50000))
+            accepted = client.post("/api/sdk/command", json={"command": "jump"})
+            result = client.get(f"/api/v2/body-requests/{accepted.json()['request_id']}")
+
+        self.assertEqual(result.json()["status"], "succeeded")
+        self.assertTrue(result.json()["terminal"])
+        self.assertEqual(result.json()["response"]["data"]["message"], "accepted")
+
+    def test_body_request_diagnostics_marks_timeout_and_disconnect_unknown(self):
+        diagnostics = BodyRequestDiagnostics(timeout_seconds=0)
+        diagnostics.register("timeout", "move_to", {}, "sdk", "outcome")
+        self.assertEqual(diagnostics.get("timeout")["status"], "unknown")
+
+        diagnostics = BodyRequestDiagnostics()
+        diagnostics.register("disconnect", "move_to", {}, "sdk", "outcome")
+        diagnostics.mark_inflight_unknown("companion body disconnected before terminal event")
+        record = diagnostics.get("disconnect")
+        self.assertEqual(record["status"], "unknown")
+        self.assertTrue(record["terminal"])
 
     def test_sdk_command_rejects_disconnected_body(self):
         with (

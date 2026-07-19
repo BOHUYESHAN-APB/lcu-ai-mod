@@ -118,6 +118,10 @@ export class LCUClient {
     return result.request_id;
   }
 
+  getBodyRequest(requestId) {
+    return this.request(`/api/v2/body-requests/${encodeURIComponent(requestId)}`);
+  }
+
   async listSkills(category = '') {
     const suffix = category ? `?category=${encodeURIComponent(category)}` : '';
     const result = await this.request(`/api/v2/skills${suffix}`);
@@ -140,6 +144,13 @@ export class LCUClient {
 
   getControl() {
     return this.request('/api/v2/control');
+  }
+
+  createPlayerPairing(playerId, serverId) {
+    return this.request('/api/v2/player-pairings', {
+      method: 'POST',
+      body: JSON.stringify({ player_id: playerId, server_id: serverId }),
+    });
   }
 
   async acquireControl(owner, { mode = 'external', owns, ttlSeconds = 30 } = {}) {

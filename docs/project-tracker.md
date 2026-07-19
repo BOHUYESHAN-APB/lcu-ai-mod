@@ -598,7 +598,7 @@ The following foundation already exists and must not regress:
 
 Latest recorded verification:
 
-- Python tests: 205 passed with 1 intentional opt-in integration skip on 2026-07-19.
+- Python tests: 210 passed with 1 intentional opt-in integration skip on 2026-07-19.
 - Gradle: `clean build` passed on 2026-07-19.
 - Explicit production Java-to-Python wire integration: 1 passed.
 - NeoForge `runServer` smoke reached `Done` and logged both side-neutral common and
@@ -746,3 +746,12 @@ Pending headed-body verification, deferred to the next test session:
 - Added a non-configurable protocol-safety floor: one queued command per tick, bounded wire backlog,
   grounded jumps, crosshair/visibility/cooldown-verified attacks, real block-hit/face validation,
   target-loss mining cancellation, and fail-closed client-only inventory mutation/drop paths.
+- Added bounded, non-durable raw body-request diagnostics with correlated response/progress/outcome,
+  secret redaction, timeout/disconnect uncertainty, SDK lookup methods, and a safe PowerShell headed-
+  test driver for status, discovery, raw primitives, Skills, and presets.
+- Upgraded the restricted player screen to a phone-style contacts/history view with persisted thread
+  loading, scrolling, presence/status, responsive compact layout, and player+server scoped reads.
+  Operator-issued HMAC pairing tokens now bind access to one player UUID + server ID scope; a future
+  server relay is still required to derive that identity directly from an authenticated ServerPlayer.
+- Made the unimplemented server fake-player configuration fail startup when explicitly enabled;
+  no placeholder wire listener or executor is advertised.

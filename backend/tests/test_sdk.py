@@ -58,6 +58,26 @@ class SDKClientTests(unittest.TestCase):
         self.assertEqual(client.get_identity()["companion_id"], "stable-id")
         client.close()
 
+    def test_body_request_diagnostics_endpoint_is_exposed(self):
+        requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json={"request_id": "req/1", "status": "running"})
+
+        client = LCUClient()
+        client._client.close()
+        client._client = cast(Any, httpx.Client(
+            base_url="http://127.0.0.1:8080",
+            transport=httpx.MockTransport(handler),
+        ))
+
+        result = client.get_body_request("req/1")
+        client.close()
+
+        self.assertEqual(result["status"], "running")
+        self.assertEqual(requests[0].url.raw_path, b"/api/v2/body-requests/req%2F1")
+
     def test_v2_control_and_skill_run_are_typed(self):
         requests = []
 
@@ -91,6 +111,28 @@ class SDKClientTests(unittest.TestCase):
         self.assertEqual(requests[0].url.path, "/api/v2/control/leases")
         self.assertEqual(requests[1].url.path, "/api/v2/skills/general.craft_item/runs")
         self.assertIn(b'"fencing_token":7', requests[1].content)
+
+    def test_player_pairing_endpoint_is_exposed(self):
+        requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json={
+                "player_id": "uuid-alice", "server_id": "example.org", "token": "paired",
+            })
+
+        client = LCUClient()
+        client._client.close()
+        client._client = cast(Any, httpx.Client(
+            base_url="http://127.0.0.1:8080", transport=httpx.MockTransport(handler),
+        ))
+
+        result = client.create_player_pairing("uuid-alice", "example.org")
+        client.close()
+
+        self.assertEqual(result["token"], "paired")
+        self.assertEqual(requests[0].url.path, "/api/v2/player-pairings")
+        self.assertIn(b'"server_id":"example.org"', requests[0].content)
 
     def test_task_preset_endpoints_are_exposed(self):
         requests = []
