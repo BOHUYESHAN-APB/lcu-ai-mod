@@ -598,7 +598,7 @@ The following foundation already exists and must not regress:
 
 Latest recorded verification:
 
-- Python tests: 210 passed with 1 intentional opt-in integration skip on 2026-07-19.
+- Python tests: 215 passed with 1 intentional opt-in integration skip on 2026-07-19.
 - Gradle: `clean build` passed on 2026-07-19.
 - Explicit production Java-to-Python wire integration: 1 passed.
 - NeoForge `runServer` smoke reached `Done` and logged both side-neutral common and
@@ -755,3 +755,9 @@ Pending headed-body verification, deferred to the next test session:
   server relay is still required to derive that identity directly from an authenticated ServerPlayer.
 - Made the unimplemented server fake-player configuration fail startup when explicitly enabled;
   no placeholder wire listener or executor is advertised.
+- Scoped player-message idempotency receipts by conversation, added content-hash conflict checks,
+  and atomically migrated existing SQLite receipts so one player's client message ID cannot expose
+  another player's reply. Conversation history now returns the newest bounded page.
+- Made raw body-request terminal diagnostics immutable to late events. Player conversation HTTP
+  construction failures now surface asynchronously in the screen, while serialized read/send state
+  and lifecycle generations prevent duplicate sends and stale callbacks after the screen closes.

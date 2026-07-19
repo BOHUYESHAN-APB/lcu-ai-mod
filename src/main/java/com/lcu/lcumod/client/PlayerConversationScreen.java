@@ -26,6 +26,9 @@ public final class PlayerConversationScreen extends Screen {
     private Button refreshButton;
     private String status = "";
     private int requestGeneration;
+    private int sendGeneration;
+    private boolean readPending;
+    private boolean sendPending;
     private int scrollLines;
     private int maxScrollLines;
 
@@ -56,13 +59,14 @@ public final class PlayerConversationScreen extends Screen {
         PlayerIdentity identity = playerIdentity();
         if (identity == null) return;
         int generation = ++requestGeneration;
-        status = Component.translatable("screen.lcumod.conversation.loading").getString();
-        if (refreshButton != null) refreshButton.active = false;
+        readPending = true;
+        if (!sendPending) status = Component.translatable("screen.lcumod.conversation.loading").getString();
+        updateControls();
         PlayerConversationClient.loadContacts(identity.playerId(), identity.serverId())
                 .whenComplete((loadedContacts, error) -> minecraft.execute(() -> {
-                    if (generation != requestGeneration) return;
+                    if (!isActive() || generation != requestGeneration) return;
                     if (error != null) {
-                        fail(error);
+                        failRead(error);
                         return;
                     }
                     String selectedId = selectedContact == null ? null : selectedContact.conversationId();
@@ -73,7 +77,7 @@ public final class PlayerConversationScreen extends Screen {
                             .findFirst().orElse(contacts.isEmpty() ? null : contacts.getFirst());
                     if (selectedContact == null) {
                         messages.clear();
-                        finishRequest();
+                        finishRead();
                     } else {
                         loadMessages(identity, selectedContact, generation);
                     }
@@ -83,43 +87,51 @@ public final class PlayerConversationScreen extends Screen {
     private void loadMessages(PlayerIdentity identity, PlayerConversationClient.Contact contact, int generation) {
         PlayerConversationClient.loadMessages(identity.playerId(), identity.serverId(), contact.conversationId())
                 .whenComplete((thread, error) -> minecraft.execute(() -> {
-                    if (generation != requestGeneration || selectedContact != contact) return;
+                    if (!isActive() || generation != requestGeneration || selectedContact != contact) return;
                     if (error != null) {
-                        fail(error);
+                        failRead(error);
                         return;
                     }
                     messages.clear();
                     messages.addAll(thread.messages());
                     scrollLines = 0;
-                    finishRequest();
+                    finishRead();
                 }));
     }
 
     private void selectContact(PlayerConversationClient.Contact contact) {
-        if (contact == selectedContact) return;
+        if (contact == selectedContact || readPending || sendPending) return;
         selectedContact = contact;
         messages.clear();
         scrollLines = 0;
         PlayerIdentity identity = playerIdentity();
         if (identity == null) return;
         int generation = ++requestGeneration;
+        readPending = true;
         status = Component.translatable("screen.lcumod.conversation.loading").getString();
+        updateControls();
         loadMessages(identity, contact, generation);
     }
 
     private void sendMessage() {
         String message = input.getValue().trim();
         PlayerIdentity identity = playerIdentity();
-        if (message.isEmpty() || identity == null || sendButton == null) return;
+        if (message.isEmpty() || identity == null || sendButton == null || readPending || sendPending) return;
         input.setValue("");
         status = Component.translatable("screen.lcumod.conversation.sending").getString();
-        sendButton.active = false;
+        sendPending = true;
+        int generation = ++sendGeneration;
+        updateControls();
         PlayerConversationClient.send(
                 identity.playerId(), identity.playerName(), identity.serverId(),
                 UUID.randomUUID().toString(), message
         ).whenComplete((reply, error) -> minecraft.execute(() -> {
+            if (!isActive() || generation != sendGeneration) return;
+            sendPending = false;
             if (error != null) {
-                fail(error);
+                status = Component.translatable(
+                        "screen.lcumod.conversation.failed_detail", rootMessage(error)).getString();
+                updateControls();
             } else {
                 loadContacts();
             }
@@ -137,16 +149,29 @@ public final class PlayerConversationScreen extends Screen {
                 client.player.getName().getString(), serverId);
     }
 
-    private void finishRequest() {
-        status = "";
-        if (sendButton != null) sendButton.active = true;
-        if (refreshButton != null) refreshButton.active = true;
+    private void finishRead() {
+        readPending = false;
+        if (!sendPending) status = "";
+        updateControls();
     }
 
-    private void fail(Throwable error) {
-        status = Component.translatable("screen.lcumod.conversation.failed_detail", rootMessage(error)).getString();
-        if (sendButton != null) sendButton.active = true;
-        if (refreshButton != null) refreshButton.active = true;
+    private void failRead(Throwable error) {
+        readPending = false;
+        if (!sendPending) {
+            status = Component.translatable(
+                    "screen.lcumod.conversation.failed_detail", rootMessage(error)).getString();
+        }
+        updateControls();
+    }
+
+    private void updateControls() {
+        boolean idle = !readPending && !sendPending;
+        if (sendButton != null) sendButton.active = idle;
+        if (refreshButton != null) refreshButton.active = idle;
+    }
+
+    private boolean isActive() {
+        return minecraft != null && minecraft.screen == this;
     }
 
     private static String rootMessage(Throwable error) {
@@ -157,11 +182,21 @@ public final class PlayerConversationScreen extends Screen {
 
     @Override
     public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
-        if (keyCode == GLFW.GLFW_KEY_ENTER && input != null && input.isFocused()) {
+        if (keyCode == GLFW.GLFW_KEY_ENTER && input != null && input.isFocused()
+                && !readPending && !sendPending) {
             sendMessage();
             return true;
         }
         return super.keyPressed(keyCode, scanCode, modifiers);
+    }
+
+    @Override
+    public void removed() {
+        requestGeneration++;
+        sendGeneration++;
+        readPending = false;
+        sendPending = false;
+        super.removed();
     }
 
     @Override

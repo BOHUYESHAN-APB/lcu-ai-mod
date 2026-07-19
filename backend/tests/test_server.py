@@ -236,9 +236,13 @@ class ServerSDKTests(unittest.TestCase):
                         "player_id": "uuid-alice", "player_name": "Alice", "server_id": "server-a",
                         "client_message_id": "alice-1", "message": "Alice private message",
                     })
+                    altered_retry = client.post("/api/player/v1/messages", headers=alice_headers, json={
+                        "player_id": "uuid-alice", "player_name": "Alice", "server_id": "server-a",
+                        "client_message_id": "alice-1", "message": "Changed private message",
+                    })
                     bob = client.post("/api/player/v1/messages", headers=player_headers("uuid-bob", "server-a"), json={
                         "player_id": "uuid-bob", "player_name": "Bob", "server_id": "server-a",
-                        "client_message_id": "bob-1", "message": "Bob private message",
+                        "client_message_id": "alice-1", "message": "Bob private message",
                     })
                     alice_other_server = client.post(
                         "/api/player/v1/messages", headers=player_headers("uuid-alice", "server-b"), json={
@@ -276,6 +280,8 @@ class ServerSDKTests(unittest.TestCase):
         ])
         self.assertEqual(bob_history.status_code, 404)
         self.assertEqual(other_server_history.status_code, 404)
+        self.assertEqual(altered_retry.status_code, 409)
+        self.assertEqual(altered_retry.json()["detail"], "Message id was already used for different content")
         self.assertEqual(spoofed_scope.status_code, 403)
         self.assertEqual(unscoped_contacts.status_code, 422)
 
@@ -682,7 +688,13 @@ class ServerSDKTests(unittest.TestCase):
     def test_body_request_diagnostics_marks_timeout_and_disconnect_unknown(self):
         diagnostics = BodyRequestDiagnostics(timeout_seconds=0)
         diagnostics.register("timeout", "move_to", {}, "sdk", "outcome")
-        self.assertEqual(diagnostics.get("timeout")["status"], "unknown")
+        expired = diagnostics.get("timeout")
+        diagnostics.capture(BodyEvent("outcome", {
+            "id": "timeout", "status": "succeeded", "message": "late success",
+        }))
+        after_late_outcome = diagnostics.get("timeout")
+        self.assertEqual(expired["status"], "unknown")
+        self.assertEqual(after_late_outcome, expired)
 
         diagnostics = BodyRequestDiagnostics()
         diagnostics.register("disconnect", "move_to", {}, "sdk", "outcome")

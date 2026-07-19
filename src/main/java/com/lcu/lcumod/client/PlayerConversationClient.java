@@ -15,6 +15,7 @@ import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Supplier;
 
 public final class PlayerConversationClient {
     private static final Gson GSON = new Gson();
@@ -33,34 +34,40 @@ public final class PlayerConversationClient {
     public record ConversationThread(String conversationId, List<Message> messages) {}
 
     public static CompletableFuture<List<Contact>> loadContacts(String playerId, String serverId) {
-        URI uri = withQuery(endpoint("/api/player/v1/contacts"),
-                "player_id=" + encode(playerId) + "&server_id=" + encode(serverId));
-        return get(uri).thenApply(response -> parseContactsResponse(response.statusCode(), response.body()));
+        return prepareRequest(() -> {
+            URI uri = withQuery(endpoint("/api/player/v1/contacts"),
+                    "player_id=" + encode(playerId) + "&server_id=" + encode(serverId));
+            return get(uri).thenApply(response -> parseContactsResponse(response.statusCode(), response.body()));
+        });
     }
 
     public static CompletableFuture<ConversationThread> loadMessages(String playerId, String serverId,
                                                                       String conversationId) {
-        URI uri = withQuery(endpoint("/api/player/v1/conversations/" + encode(conversationId) + "/messages"),
-                "player_id=" + encode(playerId) + "&server_id=" + encode(serverId) + "&limit=200");
-        return get(uri).thenApply(response -> parseMessagesResponse(response.statusCode(), response.body()));
+        return prepareRequest(() -> {
+            URI uri = withQuery(endpoint("/api/player/v1/conversations/" + encode(conversationId) + "/messages"),
+                    "player_id=" + encode(playerId) + "&server_id=" + encode(serverId) + "&limit=200");
+            return get(uri).thenApply(response -> parseMessagesResponse(response.statusCode(), response.body()));
+        });
     }
 
     public static CompletableFuture<String> send(String playerId, String playerName,
                                                   String serverId, String clientMessageId,
                                                   String message) {
-        URI endpoint = endpoint("/api/player/v1/messages");
-        JsonObject payload = new JsonObject();
-        payload.addProperty("player_id", playerId);
-        payload.addProperty("player_name", playerName);
-        payload.addProperty("server_id", serverId);
-        payload.addProperty("client_message_id", clientMessageId);
-        payload.addProperty("message", message);
-        HttpRequest.Builder request = authorizedRequest(endpoint)
-                .timeout(Duration.ofSeconds(120))
-                .header("Content-Type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofString(GSON.toJson(payload)));
-        return HTTP.sendAsync(request.build(), HttpResponse.BodyHandlers.ofString())
-                .thenApply(response -> parseResponse(response.statusCode(), response.body()));
+        return prepareRequest(() -> {
+            URI endpoint = endpoint("/api/player/v1/messages");
+            JsonObject payload = new JsonObject();
+            payload.addProperty("player_id", playerId);
+            payload.addProperty("player_name", playerName);
+            payload.addProperty("server_id", serverId);
+            payload.addProperty("client_message_id", clientMessageId);
+            payload.addProperty("message", message);
+            HttpRequest.Builder request = authorizedRequest(endpoint)
+                    .timeout(Duration.ofSeconds(120))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(GSON.toJson(payload)));
+            return HTTP.sendAsync(request.build(), HttpResponse.BodyHandlers.ofString())
+                    .thenApply(response -> parseResponse(response.statusCode(), response.body()));
+        });
     }
 
     static URI endpoint() {
@@ -99,6 +106,14 @@ public final class PlayerConversationClient {
 
     private static URI withQuery(URI uri, String query) {
         return URI.create(uri.toString() + "?" + query);
+    }
+
+    static <T> CompletableFuture<T> prepareRequest(Supplier<CompletableFuture<T>> request) {
+        try {
+            return request.get();
+        } catch (RuntimeException error) {
+            return CompletableFuture.failedFuture(error);
+        }
     }
 
     static String parseResponse(int status, String body) {

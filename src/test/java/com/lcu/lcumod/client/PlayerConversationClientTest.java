@@ -1,5 +1,6 @@
 package com.lcu.lcumod.client;
 
+import java.util.concurrent.CompletionException;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -49,5 +50,15 @@ class PlayerConversationClientTest {
                 PlayerConversationClient.parseContactsResponse(200, "not-json"));
         assertThrows(IllegalStateException.class, () ->
                 PlayerConversationClient.parseMessagesResponse(200, "{\"messages\":[]}"));
+    }
+
+    @Test
+    void requestConstructionErrorsBecomeFailedFutures() {
+        var future = PlayerConversationClient.<String>prepareRequest(() -> {
+            throw new IllegalArgumentException("invalid backend URL");
+        });
+
+        CompletionException error = assertThrows(CompletionException.class, future::join);
+        assertEquals("invalid backend URL", error.getCause().getMessage());
     }
 }

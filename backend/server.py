@@ -30,6 +30,7 @@ from agent.config_store import ConfigStore, DEFAULT_CONFIG_PATH
 from agent.memory_catalog import MEMORY_CATEGORIES, MemoryCatalog, MemoryQuery
 from agent.memory_management import MemoryPreviewError, MemoryPreviewStore, evaluate_retention
 from agent.memory_overlay import MEMORY_STATES, RetentionConflictError
+from agent.message_db import MessageDB
 from agent.llm_service import LLMRequestRejected
 from agent.orchestrator import Orchestrator
 from agent.skill_registry import SkillRegistry, SkillValidationError
@@ -902,10 +903,15 @@ async def send_player_conversation_message(data: PlayerConversationRequest, requ
         raise HTTPException(status_code=503, detail="Companion session is not available")
     _authorize_player_scope(request, data.player_id, data.server_id)
     contact_id = _player_contact_id(data.player_id, data.server_id)
+    request_hash = MessageDB.player_message_request_hash(data.player_name, data.message)
     with orchestrator.session_context() as session:
         conversation_id = session.message_db.get_or_create_direct_conversation(contact_id, data.player_name)
-        claimed, receipt = session.message_db.claim_player_message(data.client_message_id, conversation_id)
+        claimed, receipt = session.message_db.claim_player_message(
+            data.client_message_id, conversation_id, request_hash,
+        )
         if not claimed:
+            if receipt.get("request_hash") != request_hash:
+                raise HTTPException(status_code=409, detail="Message id was already used for different content")
             if receipt["status"] == "completed":
                 return {
                     "status": "completed", "conversation_id": conversation_id,
@@ -929,7 +935,9 @@ async def send_player_conversation_message(data: PlayerConversationRequest, requ
         llm = session.llm
     if not llm.is_configured("conversation"):
         with orchestrator.session_context() as session:
-            session.message_db.fail_player_message(data.client_message_id, "conversation model is not configured")
+            session.message_db.fail_player_message(
+                data.client_message_id, conversation_id, "conversation model is not configured",
+            )
         raise HTTPException(status_code=503, detail="Conversation model is not configured")
     system_prompt = llm.build_system_prompt(context)
     system_prompt += (
@@ -950,7 +958,7 @@ async def send_player_conversation_message(data: PlayerConversationRequest, requ
             raise ValueError("Conversation model returned an empty reply")
     except Exception as exc:
         with orchestrator.session_context() as session:
-            session.message_db.fail_player_message(data.client_message_id, str(exc))
+            session.message_db.fail_player_message(data.client_message_id, conversation_id, str(exc))
         raise HTTPException(status_code=502, detail="Conversation model failed") from exc
     with orchestrator.session_context() as session:
         session.message_db.add_message(
@@ -961,7 +969,7 @@ async def send_player_conversation_message(data: PlayerConversationRequest, requ
             metadata={"transport": "player_client", "reply_to": data.client_message_id},
         )
         session.memory.attach_response(data.player_name, data.message, reply)
-        session.message_db.complete_player_message(data.client_message_id, reply)
+        session.message_db.complete_player_message(data.client_message_id, conversation_id, reply)
     return {
         "status": "completed",
         "conversation_id": conversation_id,

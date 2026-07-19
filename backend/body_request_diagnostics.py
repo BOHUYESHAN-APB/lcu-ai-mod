@@ -96,6 +96,8 @@ class BodyRequestDiagnostics:
             record = self._records.get(request_id)
             if not record:
                 return
+            if record["terminal"]:
+                return
             data = event.data
             if event.type == "response":
                 record["response"] = _safe_value(data)
@@ -104,9 +106,7 @@ class BodyRequestDiagnostics:
                 detail_data = data.get("data", {})
                 message = detail_data.get("message", "") if isinstance(detail_data, dict) else detail_data
                 record["detail"] = str(data.get("error") or message or "")[:2000]
-                if record["terminal"]:
-                    pass
-                elif not success:
+                if not success:
                     self._complete(request_id, record, "failed", now)
                 elif self._completion.get(request_id) == "response":
                     self._complete(request_id, record, "succeeded", now)
