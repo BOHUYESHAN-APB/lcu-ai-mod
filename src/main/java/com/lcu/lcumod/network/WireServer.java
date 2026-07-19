@@ -3,7 +3,6 @@ package com.lcu.lcumod.network;
 import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
-import com.lcu.lcumod.action.ActionExecutor;
 import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -42,10 +41,6 @@ public class WireServer {
     private final BlockingQueue<String> sendQueue = new ArrayBlockingQueue<>(SEND_QUEUE_CAPACITY);
 
     public static final PriorityCommandQueue commandQueue = new PriorityCommandQueue();
-
-    public WireServer(int port, String authToken) {
-        this(port, authToken, "body_client", ActionExecutor::requestBackendDisconnectStop, Map.of());
-    }
 
     public WireServer(int port, String authToken, String role, Runnable disconnectHandler) {
         this(port, authToken, role, disconnectHandler, Map.of());

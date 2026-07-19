@@ -16,7 +16,7 @@ public final class LCUModServer {
 
     @SubscribeEvent
     public static void onServerAboutToStart(ServerAboutToStartEvent event) {
-        if (RuntimeRole.current() != RuntimeRole.SERVER_FAKE_PLAYER) {
+        if (!RuntimeRole.current().activatesServerFakePlayers()) {
             LCUMod.LOGGER.info("[LCUMod] Dedicated server loaded without fake-player body activation");
             return;
         }

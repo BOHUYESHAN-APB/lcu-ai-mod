@@ -5,6 +5,15 @@
 - [ ] 启动 Minecraft (FTB StoneBlock 4)
 - [ ] 打开浏览器: `http://localhost:8080`
 
+同一个 `build/libs/lcumod-0.1.0.jar` 必须按以下角色矩阵分别验收：
+
+| 物理侧 | `runtimeRole` | 预期结果 | 结果 |
+|--------|---------------|----------|------|
+| 客户端 | `body_client`（新配置默认） | WireServer 和真实客户端身体启动，`P` 对话窗口不启用 | |
+| 客户端 | `player_client` | `P` 对话窗口启用，WireServer/F12/动作执行器不启动 | |
+| 专用服务端 | `server_fake_player` + `fakePlayerEnabled=false` | 服务端正常启动，不声明假玩家可用 | |
+| 专用服务端 | `server_fake_player` + `fakePlayerEnabled=true` | 当前构建明确拒绝启动，直到服务端执行器实现 | |
+
 ---
 
 ## 1. 基础连接

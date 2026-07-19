@@ -37,7 +37,7 @@ public final class ClientBodyRuntime {
 
     public static boolean isBodyClient() {
         try {
-            return RuntimeRole.current() == RuntimeRole.BODY_CLIENT;
+            return RuntimeRole.current().activatesClientBody();
         } catch (IllegalStateException ignored) {
             return false;
         }

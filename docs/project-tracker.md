@@ -585,7 +585,9 @@ The following foundation already exists and must not regress:
 - Operations console task presets, advanced/raw Skill mode, workflow step details,
   run detail pane, and body-availability-aware input forms.
 - Runtime roles isolate normal player clients, headed AI body clients, and the
-  dedicated-server fake-player placeholder. The default role is `player_client`.
+  dedicated-server fake-player placeholder. Fresh configurations default to `body_client`;
+  ordinary conversation clients explicitly select `player_client`, while invalid values
+  fail closed to the non-actuating player role.
 - Common and dedicated-server entrypoints do not load client actuators. A real
   NeoForge dedicated server reaches ready state with fake-player activation disabled.
 - Restricted player conversation APIs provide stable direct conversations,
@@ -755,6 +757,11 @@ Pending headed-body verification, deferred to the next test session:
   server relay is still required to derive that identity directly from an authenticated ServerPlayer.
 - Made the unimplemented server fake-player configuration fail startup when explicitly enabled;
   no placeholder wire listener or executor is advertised.
+- Unified one-build role selection around physical side plus explicit runtime role. The same JAR
+  now defaults fresh client configurations to the primary headed `body_client` use case, keeps
+  player conversation and server fake-player activation mutually exclusive, and stops the client
+  body runtime during game shutdown. Future server multi-AI remains a per-body runtime registry,
+  not a reuse of the client singleton executor.
 - Scoped player-message idempotency receipts by conversation, added content-hash conflict checks,
   and atomically migrated existing SQLite receipts so one player's client message ID cannot expose
   another player's reply. Conversation history now returns the newest bounded page.

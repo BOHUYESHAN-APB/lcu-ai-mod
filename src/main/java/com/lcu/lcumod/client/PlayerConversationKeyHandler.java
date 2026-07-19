@@ -24,7 +24,7 @@ public final class PlayerConversationKeyHandler {
 
     @SubscribeEvent
     public static void onKeyPress(InputEvent.Key event) {
-        if (RuntimeRole.current() != RuntimeRole.PLAYER_CLIENT) return;
+        if (!RuntimeRole.current().activatesPlayerConversation()) return;
         if (OPEN_CONVERSATION.consumeClick()) {
             Minecraft minecraft = Minecraft.getInstance();
             if (minecraft.player != null) {

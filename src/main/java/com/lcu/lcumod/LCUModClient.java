@@ -10,13 +10,15 @@ import net.neoforged.fml.ModContainer;
 import net.neoforged.fml.common.EventBusSubscriber;
 import net.neoforged.fml.common.Mod;
 import net.neoforged.fml.event.lifecycle.FMLClientSetupEvent;
+import net.neoforged.neoforge.common.NeoForge;
+import net.neoforged.neoforge.event.GameShuttingDownEvent;
 
 // Client-only mod class.
 @Mod(value = LCUMod.MODID, dist = Dist.CLIENT)
 @EventBusSubscriber(modid = LCUMod.MODID, bus = EventBusSubscriber.Bus.MOD, value = Dist.CLIENT)
 public class LCUModClient {
     public LCUModClient(ModContainer container) {
-        // Client-side setup placeholder
+        NeoForge.EVENT_BUS.addListener(LCUModClient::onGameShuttingDown);
     }
 
     /**
@@ -27,8 +29,10 @@ public class LCUModClient {
     @SubscribeEvent
     public static void onClientSetup(FMLClientSetupEvent event) {
         event.enqueueWork(() -> {
-            if (RuntimeRole.current() != RuntimeRole.BODY_CLIENT) {
-                LCUMod.LOGGER.info("[LCUMod] Player client role active; actuator runtime is disabled");
+            RuntimeRole role = RuntimeRole.current();
+            if (!role.activatesClientBody()) {
+                LCUMod.LOGGER.info("[LCUMod] Client role {} active; actuator runtime is disabled",
+                        role.configValue());
                 return;
             }
             ClientBodyRuntime.start();
@@ -38,5 +42,9 @@ public class LCUModClient {
                 LCUMod.LOGGER.warn("[LCUMod] Background execution enabled by explicit server-policy configuration");
             }
         });
+    }
+
+    private static void onGameShuttingDown(GameShuttingDownEvent event) {
+        ClientBodyRuntime.stop();
     }
 }
