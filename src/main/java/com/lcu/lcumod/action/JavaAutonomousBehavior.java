@@ -1,5 +1,6 @@
 package com.lcu.lcumod.action;
 
+import com.lcu.lcumod.config.ServerPolicy;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.entity.Entity;
@@ -8,6 +9,7 @@ import net.minecraft.world.entity.monster.Enemy;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.phys.EntityHitResult;
 
 import java.util.List;
 import java.util.Random;
@@ -175,6 +177,7 @@ public class JavaAutonomousBehavior {
     // ── Survival Logic ──
     
     private static boolean shouldFlee(Minecraft mc) {
+        if (!ServerPolicy.movementAutomationAllowed()) return false;
         float health = mc.player.getHealth();
         float maxHealth = mc.player.getMaxHealth();
         return health < maxHealth * 0.3f;  // Flee below 30% health
@@ -204,6 +207,7 @@ public class JavaAutonomousBehavior {
     // ── Combat Logic ──
     
     private static boolean shouldAttack(Minecraft mc) {
+        if (!ServerPolicy.automatedCombatAllowed()) return false;
         if (attackCooldown > 0) {
             attackCooldown--;
             return false;
@@ -224,8 +228,9 @@ public class JavaAutonomousBehavior {
         // Look at target
         lookAtEntity(mc, attackTarget);
         
-        // Attack if close enough
-        if (mc.player.distanceTo(attackTarget) < 4) {
+        boolean targeted = mc.hitResult instanceof EntityHitResult hit && hit.getEntity() == attackTarget;
+        if (targeted && mc.player.hasLineOfSight(attackTarget)
+                && mc.player.getAttackStrengthScale(0.5f) >= 0.9f) {
             if (mc.gameMode != null) {
                 mc.gameMode.attack(mc.player, attackTarget);
                 mc.player.swing(net.minecraft.world.InteractionHand.MAIN_HAND);
@@ -233,12 +238,14 @@ public class JavaAutonomousBehavior {
             attackCooldown = ATTACK_COOLDOWN_TICKS;
         } else {
             // Move toward target
-            MovementSystem.moveTo(
-                attackTarget.getX(), 
-                attackTarget.getY(), 
-                attackTarget.getZ(), 
-                1.2f
-            );
+            if (ServerPolicy.movementAutomationAllowed()) {
+                MovementSystem.moveTo(
+                    attackTarget.getX(),
+                    attackTarget.getY(),
+                    attackTarget.getZ(),
+                    1.2f
+                );
+            }
         }
     }
     
@@ -262,6 +269,7 @@ public class JavaAutonomousBehavior {
     // ── Eating Logic ──
     
     private static boolean shouldEat(Minecraft mc) {
+        if (!ServerPolicy.inventoryAutomationAllowed()) return false;
         if (eatCooldown > 0) {
             eatCooldown--;
             return false;
@@ -383,6 +391,7 @@ public class JavaAutonomousBehavior {
     // ── Wandering Logic ──
     
     private static boolean shouldWander(Minecraft mc) {
+        if (!ServerPolicy.movementAutomationAllowed()) return false;
         if (wanderCooldown > 0) {
             wanderCooldown--;
             return false;

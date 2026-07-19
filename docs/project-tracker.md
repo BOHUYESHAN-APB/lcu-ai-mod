@@ -445,8 +445,8 @@ Recovery policy:
 - Other grave/corpse mods use versioned adapters and remain documented as unsupported
   until encountered and tested.
 
-WATUT compatibility reports successful programmatic game actions to WATUT's own idle
-tracker without synthesizing global hardware input. This does not bypass server AFK policy.
+WATUT compatibility can report successful programmatic actions only when explicitly enabled;
+it defaults off and never synthesizes global hardware input. Anti-AFK activity also defaults off.
 Inventory Sorter compatibility must prefer a stable API or deterministic inventory clicks;
 it must not blindly synthesize R/middle-click events that affect unrelated screens.
 
@@ -740,3 +740,9 @@ Pending headed-body verification, deferred to the next test session:
   Java now runs `stop_all` at CONTROL priority, drains lower-priority work atomically, preserves
   CONTROL FIFO, and returns terminal messages for preempted requests. This batch is automated-
   test verified but remains undeployed pending headed-body acceptance.
+- Audited public-server and anti-cheat exposure. Added independent policy controls for movement,
+  world mutation, inventory/menu automation, combat, chat, autonomous behavior, anti-AFK, WATUT,
+  background execution, auto-respawn, and surroundings telemetry. High-risk categories default off.
+- Added a non-configurable protocol-safety floor: one queued command per tick, bounded wire backlog,
+  grounded jumps, crosshair/visibility/cooldown-verified attacks, real block-hit/face validation,
+  target-loss mining cancellation, and fail-closed client-only inventory mutation/drop paths.

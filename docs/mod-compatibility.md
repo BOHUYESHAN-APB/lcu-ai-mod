@@ -8,7 +8,7 @@
 
 | 模组 | 检测版本 | 兼容状态 | 当前结论 |
 |------|----------|----------|----------|
-| WATUT | `1.21.0-1.2.7` | 已实现，待整合包验证 | 程序动作按节流频率调用 WATUT 活动接口，不伪造全局输入 |
+| WATUT | `1.21.0-1.2.7` | 可选，待整合包验证 | 默认不报告程序活动；仅在服务器规则允许且显式开启时调用 WATUT 活动接口 |
 | Simple Tomb | `1.21.1-1.4.4` | 调研中 | 已确认墓碑、`grave_key`、死亡记录与传送相关实现，尚未接入恢复流程 |
 | Inventory Sorter | `1.21.1-24.0.24` | 调研中 | 已识别当前 R/鼠标中键整理模组，尚未确认稳定 API |
 | Inventory Essentials | `1.21.1-21.1.16` | 未开始 | 可能影响鼠标库存操作，需要与 Inventory Sorter 一并验证 |
@@ -21,13 +21,14 @@ WATUT 的 NeoForge 输入链是 `InputEvent.Key` / `InputEvent.MouseButton.Post`
 `PlayerStatusManagerClient.onKey()` / `onMouse()`，最终调用公开但非稳定 API
 `onAction()` 清除内部 idle tick。LCU 直接写入 Minecraft 按键状态不会触发这条链。
 
-当前使用可选反射适配：仅在 `watut` 已加载且 LCU 动作确实执行时调用
+当前使用可选反射适配：仅在 `watut` 已加载、LCU 动作确实执行且
+`reportProgrammaticActivity=true` 时调用
 `WatutMod.getPlayerStatusManagerClient().onAction()`。不得伪造全局 GLFW 或 NeoForge
 输入事件，避免误导其他模组。
 
 已知边界：这只能清除 WATUT 的低头、头顶 idle 粒子和 Tab 状态，不能重置
-Minecraft 服务端或服务器插件自己的 AFK 计时。服务端防踢仍必须依赖有效移动、
-交互或服务器明确允许的保活策略。
+Minecraft 服务端或服务器插件自己的 AFK 计时。LCU 不得绕过服务端 AFK 策略；
+`enableActivitySignals` 与 `reportProgrammaticActivity` 默认关闭，只能在规则明确允许时开启。
 
 源码：
 

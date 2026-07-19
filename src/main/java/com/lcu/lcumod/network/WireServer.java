@@ -12,6 +12,8 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.Map;
+import java.util.function.Supplier;
 
 /**
  * TCP JSONL wire protocol server.
@@ -27,6 +29,7 @@ public class WireServer {
     private final String authToken;
     private final String role;
     private final Runnable disconnectHandler;
+    private final Supplier<Map<String, Boolean>> policySupplier;
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final Gson gson = new Gson();
     private Thread serverThread;
@@ -41,14 +44,25 @@ public class WireServer {
     public static final PriorityCommandQueue commandQueue = new PriorityCommandQueue();
 
     public WireServer(int port, String authToken) {
-        this(port, authToken, "body_client", ActionExecutor::requestBackendDisconnectStop);
+        this(port, authToken, "body_client", ActionExecutor::requestBackendDisconnectStop, Map.of());
     }
 
     public WireServer(int port, String authToken, String role, Runnable disconnectHandler) {
+        this(port, authToken, role, disconnectHandler, Map.of());
+    }
+
+    public WireServer(int port, String authToken, String role, Runnable disconnectHandler,
+                      Map<String, Boolean> policy) {
+        this(port, authToken, role, disconnectHandler, () -> policy == null ? Map.of() : Map.copyOf(policy));
+    }
+
+    public WireServer(int port, String authToken, String role, Runnable disconnectHandler,
+                      Supplier<Map<String, Boolean>> policySupplier) {
         this.port = port;
         this.authToken = authToken == null ? "" : authToken;
         this.role = role == null || role.isBlank() ? "body_client" : role;
         this.disconnectHandler = disconnectHandler == null ? () -> {} : disconnectHandler;
+        this.policySupplier = policySupplier == null ? Map::of : policySupplier;
     }
 
     public synchronized void start() {
@@ -293,7 +307,16 @@ public class WireServer {
                     capabilities.add("actions");
                     capabilities.add("progress");
                     accepted.add("capabilities", capabilities);
-                    accepted.add("tools", ToolCatalog.describe());
+                    Map<String, Boolean> currentPolicy;
+                    try {
+                        currentPolicy = Map.copyOf(policySupplier.get());
+                    } catch (RuntimeException exception) {
+                        currentPolicy = Map.of();
+                    }
+                    accepted.add("tools", ToolCatalog.describe(currentPolicy));
+                    JsonObject policyState = new JsonObject();
+                    currentPolicy.forEach(policyState::addProperty);
+                    accepted.add("policy", policyState);
                     send(gson.toJson(accepted));
                     activate(this);
                     socket.setSoTimeout(0);
@@ -320,7 +343,11 @@ public class WireServer {
                                             rejectPreempted(discarded);
                                         }
                                     } else {
-                                        commandQueue.submitBackend(cmd);
+                                        if (!commandQueue.submitBackend(cmd)) {
+                                            JsonObject data = new JsonObject();
+                                            data.addProperty("message", "command queue is full");
+                                            WireServer.this.sendResponse(cmd.id(), false, data, "QUEUE_FULL");
+                                        }
                                     }
                                 }
                             }

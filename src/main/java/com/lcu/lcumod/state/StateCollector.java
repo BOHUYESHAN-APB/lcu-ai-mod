@@ -5,6 +5,7 @@ import com.google.gson.JsonObject;
 import com.lcu.lcumod.action.PoiMemory;
 import com.lcu.lcumod.LCUMod;
 import com.lcu.lcumod.config.ModConfig;
+import com.lcu.lcumod.config.ServerPolicy;
 import com.lcu.lcumod.client.ClientBodyRuntime;
 import com.lcu.lcumod.compat.CuriosCompat;
 import net.minecraft.client.Minecraft;
@@ -219,22 +220,25 @@ public class StateCollector {
 
         // Nearby entities (players, mobs, items)
         JsonArray entities = new JsonArray();
-        var players = mc.level.players();
-        for (var other : players) {
-            if (other == p) continue;
-            JsonObject e = new JsonObject();
-            e.addProperty("name", other.getName().getString());
-            e.addProperty("uuid", other.getUUID().toString());
-            e.addProperty("distance", p.distanceTo(other));
-            e.addProperty("type", "player");
-            e.addProperty("dimension", other.level().dimension().location().toString());
-            e.addProperty("armor_value", other.getArmorValue());
-            e.addProperty("absorption", other.getAbsorptionAmount());
-            entities.add(e);
+        boolean collectSurroundings = ServerPolicy.surroundingsCollectionAllowed();
+        if (collectSurroundings) {
+            var players = mc.level.players();
+            for (var other : players) {
+                if (other == p) continue;
+                JsonObject e = new JsonObject();
+                e.addProperty("name", other.getName().getString());
+                e.addProperty("uuid", other.getUUID().toString());
+                e.addProperty("distance", p.distanceTo(other));
+                e.addProperty("type", "player");
+                e.addProperty("dimension", other.level().dimension().location().toString());
+                e.addProperty("armor_value", other.getArmorValue());
+                e.addProperty("absorption", other.getAbsorptionAmount());
+                entities.add(e);
+            }
         }
 
         JsonArray onlinePlayers = new JsonArray();
-        if (mc.getConnection() != null) {
+        if (collectSurroundings && mc.getConnection() != null) {
             for (var info : mc.getConnection().getOnlinePlayers()) {
                 JsonObject online = new JsonObject();
                 online.addProperty("name", info.getProfile().getName());
@@ -259,7 +263,7 @@ public class StateCollector {
 
         // Scan for nearby mobs and items within 16 blocks
         var searchBox = p.getBoundingBox().inflate(16);
-        for (var entity : mc.level.getEntities(p, searchBox)) {
+        for (var entity : collectSurroundings ? mc.level.getEntities(p, searchBox) : List.<Entity>of()) {
             if (entity == p) continue;
             // Skip other players (already handled above)
             if (entity instanceof Player) continue;
@@ -301,9 +305,10 @@ public class StateCollector {
         // Nearby blocks/resources — compact perception map for planning
         List<JsonObject> nearbyBlocks = new ArrayList<>();
         BlockPos origin = p.blockPosition();
-        for (int dx = -6; dx <= 6; dx++) {
-            for (int dy = -2; dy <= 2; dy++) {
-                for (int dz = -6; dz <= 6; dz++) {
+        if (collectSurroundings) {
+            for (int dx = -6; dx <= 6; dx++) {
+                for (int dy = -2; dy <= 2; dy++) {
+                    for (int dz = -6; dz <= 6; dz++) {
                     BlockPos pos = origin.offset(dx, dy, dz);
                     var blockState = mc.level.getBlockState(pos);
                     if (blockState.isAir()) continue;
@@ -327,7 +332,8 @@ public class StateCollector {
                     block.addProperty("x", pos.getX());
                     block.addProperty("y", pos.getY());
                     block.addProperty("z", pos.getZ());
-                    nearbyBlocks.add(block);
+                        nearbyBlocks.add(block);
+                    }
                 }
             }
         }
@@ -339,14 +345,18 @@ public class StateCollector {
         state.add("nearby_blocks", nearbyBlocksJson);
 
         JsonArray nearbyWorkstations = new JsonArray();
-        for (JsonObject item : PoiMemory.snapshot(mc, "workstation", PoiMemory.INTERACTION_RADIUS, 16)) {
-            nearbyWorkstations.add(item);
+        if (collectSurroundings) {
+            for (JsonObject item : PoiMemory.snapshot(mc, "workstation", PoiMemory.INTERACTION_RADIUS, 16)) {
+                nearbyWorkstations.add(item);
+            }
         }
         state.add("nearby_workstations", nearbyWorkstations);
 
         JsonArray nearbyStorage = new JsonArray();
-        for (JsonObject item : PoiMemory.snapshotWithContents(mc, "storage", PoiMemory.INTERACTION_RADIUS, 16)) {
-            nearbyStorage.add(item);
+        if (collectSurroundings) {
+            for (JsonObject item : PoiMemory.snapshotWithContents(mc, "storage", PoiMemory.INTERACTION_RADIUS, 16)) {
+                nearbyStorage.add(item);
+            }
         }
         state.add("nearby_storage", nearbyStorage);
 

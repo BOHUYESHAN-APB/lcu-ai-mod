@@ -55,6 +55,35 @@ class PriorityCommandQueueTest {
         assertEquals("stop", queue.poll().id());
     }
 
+    @Test
+    void backendQueueIsBoundedButControlStopStillPreemptsIt() {
+        PriorityCommandQueue queue = new PriorityCommandQueue();
+        for (int i = 0; i < 40; i++) {
+            assertEquals(true, queue.submitBackend(command("work-" + i, "jump")));
+        }
+
+        assertEquals(false, queue.submitBackend(command("overflow", "jump")));
+        var discarded = queue.submitStop(command("stop", "stop_all"));
+        assertEquals(40, discarded.size());
+        assertEquals("stop", queue.poll().id());
+    }
+
+    @Test
+    void duplicateStopsAreCoalescedAndControlQueueRemainsBounded() {
+        PriorityCommandQueue queue = new PriorityCommandQueue();
+        queue.submitStop(command("stop-1", "stop_all"));
+
+        var duplicate = queue.submitStop(command("stop-2", "stop_all"));
+        for (int i = 0; i < 39; i++) {
+            queue.submitControl(command("control-" + i, "control_builtin"));
+        }
+        var overflow = queue.submitControl(command("overflow", "control_external"));
+
+        assertEquals(java.util.List.of("stop-1"), duplicate.stream().map(WireServer.WireCommand::id).toList());
+        assertEquals(java.util.List.of("overflow"), overflow.stream().map(WireServer.WireCommand::id).toList());
+        assertEquals("stop-2", queue.poll().id());
+    }
+
     private static WireServer.WireCommand command(String id, String command) {
         return new WireServer.WireCommand(id, command, new JsonObject());
     }

@@ -2,6 +2,7 @@ package com.lcu.lcumod;
 
 import com.lcu.lcumod.client.ClientBodyRuntime;
 import com.lcu.lcumod.config.RuntimeRole;
+import com.lcu.lcumod.config.ServerPolicy;
 import net.minecraft.client.Minecraft;
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.SubscribeEvent;
@@ -32,9 +33,10 @@ public class LCUModClient {
             }
             ClientBodyRuntime.start();
             var options = Minecraft.getInstance().options;
-            // Disable pause on lost focus — AI keeps running in background
-            options.pauseOnLostFocus = false;
-            LCUMod.LOGGER.info("[LCUMod] Pause-on-lost-focus disabled (AI background mode)");
+            options.pauseOnLostFocus = !ServerPolicy.backgroundExecutionAllowed();
+            if (!options.pauseOnLostFocus) {
+                LCUMod.LOGGER.warn("[LCUMod] Background execution enabled by explicit server-policy configuration");
+            }
         });
     }
 }

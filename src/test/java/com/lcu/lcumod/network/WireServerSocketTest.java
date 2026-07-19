@@ -9,6 +9,7 @@ import java.io.OutputStreamWriter;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.Map;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -26,7 +27,8 @@ class WireServerSocketTest {
 
     @Test
     void authenticatesAndExchangesFramesOverRealLoopbackSocket() throws Exception {
-        server = new WireServer(0, "shared-secret", "body_client", () -> {});
+        server = new WireServer(0, "shared-secret", "body_client", () -> {},
+            Map.of("allowAutomatedCombat", false));
         server.start();
 
         try (Peer peer = new Peer(server.getBoundPort())) {
@@ -39,6 +41,16 @@ class WireServerSocketTest {
                 .anyMatch(tool -> tool.getAsJsonObject().get("command").getAsString().equals("craft_item")));
             assertTrue(auth.getAsJsonArray("tools").asList().stream()
                 .anyMatch(tool -> tool.getAsJsonObject().get("command").getAsString().equals("cancel_operation")));
+            JsonObject attack = auth.getAsJsonArray("tools").asList().stream()
+                .map(tool -> tool.getAsJsonObject())
+                .filter(tool -> tool.get("command").getAsString().equals("attack"))
+                .findFirst().orElseThrow();
+            assertEquals("disabled", attack.get("policy_default").getAsString());
+            assertEquals("allowAutomatedCombat", attack.get("policy_option").getAsString());
+            assertFalse(attack.get("available").getAsBoolean());
+            assertFalse(auth.getAsJsonObject("policy").get("allowAutomatedCombat").getAsBoolean());
+            assertFalse(auth.getAsJsonArray("tools").asList().stream()
+                .anyMatch(tool -> tool.getAsJsonObject().get("command").getAsString().equals("drop_item")));
 
             peer.send("""
                     {"type":"command","id":"req-1","cmd":"jump","args":{"message":"你好"}}

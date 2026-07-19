@@ -11,6 +11,7 @@ import java.util.concurrent.PriorityBlockingQueue;
  * High-priority commands (flee, reflex) jump ahead of backend commands.
  */
 public class PriorityCommandQueue {
+    private static final int MAX_PENDING_COMMANDS = 40;
 
     private final PriorityBlockingQueue<PriorityEntry> queue = new PriorityBlockingQueue<>(64,
             (a, b) -> {
@@ -21,27 +22,63 @@ public class PriorityCommandQueue {
 
     private volatile int currentPriority = CommandPriority.BACKEND;
 
-    public synchronized void submitBackend(WireServer.WireCommand cmd) {
+    public synchronized boolean submitBackend(WireServer.WireCommand cmd) {
+        if (queue.size() >= MAX_PENDING_COMMANDS) return false;
         PriorityEntry entry = new PriorityEntry(CommandPriority.BACKEND, sequence.getAndIncrement(),
                 cmd.id(), cmd.cmd(), cmd.args());
         queue.offer(entry);
         currentPriority = entry.priority;
+        return true;
     }
 
     public synchronized List<WireServer.WireCommand> submitControl(WireServer.WireCommand cmd) {
         List<PriorityEntry> entries = drainEntries();
         List<WireServer.WireCommand> discarded = new ArrayList<>();
+        List<PriorityEntry> retained = new ArrayList<>();
+        boolean stopRetained = false;
         for (PriorityEntry entry : entries) {
             if (entry.priority == CommandPriority.CONTROL) {
-                queue.offer(entry);
+                if ("stop_all".equals(entry.action)) {
+                    if (stopRetained) {
+                        discarded.add(entry.cmd());
+                        continue;
+                    }
+                    stopRetained = true;
+                }
+                retained.add(entry);
             } else {
                 discarded.add(entry.cmd());
             }
         }
-        PriorityEntry entry = new PriorityEntry(
-            CommandPriority.CONTROL, sequence.getAndIncrement(), cmd.id(), cmd.cmd(), cmd.args());
-        queue.offer(entry);
-        currentPriority = entry.priority;
+
+        boolean incomingStop = "stop_all".equals(cmd.cmd());
+        if (incomingStop && stopRetained) {
+            for (int i = 0; i < retained.size(); i++) {
+                if ("stop_all".equals(retained.get(i).action)) {
+                    discarded.add(retained.remove(i).cmd());
+                    break;
+                }
+            }
+            retained.add(new PriorityEntry(
+                CommandPriority.CONTROL, sequence.getAndIncrement(), cmd.id(), cmd.cmd(), cmd.args()));
+        } else if (!incomingStop && retained.size() >= MAX_PENDING_COMMANDS) {
+            discarded.add(cmd);
+        } else {
+            if (incomingStop && retained.size() >= MAX_PENDING_COMMANDS) {
+                int removable = -1;
+                for (int i = 0; i < retained.size(); i++) {
+                    if (!"stop_all".equals(retained.get(i).action)) {
+                        removable = i;
+                        break;
+                    }
+                }
+                if (removable >= 0) discarded.add(retained.remove(removable).cmd());
+            }
+            retained.add(new PriorityEntry(
+                CommandPriority.CONTROL, sequence.getAndIncrement(), cmd.id(), cmd.cmd(), cmd.args()));
+        }
+        retained.forEach(queue::offer);
+        currentPriority = queue.isEmpty() ? CommandPriority.BACKEND : queue.peek().priority;
         return discarded;
     }
 
@@ -49,7 +86,8 @@ public class PriorityCommandQueue {
         return submitControl(cmd);
     }
 
-    public void submitBehavior(int priority, String id, String action, JsonObject args) {
+    public synchronized void submitBehavior(int priority, String id, String action, JsonObject args) {
+        if (queue.size() >= MAX_PENDING_COMMANDS) return;
         queue.offer(new PriorityEntry(priority, sequence.getAndIncrement(), id, action, args));
         if (priority < currentPriority) {
             currentPriority = priority;

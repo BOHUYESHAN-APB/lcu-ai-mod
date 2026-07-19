@@ -5,6 +5,7 @@ import com.google.gson.JsonObject;
 import com.lcu.lcumod.LCUMod;
 import com.lcu.lcumod.client.ClientBodyRuntime;
 import com.lcu.lcumod.compat.WatutCompat;
+import com.lcu.lcumod.config.ServerPolicy;
 import com.lcu.lcumod.network.WireServer;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
@@ -21,6 +22,7 @@ import net.minecraft.world.item.crafting.RecipeHolder;
 import net.minecraft.world.item.crafting.RecipeType;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.EntityHitResult;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.core.Direction;
 import net.minecraft.world.level.block.Blocks;
@@ -45,6 +47,26 @@ public class ActionExecutor {
     private static int diggingTicks = 0;
     private static String diggingReqId = null;
     private static final int DIGGING_TIMEOUT_TICKS = 600;
+    private static final Set<String> HAND_ACTION_COMMANDS = Set.of(
+        "attack", "attack_entity", "use_item", "use_on", "use_on_entity", "interact_block_at",
+        "mine_block", "dig_block", "mine_block_at", "place_block", "interact_block", "interact",
+        "eat", "select_hotbar", "equip_item", "auto_equip", "inventory_click", "container_button",
+        "place_recipe", "take_item", "put_item", "drop_item", "sort_inventory", "craft_item"
+    );
+    private static final Set<String> MOVEMENT_COMMANDS = Set.of(
+        "move_to", "jump", "sneak", "sprint", "set_control_state", "follow_player",
+        "collect_blocks", "craft_item", "explore", "build"
+    );
+    private static final Set<String> WORLD_COMMANDS = Set.of(
+        "mine_block", "dig_block", "mine_block_at", "use_on", "use_on_entity",
+        "interact_block_at", "interact_block", "interact", "place_block", "collect_blocks", "craft_item",
+        "trade", "sleep", "build"
+    );
+    private static final Set<String> INVENTORY_COMMANDS = Set.of(
+        "use_item", "select_hotbar", "equip_item", "auto_equip", "inventory_click", "container_button",
+        "place_recipe", "take_item", "put_item", "drop_item", "sort_inventory",
+        "craft_item", "eat", "trade", "build"
+    );
     // Jump cooldown
     private static int jumpCooldown = 0;
     private static final int JUMP_COOLDOWN_TICKS = 25;
@@ -112,11 +134,32 @@ public class ActionExecutor {
     private static long activeFencingToken = 0;
     private static volatile boolean backendDisconnectStopRequested = false;
     private int tickCount = 0;
+    private boolean activitySignalsWereAllowed;
+    private boolean movementWasAllowed = true;
+    private boolean inventoryWasAllowed;
+    private boolean backgroundSuspended;
 
     /** Called every client tick via ActionExecutorBridge (ClientTickEvent.Post). */
     public void onTick() {
         var mc = Minecraft.getInstance();
         if (mc == null || mc.level == null || mc.player == null) return;
+
+        if (!ServerPolicy.backgroundExecutionAllowed() && !mc.isWindowActive()) {
+            if (!backgroundSuspended) {
+                backgroundSuspended = true;
+                stopAllRuntime();
+            }
+            for (WireServer.WireCommand pending : WireServer.commandQueue.drain()) {
+                if (isSafetyControl(pending.cmd())) {
+                    executeCommand(pending);
+                } else {
+                    sendResponse(pending.id(), false,
+                        "POLICY_DISABLED: background execution is disabled while Minecraft is unfocused");
+                }
+            }
+            return;
+        }
+        backgroundSuspended = false;
 
         if (backendDisconnectStopRequested) {
             backendDisconnectStopRequested = false;
@@ -127,6 +170,8 @@ public class ActionExecutor {
             handleStopAll(new WireServer.WireCommand("backend-disconnect", "stop_all", new JsonObject()));
         }
 
+        enforceActivePolicies(mc);
+
         // ── Input isolation (core control system) ──
         InputIsolation.tick(mc);
 
@@ -134,7 +179,9 @@ public class ActionExecutor {
         Pathfinder.tick(mc);
 
         // ── Remembered workstations/storage POIs ──
-        PoiMemory.tick(mc, tickCount);
+        if (ServerPolicy.surroundingsCollectionAllowed()) {
+            PoiMemory.tick(mc, tickCount);
+        }
 
         // ── Follow controller (persistent follow target) ──
         tickFollowTarget(mc);
@@ -154,7 +201,8 @@ public class ActionExecutor {
         // ── Movement system (packet-based) ──
         MovementSystem.tick(mc);
 
-        boolean optionalAutonomy = ClientBodyRuntime.BEHAVIORS == null || ClientBodyRuntime.BEHAVIORS.isEnabled();
+        boolean optionalAutonomy = ServerPolicy.autonomousBehaviorsAllowed()
+                && (ClientBodyRuntime.BEHAVIORS == null || ClientBodyRuntime.BEHAVIORS.isEnabled());
 
         boolean manualTaskActive = hasManualTask();
         boolean behaviorActive = false;
@@ -169,7 +217,8 @@ public class ActionExecutor {
                 || JavaAutonomousBehavior.getState() != JavaAutonomousBehavior.BehaviorState.IDLE
                 || !WireServer.commandQueue.isEmpty();
 
-        if (InputIsolation.isAiControlled() && runtimeBusy) {
+        if (InputIsolation.isAiControlled() && runtimeBusy
+                && ServerPolicy.programmaticActivityReportingAllowed()) {
             WatutCompat.reportProgrammaticAction(mc.player.tickCount);
         }
 
@@ -189,7 +238,7 @@ public class ActionExecutor {
         }
 
         // ── Anti-AFK subtle activity pulses ──
-        if (optionalAutonomy) {
+        if (ServerPolicy.activitySignalsAllowed()) {
             ActivitySignalController.tick(mc, runtimeBusy);
         }
 
@@ -202,7 +251,7 @@ public class ActionExecutor {
                 stopAllRuntime();
             }
 
-            if (respawnRetryTicks-- <= 0) {
+            if (ServerPolicy.autoRespawnAllowed() && respawnRetryTicks-- <= 0) {
                 respawnRetryTicks = 12;
                 respawnAttempts++;
                 LCUMod.LOGGER.info("[AutoRespawn] Attempt {}", respawnAttempts);
@@ -211,6 +260,7 @@ public class ActionExecutor {
                     conn.send(new ServerboundClientCommandPacket(ServerboundClientCommandPacket.Action.PERFORM_RESPAWN));
                 }
             }
+            return;
         } else if (wasDead) {
             wasDead = false;
             respawnAttempts = 0;
@@ -225,13 +275,10 @@ public class ActionExecutor {
         handleContinuousDigging(mc);
 
         // ── Drain command queue ──
-        int processed = 0;
-        while (processed < 5) {
-            WireServer.WireCommand cmd = WireServer.commandQueue.poll();
-            if (cmd == null) break;
+        WireServer.WireCommand cmd = WireServer.commandQueue.poll();
+        if (cmd != null) {
             LCUMod.LOGGER.info("[Action] Processing: {} id={}", cmd.cmd(), cmd.id());
             executeCommand(cmd);
-            processed++;
         }
 
         // ── Safety: release stuck keys every 100 ticks ──
@@ -314,6 +361,47 @@ public class ActionExecutor {
         backendDisconnectStopRequested = true;
     }
 
+    private void enforceActivePolicies(Minecraft mc) {
+        boolean movementAllowed = ServerPolicy.movementAutomationAllowed();
+        boolean inventoryAllowed = ServerPolicy.inventoryAutomationAllowed();
+        boolean movementRevoked = !movementAllowed
+            && (Pathfinder.isNavigating() || MovementSystem.isMoving() || followReqId != null
+                || pendingCollectReqId != null || pendingCraftReqId != null);
+        boolean worldRevoked = !ServerPolicy.worldAutomationAllowed()
+            && (diggingPos != null || pendingCollectReqId != null || pendingCraftReqId != null);
+        boolean inventoryRevoked = !inventoryAllowed
+            && (pendingCraftReqId != null || pendingEatReqId != null || pendingStorageTargetItem != null);
+        if (movementRevoked || worldRevoked || inventoryRevoked) {
+            stopAllRuntime();
+        }
+        if (!ServerPolicy.autonomousBehaviorsAllowed()
+                && JavaAutonomousBehavior.getState() != JavaAutonomousBehavior.BehaviorState.IDLE) {
+            JavaAutonomousBehavior.resetCurrentState();
+            MovementSystem.stop();
+            if (mc.player.isUsingItem() && mc.gameMode != null) mc.gameMode.releaseUsingItem(mc.player);
+        }
+        if (!movementAllowed && movementWasAllowed) InputIsolation.clearAiControls();
+        if (!inventoryAllowed && inventoryWasAllowed
+                && mc.player.isUsingItem() && mc.gameMode != null) {
+            mc.gameMode.releaseUsingItem(mc.player);
+        }
+        movementWasAllowed = movementAllowed;
+        inventoryWasAllowed = inventoryAllowed;
+        boolean activitySignalsAllowed = ServerPolicy.activitySignalsAllowed();
+        if (!activitySignalsAllowed && activitySignalsWereAllowed) {
+            ActivitySignalController.reset();
+        }
+        activitySignalsWereAllowed = activitySignalsAllowed;
+    }
+
+    private boolean isSafetyControl(String command) {
+        return switch (command) {
+            case "stop_all", "stop_digging", "cancel_operation", "control_external",
+                 "control_builtin", "behavior_disable" -> true;
+            default -> false;
+        };
+    }
+
     // ── Command Execution ──
 
     private void executeCommand(WireServer.WireCommand cmd) {
@@ -333,18 +421,39 @@ public class ActionExecutor {
                 sendResponse(cmd.id(), false, "BODY_DISARMED: press F12 or explicitly arm this body before actions");
                 return;
             }
+            if (MOVEMENT_COMMANDS.contains(cmd.cmd()) && !ServerPolicy.movementAutomationAllowed()) {
+                sendResponse(cmd.id(), false, "POLICY_DISABLED: movement automation is disabled");
+                return;
+            }
+            if (WORLD_COMMANDS.contains(cmd.cmd()) && !ServerPolicy.worldAutomationAllowed()) {
+                sendResponse(cmd.id(), false, "POLICY_DISABLED: world automation is disabled");
+                return;
+            }
+            if (INVENTORY_COMMANDS.contains(cmd.cmd()) && !ServerPolicy.inventoryAutomationAllowed()) {
+                sendResponse(cmd.id(), false, "POLICY_DISABLED: inventory automation is disabled");
+                return;
+            }
+            if ("send_chat".equals(cmd.cmd()) && !ServerPolicy.chatAutomationAllowed()) {
+                sendResponse(cmd.id(), false, "POLICY_DISABLED: chat automation is disabled");
+                return;
+            }
+            if (diggingPos != null && HAND_ACTION_COMMANDS.contains(cmd.cmd())) {
+                sendResponse(cmd.id(), false, "HANDS_BUSY: a mining operation owns the hands channel");
+                return;
+            }
             switch (cmd.cmd()) {
                 case "control_external" -> handleControlExternal(cmd);
                 case "control_builtin" -> handleControlBuiltin(cmd);
                 case "move_to" -> handleMoveTo(cmd);
                 case "look_at" -> handleLookAt(cmd);
                 case "jump" -> {
-                    if (jumpCooldown <= 0) {
+                    if (jumpCooldown <= 0 && mc.player.onGround()) {
                         mc.player.jumpFromGround();
                         jumpCooldown = JUMP_COOLDOWN_TICKS;
                         sendResponse(cmd.id(), true, "Jumped");
                     } else {
-                        sendResponse(cmd.id(), false, "Jump on cooldown (" + jumpCooldown + " ticks)");
+                        sendResponse(cmd.id(), false, mc.player.onGround()
+                            ? "Jump on cooldown (" + jumpCooldown + " ticks)" : "Jump requires ground contact");
                     }
                 }
                 case "sneak" -> { mc.player.setShiftKeyDown(cmd.args() != null && cmd.args().has("sneak") ? cmd.args().get("sneak").getAsBoolean() : true); sendResponse(cmd.id(), true, "Sneak"); }
@@ -534,6 +643,14 @@ public class ActionExecutor {
             return;
         }
 
+        if (!ServerPolicy.automatedCombatAllowed()) {
+            sendResponse(cmd.id(), false, "POLICY_DISABLED: automated combat is disabled");
+            return;
+        }
+        if (mc.player.getAttackStrengthScale(0.5f) < 0.9f) {
+            sendResponse(cmd.id(), false, "Attack cooldown is not ready");
+            return;
+        }
         Entity target = findEntityTarget(mc, cmd);
         if (target != null) {
             mc.gameMode.attack(mc.player, target);
@@ -544,39 +661,6 @@ public class ActionExecutor {
             mc.player.swing(InteractionHand.MAIN_HAND);
             sendResponse(cmd.id(), false, "No target found");
         }
-    }
-
-    private Entity findTargetEntity(Minecraft mc, double range) {
-        var level = mc.level;
-        var player = mc.player;
-        if (level == null || player == null) return null;
-
-        // Entity ray trace
-        var lookVec = player.getLookAngle();
-        var start = player.getEyePosition();
-        var end = start.add(lookVec.scale(range));
-
-        // Check entities in bounding box
-        AABB searchBox = player.getBoundingBox().inflate(range);
-        Entity nearest = null;
-        double nearestDist = Double.MAX_VALUE;
-
-        for (Entity e : level.getEntities(player, searchBox)) {
-            if (!e.isAlive()) continue;
-            // Check if entity is in line of sight
-            var ePos = e.position();
-            double dist = player.distanceTo(e);
-            if (dist > range) continue;
-            
-            // Check angle
-            var toEntity = ePos.subtract(start).normalize();
-            double dot = lookVec.dot(toEntity);
-            if (dot > 0.85 && dist < nearestDist) {  // ~31 degree cone
-                nearest = e;
-                nearestDist = dist;
-            }
-        }
-        return nearest;
     }
 
     private void handleGetState(WireServer.WireCommand cmd) {
@@ -649,9 +733,7 @@ public class ActionExecutor {
             mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, blockHit);
             sendResponse(cmd.id(), true, "Interacted");
         } else {
-            // Use item in hand instead
-            mc.gameMode.useItem(mc.player, InteractionHand.MAIN_HAND);
-            sendResponse(cmd.id(), true, "Used item");
+            sendResponse(cmd.id(), false, "No block targeted; use use_item for held-item use");
         }
     }
 
@@ -672,7 +754,9 @@ public class ActionExecutor {
             Direction dir = blockHit.getDirection();
 
             // Auto-equip best tool (mineflayer-style)
-            autoEquipForBlock(mc);
+            if (ServerPolicy.inventoryAutomationAllowed()) {
+                autoEquipForBlock(mc);
+            }
 
             // Start digging — track for continuous ticks
             mc.gameMode.startDestroyBlock(pos, dir);
@@ -717,14 +801,14 @@ public class ActionExecutor {
     }
 
     private Entity findEntityTarget(Minecraft mc, WireServer.WireCommand cmd) {
+        if (!(mc.hitResult instanceof EntityHitResult entityHit)) return null;
+        Entity target = entityHit.getEntity();
+        if (!target.isAlive() || !mc.player.hasLineOfSight(target)) return null;
         var args = cmd.args();
         if (args != null && args.has("entity_id")) {
-            Entity target = mc.level.getEntity(args.get("entity_id").getAsInt());
-            if (target != null && target.isAlive() && mc.player.distanceTo(target) <= 4.5
-                && mc.player.hasLineOfSight(target)) return target;
-            return null;
+            return target.getId() == args.get("entity_id").getAsInt() ? target : null;
         }
-        return findTargetEntity(mc, 6.0);
+        return target;
     }
 
     private void handleInteractBlockAt(WireServer.WireCommand cmd) {
@@ -734,18 +818,21 @@ public class ActionExecutor {
             sendResponse(cmd.id(), false, "Need player, game mode, and x/y/z");
             return;
         }
-        if (!withinInteractionReach(mc, pos)) {
-            sendResponse(cmd.id(), false, "Block is out of interaction reach");
+        BlockHitResult blockHit = targetedBlockHit(mc, pos);
+        if (blockHit == null) {
+            sendResponse(cmd.id(), false, "Block must be the current unobstructed crosshair target");
             return;
         }
         Direction face = parseDirection(cmd.args());
-        if (face == null) {
+        if (cmd.args().has("face") && face == null) {
             sendResponse(cmd.id(), false, "Invalid block face");
             return;
         }
-        mc.player.lookAt(net.minecraft.commands.arguments.EntityAnchorArgument.Anchor.EYES, Vec3.atCenterOf(pos));
-        mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND,
-            new BlockHitResult(Vec3.atCenterOf(pos), face, pos, false));
+        if (face != null && blockHit.getDirection() != face) {
+            sendResponse(cmd.id(), false, "Requested face is not the current targeted face");
+            return;
+        }
+        mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, blockHit);
         sendResponse(cmd.id(), true, "Interacting with " + pos.toShortString());
     }
 
@@ -760,21 +847,27 @@ public class ActionExecutor {
             sendResponse(cmd.id(), false, "CONFLICT: another mining operation is active");
             return;
         }
-        if (!withinInteractionReach(mc, pos) || mc.level.getBlockState(pos).isAir()) {
-            sendResponse(cmd.id(), false, "Block is invalid or out of interaction reach");
+        BlockHitResult blockHit = targetedBlockHit(mc, pos);
+        if (blockHit == null || mc.level.getBlockState(pos).isAir()) {
+            sendResponse(cmd.id(), false, "Block must be the current unobstructed crosshair target");
             return;
         }
         Direction face = parseDirection(cmd.args());
-        if (face == null) {
+        if (cmd.args().has("face") && face == null) {
             sendResponse(cmd.id(), false, "Invalid block face");
             return;
         }
-        autoEquipForBlock(mc, pos);
-        mc.player.lookAt(net.minecraft.commands.arguments.EntityAnchorArgument.Anchor.EYES, Vec3.atCenterOf(pos));
-        mc.gameMode.startDestroyBlock(pos, face);
+        if (ServerPolicy.inventoryAutomationAllowed()) {
+            autoEquipForBlock(mc, pos);
+        }
+        if (face != null && blockHit.getDirection() != face) {
+            sendResponse(cmd.id(), false, "Requested face is not the current targeted face");
+            return;
+        }
+        mc.gameMode.startDestroyBlock(pos, blockHit.getDirection());
         mc.player.swing(InteractionHand.MAIN_HAND);
         diggingPos = pos;
-        diggingDir = face;
+        diggingDir = blockHit.getDirection();
         diggingTicks = 0;
         diggingReqId = cmd.id();
         sendResponse(cmd.id(), true, "Digging " + pos.toShortString());
@@ -810,11 +903,12 @@ public class ActionExecutor {
             try { return Direction.valueOf(args.get("face").getAsString().toUpperCase()); }
             catch (IllegalArgumentException ignored) { return null; }
         }
-        return Direction.UP;
+        return null;
     }
 
-    private boolean withinInteractionReach(Minecraft mc, BlockPos pos) {
-        return mc.player.distanceToSqr(Vec3.atCenterOf(pos)) <= 36.0;
+    private BlockHitResult targetedBlockHit(Minecraft mc, BlockPos pos) {
+        if (!(mc.hitResult instanceof BlockHitResult blockHit)) return null;
+        return blockHit.getBlockPos().equals(pos) ? blockHit : null;
     }
 
     private void stopDigging() {
@@ -851,6 +945,12 @@ public class ActionExecutor {
             // Block was broken!
             LCUMod.LOGGER.info("[Action] Block broken at {}", diggingPos);
             stopDigging("succeeded", "BLOCK_BROKEN", "block broken");
+            return;
+        }
+
+        BlockHitResult blockHit = targetedBlockHit(mc, diggingPos);
+        if (blockHit == null || blockHit.getDirection() != diggingDir) {
+            stopDigging("cancelled", "TARGET_LOST", "digging target is no longer under the crosshair");
             return;
         }
 
@@ -902,7 +1002,7 @@ public class ActionExecutor {
             case "left" -> setInput("left", state);
             case "right" -> setInput("right", state);
             case "jump" -> {
-                if (state && jumpCooldown <= 0) {
+                if (state && jumpCooldown <= 0 && mc.player.onGround()) {
                     mc.player.jumpFromGround();
                     jumpCooldown = JUMP_COOLDOWN_TICKS;
                 }
@@ -990,6 +1090,7 @@ public class ActionExecutor {
             sendResponse(cmd.id(), false, "Need operation_id");
             return;
         }
+
         String operationId = args.get("operation_id").getAsString();
         boolean cancelled = Pathfinder.cancelOperation(operationId, "operation cancelled by controller");
         if (operationId.equals(diggingReqId)) {
@@ -1153,9 +1254,7 @@ public class ActionExecutor {
             mc.gameMode.interact(mc.player, entityHit.getEntity(), InteractionHand.MAIN_HAND);
             sendResponse(cmd.id(), true, "Right-clicked entity");
         } else {
-            // Use item in hand
-            mc.gameMode.useItem(mc.player, InteractionHand.MAIN_HAND);
-            sendResponse(cmd.id(), true, "Used item (no target)");
+            sendResponse(cmd.id(), false, "No block/entity targeted; use use_item for held-item use");
         }
     }
 
@@ -1680,36 +1779,8 @@ public class ActionExecutor {
     }
 
     private void handleDropItem(WireServer.WireCommand cmd) {
-        var args = cmd.args();
-        if (args == null || !args.has("item")) {
-            sendResponse(cmd.id(), false, "Need item name");
-            return;
-        }
-        var mc = Minecraft.getInstance();
-        if (mc.player == null) {
-            sendResponse(cmd.id(), false, "No player");
-            return;
-        }
-        String itemName = args.get("item").getAsString();
-        int count = args.has("count") ? args.get("count").getAsInt() : 1;
-        
-        // Find item in inventory and drop
-        var inv = mc.player.getInventory();
-        for (int i = 0; i < inv.getContainerSize(); i++) {
-            var stack = inv.getItem(i);
-            if (stack.isEmpty()) continue;
-            String stackId = BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
-            if (!CraftingPlanner.matchesItemId(stackId, itemName)) continue;
-            int amount = Math.min(Math.max(1, count), stack.getCount());
-            mc.player.drop(stack.split(amount), false);
-            count -= amount;
-            if (count <= 0) {
-                sendResponse(cmd.id(), true, "Dropped " + itemName);
-                return;
-            }
-        }
-        sendResponse(cmd.id(), count < (args.has("count") ? args.get("count").getAsInt() : 1),
-            count < (args.has("count") ? args.get("count").getAsInt() : 1) ? "Dropped partial " + itemName : "Item " + itemName + " not found");
+        sendResponse(cmd.id(), false,
+            "UNSUPPORTED: item dropping requires an acknowledged inventory transaction");
     }
 
     private void handleSortInventory(WireServer.WireCommand cmd) {
@@ -2122,7 +2193,8 @@ public class ActionExecutor {
         }
 
         // Try storage source before world search (only on early search attempts)
-        if (pendingCollectSearchMisses < 3 && tryStorageSourceForCollect(mc)) {
+        if (ServerPolicy.inventoryAutomationAllowed()
+                && pendingCollectSearchMisses < 3 && tryStorageSourceForCollect(mc)) {
             setTaskState(resolveRootTaskKind(), "storage", pendingCollectItem,
                 "checking storage for " + pendingCollectItem, collectProgress(mc));
             return;
@@ -2179,12 +2251,20 @@ public class ActionExecutor {
         }
 
         if (diggingPos == null || !pendingCollectTargetPos.equals(diggingPos)) {
-            autoEquipForBlock(mc, pendingCollectTargetPos);
+            if (ServerPolicy.inventoryAutomationAllowed()) {
+                autoEquipForBlock(mc, pendingCollectTargetPos);
+            }
             mc.player.lookAt(net.minecraft.commands.arguments.EntityAnchorArgument.Anchor.EYES, Vec3.atCenterOf(pendingCollectTargetPos));
-            mc.gameMode.startDestroyBlock(pendingCollectTargetPos, Direction.UP);
+            BlockHitResult blockHit = targetedBlockHit(mc, pendingCollectTargetPos);
+            if (blockHit == null) {
+                setTaskState(resolveRootTaskKind(), "aiming", pendingCollectItem,
+                    "waiting for a visible resource face", collectProgress(mc));
+                return;
+            }
+            mc.gameMode.startDestroyBlock(pendingCollectTargetPos, blockHit.getDirection());
             mc.player.swing(InteractionHand.MAIN_HAND);
             diggingPos = pendingCollectTargetPos;
-            diggingDir = Direction.UP;
+            diggingDir = blockHit.getDirection();
             diggingTicks = 0;
             diggingReqId = null;
         }
@@ -2347,8 +2427,10 @@ public class ActionExecutor {
             }
 
             if (pendingStorageOpenSentTick < 0) {
-                Vec3 hitVec = Vec3.atCenterOf(pendingStorageInteractionPos);
-                BlockHitResult hitResult = new BlockHitResult(hitVec, Direction.UP, pendingStorageInteractionPos, false);
+                mc.player.lookAt(net.minecraft.commands.arguments.EntityAnchorArgument.Anchor.EYES,
+                    Vec3.atCenterOf(pendingStorageInteractionPos));
+                BlockHitResult hitResult = targetedBlockHit(mc, pendingStorageInteractionPos);
+                if (hitResult == null) return;
                 mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, hitResult);
                 pendingStorageOpenSentTick = pendingStorageTicks;
                 pendingStorageOpenAttempts++;
@@ -2539,12 +2621,7 @@ public class ActionExecutor {
         }
 
         if (slot >= 9) {
-            int swapHotbar = 0;
-            var current = mc.player.getInventory().getItem(swapHotbar).copy();
-            var target = mc.player.getInventory().getItem(slot).copy();
-            mc.player.getInventory().setItem(slot, current);
-            mc.player.getInventory().setItem(swapHotbar, target);
-            slot = swapHotbar;
+            return false;
         }
         mc.player.getInventory().selected = slot;
 
@@ -2553,8 +2630,10 @@ public class ActionExecutor {
             return false;
         }
         BlockPos supportPos = placePos.below();
-        Vec3 hitVec = Vec3.atCenterOf(supportPos);
-        BlockHitResult hitResult = new BlockHitResult(hitVec, Direction.UP, supportPos, false);
+        mc.player.lookAt(net.minecraft.commands.arguments.EntityAnchorArgument.Anchor.EYES, Vec3.atCenterOf(supportPos));
+        BlockHitResult hitResult = targetedBlockHit(mc, supportPos);
+        if (hitResult == null) return true;
+        if (hitResult.getDirection() != Direction.UP) return false;
         mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, hitResult);
         return true;
     }
@@ -2621,13 +2700,11 @@ public class ActionExecutor {
 
         MovementSystem.stop();
         if (pendingCraftStationUseAttempts >= 3) return false;
-        pendingCraftStationUseAttempts++;
         mc.player.lookAt(net.minecraft.commands.arguments.EntityAnchorArgument.Anchor.EYES, Vec3.atCenterOf(stationPos));
-        mc.gameMode.useItemOn(
-            mc.player,
-            InteractionHand.MAIN_HAND,
-            new BlockHitResult(Vec3.atCenterOf(stationPos), Direction.UP, stationPos, false)
-        );
+        BlockHitResult hitResult = targetedBlockHit(mc, stationPos);
+        if (hitResult == null) return true;
+        pendingCraftStationUseAttempts++;
+        mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, hitResult);
         return true;
     }
 

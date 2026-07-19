@@ -5,6 +5,7 @@ import com.lcu.lcumod.action.ActionExecutor;
 import com.lcu.lcumod.behavior.BehaviorManager;
 import com.lcu.lcumod.config.ModConfig;
 import com.lcu.lcumod.config.RuntimeRole;
+import com.lcu.lcumod.config.ServerPolicy;
 import com.lcu.lcumod.network.WireServer;
 
 public final class ClientBodyRuntime {
@@ -18,7 +19,9 @@ public final class ClientBodyRuntime {
         if (started || !isBodyClient()) return;
         ACTION = new ActionExecutor();
         BEHAVIORS = new BehaviorManager();
-        LCUMod.WIRE = new WireServer(ModConfig.WIRE_PORT.getAsInt(), ModConfig.WIRE_TOKEN.get());
+        LCUMod.WIRE = new WireServer(
+            ModConfig.WIRE_PORT.getAsInt(), ModConfig.WIRE_TOKEN.get(), "body_client",
+            ActionExecutor::requestBackendDisconnectStop, ServerPolicy::snapshot);
         LCUMod.WIRE.start();
         started = true;
         LCUMod.LOGGER.info("[LCUMod] Headed body client ready on wire port {}", LCUMod.WIRE.getBoundPort());

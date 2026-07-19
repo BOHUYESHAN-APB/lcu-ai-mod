@@ -4,12 +4,17 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 
 import java.util.List;
+import java.util.Map;
 
 /** Machine-readable deterministic actuator contracts advertised during wire auth. */
 public final class ToolCatalog {
     private ToolCatalog() {}
 
     public static JsonArray describe() {
+        return describe(Map.of());
+    }
+
+    public static JsonArray describe(Map<String, Boolean> currentPolicy) {
         JsonArray tools = new JsonArray();
         tools.add(tool("move_to", "operation", true, "outcome", List.of("body.move"),
             numbers("x", "y", "z"), List.of("x", "y", "z")));
@@ -18,9 +23,10 @@ public final class ToolCatalog {
         tools.add(tool("look_at_entity", "immediate", false, "response", List.of("camera.move"),
             integerProperties("id"), List.of("id")));
         tools.add(tool("jump", "immediate", false, "response", List.of("body.move"), emptyProperties(), List.of()));
-        tools.add(tool("attack", "immediate", false, "response", List.of("entity.attack"), emptyProperties(), List.of()));
-        tools.add(tool("attack_entity", "immediate", false, "response", List.of("entity.attack"),
-            integerProperties("entity_id"), List.of("entity_id")));
+        tools.add(policyTool("attack", "immediate", false, "response", List.of("entity.attack"),
+            emptyProperties(), List.of(), "allowAutomatedCombat"));
+        tools.add(policyTool("attack_entity", "immediate", false, "response", List.of("entity.attack"),
+            integerProperties("entity_id"), List.of("entity_id"), "allowAutomatedCombat"));
         tools.add(tool("mine_block", "operation", true, "outcome", List.of("body.move", "world.break"), emptyProperties(), List.of()));
         tools.add(tool("mine_block_at", "operation", true, "outcome", List.of("world.break"),
             blockTargetProperties(), List.of("x", "y", "z")));
@@ -62,8 +68,20 @@ public final class ToolCatalog {
         tools.add(tool("put_item", "immediate", false, "response", List.of("inventory.transfer"),
             slotAndContainer(), List.of("container_id", "expected_state_id", "slot")));
         tools.add(tool("close_container", "immediate", false, "response", List.of("inventory.ui"), emptyProperties(), List.of()));
-        tools.add(tool("drop_item", "immediate", false, "response", List.of("inventory.drop"),
-            stringAndCount("item"), List.of("item", "count")));
+        if (currentPolicy != null && !currentPolicy.isEmpty()) {
+            for (var element : tools) {
+                JsonObject descriptor = element.getAsJsonObject();
+                if (!descriptor.has("policy_options")) continue;
+                JsonArray options = descriptor.getAsJsonArray("policy_options");
+                boolean complete = options.asList().stream()
+                    .allMatch(option -> currentPolicy.containsKey(option.getAsString()));
+                if (!complete) continue;
+                boolean enabled = options.asList().stream()
+                    .allMatch(option -> Boolean.TRUE.equals(currentPolicy.get(option.getAsString())));
+                descriptor.addProperty("available", enabled);
+                descriptor.addProperty("policy_enabled", enabled);
+            }
+        }
         return tools;
     }
 
@@ -87,7 +105,46 @@ public final class ToolCatalog {
         schema.add("required", requiredArray);
         schema.addProperty("additionalProperties", false);
         descriptor.add("input_schema", schema);
+        List<String> policyOptions = policyOptionsFor(command);
+        if (!policyOptions.isEmpty()) {
+            JsonArray options = new JsonArray();
+            policyOptions.forEach(options::add);
+            descriptor.add("policy_options", options);
+            descriptor.addProperty("policy_default", policyDefaultsEnabled(command) ? "enabled" : "disabled");
+        }
         return descriptor;
+    }
+
+    private static JsonObject policyTool(String command, String execution, boolean cancellable, String completion,
+                                         List<String> effects, JsonObject properties, List<String> required,
+                                         String policyOption) {
+        JsonObject descriptor = tool(command, execution, cancellable, completion, effects, properties, required);
+        descriptor.addProperty("policy_default", "disabled");
+        descriptor.addProperty("policy_option", policyOption);
+        return descriptor;
+    }
+
+    private static List<String> policyOptionsFor(String command) {
+        return switch (command) {
+            case "move_to", "jump", "follow_player" -> List.of("allowMovementAutomation");
+            case "mine_block", "mine_block_at", "use_on", "use_on_entity", "interact_block_at" ->
+                List.of("allowWorldAutomation");
+            case "collect_blocks" -> List.of("allowMovementAutomation", "allowWorldAutomation");
+            case "craft_item" -> List.of(
+                "allowMovementAutomation", "allowWorldAutomation", "allowInventoryAutomation");
+            case "use_item", "equip_item", "select_hotbar", "inventory_click", "container_button",
+                 "place_recipe", "take_item", "put_item", "eat" -> List.of("allowInventoryAutomation");
+            case "attack", "attack_entity" -> List.of("allowAutomatedCombat");
+            case "send_chat" -> List.of("allowChatAutomation");
+            default -> List.of();
+        };
+    }
+
+    private static boolean policyDefaultsEnabled(String command) {
+        return switch (command) {
+            case "move_to", "jump", "follow_player", "send_chat" -> true;
+            default -> false;
+        };
     }
 
     private static String versionFor(String command) {
