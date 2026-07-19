@@ -92,6 +92,36 @@ class SDKClientTests(unittest.TestCase):
         self.assertEqual(requests[1].url.path, "/api/v2/skills/general.craft_item/runs")
         self.assertIn(b'"fencing_token":7', requests[1].content)
 
+    def test_task_preset_endpoints_are_exposed(self):
+        requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.url.path == "/api/v2/task-presets":
+                return httpx.Response(200, json={"presets": [{"id": "craft.iron_pickaxe"}]})
+            if request.url.path == "/api/v2/task-presets/craft.iron_pickaxe":
+                return httpx.Response(200, json={"id": "craft.iron_pickaxe", "skill_id": "general.craft_item"})
+            return httpx.Response(200, json={"id": "run-1", "skill_id": "general.craft_item", "status": "dispatched"})
+
+        client = LCUClient()
+        client._client.close()
+        client._client = cast(Any, httpx.Client(
+            base_url="http://127.0.0.1:8080",
+            transport=httpx.MockTransport(handler),
+        ))
+
+        presets = client.list_task_presets()
+        preset = client.get_task_preset("craft.iron_pickaxe")
+        run = client.run_task_preset("craft.iron_pickaxe", {})
+        client.close()
+
+        self.assertEqual(presets[0]["id"], "craft.iron_pickaxe")
+        self.assertEqual(preset["skill_id"], "general.craft_item")
+        self.assertEqual(run["status"], "dispatched")
+        self.assertEqual(requests[0].url.path, "/api/v2/task-presets")
+        self.assertEqual(requests[1].url.path, "/api/v2/task-presets/craft.iron_pickaxe")
+        self.assertEqual(requests[2].url.path, "/api/v2/task-presets/craft.iron_pickaxe/runs")
+
 
 if __name__ == "__main__":
     unittest.main()

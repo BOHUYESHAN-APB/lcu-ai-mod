@@ -55,7 +55,7 @@ class OrchestratorBodyTests(unittest.TestCase):
             self.assertFalse(orchestrator.session.get_status()["body"]["connected"])
             orchestrator.session.stop()
 
-    def test_response_and_progress_finalize_fake_body_command(self):
+    def test_response_progress_and_outcome_finalize_fake_body_command(self):
         body = FakeBody()
         with tempfile.TemporaryDirectory() as tmp:
             orchestrator = Orchestrator(body, storage_root=Path(tmp), legacy_root=None)
@@ -65,6 +65,7 @@ class OrchestratorBodyTests(unittest.TestCase):
             body.pending.extend([
                 BodyEvent("response", {"id": "fake-1", "success": True}),
                 BodyEvent("progress", {"id": "fake-1", "progress": 1.0, "message": "arrived"}),
+                BodyEvent("outcome", {"id": "fake-1", "status": "succeeded", "message": "arrived"}),
             ])
 
             orchestrator.start()
@@ -74,6 +75,22 @@ class OrchestratorBodyTests(unittest.TestCase):
             self.assertEqual(outcome["command"], "move_to")
             self.assertEqual(outcome["outcome"], "success")
             self.assertEqual(outcome["requester"], "sdk")
+            orchestrator.session.stop()
+
+    def test_malformed_state_event_does_not_block_following_valid_event(self):
+        body = FakeBody()
+        body.pending.extend([
+            BodyEvent("event", {"event": "state_update", "data": "invalid"}),
+            BodyEvent("event", {"event": "state_update", "data": {"player": {"health": 17}}}),
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            orchestrator = Orchestrator(body, storage_root=Path(tmp), legacy_root=None)
+            orchestrator.start()
+
+            orchestrator.tick()
+
+            self.assertEqual(orchestrator.session.runtime["player"]["health"], 17)
+            self.assertEqual(orchestrator.session.world_model.invalid_updates, 1)
             orchestrator.session.stop()
 
 

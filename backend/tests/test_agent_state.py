@@ -23,9 +23,42 @@ class AgentStateTests(unittest.TestCase):
             state.close()
             conn = sqlite3.connect(path)
             try:
-                self.assertEqual(conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 5)
+                self.assertEqual(conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 6)
             finally:
                 conn.close()
+
+    def test_v5_database_migrates_existing_runs_to_skill_kind(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "agent_state.db"
+            conn = sqlite3.connect(path)
+            conn.execute("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at REAL NOT NULL)")
+            conn.executemany(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (?, 0)",
+                [(version,) for version in range(1, 6)],
+            )
+            conn.execute("""
+                CREATE TABLE task_runs (
+                    id TEXT PRIMARY KEY, schedule_id TEXT, skill_id TEXT NOT NULL,
+                    skill_version TEXT NOT NULL, input_json TEXT NOT NULL, completion TEXT NOT NULL,
+                    status TEXT NOT NULL, request_id TEXT, progress REAL NOT NULL DEFAULT 0,
+                    detail TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL,
+                    dispatched_at REAL, started_at REAL, finished_at REAL, scope_id TEXT
+                )
+            """)
+            conn.execute("""
+                INSERT INTO task_runs(id, skill_id, skill_version, input_json, completion, status, created_at, scope_id)
+                VALUES ('existing', 'core.jump', '1.0.0', '{}', 'response', 'queued', 1, 'default')
+            """)
+            conn.commit()
+            conn.close()
+
+            state = AgentStateDB(path)
+            restored = state.get_run("existing")
+
+            self.assertEqual(restored["run_kind"], "skill")
+            self.assertIsNone(restored["parent_run_id"])
+            self.assertEqual(restored["input"], {})
+            state.close()
 
     def test_control_lease_is_exclusive_renewable_and_fenced(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -47,6 +80,55 @@ class AgentStateTests(unittest.TestCase):
                     pass
             next_lease = state.acquire_lease("other-agent", "external", ["actions"], 30)
             self.assertGreater(next_lease["fencing_token"], lease["fencing_token"])
+            state.close()
+
+    def test_workflow_child_completion_advances_parent_atomically(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = AgentStateDB(Path(tmp) / "agent_state.db")
+            workflow = {
+                "id": "workflow.test", "version": "1.0.0", "kind": "workflow", "parameters": {},
+                "steps": [
+                    {"key": "jump", "title": "Jump", "skill_id": "core.jump", "skill_version": "1.0.0", "completion": "response", "input": {}},
+                    {"key": "move", "title": "Move", "skill_id": "core.move_to", "skill_version": "2.0.0", "completion": "outcome", "input": {"x": 1, "y": 64, "z": 2}},
+                ],
+            }
+            parent = state.create_workflow_run(workflow, scope_id="default")
+            first_id = parent["active_child_id"]
+            state.mark_run_dispatched(first_id, first_id)
+
+            state.update_run_response(first_id, True, "jumped")
+
+            restored = state.get_run(parent["id"])
+            self.assertEqual(restored["status"], "queued")
+            self.assertNotEqual(restored["active_child_id"], first_id)
+            self.assertEqual([step["status"] for step in restored["steps"]], ["succeeded", "queued"])
+
+            duplicate = state.update_run_response(first_id, True, "duplicate")
+            after_duplicate = state.get_run(parent["id"])
+            self.assertIsNone(duplicate)
+            self.assertEqual(after_duplicate["active_child_id"], restored["active_child_id"])
+            self.assertEqual(len(after_duplicate["steps"]), 2)
+            state.close()
+
+    def test_workflow_failure_and_cancellation_propagate_to_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = AgentStateDB(Path(tmp) / "agent_state.db")
+            workflow = {
+                "id": "workflow.test", "version": "1.0.0", "kind": "workflow", "parameters": {},
+                "steps": [{
+                    "key": "move", "title": "Move", "skill_id": "core.move_to",
+                    "skill_version": "2.0.0", "completion": "outcome", "input": {"x": 1, "y": 64, "z": 2},
+                }],
+            }
+            failed = state.create_workflow_run(workflow)
+            failed_child = failed["active_child_id"]
+            state.mark_run_dispatched(failed_child, failed_child)
+            state.update_run_outcome(failed_child, "failed", "blocked", "NO_PATH")
+            self.assertEqual(state.get_run(failed["id"])["status"], "failed")
+
+            cancelled = state.create_workflow_run(workflow)
+            state.cancel_queued_workflow(cancelled["id"])
+            self.assertEqual(state.get_run(cancelled["id"])["status"], "cancelled")
             state.close()
 
 
@@ -79,6 +161,17 @@ class SkillRegistryTests(unittest.TestCase):
         registry.validate_input("core.jump", {})
         with self.assertRaisesRegex(SkillValidationError, "capability unavailable"):
             registry.validate_input("general.craft_item", {"item": "minecraft:torch", "count": 1})
+
+    def test_registry_rejects_incompatible_body_contract(self):
+        registry = SkillRegistry()
+        registry.set_body_tools([{
+            "command": "move_to", "available": True, "version": "1.0.0", "completion": "progress",
+        }])
+
+        item = next(item for item in registry.list() if item["id"] == "core.move_to")
+        self.assertFalse(item["available"])
+        with self.assertRaisesRegex(SkillValidationError, "capability unavailable"):
+            registry.validate_input("core.move_to", {"x": 1, "y": 64, "z": 2})
 
 
 if __name__ == "__main__":

@@ -650,6 +650,67 @@ class ServerSDKTests(unittest.TestCase):
             ("control_builtin", {"__lcu_fencing_token": lease["fencing_token"]}),
         ])
 
+    def test_v2_task_presets_list_detail_and_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = AgentStateDB(Path(tmp) / "agent_state.db")
+            body = FakeBody()
+            orchestrator = FakeOrchestrator(body)
+            coordinator = TaskCoordinator(state, server.skill_registry, body)
+            coordinator.set_body_armed(True)
+            with (
+                patch.dict(os.environ, {"SDK_API_TOKEN": ""}),
+                patch.object(server, "agent_state", state),
+                patch.object(server, "body", body),
+                patch.object(server, "orchestrator", orchestrator),
+                patch.object(server, "task_coordinator", coordinator),
+            ):
+                client = TestClient(server.app, base_url="http://127.0.0.1:8080", client=("127.0.0.1", 50000))
+                listed = client.get("/api/v2/task-presets?category=crafting")
+                detail = client.get("/api/v2/task-presets/craft.iron_pickaxe")
+                run = client.post("/api/v2/task-presets/craft.iron_pickaxe/runs", json={"parameters": {}})
+            state.close()
+
+        self.assertEqual(listed.status_code, 200)
+        self.assertGreaterEqual(listed.json()["count"], 1)
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(detail.json()["id"], "craft.iron_pickaxe")
+        self.assertEqual(run.status_code, 200)
+        self.assertEqual(run.json()["skill_id"], "general.craft_item")
+        self.assertEqual(body.commands, [("craft_item", {"item": "minecraft:iron_pickaxe", "count": 1})])
+
+    def test_v2_workflow_preset_returns_parent_with_step_details(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = AgentStateDB(Path(tmp) / "agent_state.db")
+            body = FakeBody()
+            orchestrator = FakeOrchestrator(body)
+            coordinator = TaskCoordinator(state, server.skill_registry, body)
+            coordinator.set_body_armed(True)
+            with (
+                patch.dict(os.environ, {"SDK_API_TOKEN": ""}),
+                patch.object(server, "agent_state", state),
+                patch.object(server, "body", body),
+                patch.object(server, "orchestrator", orchestrator),
+                patch.object(server, "task_coordinator", coordinator),
+            ):
+                client = TestClient(server.app, base_url="http://127.0.0.1:8080", client=("127.0.0.1", 50000))
+                preset = client.get("/api/v2/task-presets/workflow.starter_chest")
+                created = client.post(
+                    "/api/v2/task-presets/workflow.starter_chest/runs", json={"parameters": {}},
+                )
+                detail = client.get(f"/api/v2/runs/{created.json()['id']}")
+                listed = client.get("/api/v2/runs")
+            state.close()
+
+        self.assertEqual(preset.status_code, 200)
+        self.assertEqual(preset.json()["kind"], "workflow")
+        self.assertEqual(created.status_code, 200)
+        self.assertEqual(created.json()["run_kind"], "workflow")
+        self.assertEqual([step["status"] for step in detail.json()["steps"]], ["dispatched", "pending"])
+        self.assertEqual(listed.json()["count"], 1)
+        self.assertEqual(body.commands, [(
+            "collect_blocks", {"block_type": "#minecraft:logs", "count": 8},
+        )])
+
     def test_expired_lease_restores_session_while_body_is_disconnected(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = AgentStateDB(Path(tmp) / "agent_state.db")

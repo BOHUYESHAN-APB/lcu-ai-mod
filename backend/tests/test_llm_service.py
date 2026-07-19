@@ -182,6 +182,26 @@ class LLMServiceTests(unittest.TestCase):
 
         self.assertEqual(caught.exception.code, "output_limit_exceeded")
 
+    def test_requested_output_reduces_available_input_context(self):
+        service = LLMService()
+        service.set_agent_config("planner", {
+            "context_window_tokens": 100,
+            "max_input_tokens": 90,
+            "max_output_tokens": 80,
+            "reserved_output_tokens": 10,
+            "compression_enabled": False,
+            "api_key": "planner-key",
+        })
+
+        with patch.object(service, "_post") as post:
+            with self.assertRaises(LLMRequestRejected) as caught:
+                service.chat([
+                    {"role": "user", "content": "x" * 100},
+                ], agent="planner", max_tokens=80)
+
+        self.assertEqual(caught.exception.code, "input_limit_exceeded")
+        post.assert_not_called()
+
     def test_success_usage_is_attributed_to_agent(self):
         service = LLMService()
         service.set_agent_config("planner", {"api_key": "planner-key"})

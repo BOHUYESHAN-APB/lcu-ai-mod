@@ -188,7 +188,7 @@ class MemoryTests(unittest.TestCase):
             self.assertEqual(restored.summaries[0]["id"], "summary-one")
             self.assertIn("Alice needs diamonds", context["durable_summaries"])
 
-    def test_long_task_is_only_recorded_after_terminal_progress(self):
+    def test_long_task_is_only_recorded_after_outcome(self):
         with tempfile.TemporaryDirectory() as tmp:
             session = Session(FakeBody(), companion_id="memory-test", storage_root=Path(tmp), legacy_root=None)
             session._current_requester = ("Alice", "uuid-a")
@@ -198,6 +198,8 @@ class MemoryTests(unittest.TestCase):
             self.assertEqual(session.memory.task_outcomes, [])
 
             session.handle_event("command_progress", {"id": "req-1", "progress": 1.0, "message": "crafted"})
+            self.assertEqual(session.memory.task_outcomes, [])
+            session.handle_event("command_outcome", {"id": "req-1", "status": "succeeded", "message": "crafted"})
             self.assertEqual(session.memory.task_outcomes[-1]["outcome"], "success")
             self.assertEqual(session.memory.task_outcomes[-1]["requester"], "Alice")
             session.stop()
@@ -214,7 +216,7 @@ class MemoryTests(unittest.TestCase):
             self.assertEqual(session.memory.task_outcomes[-1]["outcome"], "success")
             session.stop()
 
-    def test_move_to_waits_for_pathfinder_terminal_progress(self):
+    def test_move_to_waits_for_pathfinder_outcome(self):
         with tempfile.TemporaryDirectory() as tmp:
             session = Session(FakeBody(), companion_id="memory-test", storage_root=Path(tmp), legacy_root=None)
             session._on_skill_command("move_to", "req-move", "manual_chat", {"x": 10, "y": 64, "z": 10})
@@ -222,6 +224,8 @@ class MemoryTests(unittest.TestCase):
             session.handle_event("command_response", {"id": "req-move", "success": True})
             self.assertEqual(session.memory.task_outcomes, [])
             session.handle_event("command_progress", {"id": "req-move", "progress": 0.0, "message": "no path"})
+            self.assertEqual(session.memory.task_outcomes, [])
+            session.handle_event("command_outcome", {"id": "req-move", "status": "failed", "message": "no path"})
 
             self.assertEqual(session.memory.task_outcomes[-1]["outcome"], "failed")
             session.stop()

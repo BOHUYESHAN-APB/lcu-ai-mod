@@ -183,11 +183,55 @@ Container mutation commands require the current container ID and slot, preventin
 screen actions. Python composes these primitives into retrieval, delivery, sorting, and
 future specialist workflows; Java keeps only the deterministic menu and safety mechanics.
 
+## Durable Workflows
+
+A multi-step preset creates one workflow parent run and one queued child Skill run. The
+parent stores the resolved immutable step specification, current step, active child, scope,
+and control lease identity. Only child runs are dispatched to the body.
+
+Child terminalization, parent progress/status propagation, and creation of the next queued
+child occur in one SQLite transaction. A successful child advances exactly once; duplicate
+terminal events cannot create duplicate steps. Failure and cancellation stop the parent.
+Disconnect, timeout, cancellation rejection, or backend restart while a child is in flight
+marks both child and parent `unknown`, preserving at-most-once execution rather than replaying
+an operation whose body-side result is uncertain. Queued parents require explicit resume.
+
+## Normalized World Model
+
+`Session` owns one revisioned World Model as the ingestion boundary for body observations.
+Production `state_update` payloads are authoritative for player, world, inventory, equipment,
+entities, online players, nearby blocks, workstations, storage, and integration snapshots.
+Snapshot-owned collections omitted by a later valid snapshot are cleared rather than retained
+as phantom state. Task, behavior, and control state are independent overlays and survive a
+snapshot that does not contain them.
+
+Each accepted fact records its revision, observation time, source, and TTL. Malformed fields
+do not replace the last valid fact and do not refresh global player/world freshness. Disconnect
+marks last-known facts stale without erasing them. Unknown top-level producer fields remain a
+last-known compatibility projection for existing adapters; they are not authoritative facts.
+
+`session.runtime` remains the compatibility projection consumed by current modes, commands,
+schedules, APIs, and dashboard code. Planner, self-prompt, and private-conversation LLM paths
+use one deterministic observation builder instead of copying runtime fields independently.
+The builder canonicalizes dictionaries, sorts and deduplicates collections, clips untrusted
+values, and enforces a character budget before prompt construction. Observation metadata
+includes schema, revision, age, source, and stale state. Request input capacity is calculated
+against the output tokens requested by that specific model call.
+
+The World Model also keeps a bounded semantic journal. It ignores ordinary position/tick
+churn, aggregates inventory count deltas, and records meaningful health, hunger, dimension,
+weather, task, behavior, control, and connection changes. Only dangerous health loss, low
+hunger crossings, dimension changes, task terminal/blocking states, and established control
+changes enter the bounded decision-trigger queue. Consumers must explicitly acknowledge
+triggers by sequence. Creating a trigger does not call the model or bypass TaskCoordinator;
+the future asynchronous decision scheduler is the sole intended consumer.
+
 ## Current Migration Order
 
 1. Advertise and reconcile deterministic Java capabilities.
 2. Route chat Planner actions through TaskCoordinator durable runs.
 3. Add explicit operation outcomes and correlated cancellation.
-4. Introduce the normalized world model, semantic journal, and observation builder.
-5. Move autonomy and specialists behind the same admission/effects gate.
-6. Add bounded image artifacts, screen identity, capture, and verified UI input tools.
+4. Persist parent/child workflow execution and atomic step advancement.
+5. Add an asynchronous decision scheduler that consumes acknowledged semantic boundaries.
+6. Move autonomy and specialists behind the same admission/effects gate.
+7. Add bounded image artifacts, screen identity, capture, and verified UI input tools.

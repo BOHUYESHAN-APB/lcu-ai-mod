@@ -209,6 +209,17 @@ class LLMService:
             parts.append("Recent conversation:")
             parts.append(context["interaction_summary"])
             parts.append("")
+        observation_keys = (
+            "observation_meta", "control_state", "task_state", "player", "world",
+            "behavior_state", "equipment", "inventory", "online_players", "entities",
+            "nearby_blocks", "nearby_workstations", "nearby_storage", "integrations",
+            "semantic_journal",
+        )
+        observation = {key: context[key] for key in observation_keys if key in context}
+        if observation:
+            parts.append("Current bounded world observation (JSON):")
+            parts.append(json.dumps(observation, ensure_ascii=False, separators=(",", ":"), default=str))
+            parts.append("")
         return "\n".join(parts).strip()
 
     # ── Internal ──
@@ -278,8 +289,14 @@ class LLMService:
         estimated_before = self._estimate_messages(working_messages)
         available_input = min(
             config["max_input_tokens"],
-            config["context_window_tokens"] - config["reserved_output_tokens"],
+            config["context_window_tokens"] - requested_output,
         )
+        if available_input <= 0:
+            self._reject(
+                agent_name, config, "context_budget_exceeded",
+                "requested output leaves no room for request input",
+                {"requested_output_tokens": requested_output, "context_window_tokens": config["context_window_tokens"]},
+            )
         compression: dict[str, Any] | None = None
         if config["compression_enabled"] and (
             estimated_before > config["compression_trigger_tokens"] or estimated_before > available_input

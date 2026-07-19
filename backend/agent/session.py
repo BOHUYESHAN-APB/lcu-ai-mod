@@ -34,6 +34,7 @@ from .llm_service import LLMService
 from .self_prompter import SelfPrompter
 from .message_db import MessageDB
 from .identity import CompanionIdentity, DEFAULT_LEGACY_ROOT, DEFAULT_STORAGE_ROOT, migrate_legacy_sessions
+from .world_model import WorldModel
 
 logger = logging.getLogger("session")
 
@@ -91,6 +92,7 @@ class Session:
             "entities": [],
             "nearby_blocks": [],
         }
+        self.world_model = WorldModel(self.runtime)
 
         # Task queue
         self.task_queue: list[dict] = []
@@ -117,8 +119,11 @@ class Session:
         """Route an event from the mod."""
         match event_type:
             case "state_update":
-                self.runtime.update(data)
-                self._last_state_at = time.time()
+                world_model = self._ensure_world_model()
+                observed_at = time.time()
+                world_model.ingest_snapshot(data, observed_at=observed_at)
+                self.runtime = world_model.legacy_projection(self.runtime)
+                self._last_state_at = observed_at
                 self._state_sequence = getattr(self, "_state_sequence", 0) + 1
                 if hasattr(self, "memory") and self.control_mode != "external":
                     self.memory.observe_world(self.runtime)
@@ -215,7 +220,7 @@ class Session:
                 success = data.get("success", False)
                 self.action_manager.handle_response(req_id, success)
                 pending = self._pending_commands.get(req_id)
-                if pending and (not success or pending["command"] not in self._terminal_progress_commands()):
+                if pending and (not success or pending["command"] not in self._deferred_terminal_commands()):
                     self._finish_pending_command(req_id, "success" if success else "failed", str(data.get("error", "")))
                 if req_id in self._manual_action_reqs:
                     if success and self._manual_task_kind in {"follow_player", "craft_item", "eat", "collect_blocks", "move_to", "explore", "build"}:
@@ -229,22 +234,35 @@ class Session:
                 progress = float(data.get("progress", 0.0) or 0.0)
                 message = data.get("message", "")
                 self.action_manager.handle_progress(req_id, progress, message)
-                if progress >= 1.0:
+                pending = self._pending_commands.get(req_id)
+                waits_for_outcome = bool(pending and pending["command"] in self._outcome_commands())
+                if progress >= 1.0 and not waits_for_outcome:
                     self._finish_pending_command(req_id, "success", message)
-                elif progress <= 0.0 and message:
+                elif progress <= 0.0 and message and not waits_for_outcome:
                     self._finish_pending_command(req_id, "failed", message)
                 if req_id in self._manual_action_reqs:
                     self._manual_command_until = max(self._manual_command_until, time.time() + 15.0)
                     if progress <= 0.0 or progress >= 1.0:
                         self._manual_action_reqs.discard(req_id)
+            case "command_outcome":
+                req_id = data.get("id", "?")
+                status = str(data.get("status", "failed"))
+                message = str(data.get("message", data.get("code", "")))
+                outcome = {
+                    "succeeded": "success",
+                    "failed": "failed",
+                    "cancelled": "cancelled",
+                }.get(status, "unknown")
+                self._finish_pending_command(req_id, outcome, message)
+                self._manual_action_reqs.discard(req_id)
             case "behavior_state":
-                self.runtime["behavior_state"] = data
+                self._set_world_overlay("behavior_state", data)
                 if self._manual_behavior_active():
                     self._manual_command_until = max(self._manual_command_until, time.time() + 8.0)
                 elif not self._manual_action_reqs:
                     self._manual_task_kind = None
             case "task_state":
-                self.runtime["task_state"] = data
+                self._set_world_overlay("task_state", data)
                 if self._manual_behavior_active():
                     self._manual_command_until = max(self._manual_command_until, time.time() + 8.0)
             case "command_interrupted":
@@ -252,7 +270,7 @@ class Session:
                 for req_id in list(self._pending_commands):
                     self._finish_pending_command(req_id, "cancelled", reason)
             case "control_state":
-                self.runtime["control_state"] = data
+                self._set_world_overlay("control_state", data)
             case _:
                 logger.debug("[Session] Unhandled event: %s", event_type)
 
@@ -321,20 +339,7 @@ class Session:
             self.memory.observe_player(sender, sender_id, message)
             self.message_db.add_message(sender=sender, message=message, is_ai=False)
 
-        # Get context
-        context = self.memory.build_context(current_player=sender)
-        context["persona"] = self.runtime.get("persona", {})
-        context["task_state"] = self.runtime.get("task_state", {})
-        context["behavior_state"] = self.runtime.get("behavior_state", {})
-        context["control_state"] = self.runtime.get("control_state", {})
-        context["player"] = self.runtime.get("player", {})
-        context["world"] = self.runtime.get("world", {})
-        context["inventory"] = self.runtime.get("inventory", [])
-        context["entities"] = self.runtime.get("entities", [])
-        context["online_players"] = self.runtime.get("online_players", [])
-        context["nearby_blocks"] = self.runtime.get("nearby_blocks", [])
-        context["nearby_workstations"] = self.runtime.get("nearby_workstations", [])
-        context["nearby_storage"] = self.runtime.get("nearby_storage", [])
+        context = self.build_planner_context(current_player=sender)
         
         # Use Planner to plan and execute
         previous_requester = self._current_requester
@@ -429,19 +434,7 @@ class Session:
     def _handle_self_prompt(self, prompt: str):
         """Handle a self-prompt by routing through LLM to generate actions."""
         self.self_prompter.on_prompt_sent()
-        # Build system context
-        context = self.memory.build_context()
-        context["persona"] = self.runtime.get("persona", {})
-        context["task_state"] = self.runtime.get("task_state", {})
-        context["behavior_state"] = self.runtime.get("behavior_state", {})
-        context["control_state"] = self.runtime.get("control_state", {})
-        context["player"] = self.runtime.get("player", {})
-        context["world"] = self.runtime.get("world", {})
-        context["inventory"] = self.runtime.get("inventory", [])
-        context["entities"] = self.runtime.get("entities", [])
-        context["nearby_blocks"] = self.runtime.get("nearby_blocks", [])
-        context["nearby_workstations"] = self.runtime.get("nearby_workstations", [])
-        context["nearby_storage"] = self.runtime.get("nearby_storage", [])
+        context = self.build_planner_context()
         system_prompt = self.llm.build_system_prompt(context, self.commands.get_docs())
         messages = [
             {"role": "system", "content": system_prompt},
@@ -516,10 +509,39 @@ class Session:
                 "stale": not self._body_connected or state_age is None or state_age > 3.0,
                 "sequence": self._state_sequence,
             },
+            "world_model": self._ensure_world_model().status(now=now),
         }
 
     def set_body_connected(self, connected: bool) -> None:
         self._body_connected = connected
+        self._ensure_world_model().set_connected(connected)
+
+    def build_planner_context(self, current_player: str | None = None,
+                              observation_max_chars: int = 8000) -> dict[str, Any]:
+        context = self.memory.build_context(current_player=current_player)
+        context.update(self._ensure_world_model().observation_slice(
+            self.runtime, max_chars=observation_max_chars,
+        ))
+        context["persona"] = self.runtime.get("persona", {})
+        return context
+
+    def pending_decision_triggers(self, limit: int = 20) -> list[dict[str, Any]]:
+        return self._ensure_world_model().pending_decision_triggers(limit)
+
+    def acknowledge_decision_triggers(self, through_sequence: int) -> int:
+        return self._ensure_world_model().acknowledge_decision_triggers(through_sequence)
+
+    def _set_world_overlay(self, name: str, data: dict[str, Any]) -> None:
+        world_model = self._ensure_world_model()
+        world_model.ingest_overlay(name, data)
+        self.runtime = world_model.legacy_projection(self.runtime)
+
+    def _ensure_world_model(self) -> WorldModel:
+        world_model = getattr(self, "world_model", None)
+        if world_model is None:
+            world_model = WorldModel(getattr(self, "runtime", {}))
+            self.world_model = world_model
+        return world_model
 
     def is_busy_for_external_task(self) -> bool:
         task_state = self.runtime.get("task_state", {})
@@ -574,8 +596,12 @@ class Session:
         self._manual_command_until = max(self._manual_command_until, time.time() + extension)
 
     @staticmethod
-    def _terminal_progress_commands() -> set[str]:
-        return {"craft_item", "eat", "collect_blocks", "move_to"}
+    def _outcome_commands() -> set[str]:
+        return {"craft_item", "eat", "collect_blocks", "move_to", "mine_block", "mine_block_at", "follow_player"}
+
+    @classmethod
+    def _deferred_terminal_commands(cls) -> set[str]:
+        return cls._outcome_commands()
 
     def register_external_command(self, command: str, req_id: str, args: dict,
                                   requester: str = "sdk") -> None:

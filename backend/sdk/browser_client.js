@@ -128,6 +128,16 @@ export class LCUClient {
     return this.request(`/api/v2/skills/${encodeURIComponent(skillId)}`);
   }
 
+  async listTaskPresets(category = '') {
+    const suffix = category ? `?category=${encodeURIComponent(category)}` : '';
+    const result = await this.request(`/api/v2/task-presets${suffix}`);
+    return result.presets || [];
+  }
+
+  getTaskPreset(presetId) {
+    return this.request(`/api/v2/task-presets/${encodeURIComponent(presetId)}`);
+  }
+
   getControl() {
     return this.request('/api/v2/control');
   }
@@ -161,6 +171,14 @@ export class LCUClient {
   runSkill(skillId, input = {}, lease = {}) {
     const payload = { input, ...this.leasePayload(lease) };
     return this.request(`/api/v2/skills/${encodeURIComponent(skillId)}/runs`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  }
+
+  runTaskPreset(presetId, parameters = {}, lease = {}) {
+    const payload = { parameters, ...this.leasePayload(lease) };
+    return this.request(`/api/v2/task-presets/${encodeURIComponent(presetId)}/runs`, {
       method: 'POST',
       body: JSON.stringify(payload),
     });

@@ -555,6 +555,17 @@ and verified UI input contracts are specified in `docs/runtime-orchestration.md`
 document is normative for future orchestration work: raw tick telemetry must not be copied
 into model history, and no specialist agent may bypass the shared admission/executor path.
 
+The complete vanilla operation baseline, current coverage, missing primitives, workstation
+adapters, and implementation order are tracked in `docs/vanilla-capability-matrix.md`.
+New gameplay features must extend this reusable capability surface before adding a
+scenario-specific workflow.
+
+TouhouLittleMaid is an additional Java reference for typed target memories, activity/work
+packages, bounded sensors, cached reachability, farming phases, and cleanup. Only those
+coordination patterns are portable: its server-side Mob navigation, direct world mutation,
+direct item-handler access, teleport, health changes, and server-authority combat are not
+valid implementations for LCU's multiplayer client player body.
+
 ## Existing Verified Foundation
 
 The following foundation already exists and must not regress:
@@ -566,8 +577,13 @@ The following foundation already exists and must not regress:
 - Concrete registry matching plus tag-based collection categories and explicit ore-to-drop mappings.
 - Task-bounded storage discovery with world-scoped five-minute content snapshots.
 - Initial body snapshot and normalized state/control/body events.
+- Revisioned normalized World Model with authoritative snapshot collections, independent
+  task/behavior/control overlays, fact provenance/TTL, disconnect staleness, and a bounded
+  deterministic observation slice shared by planner, self-prompt, and private conversation.
 - Body freshness, armed state, inventory, entities, and online-player telemetry.
 - Operations console views for leases, Skills, runs, schedules, events, and resume.
+- Operations console task presets, advanced/raw Skill mode, workflow step details,
+  run detail pane, and body-availability-aware input forms.
 - Runtime roles isolate normal player clients, headed AI body clients, and the
   dedicated-server fake-player placeholder. The default role is `player_client`.
 - Common and dedicated-server entrypoints do not load client actuators. A real
@@ -582,7 +598,7 @@ The following foundation already exists and must not regress:
 
 Latest recorded verification:
 
-- Python tests: 140 passed with 1 intentional opt-in integration skip on 2026-07-19.
+- Python tests: 177 passed with 1 intentional opt-in integration skip on 2026-07-19.
 - Gradle: `clean build` passed on 2026-07-19.
 - Explicit production Java-to-Python wire integration: 1 passed.
 - NeoForge `runServer` smoke reached `Done` and logged both side-neutral common and
@@ -627,6 +643,11 @@ Pending headed-body verification, deferred to the next test session:
   manual test gate; target-server mod policies may independently reject client mods.
 - The 2026-07-19 crafting, storage, and category-target changes have automated coverage
   and a deployed artifact but still require the headed-body checks listed above.
+- The new preset/console organization layer still needs in-browser manual verification even
+  though backend and SDK tests cover the APIs and schema validation.
+- Multi-step workflow execution is implemented locally but not deployed. Workflow schedules
+  remain intentionally unsupported until schedule targets can persist preset versions and
+  resolved step definitions atomically.
 
 ## Decision Log
 
@@ -682,3 +703,26 @@ Pending headed-body verification, deferred to the next test session:
 - Built and deployed JAR SHA-256
   `1F262640A46AF10A689DC0A95F30BF2515325AA182D06991470314CF7A2A7D6F`.
   Headed-body acceptance was intentionally deferred to the next session.
+- Researched Mineflayer, Mindcraft, Baritone, AltoClef, Voyager, Mojang-mapped
+  workstation menus, and TouhouLittleMaid. Added the normative vanilla capability
+  matrix and adopted typed targets, behavior phases, bounded sensors, work-mode
+  packages, and authoritative postconditions as the Java-body direction.
+- Implemented locally, but did not deploy, explicit operation outcomes and correlated
+  cancellation plus addressed block/entity controls, generic validated menu clicks,
+  recipe/button primitives, live recipe discovery, and semantic workstation slot roles.
+- Added a declarative `TaskPresetRegistry`, preset list/detail/run APIs, SDK bindings, and
+  control-console support for running preset-backed durable Skills or advanced/raw Skills.
+  The initial preset catalog covers iron-pickaxe crafting, generic crafting, log collection,
+  generic resource collection, coordinate travel, and eating.
+- Added durable multi-step preset execution with persisted workflow parent/child runs,
+  atomic next-step creation, progress and terminal propagation, correlated cancellation,
+  explicit queued resume, restart-to-unknown safety, and per-step Operations UI details.
+  Added `workflow.starter_chest` as the first composed preset.
+- Added the first normalized World Model layer while preserving `session.runtime` as a legacy
+  projection. Malformed facts no longer replace valid observations or refresh player/world
+  freshness; omitted authoritative collections clear; LLM observations are canonicalized,
+  deduplicated, nearest-first, and bounded before prompt construction.
+- Added a bounded semantic journal and explicitly acknowledged decision-trigger queue. Snapshot
+  churn is suppressed; inventory deltas remain informational while safety thresholds, dimension
+  transitions, task terminal/blocking states, and established control transitions become typed
+  decision boundaries without directly invoking a model or executor.

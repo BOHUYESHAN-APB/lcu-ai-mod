@@ -21,7 +21,8 @@ COMMAND_TIMEOUT_SECONDS = 30 * 60
 
 
 class TaskCoordinator:
-    def __init__(self, state: AgentStateDB, registry: SkillRegistry, body: BodyAdapter):
+    def __init__(self, state: AgentStateDB, registry: SkillRegistry, body: BodyAdapter,
+                 initial_scope: str | None = None):
         self.state = state
         self.registry = registry
         self.body = body
@@ -30,10 +31,14 @@ class TaskCoordinator:
         self._session_busy = False
         self._body_armed = False
         self._raw_requests: dict[str, tuple[str, float]] = {}
+        self._cancel_requests: dict[str, str] = {}
         clock = state.get_scheduler_clock()
-        self._last_game_time = clock["game_time"]
-        self._last_day_time = clock["day_time"]
-        self._clock_scope = clock["scope_id"]
+        scope_changed = initial_scope is not None and clock["scope_id"] != initial_scope
+        self._last_game_time = None if scope_changed else clock["game_time"]
+        self._last_day_time = None if scope_changed else clock["day_time"]
+        self._clock_scope = initial_scope or clock["scope_id"]
+        if scope_changed:
+            self.state.set_scheduler_clock(None, None, initial_scope)
         self.state.mark_inflight_unknown("backend restarted before terminal event")
 
     def create_run(self, skill_id: str, input_data: dict[str, Any], *,
@@ -52,10 +57,39 @@ class TaskCoordinator:
                     return run
                 return self.dispatch(run["id"], lease_id=lease_id, fencing_token=fencing_token)
 
+    def create_workflow(self, workflow: dict[str, Any], *, lease_id: str | None = None,
+                        fencing_token: int | None = None) -> dict[str, Any]:
+        with self._dispatch_lock:
+            if workflow.get("kind") != "workflow":
+                raise ValueError("task preset is not a workflow")
+            for step in workflow.get("steps", []):
+                manifest = self.registry.validate_input(step["skill_id"], step["input"])
+                if not manifest.durable or manifest.version != step["skill_version"]:
+                    raise ValueError(f"workflow step contract changed: {step['key']}")
+            with self.state.control_guard(lease_id, fencing_token):
+                if lease_id and self.is_busy():
+                    raise ValueError("another task run is active")
+                run = self.state.create_workflow_run(
+                    workflow, scope_id=self._clock_scope, lease_id=lease_id, fencing_token=fencing_token,
+                )
+                if self.state.has_active_runs() or self._session_busy or self._raw_requests or not self._body_armed:
+                    return run
+                self.dispatch(run["active_child_id"], lease_id=lease_id, fencing_token=fencing_token)
+                return self.state.get_run(run["id"])
+
     def dispatch(self, run_id: str, *, lease_id: str | None = None,
                  fencing_token: int | None = None) -> dict[str, Any]:
         with self._dispatch_lock:
             run = self.state.get_run(run_id)
+            if run["run_kind"] == "workflow":
+                if not run["active_child_id"]:
+                    return run
+                self.dispatch(
+                    run["active_child_id"],
+                    lease_id=run.get("lease_id") if lease_id is None else lease_id,
+                    fencing_token=run.get("fencing_token") if fencing_token is None else fencing_token,
+                )
+                return self.state.get_run(run_id)
             if run["status"] != "queued" or not self.body.is_connected:
                 return run
             if self.state.has_active_runs():
@@ -91,33 +125,70 @@ class TaskCoordinator:
             if completion and message.type == "response" \
                     and (not message.data.get("success", False) or completion == "response"):
                 self._raw_requests.pop(request_id, None)
-            elif completion and message.type == "progress":
+            elif completion and message.type == "progress" and completion != "outcome":
                 progress = float(message.data.get("progress", 0.0) or 0.0)
                 if progress <= 0.0 or progress >= 1.0:
                     self._raw_requests.pop(request_id, None)
-        if message.type == "response":
-            data = message.data
-            detail_data = data.get("data", {})
-            detail = detail_data.get("message", "") if isinstance(detail_data, dict) else str(detail_data or "")
-            return self.state.update_run_response(
-                str(data.get("id", "")), bool(data.get("success", False)), detail, str(data.get("error", "")),
-            )
-        if message.type == "progress":
-            data = message.data
-            return self.state.update_run_progress(
-                str(data.get("id", "")), float(data.get("progress", 0.0) or 0.0), str(data.get("message", "")),
-            )
-        return None
+            elif raw_request and message.type == "outcome":
+                self._raw_requests.pop(request_id, None)
+            updated = None
+            if message.type == "response":
+                data = message.data
+                cancel_run_id = self._cancel_requests.pop(str(data.get("id", "")), None)
+                if cancel_run_id is not None:
+                    if not data.get("success", False):
+                        updated = self.state.mark_run_unknown(cancel_run_id, "body rejected cancellation request")
+                    else:
+                        updated = self.state.get_run(cancel_run_id)
+                else:
+                    detail_data = data.get("data", {})
+                    detail = detail_data.get("message", "") if isinstance(detail_data, dict) else str(detail_data or "")
+                    updated = self.state.update_run_response(
+                        str(data.get("id", "")), bool(data.get("success", False)), detail,
+                        str(data.get("error", "")),
+                    )
+            elif message.type == "progress":
+                data = message.data
+                updated = self.state.update_run_progress(
+                    str(data.get("id", "")), float(data.get("progress", 0.0) or 0.0),
+                    str(data.get("message", "")),
+                )
+            elif message.type == "outcome":
+                data = message.data
+                for cancel_id, run_id in list(self._cancel_requests.items()):
+                    if run_id == str(data.get("id", "")):
+                        self._cancel_requests.pop(cancel_id, None)
+                updated = self.state.update_run_outcome(
+                    str(data.get("id", "")), str(data.get("status", "")),
+                    str(data.get("message", "")), str(data.get("code", "")),
+                )
+            if updated is not None:
+                self._dispatch_workflow_successor(updated)
+            return updated
+
+    def _dispatch_workflow_successor(self, run: dict[str, Any]) -> None:
+        parent_id = run.get("parent_run_id")
+        if not parent_id:
+            return
+        parent = self.state.get_run(parent_id)
+        child_id = parent.get("active_child_id")
+        if parent["status"] != "queued" or not child_id or child_id == run["id"]:
+            return
+        self.dispatch(
+            child_id, lease_id=parent.get("lease_id"), fencing_token=parent.get("fencing_token"),
+        )
 
     def on_disconnect(self) -> int:
         with self._dispatch_lock:
             self._raw_requests.clear()
+            self._cancel_requests.clear()
             self._body_armed = False
         return self.state.mark_inflight_unknown("companion body disconnected before terminal event")
 
     def on_control_transition(self) -> int:
         with self._dispatch_lock:
             self._raw_requests.clear()
+            self._cancel_requests.clear()
         detail = "control ownership changed before terminal event"
         return self.state.mark_inflight_unknown(detail) + self.state.cancel_queued_runs(detail)
 
@@ -181,39 +252,65 @@ class TaskCoordinator:
         with self._dispatch_lock:
             with self.state.control_guard(lease_id, fencing_token) as lease:
                 run = self.state.get_run(run_id)
+                if run.get("parent_run_id"):
+                    run = self.state.get_run(run["parent_run_id"])
                 if run["status"] in TERMINAL_STATUSES:
                     return run
+                parent = run if run["run_kind"] == "workflow" else None
+                if parent:
+                    if not parent["active_child_id"]:
+                        return self.state.cancel_run(parent["id"])
+                    run = self.state.get_run(parent["active_child_id"])
+                    if run["status"] == "queued":
+                        return self.state.cancel_queued_workflow(parent["id"])
+                elif run["status"] == "queued":
+                    return self.state.cancel_run(run["id"])
                 manifest = self.registry.get(run["skill_id"])
                 if run["status"] in {"dispatched", "running"} and not manifest.cancellable:
                     raise ValueError("skill does not support cancellation after dispatch")
+                if parent:
+                    self.state.request_workflow_cancel(parent["id"])
                 if run["status"] in {"dispatched", "running"} and self.body.is_connected:
-                    args = {FENCING_FIELD: lease["fencing_token"]} if lease else {}
+                    args = {"operation_id": run["request_id"] or run_id}
+                    if lease:
+                        args[FENCING_FIELD] = lease["fencing_token"]
                     try:
-                        self.body.send_command("stop_all", args)
+                        cancel_request_id = self.body.send_command("cancel_operation", args)
+                        self._cancel_requests[cancel_request_id] = run["id"]
                     except ConnectionError:
-                        self.state.mark_run_unknown(run_id, "body disconnected while cancellation was requested")
+                        self.state.mark_run_unknown(run["id"], "body disconnected while cancellation was requested")
                         raise
-                    return self.state.mark_run_unknown(
-                        run_id, "cancellation requested; terminal body state is uncertain",
-                    )
-                return self.state.cancel_run(run_id)
+                    return self.state.get_run(parent["id"] if parent else run["id"])
+                if run["status"] in {"dispatched", "running"}:
+                    self.state.mark_run_unknown(run["id"], "body disconnected before cancellation could be confirmed")
+                    return self.state.get_run(parent["id"] if parent else run["id"])
+                self.state.cancel_run(run["id"])
+                return self.state.get_run(parent["id"] if parent else run["id"])
 
     def resume(self, run_id: str, *, lease_id: str | None = None,
                fencing_token: int | None = None) -> dict[str, Any]:
         with self._dispatch_lock:
             with self.state.control_guard(lease_id, fencing_token):
                 run = self.state.get_run(run_id)
+                if run.get("parent_run_id"):
+                    run = self.state.get_run(run["parent_run_id"])
                 if run["status"] != "queued":
                     raise ValueError("only a queued task run can be resumed")
                 if not self._clock_scope or run.get("scope_id") != self._clock_scope:
                     raise ValueError("task run belongs to a different or unknown server/world scope")
+                if run["run_kind"] == "workflow" and run.get("cancel_requested_at") is not None:
+                    return self.state.cancel_queued_workflow(run["id"])
                 if self.state.has_active_runs() or self._raw_requests or self._session_busy:
                     raise ValueError("the companion is already executing a command or task run")
                 if not self.body.is_connected:
                     raise ConnectionError("companion body is not connected")
                 if not self._body_armed:
                     raise ValueError("companion body is not armed")
-                return self.dispatch(run_id, lease_id=lease_id, fencing_token=fencing_token)
+                if run["run_kind"] == "workflow":
+                    self.state.set_workflow_control(run["id"], lease_id, fencing_token)
+                    self.dispatch(run["active_child_id"], lease_id=lease_id, fencing_token=fencing_token)
+                    return self.state.get_run(run["id"])
+                return self.dispatch(run["id"], lease_id=lease_id, fencing_token=fencing_token)
 
     def tick(self, runtime: dict[str, Any], control_mode: str, clock_scope: str = "default") -> None:
         now_mono = time.monotonic()

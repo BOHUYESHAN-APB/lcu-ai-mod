@@ -107,6 +107,8 @@ class Orchestrator:
                 self.session.handle_event("command_response", msg.data)
             elif msg.type == "progress":
                 self._handle_progress(msg.data)
+            elif msg.type == "outcome":
+                self.session.handle_event("command_outcome", msg.data)
             if self.task_coordinator:
                 self.task_coordinator.handle_body_message(msg)
 
@@ -116,10 +118,10 @@ class Orchestrator:
     def on_body_disconnect(self) -> None:
         with self._session_lock:
             self.session.set_body_connected(False)
-            self.session.runtime["control_state"] = {
+            self.session.handle_event("control_state", {
                 "ai_controlled": False,
                 "connected": False,
-            }
+            })
             self.session.set_external_task_busy(False)
             if self.task_coordinator:
                 self.task_coordinator.on_disconnect()

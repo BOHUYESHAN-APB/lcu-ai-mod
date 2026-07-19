@@ -128,6 +128,7 @@ public class Pathfinder {
         if (!InputIsolation.isAiControlled()) {
             InputIsolation.clearAiControls();
             reportProgress(0.0, "navigation canceled: user override");
+            reportOutcome("cancelled", "USER_OVERRIDE", "navigation canceled: user override");
             stop();
             return;
         }
@@ -135,6 +136,7 @@ public class Pathfinder {
         Vec3 playerPos = mc.player.position();
         if (isReached(playerPos, targetPos)) {
             reportProgress(1.0, "arrived");
+            reportOutcome("succeeded", "ARRIVED", "arrived");
             stop();
             return;
         }
@@ -149,7 +151,9 @@ public class Pathfinder {
             calculatePath();
             if (currentPath.isEmpty()) {
                 LCUMod.LOGGER.warn("[Pathfinder] No path found to target");
-                reportProgress(0.0, lastFailureReason.isBlank() ? "no path found" : lastFailureReason);
+                String reason = lastFailureReason.isBlank() ? "no path found" : lastFailureReason;
+                reportProgress(0.0, reason);
+                reportOutcome("failed", "NO_PATH", reason);
                 stop();
                 return;
             }
@@ -519,9 +523,31 @@ public class Pathfinder {
         return lastFailureReason;
     }
 
+    public static boolean cancelOperation(String operationId, String reason) {
+        if (operationId == null || activeRequestId == null || !activeRequestId.equals(operationId)) return false;
+        reportOutcome("cancelled", "CANCELLED", reason == null || reason.isBlank() ? "operation cancelled" : reason);
+        stop();
+        return true;
+    }
+
+    public static void cancelActiveOperation(String code, String reason) {
+        if (activeRequestId == null) {
+            stop();
+            return;
+        }
+        reportOutcome("cancelled", code, reason);
+        stop();
+    }
+
     private static void reportProgress(double progress, String message) {
         if (activeRequestId != null && LCUMod.WIRE != null) {
             LCUMod.WIRE.sendProgress(activeRequestId, progress, message);
+        }
+    }
+
+    private static void reportOutcome(String status, String code, String message) {
+        if (activeRequestId != null && LCUMod.WIRE != null) {
+            LCUMod.WIRE.sendOutcome(activeRequestId, status, code, message);
         }
     }
 

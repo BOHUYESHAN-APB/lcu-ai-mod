@@ -179,6 +179,18 @@ public class WireServer {
         send(msg);
     }
 
+    public void sendOutcome(String id, String status, String code, String message) {
+        if (id == null || id.isBlank()) return;
+        JsonObject msg = new JsonObject();
+        msg.addProperty("type", "outcome");
+        msg.addProperty("id", id);
+        msg.addProperty("status", status);
+        if (code != null && !code.isBlank()) msg.addProperty("code", code);
+        if (message != null && !message.isBlank()) msg.addProperty("message", message);
+        msg.addProperty("ts", System.currentTimeMillis());
+        send(msg);
+    }
+
     private void runServer() {
         try (ServerSocket ss = new ServerSocket(port, 50, InetAddress.getByName("127.0.0.1"))) {
             serverSocket = ss;

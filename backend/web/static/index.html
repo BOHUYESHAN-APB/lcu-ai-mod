@@ -196,11 +196,13 @@ textarea{width:100%;min-height:68px;resize:vertical;background:#0d1117;border:1p
         <div id="leaseStatus" class="hint" aria-live="polite">未持有控制租约</div>
       </div>
       <div class="card">
-        <h3>执行 Skill</h3>
-        <div class="form-row"><label for="skillSelect">Skill</label><select id="skillSelect" onchange="renderSkillFields()"></select></div>
-        <div id="skillFields" class="field-grid"></div>
-        <div class="form-actions"><button class="btn primary" onclick="runSelectedSkill()">执行</button></div>
-        <div id="skillStatus" class="hint" aria-live="polite">等待能力清单</div>
+        <h3>执行任务</h3>
+        <div class="form-row"><label for="executionMode">模式</label><select id="executionMode" onchange="renderExecutionForm()"><option value="preset">任务预设</option><option value="skill">原始 Skill</option></select></div>
+        <div class="form-row" id="presetPicker"><label for="presetSelect">任务预设</label><select id="presetSelect" onchange="renderExecutionForm()"></select></div>
+        <div class="form-row" id="skillPicker" hidden><label for="skillSelect">Skill</label><select id="skillSelect" onchange="renderExecutionForm()"></select></div>
+        <div id="executionFields" class="field-grid"></div>
+        <div class="form-actions"><button class="btn primary" onclick="runSelectedOperation()">执行</button></div>
+        <div id="skillStatus" class="hint" aria-live="polite">等待预设与能力清单</div>
       </div>
       <div class="card">
         <h3>创建日程</h3>
@@ -216,6 +218,7 @@ textarea{width:100%;min-height:68px;resize:vertical;background:#0d1117;border:1p
     </div>
     <div>
       <div class="card"><h3>Task Runs</h3><div id="runList" class="data-list"><div class="empty">暂无运行记录</div></div></div>
+      <div class="card"><h3>Run 详情</h3><div id="runDetail" class="memory-detail"><div class="empty">选择一条运行记录</div></div></div>
       <div class="card"><h3>日程</h3><div id="scheduleList" class="data-list"><div class="empty">暂无日程</div></div></div>
       <div class="card"><h3>事件</h3><div id="eventList" class="data-list"><div class="empty">暂无事件</div></div></div>
     </div>
@@ -484,12 +487,16 @@ let providerPresets = [];
 let llmConfig = null;
 let sessionPollInFlight = false;
 let skillManifests = [];
+let taskPresets = [];
 let dashboardLease = null;
 let heartbeatTimer = null;
 let lastEventCursor = 0;
 let operationEvents = [];
 let bodyConnected = false;
 let bodyArmed = false;
+let selectedRunId = null;
+let operationsRefreshTimer = null;
+let executionDraft = {mode:'preset',presetId:'',presetFields:{},skillId:'',skillFields:{}};
 const memoryState = {offset:0,limit:50,count:0,nextOffset:null,selectedId:null,requestSequence:0,loaded:false,compressionPreview:null,actionPreview:null,actionEndpoint:null,retention:{version:0,rules:[]}};
 const inboxState = {contacts:[],selectedConversationId:null};
 
@@ -523,9 +530,26 @@ function showPage(name, tab) {
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.getElementById('page-' + name).classList.add('active');
   if (tab) tab.classList.add('active');
-  if (name === 'operations') loadOperations();
+  if (name === 'operations') {
+    loadOperations();
+    startOperationsPolling();
+  } else {
+    stopOperationsPolling();
+  }
   if (name === 'memory' && !memoryState.loaded) loadMemoryPage();
   if (name === 'chat') loadInbox();
+}
+
+function startOperationsPolling() {
+  stopOperationsPolling();
+  operationsRefreshTimer = setInterval(() => {
+    if (document.getElementById('page-operations').classList.contains('active')) loadOperations();
+  }, 5000);
+}
+
+function stopOperationsPolling() {
+  if (operationsRefreshTimer) clearInterval(operationsRefreshTimer);
+  operationsRefreshTimer = null;
 }
 
 // ── Local Settings Cache ──
@@ -779,23 +803,49 @@ function leasePayload() {
 
 async function loadOperations() {
   try {
-    const [control, skillData, runData, scheduleData, eventData] = await Promise.all([
-      apiFetch('/api/v2/control'), apiFetch('/api/v2/skills'), apiFetch('/api/v2/runs?limit=30'),
+    executionDraft = {
+      mode: document.getElementById('executionMode')?.value || executionDraft.mode,
+      presetId: document.getElementById('presetSelect')?.value || executionDraft.presetId,
+      presetFields: collectFields('preset'),
+      skillId: document.getElementById('skillSelect')?.value || executionDraft.skillId,
+      skillFields: collectFields('skill'),
+    };
+    const [control, skillData, presetData, runData, scheduleData, eventData] = await Promise.all([
+      apiFetch('/api/v2/control'), apiFetch('/api/v2/skills'), apiFetch('/api/v2/task-presets'), apiFetch('/api/v2/runs?limit=30'),
       apiFetch('/api/v2/schedules'), apiFetch(lastEventCursor ? `/api/v2/events?after=${lastEventCursor}&limit=50` : '/api/v2/events?after=0&limit=50&latest=true')
     ]);
     document.getElementById('opsControlMode').textContent = control.mode || 'builtin';
     document.getElementById('opsLeaseOwner').textContent = control.lease?.owner || '-';
+    document.getElementById('executionMode').value = executionDraft.mode;
     skillManifests = skillData.skills || [];
-    const select = document.getElementById('skillSelect');
-    const previous = select.value;
-    select.replaceChildren(...skillManifests.map(skill => {
+    taskPresets = presetData.presets || [];
+    const skillSelect = document.getElementById('skillSelect');
+    const previousSkill = executionDraft.skillId || skillSelect.value;
+    skillSelect.replaceChildren(...skillManifests.map(skill => {
       const option = document.createElement('option'); option.value = skill.id;
-      option.disabled = !skill.durable;
-      option.textContent = `${skill.category} · ${skill.id}${skill.durable ? '' : ' · 低层命令限定'}`; return option;
+      option.disabled = !skill.durable || skill.available === false;
+      option.textContent = `${skill.category} · ${skill.id}${skill.available === false ? ' · 身体未提供' : skill.durable ? '' : ' · 低层命令限定'}`; return option;
     }));
-    if (skillManifests.some(skill => skill.id === previous)) select.value = previous;
-    renderSkillFields();
-    renderRuns(runData.runs || []);
+    if (skillManifests.some(skill => skill.id === previousSkill)) skillSelect.value = previousSkill;
+    const presetSelect = document.getElementById('presetSelect');
+    const previousPreset = executionDraft.presetId || presetSelect.value;
+    presetSelect.replaceChildren(...taskPresets.map(preset => {
+      const option = document.createElement('option'); option.value = preset.id;
+      option.disabled = preset.available === false;
+      option.textContent = `${preset.category} · ${preset.title}${preset.available === false ? ' · 身体未提供' : ''}`; return option;
+    }));
+    if (taskPresets.some(preset => preset.id === previousPreset)) presetSelect.value = previousPreset;
+    renderExecutionForm();
+    const runs = runData.runs || [];
+    renderRuns(runs);
+    if (selectedRunId && runs.some(run => run.id === selectedRunId)) {
+      await loadRunDetail(selectedRunId);
+    } else if (!selectedRunId && runs.length) {
+      await selectRun(runs[0].id);
+    } else if (!runs.length) {
+      document.getElementById('runDetail').innerHTML = '<div class="empty">选择一条运行记录</div>';
+      selectedRunId = null;
+    }
     renderSchedules(scheduleData.schedules || []);
     const events = eventData.events || [];
     if (events.length) lastEventCursor = eventData.next_cursor || events.at(-1).cursor;
@@ -805,35 +855,123 @@ async function loadOperations() {
   } catch (error) { dbgLog('操作面板加载失败: ' + error.message); }
 }
 
-function renderSkillFields() {
+function renderExecutionForm() {
+  const mode = document.getElementById('executionMode').value;
+  document.getElementById('presetPicker').hidden = mode !== 'preset';
+  document.getElementById('skillPicker').hidden = mode !== 'skill';
+  const container = document.getElementById('executionFields');
+  container.replaceChildren();
+  if (mode === 'preset') {
+    const preset = taskPresets.find(item => item.id === document.getElementById('presetSelect').value);
+    if (!preset) return;
+    const initialValues = preset.id === executionDraft.presetId && Object.keys(executionDraft.presetFields || {}).length
+      ? executionDraft.presetFields
+      : (preset.examples?.[0]?.parameters || {});
+    renderSchemaFields(preset.parameter_schema, container, 'preset', initialValues);
+    const execution = preset.kind === 'workflow'
+      ? `${preset.step_count} 步 workflow`
+      : (preset.skill?.command || preset.skill_id);
+    document.getElementById('skillStatus').textContent = `${preset.description} · ${execution}${preset.available === false ? ' · 身体未提供' : ''}`;
+    return;
+  }
   const skill = skillManifests.find(item => item.id === document.getElementById('skillSelect').value);
-  const container = document.getElementById('skillFields'); container.replaceChildren();
   if (!skill) return;
-  Object.entries(skill.input_schema?.properties || {}).forEach(([name, schema]) => {
-    const wrapper = document.createElement('div');
-    const fieldId = `skill-field-${name}`;
-    const label = document.createElement('label'); label.textContent = name; label.htmlFor = fieldId; label.style.fontSize = '11px'; label.style.color = '#8b949e';
-    const input = document.createElement('input'); input.dataset.skillField = name;
-    input.id = fieldId;
-    input.dataset.valueType = schema.type; input.placeholder = schema.type;
-    if (schema.type === 'integer' || schema.type === 'number') {
-      input.type = 'number'; input.step = schema.type === 'integer' ? '1' : 'any';
-      if (schema.minimum !== undefined) input.min = schema.minimum;
-      if (schema.maximum !== undefined) input.max = schema.maximum;
-    }
-    wrapper.append(label, input); container.append(wrapper);
-  });
-  document.getElementById('skillStatus').textContent = `${skill.description} · ${skill.duration} · ${skill.safety_class}`;
+  const initialValues = skill.id === executionDraft.skillId ? executionDraft.skillFields : {};
+  renderSchemaFields(skill.input_schema, container, 'skill', initialValues);
+  document.getElementById('skillStatus').textContent = `${skill.description} · ${skill.duration} · ${skill.safety_class}${skill.available === false ? ' · 身体未提供' : ''}`;
 }
 
-function collectSkillInput() {
+function renderSchemaFields(schema, container, prefix, initialValues = {}) {
+  const required = new Set(schema?.required || []);
+  Object.entries(schema?.properties || {}).forEach(([name, definition]) => {
+    const wrapper = document.createElement('div');
+    const fieldId = `${prefix}-field-${name}`;
+    const label = document.createElement('label');
+    label.textContent = required.has(name) ? `${name} *` : name;
+    label.htmlFor = fieldId;
+    label.style.fontSize = '11px';
+    label.style.color = '#8b949e';
+    let input;
+    if (Array.isArray(definition.enum)) {
+      input = document.createElement('select');
+      if (!required.has(name)) {
+        const empty = document.createElement('option'); empty.value = ''; empty.textContent = '默认'; input.append(empty);
+      }
+      definition.enum.forEach(value => { const option = document.createElement('option'); option.value = value; option.textContent = value; input.append(option); });
+    } else if (definition.type === 'boolean') {
+      input = document.createElement('input');
+      input.type = 'checkbox';
+      input.checked = Boolean(initialValues[name] ?? definition.default);
+    } else {
+      input = document.createElement('input');
+      input.placeholder = definition.type || 'value';
+      if (definition.type === 'integer' || definition.type === 'number') {
+        input.type = 'number'; input.step = definition.type === 'integer' ? '1' : 'any';
+        if (definition.minimum !== undefined) input.min = definition.minimum;
+        if (definition.maximum !== undefined) input.max = definition.maximum;
+      }
+      const value = initialValues[name] ?? definition.default;
+      if (value !== undefined) input.value = value;
+    }
+    input.id = fieldId;
+    input.dataset.fieldPrefix = prefix;
+    input.dataset.fieldName = name;
+    input.dataset.valueType = definition.type || 'string';
+    wrapper.append(label, input); container.append(wrapper);
+  });
+}
+
+function collectFields(prefix) {
   const result = {};
-  document.querySelectorAll('[data-skill-field]').forEach(input => {
+  document.querySelectorAll(`[data-field-prefix="${prefix}"]`).forEach(input => {
+    if (input.dataset.valueType === 'boolean') {
+      if (input.checked) result[input.dataset.fieldName] = true;
+      return;
+    }
     if (input.value === '') return;
-    result[input.dataset.skillField] = input.dataset.valueType === 'integer' ? parseInt(input.value, 10)
+    result[input.dataset.fieldName] = input.dataset.valueType === 'integer' ? parseInt(input.value, 10)
       : input.dataset.valueType === 'number' ? Number(input.value) : input.value;
   });
   return result;
+}
+
+function resolvePresetTemplate(value, parameters) {
+  if (Array.isArray(value)) return value.map(item => resolvePresetTemplate(item, parameters));
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, resolvePresetTemplate(item, parameters)]));
+  if (typeof value !== 'string') return value;
+  const exact = value.match(/^\$\{parameters\.([A-Za-z_][A-Za-z0-9_]*)\}$/);
+  if (exact) return parameters[exact[1]];
+  return value.replace(/\$\{parameters\.([A-Za-z_][A-Za-z0-9_]*)\}/g, (_, name) => String(parameters[name] ?? ''));
+}
+
+function currentOperationSpec() {
+  const mode = document.getElementById('executionMode').value;
+  if (mode === 'preset') {
+    const preset = taskPresets.find(item => item.id === document.getElementById('presetSelect').value);
+    if (!preset) return null;
+    const parameters = collectFields('preset');
+    return {
+      kind: 'preset',
+      available: preset.available !== false,
+      title: preset.title,
+      skillId: preset.skill_id,
+      schedulable: preset.schedulable === true,
+      parameters,
+      input: resolvePresetTemplate(preset.input_template, parameters),
+      endpoint: `/api/v2/task-presets/${encodeURIComponent(preset.id)}/runs`,
+    };
+  }
+  const skill = skillManifests.find(item => item.id === document.getElementById('skillSelect').value);
+  if (!skill) return null;
+  return {
+    kind: 'skill',
+    available: skill.available !== false,
+    title: skill.id,
+    skillId: skill.id,
+    schedulable: skill.schedulable === true,
+    input: collectFields('skill'),
+    endpoint: `/api/v2/skills/${encodeURIComponent(skill.id)}/runs`,
+  };
 }
 
 async function acquireLease() {
@@ -879,11 +1017,16 @@ function updateLeaseStatus(control) {
   document.getElementById('leaseStatus').textContent = text;
 }
 
-async function runSelectedSkill() {
+async function runSelectedOperation() {
   try {
-    const skillId = document.getElementById('skillSelect').value;
-    const run = await apiFetch(`/api/v2/skills/${encodeURIComponent(skillId)}/runs`, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({input:collectSkillInput(),...leasePayload()})});
-    document.getElementById('skillStatus').textContent = `Run ${run.id} · ${run.status}`; await loadOperations();
+    const spec = currentOperationSpec();
+    if (!spec) throw new Error('当前没有可执行的任务');
+    if (!spec.available) throw new Error('当前身体未提供该任务所需能力');
+    const payload = spec.kind === 'preset' ? {parameters: spec.parameters, ...leasePayload()} : {input: spec.input, ...leasePayload()};
+    const run = await apiFetch(spec.endpoint, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    document.getElementById('skillStatus').textContent = `Run ${run.id} · ${run.status}`;
+    selectedRunId = run.id;
+    await loadOperations();
   } catch (error) { document.getElementById('skillStatus').textContent = error.message; }
 }
 
@@ -920,9 +1063,11 @@ async function createSchedule() {
     const trigger = document.getElementById('scheduleTrigger').value;
     const rawValue = document.getElementById('scheduleValue').value;
     const value = clock === 'wall' && trigger === 'once' ? Date.parse(rawValue) / 1000 : Number(rawValue);
-    const skill = skillManifests.find(item => item.id === document.getElementById('skillSelect').value);
-    if (!skill?.schedulable) throw new Error('当前 Skill 没有有限终态，不能加入日程');
-    const payload = {name:document.getElementById('scheduleName').value || 'schedule',skill_id:document.getElementById('skillSelect').value,input:collectSkillInput(),clock,trigger_type:trigger,misfire_policy:document.getElementById('scheduleMisfire').value,...leasePayload()};
+    const spec = currentOperationSpec();
+    if (!spec) throw new Error('当前没有可调度的任务');
+    if (!spec.available) throw new Error('当前身体未提供该任务所需能力');
+    if (!spec.schedulable) throw new Error('当前任务没有有限终态，不能加入日程');
+    const payload = {name:document.getElementById('scheduleName').value || spec.title || 'schedule',skill_id:spec.skillId,input:spec.input,clock,trigger_type:trigger,misfire_policy:document.getElementById('scheduleMisfire').value,...leasePayload()};
     if (clock === 'wall' && trigger === 'interval') payload.wall_interval_seconds = value;
     if (clock === 'wall' && trigger === 'once') payload.wall_run_at = value;
     if (clock === 'game' && trigger === 'interval') payload.game_interval_ticks = value;
@@ -933,7 +1078,48 @@ async function createSchedule() {
 }
 
 function renderRuns(runs) {
-  renderDataRows('runList', runs, run => { const skill=skillManifests.find(item=>item.id===run.skill_id);const canCancel=run.status==='queued'||(skill?.cancellable&&!['succeeded','failed','cancelled','unknown'].includes(run.status));const actions=[];if(run.status==='queued')actions.push(['恢复',()=>resumeRun(run.id)]);if(canCancel)actions.push(['取消',()=>cancelRun(run.id)]);return {title:`${run.skill_id} · ${run.status}`,meta:`${run.id} · ${Math.round((run.progress || 0) * 100)}% ${run.detail || run.error || ''}`,actions}; });
+  const target = document.getElementById('runList'); target.replaceChildren();
+  if (!runs.length) { const empty=document.createElement('div'); empty.className='empty'; empty.textContent='暂无运行记录'; target.append(empty); return; }
+  runs.forEach(run => {
+    const skill=skillManifests.find(item=>item.id===run.skill_id);
+    const terminal=['succeeded','failed','cancelled','unknown'].includes(run.status);
+    const canCancel=run.run_kind==='workflow' ? !terminal : run.status==='queued'||(skill?.cancellable&&!terminal);
+    const row=document.createElement('div'); row.className=`data-row${run.id===selectedRunId?' active':''}`; row.dataset.runId = run.id;
+    const content=document.createElement('button'); content.type='button'; content.style.all='unset'; content.style.cursor='pointer'; content.style.flex='1';
+    const title=document.createElement('div'); title.className='data-title'; title.textContent=`${run.run_kind==='workflow'?'Workflow':'Skill'} · ${run.skill_id} · ${run.status}`;
+    const meta=document.createElement('div'); meta.className='data-meta'; meta.textContent=`${run.id} · ${Math.round((run.progress || 0) * 100)}% ${run.detail || run.error || ''}`;
+    content.append(title,meta); content.onclick=()=>selectRun(run.id); row.append(content);
+    const actions=[]; if(run.status==='queued')actions.push(['恢复',()=>resumeRun(run.id)]); if(canCancel)actions.push(['取消',()=>cancelRun(run.id)]);
+    if(actions.length){const controls=document.createElement('div');controls.style.display='flex';controls.style.gap='6px';actions.forEach(action=>{const button=document.createElement('button');button.className='btn';button.textContent=action[0];button.onclick=event=>{event.stopPropagation();action[1]();};controls.append(button);});row.append(controls);} target.append(row);
+  });
+}
+
+async function selectRun(id) {
+  selectedRunId = id;
+  document.querySelectorAll('#runList .data-row').forEach(row => row.classList.toggle('active', row.dataset.runId === id));
+  await loadRunDetail(id);
+}
+
+async function loadRunDetail(id) {
+  try {
+    const run = await apiFetch(`/api/v2/runs/${encodeURIComponent(id)}`);
+    const detail = document.getElementById('runDetail');
+    detail.replaceChildren();
+    const rows = [
+      ['运行 ID', run.id], ['类型', run.run_kind || 'skill'], [run.run_kind === 'workflow' ? 'Preset' : 'Skill', run.skill_id], ['状态', run.status], ['进度', `${Math.round((run.progress || 0) * 100)}%`],
+      ['请求 ID', run.request_id || '-'], ['创建', run.created_at || '-'], ['派发', run.dispatched_at || '-'], ['完成', run.finished_at || '-'],
+      ['说明', run.detail || '-'], ['代码', run.error || '-'], ['输入', JSON.stringify(run.input || {}, null, 2)],
+    ];
+    rows.forEach(([key, value]) => { const k=document.createElement('div'); k.className='memory-detail-key'; k.textContent=key; const v=document.createElement('div'); v.className='memory-detail-value'; v.textContent=String(value); detail.append(k,v); });
+    (run.steps || []).forEach(step => {
+      const key=document.createElement('div'); key.className='memory-detail-key'; key.textContent=`步骤 ${step.index + 1}`;
+      const value=document.createElement('div'); value.className='memory-detail-value';
+      value.textContent=`${step.title || step.key} · ${step.skill_id} · ${step.status} · ${Math.round((step.progress || 0) * 100)}%${step.detail || step.error ? ` · ${step.detail || step.error}` : ''}`;
+      detail.append(key,value);
+    });
+  } catch (error) {
+    document.getElementById('runDetail').innerHTML = `<div class="empty">详情加载失败：${escapeHtml(error.message)}</div>`;
+  }
 }
 
 async function cancelRun(id) { try { await apiFetch(`/api/v2/runs/${id}/cancel`, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(leasePayload())}); await loadOperations(); } catch(error){dbgLog(error.message);} }

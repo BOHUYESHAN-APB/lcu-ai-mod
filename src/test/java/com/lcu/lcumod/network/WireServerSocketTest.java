@@ -37,6 +37,8 @@ class WireServerSocketTest {
             assertTrue(auth.getAsJsonArray("tools").size() >= 10);
             assertTrue(auth.getAsJsonArray("tools").asList().stream()
                 .anyMatch(tool -> tool.getAsJsonObject().get("command").getAsString().equals("craft_item")));
+            assertTrue(auth.getAsJsonArray("tools").asList().stream()
+                .anyMatch(tool -> tool.getAsJsonObject().get("command").getAsString().equals("cancel_operation")));
 
             peer.send("""
                     {"type":"command","id":"req-1","cmd":"jump","args":{"message":"你好"}}

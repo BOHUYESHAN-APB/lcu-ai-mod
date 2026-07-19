@@ -11,30 +11,56 @@ public final class ToolCatalog {
 
     public static JsonArray describe() {
         JsonArray tools = new JsonArray();
-        tools.add(tool("move_to", "operation", true, "progress", List.of("body.move"),
+        tools.add(tool("move_to", "operation", true, "outcome", List.of("body.move"),
             numbers("x", "y", "z"), List.of("x", "y", "z")));
         tools.add(tool("look_at", "immediate", false, "response", List.of("camera.move"),
             numbers("x", "y", "z"), List.of("x", "y", "z")));
+        tools.add(tool("look_at_entity", "immediate", false, "response", List.of("camera.move"),
+            integerProperties("id"), List.of("id")));
         tools.add(tool("jump", "immediate", false, "response", List.of("body.move"), emptyProperties(), List.of()));
         tools.add(tool("attack", "immediate", false, "response", List.of("entity.attack"), emptyProperties(), List.of()));
-        tools.add(tool("mine_block", "operation", true, "progress", List.of("body.move", "world.break"), emptyProperties(), List.of()));
+        tools.add(tool("attack_entity", "immediate", false, "response", List.of("entity.attack"),
+            integerProperties("entity_id"), List.of("entity_id")));
+        tools.add(tool("mine_block", "operation", true, "outcome", List.of("body.move", "world.break"), emptyProperties(), List.of()));
+        tools.add(tool("mine_block_at", "operation", true, "outcome", List.of("world.break"),
+            blockTargetProperties(), List.of("x", "y", "z")));
         tools.add(tool("use_on", "immediate", false, "response", List.of("world.interact"), emptyProperties(), List.of()));
+        tools.add(tool("use_item", "immediate", false, "response", List.of("inventory.use"), emptyProperties(), List.of()));
+        tools.add(tool("use_on_entity", "immediate", false, "response", List.of("entity.interact"),
+            integerProperties("id"), List.of("id")));
+        tools.add(tool("interact_block_at", "immediate", false, "response", List.of("world.interact"),
+            blockTargetProperties(), List.of("x", "y", "z")));
+        tools.add(tool("equip_item", "immediate", false, "response", List.of("inventory.equip"),
+            strings("item"), List.of("item")));
         tools.add(tool("send_chat", "immediate", false, "response", List.of("chat.send"),
             strings("message"), List.of("message")));
         tools.add(tool("stop_all", "immediate", false, "response", List.of("body.move", "inventory.ui"), emptyProperties(), List.of()));
-        tools.add(tool("follow_player", "operation", true, "state", List.of("body.move"),
+        tools.add(tool("cancel_operation", "immediate", false, "response", List.of("operation.cancel"),
+            strings("operation_id"), List.of("operation_id")));
+        tools.add(tool("follow_player", "operation", true, "outcome", List.of("body.move"),
             strings("player"), List.of("player")));
-        tools.add(tool("collect_blocks", "operation", true, "progress", List.of("body.move", "world.break", "inventory.produce"),
+        tools.add(tool("collect_blocks", "operation", true, "outcome", List.of("body.move", "world.break", "inventory.produce"),
             stringAndCount("block_type"), List.of("block_type", "count")));
-        tools.add(tool("craft_item", "operation", true, "progress", List.of("body.move", "inventory.ui", "inventory.consume", "inventory.produce", "world.interact"),
+        tools.add(tool("craft_item", "operation", true, "outcome", List.of("body.move", "inventory.ui", "inventory.consume", "inventory.produce", "world.interact"),
             stringAndCount("item"), List.of("item", "count")));
-        tools.add(tool("eat", "operation", true, "progress", List.of("inventory.consume"), emptyProperties(), List.of()));
+        tools.add(tool("eat", "operation", true, "outcome", List.of("inventory.consume"), emptyProperties(), List.of()));
         tools.add(tool("get_inventory", "immediate", false, "response", List.of("inventory.read"), emptyProperties(), List.of()));
+        tools.add(tool("get_recipes", "immediate", false, "response", List.of("recipes.read"),
+            strings("item"), List.of("item")));
+        tools.add(tool("get_state", "immediate", false, "response", List.of("state.read"), emptyProperties(), List.of()));
+        tools.add(tool("select_hotbar", "immediate", false, "response", List.of("inventory.equip"),
+            integerProperties("index"), List.of("index")));
         tools.add(tool("get_container", "immediate", false, "response", List.of("inventory.read"), emptyProperties(), List.of()));
+        tools.add(tool("inventory_click", "immediate", false, "response", List.of("inventory.transfer"),
+            inventoryClickProperties(), List.of("container_id", "expected_state_id", "slot", "click_type")));
+        tools.add(tool("container_button", "immediate", false, "response", List.of("inventory.ui"),
+            integerProperties("container_id", "expected_state_id", "button_id"), List.of("container_id", "expected_state_id", "button_id")));
+        tools.add(tool("place_recipe", "immediate", false, "response", List.of("inventory.ui", "inventory.transfer"),
+            recipeProperties(), List.of("container_id", "expected_state_id", "recipe_id")));
         tools.add(tool("take_item", "immediate", false, "response", List.of("inventory.transfer"),
-            slotAndContainer(), List.of("container_id", "slot")));
+            slotAndContainer(), List.of("container_id", "expected_state_id", "slot")));
         tools.add(tool("put_item", "immediate", false, "response", List.of("inventory.transfer"),
-            slotAndContainer(), List.of("container_id", "slot")));
+            slotAndContainer(), List.of("container_id", "expected_state_id", "slot")));
         tools.add(tool("close_container", "immediate", false, "response", List.of("inventory.ui"), emptyProperties(), List.of()));
         tools.add(tool("drop_item", "immediate", false, "response", List.of("inventory.drop"),
             stringAndCount("item"), List.of("item", "count")));
@@ -45,7 +71,7 @@ public final class ToolCatalog {
                                    List<String> effects, JsonObject properties, List<String> required) {
         JsonObject descriptor = new JsonObject();
         descriptor.addProperty("command", command);
-        descriptor.addProperty("version", command.equals("craft_item") ? "1.1.0" : "1.0.0");
+        descriptor.addProperty("version", versionFor(command));
         descriptor.addProperty("execution", execution);
         descriptor.addProperty("cancellable", cancellable);
         descriptor.addProperty("completion", completion);
@@ -62,6 +88,14 @@ public final class ToolCatalog {
         schema.addProperty("additionalProperties", false);
         descriptor.add("input_schema", schema);
         return descriptor;
+    }
+
+    private static String versionFor(String command) {
+        return switch (command) {
+            case "move_to", "mine_block", "follow_player", "collect_blocks", "craft_item", "eat",
+                 "get_container", "inventory_click", "container_button", "place_recipe", "take_item", "put_item" -> "2.0.0";
+            default -> "1.0.0";
+        };
     }
 
     private static JsonObject emptyProperties() {
@@ -101,12 +135,50 @@ public final class ToolCatalog {
 
     private static JsonObject slotAndContainer() {
         JsonObject properties = new JsonObject();
-        for (String name : List.of("container_id", "slot")) {
+        for (String name : List.of("container_id", "expected_state_id", "slot")) {
             JsonObject value = new JsonObject();
             value.addProperty("type", "integer");
             value.addProperty("minimum", 0);
             properties.add(name, value);
         }
+        return properties;
+    }
+
+    private static JsonObject integerProperties(String... names) {
+        JsonObject properties = new JsonObject();
+        for (String name : names) {
+            JsonObject value = new JsonObject();
+            value.addProperty("type", "integer");
+            properties.add(name, value);
+        }
+        return properties;
+    }
+
+    private static JsonObject blockTargetProperties() {
+        JsonObject properties = integerProperties("x", "y", "z");
+        JsonObject face = new JsonObject();
+        face.addProperty("type", "string");
+        JsonArray values = new JsonArray();
+        for (String value : List.of("down", "up", "north", "south", "west", "east")) values.add(value);
+        face.add("enum", values);
+        properties.add("face", face);
+        return properties;
+    }
+
+    private static JsonObject inventoryClickProperties() {
+        JsonObject properties = integerProperties("container_id", "expected_state_id", "slot", "button");
+        JsonObject clickType = new JsonObject();
+        clickType.addProperty("type", "string");
+        properties.add("click_type", clickType);
+        return properties;
+    }
+
+    private static JsonObject recipeProperties() {
+        JsonObject properties = integerProperties("container_id", "expected_state_id");
+        properties.add("recipe_id", strings("recipe_id").get("recipe_id"));
+        JsonObject craftAll = new JsonObject();
+        craftAll.addProperty("type", "boolean");
+        properties.add("craft_all", craftAll);
         return properties;
     }
 }

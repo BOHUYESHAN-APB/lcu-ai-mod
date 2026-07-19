@@ -99,6 +99,12 @@ class Skills:
         """Start mining the block being looked at (auto-equips best tool)."""
         return self._send_cmd("mine_block", {})
 
+    def mine_block_at(self, x: int, y: int, z: int, face: str | None = None) -> dict:
+        payload = {"x": x, "y": y, "z": z}
+        if face:
+            payload["face"] = face
+        return self._send_cmd("mine_block_at", payload)
+
     def stop_digging(self) -> dict:
         """Stop current digging."""
         return self._send_cmd("stop_digging", {})
@@ -114,6 +120,15 @@ class Skills:
     def interact_block(self) -> dict:
         """Right-click the targeted block."""
         return self._send_cmd("interact_block", {})
+
+    def interact_block_at(self, x: int, y: int, z: int, face: str | None = None) -> dict:
+        payload = {"x": x, "y": y, "z": z}
+        if face:
+            payload["face"] = face
+        return self._send_cmd("interact_block_at", payload)
+
+    def equip_item(self, item: str) -> dict:
+        return self._send_cmd("equip_item", {"item": item})
 
     def use_on(self) -> dict:
         """Right-click whatever is targeted (block or entity)."""
@@ -134,6 +149,33 @@ class Skills:
     def get_inventory(self) -> dict:
         """Get full player inventory."""
         return self._send_cmd("get_inventory", {})
+
+    def get_recipes(self, item: str) -> dict:
+        return self._send_cmd("get_recipes", {"item": item})
+
+    def inventory_click(self, container_id: int, expected_state_id: int, slot: int, click_type: str, button: int = 0) -> dict:
+        return self._send_cmd("inventory_click", {
+            "container_id": container_id,
+            "expected_state_id": expected_state_id,
+            "slot": slot,
+            "click_type": click_type,
+            "button": button,
+        })
+
+    def container_button(self, container_id: int, expected_state_id: int, button_id: int) -> dict:
+        return self._send_cmd("container_button", {
+            "container_id": container_id,
+            "expected_state_id": expected_state_id,
+            "button_id": button_id,
+        })
+
+    def place_recipe(self, container_id: int, expected_state_id: int, recipe_id: str, craft_all: bool = False) -> dict:
+        return self._send_cmd("place_recipe", {
+            "container_id": container_id,
+            "expected_state_id": expected_state_id,
+            "recipe_id": recipe_id,
+            "craft_all": craft_all,
+        })
 
     def select_hotbar(self, index: int) -> dict:
         """Select hotbar slot 0-8."""
@@ -156,13 +198,13 @@ class Skills:
         """Read contents of currently open container."""
         return self._send_cmd("get_container", {})
 
-    def take_item(self, container_id: int, slot: int) -> dict:
+    def take_item(self, container_id: int, expected_state_id: int, slot: int) -> dict:
         """Take item from container slot into player inventory."""
-        return self._send_cmd("take_item", {"container_id": container_id, "slot": slot})
+        return self._send_cmd("take_item", {"container_id": container_id, "expected_state_id": expected_state_id, "slot": slot})
 
-    def put_item(self, container_id: int, slot: int) -> dict:
+    def put_item(self, container_id: int, expected_state_id: int, slot: int) -> dict:
         """Put item from player inventory into container slot."""
-        return self._send_cmd("put_item", {"container_id": container_id, "slot": slot})
+        return self._send_cmd("put_item", {"container_id": container_id, "expected_state_id": expected_state_id, "slot": slot})
 
     def close_container(self) -> dict:
         """Close current container GUI."""

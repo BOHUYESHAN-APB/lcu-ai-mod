@@ -31,6 +31,20 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(session.runtime["task_state"]["kind"], "craft")
         self.assertEqual(session.runtime["task_state"]["status"], "collecting")
 
+    def test_state_update_uses_authoritative_snapshot_collections(self):
+        session = Session.__new__(Session)
+        session.runtime = {
+            "persona": {"name": "Maid"},
+            "inventory": [{"slot": 0, "name": "minecraft:bread"}],
+            "entities": [{"id": 1, "type": "item"}],
+        }
+
+        session.handle_event("state_update", {"player": {"health": 20}})
+
+        self.assertEqual(session.runtime["inventory"], [])
+        self.assertEqual(session.runtime["entities"], [])
+        self.assertEqual(session.runtime["persona"]["name"], "Maid")
+
 
 if __name__ == "__main__":
     unittest.main()

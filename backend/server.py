@@ -33,6 +33,7 @@ from agent.orchestrator import Orchestrator
 from agent.skill_registry import SkillRegistry, SkillValidationError
 from agent.storage_policy import enforce_storage_policy
 from agent.task_coordinator import TaskCoordinator
+from agent.task_preset_registry import TaskPresetRegistry, TaskPresetValidationError
 from protocol import BodyAdapter, WireClient
 
 SDK_API_VERSION = "1"
@@ -217,6 +218,10 @@ class SkillRunRequest(LeaseCredentials):
     input: dict[str, Any] = Field(default_factory=dict)
 
 
+class TaskPresetRunRequest(LeaseCredentials):
+    parameters: dict[str, Any] = Field(default_factory=dict)
+
+
 class ScheduleRequest(LeaseCredentials):
     name: str = Field(min_length=1, max_length=128)
     skill_id: str = Field(min_length=1)
@@ -335,6 +340,7 @@ body: BodyAdapter | None = None
 orchestrator: Orchestrator | None = None
 llm_service = LLMService()
 skill_registry = SkillRegistry()
+task_preset_registry = TaskPresetRegistry(skill_registry)
 agent_state = AgentStateDB()
 agent_state.sync_skills(skill_registry.list())
 task_coordinator: TaskCoordinator | None = None
@@ -500,7 +506,12 @@ async def startup():
         server_id=os.getenv("SERVER_ID", persistence.get("server_id", "default")),
         world_id=os.getenv("WORLD_ID", persistence.get("world_id", "default")),
     )
-    task_coordinator = TaskCoordinator(agent_state, skill_registry, body)
+    task_coordinator = TaskCoordinator(
+        agent_state,
+        skill_registry,
+        body,
+        initial_scope=f"{orchestrator.session.identity.server_id}\0{orchestrator.session.identity.world_id}",
+    )
     orchestrator.set_task_coordinator(task_coordinator)
     shutdown_event = threading.Event()
     stop_event = shutdown_event
@@ -821,14 +832,13 @@ async def send_player_conversation_message(data: PlayerConversationRequest):
         )
         session.memory.add_interaction(data.player_name, data.message)
         session.memory.observe_player(data.player_name, data.player_id, data.message)
-        context = session.memory.build_context(current_player=data.player_name)
+        context = session.build_planner_context(current_player=data.player_name)
         llm = session.llm
-        persona = session.runtime.get("persona", {})
     if not llm.is_configured("conversation"):
         with orchestrator.session_context() as session:
             session.message_db.fail_player_message(data.client_message_id, "conversation model is not configured")
         raise HTTPException(status_code=503, detail="Conversation model is not configured")
-    system_prompt = llm.build_system_prompt({"persona": persona, **context})
+    system_prompt = llm.build_system_prompt(context)
     system_prompt += (
         "\nThis is a private text conversation. Reply conversationally only. "
         "Do not emit commands, tool syntax, or body-control instructions."
@@ -1371,6 +1381,35 @@ async def list_v2_skills(category: str | None = None):
     return {"skills": skills, "count": len(skills)}
 
 
+@app.get("/api/v2/task-presets")
+async def list_v2_task_presets(category: str | None = None):
+    presets = task_preset_registry.list(category)
+    return {"presets": presets, "count": len(presets)}
+
+
+@app.get("/api/v2/task-presets/{preset_id}")
+async def get_v2_task_preset(preset_id: str):
+    try:
+        task_preset_registry.get(preset_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return next(item for item in task_preset_registry.list() if item["id"] == preset_id)
+
+
+@app.post("/api/v2/task-presets/{preset_id}/runs")
+async def run_v2_task_preset(preset_id: str, data: TaskPresetRunRequest):
+    try:
+        rendered = task_preset_registry.render(preset_id, data.parameters)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except TaskPresetValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if rendered["kind"] == "skill":
+        step = rendered["steps"][0]
+        return await _create_v2_skill_run(step["skill_id"], step["input"], data.lease_id, data.fencing_token)
+    return await _create_v2_workflow_run(rendered, data.lease_id, data.fencing_token)
+
+
 @app.get("/api/v2/skills/{skill_id}")
 async def get_v2_skill(skill_id: str):
     try:
@@ -1381,24 +1420,29 @@ async def get_v2_skill(skill_id: str):
 
 @app.post("/api/v2/skills/{skill_id}/runs")
 async def run_v2_skill(skill_id: str, data: SkillRunRequest):
+    return await _create_v2_skill_run(skill_id, data.input, data.lease_id, data.fencing_token)
+
+
+async def _create_v2_skill_run(skill_id: str, input_data: dict[str, Any], lease_id: str | None,
+                               fencing_token: int | None):
     if not task_coordinator:
         raise HTTPException(status_code=503, detail="Task coordinator is not running")
     try:
-        manifest = skill_registry.validate_input(skill_id, data.input)
+        manifest = skill_registry.validate_input(skill_id, input_data)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except SkillValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     try:
-        if data.lease_id is not None and (not body or not body.is_connected):
+        if lease_id is not None and (not body or not body.is_connected):
             raise HTTPException(status_code=503, detail="Companion body is not connected")
-        if data.lease_id is None and data.fencing_token is None and orchestrator:
+        if lease_id is None and fencing_token is None and orchestrator:
             with orchestrator.session_context() as session:
                 task_coordinator.set_session_busy(session.is_busy_for_external_task())
-                run = task_coordinator.create_run(manifest.id, data.input)
+                run = task_coordinator.create_run(manifest.id, input_data)
         else:
             run = task_coordinator.create_run(
-                manifest.id, data.input, lease_id=data.lease_id, fencing_token=data.fencing_token,
+                manifest.id, input_data, lease_id=lease_id, fencing_token=fencing_token,
             )
     except LeaseConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -1409,12 +1453,38 @@ async def run_v2_skill(skill_id: str, data: SkillRunRequest):
     return run
 
 
+async def _create_v2_workflow_run(workflow: dict[str, Any], lease_id: str | None,
+                                  fencing_token: int | None):
+    if not task_coordinator:
+        raise HTTPException(status_code=503, detail="Task coordinator is not running")
+    try:
+        if lease_id is not None and (not body or not body.is_connected):
+            raise HTTPException(status_code=503, detail="Companion body is not connected")
+        if lease_id is None and fencing_token is None and orchestrator:
+            with orchestrator.session_context() as session:
+                task_coordinator.set_session_busy(session.is_busy_for_external_task())
+                run = task_coordinator.create_workflow(workflow)
+        else:
+            run = task_coordinator.create_workflow(
+                workflow, lease_id=lease_id, fencing_token=fencing_token,
+            )
+    except LeaseConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ConnectionError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except (KeyError, SkillValidationError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return run
+
+
 @app.get("/api/v2/runs")
 async def list_v2_runs(
     limit: int = Query(default=50, ge=1, le=200),
     status: Literal["queued", "dispatched", "running", "succeeded", "failed", "cancelled", "unknown"] | None = None,
 ):
-    runs = agent_state.list_runs(limit=limit, status=status)
+    runs = agent_state.list_runs(limit=limit, status=status, root_only=True)
     return {"runs": runs, "count": len(runs)}
 
 

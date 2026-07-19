@@ -43,6 +43,7 @@ public class ActionExecutor {
     private static BlockPos diggingPos = null;
     private static Direction diggingDir = null;
     private static int diggingTicks = 0;
+    private static String diggingReqId = null;
     private static final int DIGGING_TIMEOUT_TICKS = 600;
     // Jump cooldown
     private static int jumpCooldown = 0;
@@ -53,6 +54,7 @@ public class ActionExecutor {
     private static int respawnRetryTicks = 0;
     private static int respawnAttempts = 0;
     private static String followTargetName = null;
+    private static String followReqId = null;
     private static String suspendedFollowTargetName = null;
     private static int followRefreshTicks = 0;
     private static String pendingCraftItem = null;
@@ -197,9 +199,7 @@ public class ActionExecutor {
                 wasDead = true;
                 respawnAttempts = 0;
                 respawnRetryTicks = 0;
-                releaseAllInputs();
-                Pathfinder.stop();
-                MovementSystem.stop();
+                stopAllRuntime();
             }
 
             if (respawnRetryTicks-- <= 0) {
@@ -359,7 +359,9 @@ public class ActionExecutor {
                 case "set_control_state" -> handleSetControlState(cmd);
                 case "auto_equip" -> handleAutoEquip(cmd);
                 case "get_inventory" -> handleGetInventory(cmd);
+                case "get_recipes" -> handleGetRecipes(cmd);
                 case "stop_all" -> handleStopAll(cmd);
+                case "cancel_operation" -> handleCancelOperation(cmd);
                 // AI/User control toggle
                 case "toggle_ai" -> {
                     toggleAiControl();
@@ -367,7 +369,13 @@ public class ActionExecutor {
                 }
                 // Container interaction (mineflayer-style)
                 case "use_on" -> handleUseOn(cmd);       // right-click block/entity
+                case "interact_block_at" -> handleInteractBlockAt(cmd);
+                case "mine_block_at" -> handleMineBlockAt(cmd);
+                case "equip_item" -> handleEquipItem(cmd);
                 case "get_container" -> handleGetContainer(cmd);
+                case "inventory_click" -> handleInventoryClick(cmd);
+                case "container_button" -> handleContainerButton(cmd);
+                case "place_recipe" -> handlePlaceRecipe(cmd);
                 case "take_item" -> handleTakeItem(cmd);
                 case "put_item" -> handlePutItem(cmd);
                 case "close_container" -> handleCloseContainer(cmd);
@@ -526,8 +534,7 @@ public class ActionExecutor {
             return;
         }
 
-        // Find nearest living entity in crosshair direction
-        Entity target = findTargetEntity(mc, 6.0);
+        Entity target = findEntityTarget(mc, cmd);
         if (target != null) {
             mc.gameMode.attack(mc.player, target);
             mc.player.swing(InteractionHand.MAIN_HAND);
@@ -631,6 +638,10 @@ public class ActionExecutor {
             sendResponse(cmd.id(), false, "No player");
             return;
         }
+        if (pendingCraftReqId != null || pendingCollectReqId != null || pendingEatReqId != null || followReqId != null) {
+            sendResponse(cmd.id(), false, "CONFLICT: another foreground operation is active");
+            return;
+        }
         // Right-click the block the player is looking at
         var hit = mc.hitResult;
         if (hit != null && hit.getType() == net.minecraft.world.phys.HitResult.Type.BLOCK) {
@@ -650,6 +661,10 @@ public class ActionExecutor {
             sendResponse(cmd.id(), false, "No player/gameMode");
             return;
         }
+        if (diggingReqId != null) {
+            sendResponse(cmd.id(), false, "CONFLICT: another mining operation is active");
+            return;
+        }
         var hit = mc.hitResult;
         if (hit != null && hit.getType() == net.minecraft.world.phys.HitResult.Type.BLOCK) {
             var blockHit = (net.minecraft.world.phys.BlockHitResult) hit;
@@ -665,6 +680,7 @@ public class ActionExecutor {
             diggingPos = pos;
             diggingDir = dir;
             diggingTicks = 0;
+            diggingReqId = cmd.id();
             LCUMod.LOGGER.info("[Action] Started digging {} with tool-slot {}", pos, mc.player.getInventory().selected);
             sendResponse(cmd.id(), true, "Digging " + pos.toShortString());
         } else {
@@ -696,11 +712,116 @@ public class ActionExecutor {
     }
 
     private void handleStopDigging(WireServer.WireCommand cmd) {
-        stopDigging();
+        stopDigging("cancelled", "STOP_DIGGING", "digging stopped");
         sendResponse(cmd.id(), true, "Digging stopped");
     }
 
+    private Entity findEntityTarget(Minecraft mc, WireServer.WireCommand cmd) {
+        var args = cmd.args();
+        if (args != null && args.has("entity_id")) {
+            Entity target = mc.level.getEntity(args.get("entity_id").getAsInt());
+            if (target != null && target.isAlive() && mc.player.distanceTo(target) <= 4.5
+                && mc.player.hasLineOfSight(target)) return target;
+            return null;
+        }
+        return findTargetEntity(mc, 6.0);
+    }
+
+    private void handleInteractBlockAt(WireServer.WireCommand cmd) {
+        var mc = Minecraft.getInstance();
+        BlockPos pos = parseBlockPos(cmd.args());
+        if (mc.player == null || mc.gameMode == null || pos == null) {
+            sendResponse(cmd.id(), false, "Need player, game mode, and x/y/z");
+            return;
+        }
+        if (!withinInteractionReach(mc, pos)) {
+            sendResponse(cmd.id(), false, "Block is out of interaction reach");
+            return;
+        }
+        Direction face = parseDirection(cmd.args());
+        if (face == null) {
+            sendResponse(cmd.id(), false, "Invalid block face");
+            return;
+        }
+        mc.player.lookAt(net.minecraft.commands.arguments.EntityAnchorArgument.Anchor.EYES, Vec3.atCenterOf(pos));
+        mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND,
+            new BlockHitResult(Vec3.atCenterOf(pos), face, pos, false));
+        sendResponse(cmd.id(), true, "Interacting with " + pos.toShortString());
+    }
+
+    private void handleMineBlockAt(WireServer.WireCommand cmd) {
+        var mc = Minecraft.getInstance();
+        BlockPos pos = parseBlockPos(cmd.args());
+        if (mc.player == null || mc.gameMode == null || pos == null) {
+            sendResponse(cmd.id(), false, "Need player, game mode, and x/y/z");
+            return;
+        }
+        if (diggingReqId != null) {
+            sendResponse(cmd.id(), false, "CONFLICT: another mining operation is active");
+            return;
+        }
+        if (!withinInteractionReach(mc, pos) || mc.level.getBlockState(pos).isAir()) {
+            sendResponse(cmd.id(), false, "Block is invalid or out of interaction reach");
+            return;
+        }
+        Direction face = parseDirection(cmd.args());
+        if (face == null) {
+            sendResponse(cmd.id(), false, "Invalid block face");
+            return;
+        }
+        autoEquipForBlock(mc, pos);
+        mc.player.lookAt(net.minecraft.commands.arguments.EntityAnchorArgument.Anchor.EYES, Vec3.atCenterOf(pos));
+        mc.gameMode.startDestroyBlock(pos, face);
+        mc.player.swing(InteractionHand.MAIN_HAND);
+        diggingPos = pos;
+        diggingDir = face;
+        diggingTicks = 0;
+        diggingReqId = cmd.id();
+        sendResponse(cmd.id(), true, "Digging " + pos.toShortString());
+    }
+
+    private void handleEquipItem(WireServer.WireCommand cmd) {
+        var args = cmd.args();
+        if (args == null || !args.has("item")) {
+            sendResponse(cmd.id(), false, "Need item");
+            return;
+        }
+        String itemId = args.get("item").getAsString();
+        var inv = Minecraft.getInstance().player.getInventory();
+        for (int slot = 0; slot < 9; slot++) {
+            var stack = inv.getItem(slot);
+            if (!stack.isEmpty() && CraftingPlanner.matchesItemId(
+                BuiltInRegistries.ITEM.getKey(stack.getItem()).toString(), itemId)) {
+                inv.selected = slot;
+                sendResponse(cmd.id(), true, "Equipped in main hand: " + itemId);
+                return;
+            }
+        }
+        sendResponse(cmd.id(), false, "Item is not in hotbar: " + itemId);
+    }
+
+    private BlockPos parseBlockPos(JsonObject args) {
+        if (args == null || !args.has("x") || !args.has("y") || !args.has("z")) return null;
+        return new BlockPos(args.get("x").getAsInt(), args.get("y").getAsInt(), args.get("z").getAsInt());
+    }
+
+    private Direction parseDirection(JsonObject args) {
+        if (args != null && args.has("face")) {
+            try { return Direction.valueOf(args.get("face").getAsString().toUpperCase()); }
+            catch (IllegalArgumentException ignored) { return null; }
+        }
+        return Direction.UP;
+    }
+
+    private boolean withinInteractionReach(Minecraft mc, BlockPos pos) {
+        return mc.player.distanceToSqr(Vec3.atCenterOf(pos)) <= 36.0;
+    }
+
     private void stopDigging() {
+        stopDigging(null, null, null);
+    }
+
+    private void stopDigging(String status, String code, String message) {
         if (diggingPos != null) {
             var mc = Minecraft.getInstance();
             if (mc.gameMode != null) {
@@ -710,6 +831,8 @@ public class ActionExecutor {
             diggingPos = null;
             diggingDir = null;
             diggingTicks = 0;
+            if (status != null) sendOperationOutcome(diggingReqId, status, code, message);
+            diggingReqId = null;
         }
     }
 
@@ -719,7 +842,7 @@ public class ActionExecutor {
         diggingTicks++;
         if (diggingTicks > DIGGING_TIMEOUT_TICKS) {
             LCUMod.LOGGER.warn("[Action] Digging timeout at {}", diggingPos);
-            stopDigging();
+            stopDigging("failed", "DIG_TIMEOUT", "digging timed out");
             return;
         }
 
@@ -727,7 +850,7 @@ public class ActionExecutor {
         if (mc.level.isEmptyBlock(diggingPos)) {
             // Block was broken!
             LCUMod.LOGGER.info("[Action] Block broken at {}", diggingPos);
-            stopDigging();
+            stopDigging("succeeded", "BLOCK_BROKEN", "block broken");
             return;
         }
 
@@ -861,9 +984,53 @@ public class ActionExecutor {
         sendResponse(cmd.id(), true, "All stopped");
     }
 
+    private void handleCancelOperation(WireServer.WireCommand cmd) {
+        var args = cmd.args();
+        if (args == null || !args.has("operation_id")) {
+            sendResponse(cmd.id(), false, "Need operation_id");
+            return;
+        }
+        String operationId = args.get("operation_id").getAsString();
+        boolean cancelled = Pathfinder.cancelOperation(operationId, "operation cancelled by controller");
+        if (operationId.equals(diggingReqId)) {
+            stopDigging("cancelled", "CANCELLED", "digging cancelled by controller");
+            cancelled = true;
+        }
+        if (operationId.equals(pendingCraftReqId)) {
+            sendOperationOutcome(operationId, "cancelled", "CANCELLED", "craft cancelled by controller");
+            finishCraftTask();
+            cancelled = true;
+        } else if (operationId.equals(pendingCollectReqId)) {
+            sendOperationOutcome(operationId, "cancelled", "CANCELLED", "collection cancelled by controller");
+            clearPendingCollectTask();
+            clearTaskState();
+            cancelled = true;
+        }
+        if (operationId.equals(pendingEatReqId)) {
+            sendOperationOutcome(operationId, "cancelled", "CANCELLED", "eat cancelled by controller");
+            pendingEatReqId = null;
+            pendingEatTicks = 0;
+            pendingEatAttempts = 0;
+            clearTaskState();
+            cancelled = true;
+        }
+        if (operationId.equals(followReqId)) {
+            followTargetName = null;
+            followReqId = null;
+            MovementSystem.stop();
+            sendOperationOutcome(operationId, "cancelled", "CANCELLED", "follow cancelled by controller");
+            clearTaskState();
+            cancelled = true;
+        }
+        sendBehaviorSnapshot();
+        sendResponse(cmd.id(), cancelled, cancelled ? "Operation cancelled" : "Operation is not active");
+    }
+
     private void stopAllRuntime() {
         var mc = Minecraft.getInstance();
+        cancelActiveOperations("STOP_ALL", "all operations stopped");
         followTargetName = null;
+        followReqId = null;
         suspendedFollowTargetName = null;
         pendingCraftItem = null;
         pendingCraftReqId = null;
@@ -878,7 +1045,7 @@ public class ActionExecutor {
         pendingEatTicks = 0;
         pendingEatAttempts = 0;
         clearPendingCollectTask();
-        Pathfinder.stop();
+        Pathfinder.cancelActiveOperation("STOP_ALL", "all operations stopped");
         MovementSystem.stop();
         JavaAutonomousBehavior.resetCurrentState();
         releaseAllInputs();
@@ -895,10 +1062,28 @@ public class ActionExecutor {
         sendBehaviorSnapshot();
     }
 
+    private void cancelActiveOperations(String code, String message) {
+        java.util.Set<String> requestIds = new java.util.HashSet<>();
+        if (diggingReqId != null) requestIds.add(diggingReqId);
+        if (followReqId != null) requestIds.add(followReqId);
+        if (pendingCraftReqId != null) requestIds.add(pendingCraftReqId);
+        if (pendingCollectReqId != null) requestIds.add(pendingCollectReqId);
+        if (pendingEatReqId != null) requestIds.add(pendingEatReqId);
+        for (String requestId : requestIds) {
+            sendOperationOutcome(requestId, "cancelled", code, message);
+        }
+    }
+
+    private static void sendOperationOutcome(String requestId, String status, String code, String message) {
+        if (requestId != null && LCUMod.WIRE != null) {
+            LCUMod.WIRE.sendOutcome(requestId, status, code, message);
+        }
+    }
+
     private boolean requiresArmedBody(String command) {
         return switch (command) {
             case "control_external", "control_builtin", "get_state", "get_inventory", "get_container",
-                 "stop_all", "toggle_ai", "behavior_disable", "send_chat" -> false;
+                 "stop_all", "cancel_operation", "toggle_ai", "behavior_disable", "send_chat" -> false;
             default -> true;
         };
     }
@@ -985,29 +1170,219 @@ public class ActionExecutor {
         // Send the container's items in the response
         JsonObject result = new JsonObject();
         result.addProperty("container_id", menu.containerId);
+        result.addProperty("menu_class", menu.getClass().getName());
+        result.addProperty("menu_adapter", menuAdapterName(menu));
+        result.addProperty("state_id", menu.getStateId());
         result.addProperty("slots", menu.slots.size());
+        var carried = menu.getCarried();
+        if (!carried.isEmpty()) {
+            JsonObject carriedItem = new JsonObject();
+            carriedItem.addProperty("name", BuiltInRegistries.ITEM.getKey(carried.getItem()).toString());
+            carriedItem.addProperty("count", carried.getCount());
+            result.add("carried", carriedItem);
+        }
 
         JsonArray items = new JsonArray();
         for (int i = 0; i < menu.slots.size(); i++) {
             var stack = menu.slots.get(i).getItem();
-            if (stack.isEmpty()) continue;
             JsonObject item = new JsonObject();
             item.addProperty("slot", i);
-            item.addProperty("scope", menu.slots.get(i).container == mc.player.getInventory() ? "player" : "storage");
-            item.addProperty("name", stack.getItem().toString());
-            item.addProperty("count", stack.getCount());
-            item.addProperty("display", stack.getDisplayName().getString());
+            boolean playerSlot = menu.slots.get(i).container == mc.player.getInventory();
+            item.addProperty("scope", playerSlot ? "player" : "storage");
+            item.addProperty("menu_scope", playerSlot ? "player" : "menu");
+            item.addProperty("role", playerSlot ? "player_inventory" : menuSlotRole(menu, i));
+            item.addProperty("empty", stack.isEmpty());
+            if (!stack.isEmpty()) {
+                item.addProperty("name", BuiltInRegistries.ITEM.getKey(stack.getItem()).toString());
+                item.addProperty("count", stack.getCount());
+                item.addProperty("display", stack.getDisplayName().getString());
+            }
             items.add(item);
         }
         result.add("items", items);
         sendResponse(cmd.id(), true, result);
     }
 
+    private String menuAdapterName(net.minecraft.world.inventory.AbstractContainerMenu menu) {
+        String name = menu.getClass().getSimpleName().toLowerCase();
+        if (name.contains("blastfurnace")) return "blast_furnace";
+        if (name.contains("furnace")) return "furnace";
+        if (name.contains("smoker")) return "smoker";
+        if (name.contains("stonecutter")) return "stonecutter";
+        if (name.contains("smithing")) return "smithing";
+        if (name.contains("brewing")) return "brewing_stand";
+        if (name.contains("anvil")) return "anvil";
+        if (name.contains("grindstone")) return "grindstone";
+        if (name.contains("loom")) return "loom";
+        if (name.contains("cartography")) return "cartography";
+        if (name.contains("enchantment")) return "enchanting";
+        if (name.contains("merchant")) return "merchant";
+        if (name.contains("crafting")) return "crafting_table";
+        if (name.contains("shulker")) return "shulker_box";
+        if (name.contains("chest")) return "container";
+        return "generic";
+    }
+
+    private String menuSlotRole(net.minecraft.world.inventory.AbstractContainerMenu menu, int slot) {
+        return switch (menuAdapterName(menu)) {
+            case "crafting_table" -> slot == 0 ? "result" : slot <= 9 ? "crafting_grid" : "menu";
+            case "furnace", "blast_furnace", "smoker" -> switch (slot) {
+                case 0 -> "input";
+                case 1 -> "fuel";
+                case 2 -> "result";
+                default -> "menu";
+            };
+            case "stonecutter" -> slot == 0 ? "input" : slot == 1 ? "result" : "menu";
+            case "smithing" -> switch (slot) {
+                case 0 -> "template";
+                case 1 -> "base";
+                case 2 -> "addition";
+                case 3 -> "result";
+                default -> "menu";
+            };
+            case "brewing_stand" -> slot <= 2 ? "bottle" : slot == 3 ? "ingredient" : slot == 4 ? "fuel" : "menu";
+            case "anvil", "grindstone", "cartography" -> slot <= 1 ? "input" : slot == 2 ? "result" : "menu";
+            case "loom" -> switch (slot) {
+                case 0 -> "banner";
+                case 1 -> "dye";
+                case 2 -> "pattern";
+                case 3 -> "result";
+                default -> "menu";
+            };
+            case "enchanting" -> slot == 0 ? "item" : slot == 1 ? "lapis" : "menu";
+            case "merchant" -> slot <= 1 ? "payment" : slot == 2 ? "result" : "menu";
+            case "container", "shulker_box", "generic" -> "storage";
+            default -> "menu";
+        };
+    }
+
+    private void handleGetRecipes(WireServer.WireCommand cmd) {
+        var args = cmd.args();
+        var mc = Minecraft.getInstance();
+        if (mc.level == null || args == null || !args.has("item")) {
+            sendResponse(cmd.id(), false, "Need item and loaded world");
+            return;
+        }
+        String target = args.get("item").getAsString();
+        JsonArray recipes = new JsonArray();
+        for (RecipeHolder<?> holder : mc.level.getRecipeManager().getRecipes()) {
+            var resultStack = holder.value().getResultItem(mc.level.registryAccess());
+            if (resultStack.isEmpty()) continue;
+            String resultId = BuiltInRegistries.ITEM.getKey(resultStack.getItem()).toString();
+            if (!CraftingPlanner.matchesItemId(resultId, target)) continue;
+
+            JsonObject recipe = new JsonObject();
+            recipe.addProperty("recipe_id", holder.id().toString());
+            recipe.addProperty("recipe_type", BuiltInRegistries.RECIPE_TYPE.getKey(holder.value().getType()).toString());
+            recipe.addProperty("result_item", resultId);
+            recipe.addProperty("result_count", resultStack.getCount());
+            recipe.addProperty("crafting_table_required",
+                holder.value().getType() == RecipeType.CRAFTING && !holder.value().canCraftInDimensions(2, 2));
+            JsonArray ingredients = new JsonArray();
+            holder.value().getIngredients().forEach(ingredient -> {
+                if (ingredient == null || ingredient.isEmpty()) return;
+                JsonArray alternatives = new JsonArray();
+                for (var stack : ingredient.getItems()) {
+                    if (!stack.isEmpty()) alternatives.add(BuiltInRegistries.ITEM.getKey(stack.getItem()).toString());
+                }
+                ingredients.add(alternatives);
+            });
+            recipe.add("ingredients", ingredients);
+            recipes.add(recipe);
+            if (recipes.size() >= 128) break;
+        }
+        JsonObject result = new JsonObject();
+        result.addProperty("item", target);
+        result.add("recipes", recipes);
+        sendResponse(cmd.id(), true, result);
+    }
+
+    private void handleInventoryClick(WireServer.WireCommand cmd) {
+        var args = cmd.args();
+        var mc = Minecraft.getInstance();
+        if (mc.player == null || mc.gameMode == null || args == null
+            || !args.has("container_id") || !args.has("expected_state_id") || !args.has("slot") || !args.has("click_type")) {
+            sendResponse(cmd.id(), false, "Need container_id, expected_state_id, slot, and click_type");
+            return;
+        }
+        var menu = mc.player.containerMenu;
+        int containerId = args.get("container_id").getAsInt();
+        int slot = args.get("slot").getAsInt();
+        int button = args.has("button") ? args.get("button").getAsInt() : 0;
+        if (menu == null || menu.containerId != containerId || slot < 0 || slot >= menu.slots.size()
+            || !matchesExpectedMenuState(args, menu)) {
+            sendResponse(cmd.id(), false, "Stale container or invalid slot");
+            return;
+        }
+        ClickType clickType;
+        try {
+            clickType = ClickType.valueOf(args.get("click_type").getAsString().toUpperCase());
+        } catch (IllegalArgumentException exception) {
+            sendResponse(cmd.id(), false, "Unsupported click_type");
+            return;
+        }
+        if (!java.util.Set.of(ClickType.PICKUP, ClickType.QUICK_MOVE, ClickType.SWAP, ClickType.THROW).contains(clickType)) {
+            sendResponse(cmd.id(), false, "click_type is not allowed");
+            return;
+        }
+        if (clickType == ClickType.SWAP && (button < 0 || button > 8)) {
+            sendResponse(cmd.id(), false, "SWAP button must be hotbar index 0-8");
+            return;
+        }
+        mc.gameMode.handleInventoryMouseClick(containerId, slot, button, clickType, mc.player);
+        sendResponse(cmd.id(), true, "Inventory click sent");
+    }
+
+    private void handleContainerButton(WireServer.WireCommand cmd) {
+        var args = cmd.args();
+        var mc = Minecraft.getInstance();
+        if (mc.player == null || mc.gameMode == null || args == null
+            || !args.has("container_id") || !args.has("expected_state_id") || !args.has("button_id")) {
+            sendResponse(cmd.id(), false, "Need container_id, expected_state_id, and button_id");
+            return;
+        }
+        int containerId = args.get("container_id").getAsInt();
+        if (mc.player.containerMenu == null || mc.player.containerMenu.containerId != containerId
+            || !matchesExpectedMenuState(args, mc.player.containerMenu)) {
+            sendResponse(cmd.id(), false, "Stale container id");
+            return;
+        }
+        mc.gameMode.handleInventoryButtonClick(containerId, args.get("button_id").getAsInt());
+        sendResponse(cmd.id(), true, "Container button sent");
+    }
+
+    private void handlePlaceRecipe(WireServer.WireCommand cmd) {
+        var args = cmd.args();
+        var mc = Minecraft.getInstance();
+        if (mc.player == null || mc.level == null || mc.gameMode == null || args == null
+            || !args.has("container_id") || !args.has("expected_state_id") || !args.has("recipe_id")) {
+            sendResponse(cmd.id(), false, "Need container_id, expected_state_id, and recipe_id");
+            return;
+        }
+        int containerId = args.get("container_id").getAsInt();
+        if (mc.player.containerMenu == null || mc.player.containerMenu.containerId != containerId
+            || !matchesExpectedMenuState(args, mc.player.containerMenu)) {
+            sendResponse(cmd.id(), false, "Stale container id");
+            return;
+        }
+        String recipeId = args.get("recipe_id").getAsString();
+        RecipeHolder<?> recipe = mc.level.getRecipeManager().getRecipes().stream()
+            .filter(candidate -> candidate.id().toString().equals(recipeId))
+            .findFirst().orElse(null);
+        if (recipe == null) {
+            sendResponse(cmd.id(), false, "Unknown recipe: " + recipeId);
+            return;
+        }
+        boolean craftAll = args.has("craft_all") && args.get("craft_all").getAsBoolean();
+        mc.gameMode.handlePlaceRecipe(containerId, recipe, craftAll);
+        sendResponse(cmd.id(), true, "Recipe placement sent: " + recipeId);
+    }
+
     private void handleTakeItem(WireServer.WireCommand cmd) {
         // Take item from container slot (shift-click to player inventory)
         var args = cmd.args();
-        if (args == null || !args.has("container_id") || !args.has("slot")) {
-            sendResponse(cmd.id(), false, "Need container_id and slot number");
+        if (args == null || !args.has("container_id") || !args.has("slot") || !args.has("expected_state_id")) {
+            sendResponse(cmd.id(), false, "Need container_id, expected_state_id, and slot number");
             return;
         }
         var mc = Minecraft.getInstance();
@@ -1020,7 +1395,7 @@ public class ActionExecutor {
 
         int containerId = args.get("container_id").getAsInt();
         int slot = args.get("slot").getAsInt();
-        if (containerId != menu.containerId) {
+        if (containerId != menu.containerId || !matchesExpectedMenuState(args, menu)) {
             sendResponse(cmd.id(), false, "Stale container id");
             return;
         }
@@ -1040,8 +1415,8 @@ public class ActionExecutor {
     private void handlePutItem(WireServer.WireCommand cmd) {
         // Put item from player inventory into container (shift-click)
         var args = cmd.args();
-        if (args == null || !args.has("container_id") || !args.has("slot")) {
-            sendResponse(cmd.id(), false, "Need container_id and slot number");
+        if (args == null || !args.has("container_id") || !args.has("slot") || !args.has("expected_state_id")) {
+            sendResponse(cmd.id(), false, "Need container_id, expected_state_id, and slot number");
             return;
         }
         var mc = Minecraft.getInstance();
@@ -1054,7 +1429,7 @@ public class ActionExecutor {
 
         int containerId = args.get("container_id").getAsInt();
         int slot = args.get("slot").getAsInt();
-        if (containerId != menu.containerId) {
+        if (containerId != menu.containerId || !matchesExpectedMenuState(args, menu)) {
             sendResponse(cmd.id(), false, "Stale container id");
             return;
         }
@@ -1124,11 +1499,12 @@ public class ActionExecutor {
         }
         int entityId = args.get("id").getAsInt();
         var entity = mc.level.getEntity(entityId);
-        if (entity != null) {
+        if (entity != null && entity.isAlive() && mc.player.distanceTo(entity) <= 4.5
+            && mc.player.hasLineOfSight(entity)) {
             mc.gameMode.interact(mc.player, entity, InteractionHand.MAIN_HAND);
             sendResponse(cmd.id(), true, "Interacted with entity " + entityId);
         } else {
-            sendResponse(cmd.id(), false, "Entity " + entityId + " not found");
+            sendResponse(cmd.id(), false, "Entity " + entityId + " is missing, blocked, or out of reach");
         }
     }
 
@@ -1146,6 +1522,14 @@ public class ActionExecutor {
             return;
         }
         String playerName = args.get("player").getAsString();
+        if (followReqId != null) {
+            sendResponse(cmd.id(), false, "CONFLICT: follow operation already active");
+            return;
+        }
+        if (pendingEatReqId != null || pendingCollectReqId != null) {
+            sendResponse(cmd.id(), false, "CONFLICT: inventory or collection operation is active");
+            return;
+        }
         if (pendingCraftItem != null) {
             sendResponse(cmd.id(), false, "CONFLICT: craft operation currently owns movement and inventory");
             return;
@@ -1153,10 +1537,8 @@ public class ActionExecutor {
         Pathfinder.stop();
         MovementSystem.stop();
         JavaAutonomousBehavior.resetCurrentState();
-        pendingEatReqId = null;
-        pendingEatTicks = 0;
-        pendingEatAttempts = 0;
         followTargetName = playerName;
+        followReqId = cmd.id();
         followRefreshTicks = 0;
         setTaskState("follow", "running", playerName, "following player", 0.1);
         
@@ -1171,6 +1553,7 @@ public class ActionExecutor {
             }
         }
         followTargetName = null;
+        followReqId = null;
         sendBehaviorSnapshot();
         sendResponse(cmd.id(), false, "Player " + playerName + " not found");
     }
@@ -1190,11 +1573,11 @@ public class ActionExecutor {
         int requestedCount = args.has("count") ? Math.max(1, args.get("count").getAsInt()) : 1;
 
         if (pendingCraftItem != null && countInventoryItem(mc, pendingCraftItem) < pendingCraftGoalCount) {
-            if (CraftingPlanner.matchesRegistryId(pendingCraftItem, itemName)) {
-                sendResponse(cmd.id(), true, "Already crafting " + pendingCraftItem);
-            } else {
-                sendResponse(cmd.id(), false, "CONFLICT: already crafting " + pendingCraftItem);
-            }
+            sendResponse(cmd.id(), false, "CONFLICT: already crafting " + pendingCraftItem);
+            return;
+        }
+        if (pendingEatReqId != null || pendingCollectReqId != null) {
+            sendResponse(cmd.id(), false, "CONFLICT: inventory or collection operation is active");
             return;
         }
 
@@ -1236,9 +1619,12 @@ public class ActionExecutor {
             sendResponse(cmd.id(), false, "No player");
             return;
         }
+        if (pendingCraftReqId != null || pendingCollectReqId != null || pendingEatReqId != null || followReqId != null) {
+            sendResponse(cmd.id(), false, "CONFLICT: another foreground operation is active");
+            return;
+        }
         String blockType = normalizeItemName(args.get("block_type").getAsString());
         int count = args.has("count") ? args.get("count").getAsInt() : 1;
-        followTargetName = null;
 
         startCollectTask(mc, cmd.id(), blockType, Math.max(1, count));
         setTaskState("collect", "searching", blockType, "searching nearby resources", 0.02);
@@ -1269,20 +1655,21 @@ public class ActionExecutor {
             sendResponse(cmd.id(), false, "No player");
             return;
         }
+        if (pendingCraftReqId != null || pendingCollectReqId != null || pendingEatReqId != null || followReqId != null) {
+            sendResponse(cmd.id(), false, "CONFLICT: another foreground operation is active");
+            return;
+        }
 
         if (!hasFoodInHotbar(mc)) {
             sendResponse(cmd.id(), false, "No food in hotbar");
             return;
         }
 
-        followTargetName = null;
-
         pendingEatReqId = cmd.id();
         pendingEatTicks = 0;
         pendingEatAttempts = 0;
         pendingEatStartHunger = mc.player.getFoodData().getFoodLevel();
         pendingEatStartHealth = mc.player.getHealth();
-        clearPendingCollectTask();
         setTaskState("eat", "running", "food", "consuming food", 0.05);
         startEating(mc);
         sendBehaviorSnapshot();
@@ -1311,14 +1698,18 @@ public class ActionExecutor {
         for (int i = 0; i < inv.getContainerSize(); i++) {
             var stack = inv.getItem(i);
             if (stack.isEmpty()) continue;
-            if (stack.getItem().toString().contains(itemName)) {
-                // Drop item
-                mc.player.drop(stack.split(count), false);
+            String stackId = BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
+            if (!CraftingPlanner.matchesItemId(stackId, itemName)) continue;
+            int amount = Math.min(Math.max(1, count), stack.getCount());
+            mc.player.drop(stack.split(amount), false);
+            count -= amount;
+            if (count <= 0) {
                 sendResponse(cmd.id(), true, "Dropped " + itemName);
                 return;
             }
         }
-        sendResponse(cmd.id(), false, "Item " + itemName + " not found");
+        sendResponse(cmd.id(), count < (args.has("count") ? args.get("count").getAsInt() : 1),
+            count < (args.has("count") ? args.get("count").getAsInt() : 1) ? "Dropped partial " + itemName : "Item " + itemName + " not found");
     }
 
     private void handleSortInventory(WireServer.WireCommand cmd) {
@@ -1373,6 +1764,11 @@ public class ActionExecutor {
         data.addProperty("active_behavior", JavaAutonomousBehavior.getState().name().toLowerCase());
         data.addProperty("movement_owner", currentMovementOwner());
         LCUMod.WIRE.sendEvent("behavior_state", data);
+    }
+
+    private boolean matchesExpectedMenuState(JsonObject args, net.minecraft.world.inventory.AbstractContainerMenu menu) {
+        return args != null && args.has("expected_state_id")
+            && args.get("expected_state_id").getAsInt() == menu.getStateId();
     }
 
     private boolean hasManualTask() {
@@ -1478,6 +1874,7 @@ public class ActionExecutor {
             if (LCUMod.WIRE != null) {
                 LCUMod.WIRE.sendProgress(pendingCraftReqId, 1.0, "crafted: " + pendingCraftItem);
             }
+            sendOperationOutcome(pendingCraftReqId, "succeeded", "CRAFTED", "crafted: " + pendingCraftItem);
             finishCraftTask();
             return;
         }
@@ -1490,6 +1887,7 @@ public class ActionExecutor {
             if (LCUMod.WIRE != null) {
                 LCUMod.WIRE.sendProgress(pendingCraftReqId, 0.0, "craft made no inventory progress: " + pendingCraftItem);
             }
+            sendOperationOutcome(pendingCraftReqId, "failed", "NO_PROGRESS", "craft made no inventory progress: " + pendingCraftItem);
             finishCraftTask();
             return;
         }
@@ -1518,9 +1916,11 @@ public class ActionExecutor {
         }
 
         if (!plan.success || plan.steps.isEmpty()) {
+            String reason = plan.failureReason.isBlank() ? "no craft path for " + pendingCraftItem : plan.failureReason;
             if (LCUMod.WIRE != null) {
-                LCUMod.WIRE.sendProgress(pendingCraftReqId, 0.0, plan.failureReason.isBlank() ? "no craft path for " + pendingCraftItem : plan.failureReason);
+                LCUMod.WIRE.sendProgress(pendingCraftReqId, 0.0, reason);
             }
+            sendOperationOutcome(pendingCraftReqId, "failed", "NO_CRAFT_PATH", reason);
             finishCraftTask();
             return;
         }
@@ -1534,6 +1934,7 @@ public class ActionExecutor {
                     if (LCUMod.WIRE != null) {
                         LCUMod.WIRE.sendProgress(pendingCraftReqId, 0.0, "need nearby crafting table for " + pendingCraftItem);
                     }
+                    sendOperationOutcome(pendingCraftReqId, "failed", "STATION_UNAVAILABLE", "need nearby crafting table for " + pendingCraftItem);
                     finishCraftTask();
                 }
                 return;
@@ -1568,6 +1969,7 @@ public class ActionExecutor {
                     if (LCUMod.WIRE != null) {
                         LCUMod.WIRE.sendProgress(pendingCraftReqId, 0.0, "need nearby " + step.stationBlockId + " for " + pendingCraftItem);
                     }
+                    sendOperationOutcome(pendingCraftReqId, "failed", "STATION_UNAVAILABLE", "need nearby " + step.stationBlockId + " for " + pendingCraftItem);
                     finishCraftTask();
                 }
                 return;
@@ -1596,6 +1998,7 @@ public class ActionExecutor {
                     if (LCUMod.WIRE != null) {
                         LCUMod.WIRE.sendProgress(pendingCraftReqId, 0.0, "processing station blocked by unrelated or stalled contents");
                     }
+                    sendOperationOutcome(pendingCraftReqId, "failed", "STATION_BLOCKED", "processing station blocked by unrelated or stalled contents");
                     finishCraftTask();
                     return;
                 }
@@ -1699,10 +2102,12 @@ public class ActionExecutor {
 
         int currentCount = countInventoryItem(mc, pendingCollectItem);
         if (currentCount >= pendingCollectGoalCount) {
+            boolean parentCraft = pendingCraftReqId != null && pendingCollectReqId.equals(pendingCraftReqId);
+            String detail = "collected " + pendingCollectItem + " x" + Math.max(0, currentCount - pendingCollectBaselineCount);
             if (LCUMod.WIRE != null) {
-                LCUMod.WIRE.sendProgress(pendingCollectReqId, pendingCraftReqId != null && pendingCollectReqId.equals(pendingCraftReqId) ? 0.5 : 1.0,
-                    "collected " + pendingCollectItem + " x" + Math.max(0, currentCount - pendingCollectBaselineCount));
+                LCUMod.WIRE.sendProgress(pendingCollectReqId, parentCraft ? 0.5 : 1.0, detail);
             }
+            if (!parentCraft) sendOperationOutcome(pendingCollectReqId, "succeeded", "COLLECTED", detail);
             clearPendingCollectTask();
             if (pendingCraftReqId == null) {
                 clearTaskState();
@@ -1747,9 +2152,12 @@ public class ActionExecutor {
                 setTaskState(resolveRootTaskKind(), "searching", pendingCollectItem, "searching for collectible block or drop", collectProgress(mc));
                 if (pendingCollectSearchMisses >= 12) {
                     boolean parentCraft = pendingCraftReqId != null && pendingCraftReqId.equals(pendingCollectReqId);
+                    String requestId = pendingCollectReqId;
+                    String detail = "no collectible source found for " + pendingCollectItem;
                     if (LCUMod.WIRE != null) {
-                        LCUMod.WIRE.sendProgress(pendingCollectReqId, 0.0, "no collectible source found for " + pendingCollectItem);
+                        LCUMod.WIRE.sendProgress(requestId, 0.0, detail);
                     }
+                    sendOperationOutcome(requestId, "failed", "NO_SOURCE", detail);
                     clearPendingCollectTask();
                     if (parentCraft) {
                         finishCraftTask();
@@ -1778,6 +2186,7 @@ public class ActionExecutor {
             diggingPos = pendingCollectTargetPos;
             diggingDir = Direction.UP;
             diggingTicks = 0;
+            diggingReqId = null;
         }
         setTaskState(resolveRootTaskKind(), "mining", pendingCollectItem, "mining resource block", collectProgress(mc));
     }
@@ -2421,6 +2830,7 @@ public class ActionExecutor {
             if (LCUMod.WIRE != null) {
                 LCUMod.WIRE.sendProgress(pendingEatReqId, 1.0, "eat complete");
             }
+            sendOperationOutcome(pendingEatReqId, "succeeded", "CONSUMED", "eat complete");
             pendingEatReqId = null;
             pendingEatTicks = 0;
             pendingEatAttempts = 0;
@@ -2439,6 +2849,7 @@ public class ActionExecutor {
             if (LCUMod.WIRE != null) {
                 LCUMod.WIRE.sendProgress(pendingEatReqId, 0.0, "eat failed or cannot start use animation");
             }
+            sendOperationOutcome(pendingEatReqId, "failed", "USE_FAILED", "eat failed or cannot start use animation");
             pendingEatReqId = null;
             pendingEatTicks = 0;
             pendingEatAttempts = 0;

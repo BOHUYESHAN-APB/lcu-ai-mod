@@ -176,6 +176,33 @@ class AgentStateDB:
                 self._conn.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)", (5, time.time())
                 )
+            if 6 not in applied:
+                run_columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(task_runs)")}
+                additions = {
+                    "run_kind": "TEXT NOT NULL DEFAULT 'skill'",
+                    "parent_run_id": "TEXT",
+                    "root_run_id": "TEXT",
+                    "step_index": "INTEGER",
+                    "step_key": "TEXT",
+                    "workflow_spec_json": "TEXT",
+                    "current_step": "INTEGER",
+                    "active_child_id": "TEXT",
+                    "cancel_requested_at": "REAL",
+                    "lease_id": "TEXT",
+                    "fencing_token": "INTEGER",
+                }
+                for name, definition in additions.items():
+                    if name not in run_columns:
+                        self._conn.execute(f"ALTER TABLE task_runs ADD COLUMN {name} {definition}")
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_task_runs_parent ON task_runs(parent_run_id, step_index)"
+                )
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_task_runs_root ON task_runs(root_run_id, created_at)"
+                )
+                self._conn.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)", (6, time.time())
+                )
             self._conn.commit()
         except Exception:
             self._conn.rollback()
@@ -228,6 +255,48 @@ class AgentStateDB:
             self._append_event("run.created", "run", run_id, {"skill_id": skill["id"]}, now)
         return self.get_run(run_id)
 
+    def create_workflow_run(self, workflow: dict[str, Any], *, scope_id: str | None = None,
+                            lease_id: str | None = None, fencing_token: int | None = None) -> dict[str, Any]:
+        steps = workflow.get("steps", [])
+        if not steps:
+            raise ValueError("workflow must contain at least one step")
+        run_id = str(uuid.uuid4())
+        child_id = str(uuid.uuid4())
+        now = time.time()
+        first = steps[0]
+        with self._lock, self._conn:
+            self._conn.execute("""
+                INSERT INTO task_runs(
+                    id, skill_id, skill_version, input_json, completion, status, created_at,
+                    scope_id, run_kind, root_run_id, workflow_spec_json, current_step, active_child_id,
+                    lease_id, fencing_token
+                ) VALUES (?, ?, ?, ?, 'workflow', 'queued', ?, ?, 'workflow', ?, ?, 0, ?, ?, ?)
+            """, (
+                run_id, workflow["id"], workflow["version"],
+                json.dumps(workflow.get("parameters", {}), ensure_ascii=False, sort_keys=True),
+                now, scope_id, run_id,
+                json.dumps(workflow, ensure_ascii=False, sort_keys=True), child_id, lease_id, fencing_token,
+            ))
+            self._insert_workflow_child(child_id, run_id, run_id, 0, first, scope_id, now)
+            self._append_event("run.created", "run", run_id, {
+                "run_kind": "workflow", "step_count": len(steps),
+            }, now)
+            self._append_event("run.created", "run", child_id, {
+                "skill_id": first["skill_id"], "parent_run_id": run_id, "step_index": 0,
+            }, now)
+        return self.get_run(run_id)
+
+    def set_workflow_control(self, run_id: str, lease_id: str | None,
+                             fencing_token: int | None) -> dict[str, Any]:
+        with self._lock, self._conn:
+            cursor = self._conn.execute("""
+                UPDATE task_runs SET lease_id=?, fencing_token=?
+                WHERE id=? AND run_kind='workflow' AND status='queued'
+            """, (lease_id, fencing_token, run_id))
+            if cursor.rowcount != 1:
+                raise ValueError("workflow is not queued")
+        return self.get_run(run_id)
+
     def trigger_schedule(self, schedule_id: str, skill: dict[str, Any], *,
                          next_wall_at: float | None, next_game_tick: int | None,
                          disable: bool) -> dict[str, Any]:
@@ -266,6 +335,15 @@ class AgentStateDB:
             if cursor.rowcount != 1:
                 raise ValueError("task run is no longer queued")
             self._append_event("run.dispatched", "run", run_id, {"request_id": request_id}, now)
+            row = self._conn.execute("SELECT parent_run_id FROM task_runs WHERE id=?", (run_id,)).fetchone()
+            if row is not None and row["parent_run_id"]:
+                self._conn.execute("""
+                    UPDATE task_runs SET status='running', detail='', started_at=COALESCE(started_at, ?)
+                    WHERE id=? AND run_kind='workflow' AND active_child_id=? AND status='queued'
+                """, (now, row["parent_run_id"], run_id))
+                self._append_event("workflow.step_dispatched", "run", row["parent_run_id"], {
+                    "child_run_id": run_id,
+                }, now)
         return self.get_run(run_id)
 
     def update_run_response(self, request_id: str, success: bool, detail: str = "", error: str = "") -> dict[str, Any] | None:
@@ -274,19 +352,18 @@ class AgentStateDB:
             if row is None or row["status"] in {"succeeded", "failed", "cancelled", "unknown"}:
                 return None
             now = time.time()
-            if not success:
-                status, event_type, finished_at = "failed", "run.failed", now
-            elif row["completion"] == "response":
-                status, event_type, finished_at = "succeeded", "run.succeeded", now
-            else:
-                status, event_type, finished_at = "running", "run.started", None
             with self._conn:
-                self._conn.execute("""
-                    UPDATE task_runs SET status=?, progress=?, detail=?, error=?,
-                        started_at=COALESCE(started_at, ?), finished_at=?
-                    WHERE id=?
-                """, (status, 1.0 if status == "succeeded" else row["progress"], detail, error, now, finished_at, row["id"]))
-                self._append_event(event_type, "run", row["id"], {"detail": detail, "error": error}, now)
+                if not success:
+                    self._finish_run_locked(row, "failed", detail, error, now)
+                elif row["completion"] == "response":
+                    self._finish_run_locked(row, "succeeded", detail, "", now)
+                else:
+                    self._conn.execute("""
+                        UPDATE task_runs SET status='running', detail=?, error='',
+                            started_at=COALESCE(started_at, ?) WHERE id=?
+                    """, (detail, now, row["id"]))
+                    self._append_event("run.started", "run", row["id"], {"detail": detail}, now)
+                    self._update_parent_progress_locked(row, float(row["progress"] or 0.0), detail, now)
         return self.get_run(row["id"])
 
     def update_run_progress(self, request_id: str, progress: float, detail: str = "") -> dict[str, Any] | None:
@@ -295,7 +372,9 @@ class AgentStateDB:
             if row is None or row["status"] in {"succeeded", "failed", "cancelled", "unknown"}:
                 return None
             now = time.time()
-            if progress >= 1.0:
+            if row["completion"] == "outcome":
+                status, event_type, finished_at = "running", "run.progress", None
+            elif progress >= 1.0:
                 status, event_type, finished_at = "succeeded", "run.succeeded", now
             elif progress <= 0.0 and detail:
                 status, event_type, finished_at = "failed", "run.failed", now
@@ -303,25 +382,146 @@ class AgentStateDB:
                 status, event_type, finished_at = "running", "run.progress", None
             bounded = max(0.0, min(1.0, progress))
             with self._conn:
-                self._conn.execute("""
-                    UPDATE task_runs SET status=?, progress=?, detail=?, started_at=COALESCE(started_at, ?), finished_at=?
-                    WHERE id=?
-                """, (status, bounded, detail, now, finished_at, row["id"]))
-                self._append_event(event_type, "run", row["id"], {"progress": bounded, "detail": detail}, now)
+                if status in {"succeeded", "failed"}:
+                    self._finish_run_locked(row, status, detail, "", now, progress=bounded)
+                else:
+                    self._conn.execute("""
+                        UPDATE task_runs SET status=?, progress=?, detail=?, started_at=COALESCE(started_at, ?)
+                        WHERE id=?
+                    """, (status, bounded, detail, now, row["id"]))
+                    self._append_event(event_type, "run", row["id"], {"progress": bounded, "detail": detail}, now)
+                    self._update_parent_progress_locked(row, bounded, detail, now)
         return self.get_run(row["id"])
+
+    def update_run_outcome(self, request_id: str, status: str, detail: str = "", code: str = "") -> dict[str, Any] | None:
+        normalized = str(status).strip().lower()
+        if normalized not in {"succeeded", "failed", "cancelled"}:
+            raise ValueError(f"invalid operation outcome: {status}")
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM task_runs WHERE request_id=?", (request_id,)).fetchone()
+            if row is None or row["status"] in {"succeeded", "failed", "cancelled", "unknown"}:
+                return None
+            now = time.time()
+            progress = 1.0 if normalized == "succeeded" else max(0.0, min(1.0, float(row["progress"] or 0.0)))
+            with self._conn:
+                self._finish_run_locked(row, normalized, detail, code, now, progress=progress)
+        return self.get_run(row["id"])
+
+    def _finish_run_locked(self, row: sqlite3.Row, status: str, detail: str, error: str,
+                           now: float, progress: float | None = None) -> str | None:
+        bounded = 1.0 if status == "succeeded" else max(
+            0.0, min(1.0, float(row["progress"] or 0.0) if progress is None else progress)
+        )
+        cursor = self._conn.execute("""
+            UPDATE task_runs SET status=?, progress=?, detail=?, error=?,
+                started_at=COALESCE(started_at, dispatched_at, ?), finished_at=?
+            WHERE id=? AND status IN ('queued', 'dispatched', 'running')
+        """, (status, bounded, detail, error, now, now, row["id"]))
+        if cursor.rowcount != 1:
+            return None
+        self._append_event(f"run.{status}", "run", row["id"], {
+            "detail": detail, "code": error,
+        }, now)
+        if not row["parent_run_id"]:
+            return None
+        return self._advance_workflow_locked(row, status, detail, error, now)
+
+    def _advance_workflow_locked(self, child: sqlite3.Row, child_status: str, detail: str,
+                                 error: str, now: float) -> str | None:
+        parent = self._conn.execute("SELECT * FROM task_runs WHERE id=?", (child["parent_run_id"],)).fetchone()
+        if parent is None or parent["status"] in {"succeeded", "failed", "cancelled", "unknown"}:
+            return None
+        if parent["active_child_id"] != child["id"]:
+            return None
+        workflow = json.loads(parent["workflow_spec_json"] or "{}")
+        steps = workflow.get("steps", [])
+        if child_status == "unknown":
+            parent_status = "unknown"
+        elif parent["cancel_requested_at"] is not None:
+            parent_status = "cancelled"
+        elif child_status != "succeeded":
+            parent_status = child_status
+        else:
+            next_index = int(child["step_index"] or 0) + 1
+            if next_index < len(steps):
+                next_id = str(uuid.uuid4())
+                self._insert_workflow_child(
+                    next_id, parent["id"], parent["root_run_id"] or parent["id"], next_index,
+                    steps[next_index], parent["scope_id"], now,
+                )
+                self._conn.execute("""
+                    UPDATE task_runs SET status='queued', current_step=?, active_child_id=?,
+                        progress=?, detail='', error='' WHERE id=?
+                """, (next_index, next_id, next_index / len(steps), parent["id"]))
+                self._append_event("run.created", "run", next_id, {
+                    "skill_id": steps[next_index]["skill_id"], "parent_run_id": parent["id"],
+                    "step_index": next_index,
+                }, now)
+                self._append_event("workflow.step_queued", "run", parent["id"], {
+                    "child_run_id": next_id, "step_index": next_index,
+                }, now)
+                return next_id
+            parent_status = "succeeded"
+
+        parent_progress = 1.0 if parent_status == "succeeded" else max(
+            0.0, min(1.0, (int(child["step_index"] or 0) + float(child["progress"] or 0.0)) / max(1, len(steps)))
+        )
+        parent_detail = (
+            "cancelled by controller"
+            if parent_status == "cancelled" and parent["cancel_requested_at"] is not None
+            else detail
+        )
+        self._conn.execute("""
+            UPDATE task_runs SET status=?, progress=?, detail=?, error=?, active_child_id=NULL, finished_at=?
+            WHERE id=? AND status IN ('queued', 'running')
+        """, (parent_status, parent_progress, parent_detail, error, now, parent["id"]))
+        self._append_event(f"run.{parent_status}", "run", parent["id"], {
+            "detail": parent_detail, "code": error, "child_run_id": child["id"],
+        }, now)
+        return None
+
+    def _update_parent_progress_locked(self, child: sqlite3.Row, progress: float,
+                                       detail: str, now: float) -> None:
+        if not child["parent_run_id"]:
+            return
+        parent = self._conn.execute(
+            "SELECT workflow_spec_json, active_child_id FROM task_runs WHERE id=?",
+            (child["parent_run_id"],),
+        ).fetchone()
+        if parent is None or parent["active_child_id"] != child["id"]:
+            return
+        steps = json.loads(parent["workflow_spec_json"] or "{}").get("steps", [])
+        overall = (int(child["step_index"] or 0) + progress) / max(1, len(steps))
+        self._conn.execute("""
+            UPDATE task_runs SET status='running', progress=?, detail=?
+            WHERE id=? AND run_kind='workflow' AND status IN ('queued', 'running')
+        """, (max(0.0, min(1.0, overall)), detail, child["parent_run_id"]))
+        self._append_event("workflow.progress", "run", child["parent_run_id"], {
+            "child_run_id": child["id"], "progress": overall, "detail": detail,
+        }, now)
+
+    def _insert_workflow_child(self, child_id: str, parent_id: str, root_id: str,
+                               step_index: int, step: dict[str, Any], scope_id: str | None,
+                               now: float) -> None:
+        self._conn.execute("""
+            INSERT INTO task_runs(
+                id, skill_id, skill_version, input_json, completion, status, created_at, scope_id,
+                run_kind, parent_run_id, root_run_id, step_index, step_key
+            ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, 'skill', ?, ?, ?, ?)
+        """, (
+            child_id, step["skill_id"], step["skill_version"],
+            json.dumps(step["input"], ensure_ascii=False, sort_keys=True), step["completion"],
+            now, scope_id, parent_id, root_id, step_index, step["key"],
+        ))
 
     def mark_inflight_unknown(self, detail: str) -> int:
         now = time.time()
         with self._lock, self._conn:
             rows = list(self._conn.execute(
-                "SELECT id FROM task_runs WHERE status IN ('dispatched', 'running')"
+                "SELECT * FROM task_runs WHERE run_kind='skill' AND status IN ('dispatched', 'running')"
             ))
             for row in rows:
-                self._conn.execute(
-                    "UPDATE task_runs SET status='unknown', detail=?, finished_at=? WHERE id=?",
-                    (detail, now, row["id"]),
-                )
-                self._append_event("run.unknown", "run", row["id"], {"detail": detail}, now)
+                self._finish_run_locked(row, "unknown", detail, "", now)
         return len(rows)
 
     def expire_stale_runs(self, max_age_seconds: float, detail: str) -> int:
@@ -329,76 +529,130 @@ class AgentStateDB:
         cutoff = now - max_age_seconds
         with self._lock, self._conn:
             rows = list(self._conn.execute("""
-                SELECT id FROM task_runs
-                WHERE status IN ('dispatched', 'running')
+                SELECT * FROM task_runs
+                WHERE run_kind='skill' AND status IN ('dispatched', 'running')
                   AND COALESCE(started_at, dispatched_at, created_at) < ?
             """, (cutoff,)))
             for row in rows:
-                self._conn.execute(
-                    "UPDATE task_runs SET status='unknown', detail=?, finished_at=? WHERE id=?",
-                    (detail, now, row["id"]),
-                )
-                self._append_event("run.unknown", "run", row["id"], {"detail": detail}, now)
+                self._finish_run_locked(row, "unknown", detail, "", now)
         return len(rows)
 
     def cancel_queued_runs(self, detail: str) -> int:
         now = time.time()
         with self._lock, self._conn:
-            rows = list(self._conn.execute("SELECT id FROM task_runs WHERE status='queued'"))
+            rows = list(self._conn.execute(
+                "SELECT * FROM task_runs WHERE run_kind='skill' AND status='queued'"
+            ))
             for row in rows:
-                self._conn.execute(
-                    "UPDATE task_runs SET status='cancelled', detail=?, finished_at=? WHERE id=?",
-                    (detail, now, row["id"]),
-                )
-                self._append_event("run.cancelled", "run", row["id"], {"detail": detail}, now)
+                self._finish_run_locked(row, "cancelled", detail, "", now)
         return len(rows)
 
     def mark_run_unknown(self, run_id: str, detail: str) -> dict[str, Any]:
         now = time.time()
         with self._lock, self._conn:
-            cursor = self._conn.execute("""
-                UPDATE task_runs SET status='unknown', detail=?, finished_at=?
-                WHERE id=? AND status IN ('dispatched', 'running')
-            """, (detail, now, run_id))
-            if cursor.rowcount == 1:
-                self._append_event("run.unknown", "run", run_id, {"detail": detail}, now)
+            row = self._conn.execute("SELECT * FROM task_runs WHERE id=?", (run_id,)).fetchone()
+            if row is not None and row["status"] in {"dispatched", "running"}:
+                self._finish_run_locked(row, "unknown", detail, "", now)
         return self.get_run(run_id)
 
     def fail_run(self, run_id: str, error: str) -> dict[str, Any]:
         now = time.time()
         with self._lock, self._conn:
-            self._conn.execute("""
-                UPDATE task_runs SET status='failed', error=?, finished_at=?
-                WHERE id=? AND status IN ('queued', 'dispatched', 'running')
-            """, (error, now, run_id))
-            self._append_event("run.failed", "run", run_id, {"error": error}, now)
+            row = self._conn.execute("SELECT * FROM task_runs WHERE id=?", (run_id,)).fetchone()
+            if row is not None and row["status"] in {"queued", "dispatched", "running"}:
+                self._finish_run_locked(row, "failed", "", error, now)
         return self.get_run(run_id)
 
     def cancel_run(self, run_id: str, detail: str = "cancelled by controller") -> dict[str, Any]:
         now = time.time()
         with self._lock, self._conn:
-            cursor = self._conn.execute("""
-                UPDATE task_runs SET status='cancelled', detail=?, finished_at=?
-                WHERE id=? AND status IN ('queued', 'dispatched', 'running')
-            """, (detail, now, run_id))
-            if cursor.rowcount != 1:
+            row = self._conn.execute("SELECT * FROM task_runs WHERE id=?", (run_id,)).fetchone()
+            if row is None or row["status"] not in {"queued", "dispatched", "running"}:
                 raise ValueError("task run is not cancellable")
-            self._append_event("run.cancelled", "run", run_id, {"detail": detail}, now)
+            self._finish_run_locked(row, "cancelled", detail, "", now)
+        return self.get_run(run_id)
+
+    def request_workflow_cancel(self, run_id: str) -> dict[str, Any]:
+        now = time.time()
+        with self._lock, self._conn:
+            row = self._conn.execute("SELECT * FROM task_runs WHERE id=?", (run_id,)).fetchone()
+            if row is None:
+                raise KeyError("task run not found")
+            if row["run_kind"] != "workflow":
+                raise ValueError("task run is not a workflow")
+            if row["status"] in {"succeeded", "failed", "cancelled", "unknown"}:
+                return self._run_dict(row)
+            self._conn.execute("""
+                UPDATE task_runs SET cancel_requested_at=?, detail='cancellation requested' WHERE id=?
+            """, (now, run_id))
+            self._append_event("workflow.cancel_requested", "run", run_id, {
+                "active_child_id": row["active_child_id"],
+            }, now)
+        return self.get_run(run_id)
+
+    def cancel_queued_workflow(self, run_id: str,
+                               detail: str = "cancelled by controller") -> dict[str, Any]:
+        now = time.time()
+        with self._lock, self._conn:
+            parent = self._conn.execute("SELECT * FROM task_runs WHERE id=?", (run_id,)).fetchone()
+            if parent is None:
+                raise KeyError("task run not found")
+            if parent["run_kind"] != "workflow" or parent["status"] != "queued":
+                raise ValueError("workflow is not queued")
+            child = self._conn.execute(
+                "SELECT * FROM task_runs WHERE id=?", (parent["active_child_id"],)
+            ).fetchone()
+            if child is None or child["status"] != "queued":
+                raise ValueError("workflow active step is not queued")
+            self._conn.execute("""
+                UPDATE task_runs SET cancel_requested_at=?, detail='cancellation requested' WHERE id=?
+            """, (now, run_id))
+            self._append_event("workflow.cancel_requested", "run", run_id, {
+                "active_child_id": child["id"],
+            }, now)
+            self._finish_run_locked(child, "cancelled", detail, "", now)
         return self.get_run(run_id)
 
     def get_run(self, run_id: str) -> dict[str, Any]:
         with self._lock:
             row = self._conn.execute("SELECT * FROM task_runs WHERE id=?", (run_id,)).fetchone()
+            children = list(self._conn.execute(
+                "SELECT * FROM task_runs WHERE parent_run_id=? ORDER BY step_index", (run_id,)
+            )) if row is not None and row["run_kind"] == "workflow" else []
         if row is None:
             raise KeyError("task run not found")
-        return self._run_dict(row)
+        result = self._run_dict(row)
+        if result["run_kind"] == "workflow":
+            persisted = {int(child["step_index"]): self._run_dict(child) for child in children}
+            result["steps"] = []
+            for index, step in enumerate(result.get("workflow_spec", {}).get("steps", [])):
+                child = persisted.get(index)
+                result["steps"].append({
+                    **step,
+                    "index": index,
+                    "run_id": child["id"] if child else None,
+                    "status": child["status"] if child else "pending",
+                    "progress": child["progress"] if child else 0.0,
+                    "detail": child["detail"] if child else "",
+                    "error": child["error"] if child else "",
+                    "created_at": child["created_at"] if child else None,
+                    "started_at": child["started_at"] if child else None,
+                    "finished_at": child["finished_at"] if child else None,
+                })
+        return result
 
-    def list_runs(self, limit: int = 50, status: str | None = None) -> list[dict[str, Any]]:
+    def list_runs(self, limit: int = 50, status: str | None = None,
+                  root_only: bool = False) -> list[dict[str, Any]]:
         query = "SELECT * FROM task_runs"
         params: list[Any] = []
+        conditions = []
         if status:
-            query += " WHERE status=?"
+            conditions.append("status=?")
             params.append(status)
+        if root_only:
+            conditions.append("parent_run_id IS NULL")
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
         query += " ORDER BY created_at ASC" if status == "queued" else " ORDER BY created_at DESC"
         query += " LIMIT ?"
         params.append(max(1, min(200, limit)))
@@ -408,7 +662,8 @@ class AgentStateDB:
     def has_active_runs(self) -> bool:
         with self._lock:
             row = self._conn.execute("""
-                SELECT 1 FROM task_runs WHERE status IN ('dispatched', 'running') LIMIT 1
+                SELECT 1 FROM task_runs
+                WHERE run_kind='skill' AND status IN ('dispatched', 'running') LIMIT 1
             """).fetchone()
         return row is not None
 
@@ -539,6 +794,8 @@ class AgentStateDB:
     def _run_dict(row: sqlite3.Row) -> dict[str, Any]:
         result = dict(row)
         result["input"] = json.loads(result.pop("input_json"))
+        spec = result.pop("workflow_spec_json", None)
+        result["workflow_spec"] = json.loads(spec) if spec else None
         return result
 
     @staticmethod

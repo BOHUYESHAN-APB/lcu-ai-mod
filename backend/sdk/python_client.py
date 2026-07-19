@@ -106,6 +106,13 @@ class LCUClient:
     def get_skill(self, skill_id: str) -> dict[str, Any]:
         return self._get(f"/api/v2/skills/{quote(skill_id, safe='')}")
 
+    def list_task_presets(self, category: str | None = None) -> list[dict[str, Any]]:
+        suffix = f"?{urlencode({'category': category})}" if category else ""
+        return self._get(f"/api/v2/task-presets{suffix}").get("presets", [])
+
+    def get_task_preset(self, preset_id: str) -> dict[str, Any]:
+        return self._get(f"/api/v2/task-presets/{quote(preset_id, safe='')}")
+
     def get_control(self) -> dict[str, Any]:
         return self._get("/api/v2/control")
 
@@ -137,6 +144,15 @@ class LCUClient:
         if fencing_token is not None:
             payload["fencing_token"] = fencing_token
         return self._post(f"/api/v2/skills/{quote(skill_id, safe='')}/runs", payload)
+
+    def run_task_preset(self, preset_id: str, parameters: dict[str, Any] | None = None, *,
+                        lease_id: str | None = None, fencing_token: int | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {"parameters": parameters or {}}
+        if lease_id is not None:
+            payload["lease_id"] = lease_id
+        if fencing_token is not None:
+            payload["fencing_token"] = fencing_token
+        return self._post(f"/api/v2/task-presets/{quote(preset_id, safe='')}/runs", payload)
 
     def list_runs(self, limit: int = 50, status: str | None = None) -> list[dict[str, Any]]:
         query: dict[str, Any] = {"limit": limit}
