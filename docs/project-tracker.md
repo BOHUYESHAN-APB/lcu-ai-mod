@@ -613,8 +613,8 @@ Latest recorded verification:
   operator conversation contacts/history round trips are covered by tests.
 - Memory V2 status, records, export, summary preview/commit contracts, and local
   production-readiness reporting are covered by tests.
-- Shared-server JAR SHA-256:
-  `1F262640A46AF10A689DC0A95F30BF2515325AA182D06991470314CF7A2A7D6F`.
+- Current headed-test JAR SHA-256:
+  `0C811FAECD8C678706CC36B8FAA5D7F5AA878360894428188055DD3968CFD53D`.
 
 The recorded JAR is deployed to the external FTB StoneBlock 4 test instance with
 `runtimeRole="body_client"` for headed-body acceptance testing.
