@@ -142,6 +142,8 @@ with LCUClient("http://127.0.0.1:8080", api_token="token") as client:
 
 异步 decision scheduler 的状态位于 `GET /api/status` 的 `decision_scheduler`。`state` 为 `idle`、`thinking`、`invalidated` 或 `proposal`，并提供 request ID、semantic sequence、当前 typed proposal、错误和最近 disposition。完整生命周期同时写入 `/api/v2/events`。当前自动执行策略只允许契约固定且再次验证饥饿状态的 `general.eat`；其他模型建议返回 `rejected`，不会创建 queued run。
 
+聊天 Planner 不再直接调用身体 Skills。模型每轮最多提交一个完整顶层 `tool(name, JSON)`，转换为 typed proposal 后由 TaskCoordinator 原子校验和准入；当前只接受具备可靠终态的 durable、非战斗 Skill。旧式动作文本、围栏或多行动作输出会整体拒绝。`core.stop` 属于确定性安全控制，可在已有 run 或 LLM 规划期间抢占；重复 stop 请求会合并到当前 stop request。
+
 只有 manifest 中 `durable=true`、具备可靠终态事件的 Skill 可创建 Task Run。任务预设本身不执行代码，只保存参数 schema、输入模板、示例和有序 durable Skill 步骤；渲染后的每一步仍会再次经过 SkillRegistry 和身体 capability 校验。
 
 单步骤预设继续返回普通 Skill run。多步骤预设返回 `run_kind=workflow` 的父 run；父 run 的 `steps` 包含每个 child run 的 ID、状态、进度和终态。child 成功、父进度更新和下一 child 创建在同一数据库事务内提交。失败、取消或 `unknown` 会传播到父 run；重启只允许显式恢复仍为 `queued` 的确定状态，不会重放已派发但终态未知的步骤。

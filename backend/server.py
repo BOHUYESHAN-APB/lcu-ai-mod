@@ -358,6 +358,10 @@ FENCING_FIELD = "__lcu_fencing_token"
 
 
 def _capture_control_response(event) -> None:
+    active_orchestrator = orchestrator
+    priority_handler = getattr(active_orchestrator, "handle_priority_body_event", None)
+    if callable(priority_handler):
+        priority_handler(event)
     if event.type != "response":
         return
     request_id = str(event.data.get("id", ""))

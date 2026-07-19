@@ -11,7 +11,9 @@ import time
 from typing import Optional
 
 from protocol import BodyAdapter
+from .agent_state import LeaseConflictError
 from .decision_scheduler import DecisionScheduler
+from .planner import SkillProposal
 from .session import Session
 
 logger = logging.getLogger("orchestrator")
@@ -148,6 +150,26 @@ class Orchestrator:
 
     def set_task_coordinator(self, coordinator) -> None:
         self.task_coordinator = coordinator
+        self.session.set_planner_proposal_dispatcher(self._dispatch_planner_proposal)
+
+    def _dispatch_planner_proposal(self, proposal: SkillProposal) -> bool:
+        if self.task_coordinator is None:
+            return False
+        event = proposal.public_dict()
+        try:
+            run = self.task_coordinator.admit_planner_run(proposal.skill_id, proposal.input)
+        except (KeyError, ConnectionError, LeaseConflictError, ValueError) as exc:
+            event["error"] = str(exc)
+            self.task_coordinator.state.append_event(
+                "planner.proposal_rejected", "planner", proposal.skill_id, event,
+            )
+            raise
+        event["run_id"] = run["id"]
+        event["status"] = run["status"]
+        self.task_coordinator.state.append_event(
+            "planner.proposal_admitted", "planner", run["id"], event,
+        )
+        return True
 
     def _apply_decision_result(self) -> None:
         result = self.decision_scheduler.poll()
@@ -260,10 +282,35 @@ class Orchestrator:
 
     def handle_chat(self, sender: str, message: str) -> Optional[str]:
         """Process a chat message through the session's LLM pipeline."""
+        if self.task_coordinator and self.session.is_stop_intent(message):
+            self.session.planner.interrupt()
+            return "停下了" if self._dispatch_planner_proposal(
+                SkillProposal("core.stop", {}, "direct_stop_intent")
+            ) else None
         with self._session_lock:
             if self.task_coordinator and self.task_coordinator.is_busy():
                 return None
             return self.session.handle_chat(sender, message)
+
+    def handle_priority_body_event(self, event) -> bool:
+        """Admit permitted chat stop intents before the serialized tick drains them."""
+        if event.type != "event" or event.data.get("event") != "player_chat" or not self.task_coordinator:
+            return False
+        data = event.data.get("data", {})
+        if not isinstance(data, dict) or self.session.control_mode == "external":
+            return False
+        sender = str(data.get("sender", "?"))
+        is_system = bool(data.get("is_system", False))
+        message = str(data.get("message", ""))
+        if not self.session._check_chat_permission(sender, is_system) or not self.session.is_stop_intent(message):
+            return False
+        self.session.planner.interrupt()
+        accepted = self._dispatch_planner_proposal(
+            SkillProposal("core.stop", {}, "priority_body_stop_intent")
+        )
+        if accepted:
+            data["_lcu_priority_stop_admitted"] = True
+        return accepted
 
     @contextmanager
     def session_context(self):

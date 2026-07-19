@@ -160,6 +160,95 @@ class OrchestratorBodyTests(unittest.TestCase):
             orchestrator.session.stop()
             state.close()
 
+    def test_chat_planner_proposal_creates_durable_run_through_coordinator(self):
+        body = FakeBody()
+        with tempfile.TemporaryDirectory() as tmp:
+            state = AgentStateDB(Path(tmp) / "agent_state.db")
+            orchestrator = Orchestrator(body, storage_root=Path(tmp) / "session", legacy_root=None)
+            coordinator = TaskCoordinator(state, SkillRegistry(), body, initial_scope="default\0default")
+            coordinator.set_body_armed(True)
+            orchestrator.set_task_coordinator(coordinator)
+
+            response = orchestrator.session.planner._execute_plan(
+                'reply(马上做)\ntool(craft_item, {"item":"minecraft:torch","count":4})',
+                sender="Alice", message="做四个火把", context={},
+            )
+
+            self.assertEqual(response, "马上做")
+            self.assertEqual(body.commands, [("craft_item", {"item": "minecraft:torch", "count": 4})])
+            run = state.list_runs(root_only=True)[0]
+            self.assertEqual((run["skill_id"], run["status"]), ("general.craft_item", "dispatched"))
+            self.assertIn("planner.proposal_admitted", [event["type"] for event in state.list_events()])
+            orchestrator.close()
+            orchestrator.session.stop()
+            state.close()
+
+    def test_chat_planner_rejects_non_durable_follow_without_body_command(self):
+        body = FakeBody()
+        with tempfile.TemporaryDirectory() as tmp:
+            state = AgentStateDB(Path(tmp) / "agent_state.db")
+            orchestrator = Orchestrator(body, storage_root=Path(tmp) / "session", legacy_root=None)
+            coordinator = TaskCoordinator(state, SkillRegistry(), body, initial_scope="default\0default")
+            coordinator.set_body_armed(True)
+            orchestrator.set_task_coordinator(coordinator)
+
+            orchestrator.session.planner._execute_plan(
+                'tool(follow, {"player":"Alice"})', sender="Alice", message="跟着我", context={},
+            )
+
+            self.assertEqual(body.commands, [])
+            self.assertEqual(state.list_runs(root_only=True), [])
+            self.assertIn("durable", orchestrator.session.planner.get_status()["last_protocol_error"])
+            self.assertEqual(
+                [event["type"] for event in state.list_events() if event["aggregate_type"] == "planner"],
+                ["planner.proposal_rejected"],
+            )
+            orchestrator.close()
+            orchestrator.session.stop()
+            state.close()
+
+    def test_stop_intent_preempts_active_coordinator_run(self):
+        body = FakeBody()
+        with tempfile.TemporaryDirectory() as tmp:
+            state = AgentStateDB(Path(tmp) / "agent_state.db")
+            orchestrator = Orchestrator(body, storage_root=Path(tmp) / "session", legacy_root=None)
+            coordinator = TaskCoordinator(state, SkillRegistry(), body, initial_scope="default\0default")
+            coordinator.set_body_armed(True)
+            orchestrator.set_task_coordinator(coordinator)
+            coordinator.create_run("core.move_to", {"x": 1, "y": 64, "z": 2})
+
+            accepted = orchestrator.session.dispatch_stop_intent()
+
+            self.assertTrue(accepted)
+            self.assertEqual([command for command, _ in body.commands], ["move_to", "stop_all"])
+            self.assertIn("control.stop_requested", [event["type"] for event in state.list_events()])
+            orchestrator.close()
+            orchestrator.session.stop()
+            state.close()
+
+    def test_priority_body_chat_stop_is_admitted_before_tick_drain(self):
+        body = FakeBody()
+        with tempfile.TemporaryDirectory() as tmp:
+            state = AgentStateDB(Path(tmp) / "agent_state.db")
+            orchestrator = Orchestrator(body, storage_root=Path(tmp) / "session", legacy_root=None)
+            coordinator = TaskCoordinator(state, SkillRegistry(), body, initial_scope="default\0default")
+            coordinator.set_body_armed(True)
+            orchestrator.set_task_coordinator(coordinator)
+            coordinator.create_run("core.move_to", {"x": 1, "y": 64, "z": 2})
+            event = BodyEvent("event", {
+                "event": "player_chat",
+                "data": {"sender": "Alice", "message": "先停下", "is_system": False},
+            })
+
+            accepted = orchestrator.handle_priority_body_event(event)
+
+            self.assertTrue(accepted)
+            self.assertEqual([command for command, _ in body.commands], ["move_to", "stop_all"])
+            self.assertTrue(event.data["data"]["_lcu_priority_stop_admitted"])
+            orchestrator.close()
+            orchestrator.session.stop()
+            state.close()
+
     def test_decision_scheduler_rejects_skill_outside_automatic_allowlist(self):
         body = FakeBody()
         with tempfile.TemporaryDirectory() as tmp:

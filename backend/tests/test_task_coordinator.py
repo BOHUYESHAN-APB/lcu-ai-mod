@@ -140,6 +140,26 @@ class TaskCoordinatorTests(unittest.TestCase):
         roots = self.state.list_runs(root_only=True)
         self.assertEqual([run["id"] for run in roots], [active["id"]])
 
+    def test_repeated_stop_requests_are_coalesced_until_body_response(self):
+        first = self.coordinator.preempt_all("first")
+        second = self.coordinator.preempt_all("second")
+
+        self.assertEqual(first["id"], second["id"])
+        self.assertEqual(self.body.commands, [("stop_all", {})])
+        self.coordinator.handle_body_message(BodyEvent("response", {
+            "id": first["id"], "success": True, "data": {"message": "stopped"},
+        }))
+        third = self.coordinator.preempt_all("third")
+        self.assertNotEqual(third["id"], first["id"])
+
+    def test_uncertain_planner_dispatch_is_not_reported_as_admitted(self):
+        with patch.object(self.body, "send_command", side_effect=ConnectionError("offline")):
+            with self.assertRaisesRegex(ConnectionError, "uncertain"):
+                self.coordinator.admit_planner_run("general.eat", {})
+
+        run = self.state.list_runs(root_only=True)[0]
+        self.assertEqual(run["status"], "unknown")
+
     def test_workflow_dispatches_steps_in_order_and_completes_parent(self):
         workflow = self.presets.render("workflow.starter_chest", {})
         parent = self.coordinator.create_workflow(workflow)

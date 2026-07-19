@@ -17,6 +17,7 @@ Session — 核心管理单元。
 
 import asyncio
 import logging
+import re
 import time
 import uuid
 from pathlib import Path
@@ -34,6 +35,7 @@ from .llm_service import LLMService
 from .self_prompter import SelfPrompter
 from .message_db import MessageDB
 from .identity import CompanionIdentity, DEFAULT_LEGACY_ROOT, DEFAULT_STORAGE_ROOT, migrate_legacy_sessions
+from .planner import SkillProposal
 from .world_model import WorldModel
 
 logger = logging.getLogger("session")
@@ -157,7 +159,15 @@ class Session:
                 )
                 self.memory.observe_player(sender, sender_id, message)
 
+                if data.pop("_lcu_priority_stop_admitted", False):
+                    with self.skills.command_context("chat_reply"):
+                        self.skills.send_chat("停下了")
+                    return
+
                 if self._external_task_busy:
+                    if self.is_stop_intent(message) and self.dispatch_stop_intent():
+                        with self.skills.command_context("chat_reply"):
+                            self.skills.send_chat("停下了")
                     return
 
                 # Timing Gate: 判断是否应该回复（参考 MaiBot）
@@ -332,8 +342,10 @@ class Session:
         Process a chat message through the LLM.
         Uses Planner for intelligent action planning.
         """
-        if self.control_mode == "external" or self._external_task_busy:
+        if self.control_mode == "external":
             return None
+        if self._external_task_busy:
+            return "停下了" if self.is_stop_intent(message) and self.dispatch_stop_intent() else None
         if record_interaction:
             self.memory.add_interaction(sender=sender, message=message)
             self.memory.observe_player(sender, sender_id, message)
@@ -533,6 +545,21 @@ class Session:
 
     def acknowledge_decision_triggers(self, through_sequence: int) -> int:
         return self._ensure_world_model().acknowledge_decision_triggers(through_sequence)
+
+    def set_planner_proposal_dispatcher(self, dispatcher) -> None:
+        self.planner.set_proposal_dispatcher(dispatcher)
+
+    def dispatch_stop_intent(self) -> bool:
+        return self.planner.dispatch_proposal(SkillProposal("core.stop", {}, "direct_stop_intent"))
+
+    @staticmethod
+    def is_stop_intent(message: str) -> bool:
+        compact = re.sub(r"\s+", "", str(message)).casefold()
+        if any(phrase in compact for phrase in ("不要停", "别停", "不用停", "无需停止")) \
+                or re.search(r"\b(?:do\s+not|don't|dont)\s+stop\b", str(message), re.IGNORECASE):
+            return False
+        return any(phrase in compact for phrase in ("停下", "停止", "别跟了", "先别做了")) \
+            or re.search(r"\bstop\b", str(message), re.IGNORECASE) is not None
 
     def _set_world_overlay(self, name: str, data: dict[str, Any]) -> None:
         world_model = self._ensure_world_model()

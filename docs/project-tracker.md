@@ -598,7 +598,7 @@ The following foundation already exists and must not regress:
 
 Latest recorded verification:
 
-- Python tests: 189 passed with 1 intentional opt-in integration skip on 2026-07-19.
+- Python tests: 205 passed with 1 intentional opt-in integration skip on 2026-07-19.
 - Gradle: `clean build` passed on 2026-07-19.
 - Explicit production Java-to-Python wire integration: 1 passed.
 - NeoForge `runServer` smoke reached `Done` and logged both side-neutral common and
@@ -625,6 +625,8 @@ Pending headed-body verification, deferred to the next test session:
   materials, and otherwise expands logs to planks to sticks plus supported iron processing.
 - Iron Chests and Sophisticated Storage menus expose real storage slots and permit confirmed
   one-slot-at-a-time withdrawal without touching player or auxiliary slots.
+- A permitted body-chat stop preempts an in-flight Planner call and active operation; Java runs
+  `stop_all` before older lower-priority work and every discarded request receives one terminal message.
 
 ## Release Blockers
 
@@ -731,3 +733,10 @@ Pending headed-body verification, deferred to the next test session:
   Skill contracts, and atomic TaskCoordinator admission. Automatic execution is intentionally
   limited to revalidated `general.eat`; broader Planner actions remain blocked pending typed
   effect admission and deterministic safety arbitration.
+- Routed structured chat Planner actions through typed proposals and TaskCoordinator durable-run
+  admission. Removed direct Skills and legacy substring execution; malformed, fenced, multiline,
+  prose-embedded, and multi-action model output now fails closed before body access.
+- Added Planner generation invalidation and lock-free stop admission for permitted body chat.
+  Java now runs `stop_all` at CONTROL priority, drains lower-priority work atomically, preserves
+  CONTROL FIFO, and returns terminal messages for preempted requests. This batch is automated-
+  test verified but remains undeployed pending headed-body acceptance.

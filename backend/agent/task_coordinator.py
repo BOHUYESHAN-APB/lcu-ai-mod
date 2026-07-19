@@ -32,6 +32,7 @@ class TaskCoordinator:
         self._body_armed = False
         self._raw_requests: dict[str, tuple[str, float]] = {}
         self._cancel_requests: dict[str, str] = {}
+        self._stop_request_id: str | None = None
         clock = state.get_scheduler_clock()
         scope_changed = initial_scope is not None and clock["scope_id"] != initial_scope
         self._last_game_time = None if scope_changed else clock["game_time"]
@@ -99,6 +100,65 @@ class TaskCoordinator:
                 raise ConnectionError("automatic run could not be dispatched")
             return dispatched
 
+    def admit_planner_run(self, skill_id: str, input_data: dict[str, Any]) -> dict[str, Any]:
+        """Admit one typed chat-Planner action without creating a deferred queue."""
+        if skill_id == "core.stop":
+            return self.preempt_all("planner stop intent")
+        with self._dispatch_lock:
+            manifest = self.registry.validate_input(skill_id, input_data)
+            if not manifest.durable:
+                raise ValueError("planner action requires a durable skill")
+            if manifest.safety_class == "combat":
+                raise ValueError("combat skills are not admitted from chat Planner")
+            if not self.body.is_connected:
+                raise ConnectionError("companion body is not connected")
+            if not self._body_armed:
+                raise ValueError("companion body is not armed")
+            if self.state.has_active_runs() or self._raw_requests or self._session_busy:
+                raise ValueError("the companion is already executing a command or task run")
+            with self.state.control_guard(None, None):
+                run = self.state.create_run(
+                    manifest.public_dict(), input_data, scope_id=self._clock_scope,
+                )
+                dispatched = self.dispatch(run["id"])
+            if dispatched["status"] == "queued":
+                self.state.fail_run(run["id"], "planner admission changed before dispatch")
+                raise ConnectionError("planner run could not be dispatched")
+            if dispatched["status"] not in {"dispatched", "running", "succeeded"}:
+                raise ConnectionError(
+                    f"planner dispatch is uncertain for run {run['id']}: {dispatched['status']}"
+                )
+            return dispatched
+
+    def preempt_all(self, reason: str = "stop requested") -> dict[str, Any]:
+        """Send deterministic stop through the coordinator even while an operation is active."""
+        with self._dispatch_lock:
+            if not self.body.is_connected:
+                raise ConnectionError("companion body is not connected")
+            if self._stop_request_id and self._stop_request_id in self._raw_requests:
+                return {
+                    "id": self._stop_request_id, "request_id": self._stop_request_id,
+                    "skill_id": "core.stop", "status": "dispatched",
+                }
+            with self.state.control_guard(None, None):
+                request_id = str(uuid.uuid4())
+                self._raw_requests[request_id] = ("response", time.monotonic())
+                self._stop_request_id = request_id
+                try:
+                    returned_id = self.body.send_command("stop_all", {}, request_id=request_id)
+                except Exception:
+                    self._raw_requests.pop(request_id, None)
+                    self._stop_request_id = None
+                    raise
+                if returned_id != request_id:
+                    self._raw_requests.pop(request_id, None)
+                    self._stop_request_id = None
+                    raise ConnectionError("body did not preserve stop request id")
+                self.state.append_event("control.stop_requested", "control", request_id, {
+                    "reason": str(reason)[:500],
+                })
+                return {"id": request_id, "request_id": request_id, "skill_id": "core.stop", "status": "dispatched"}
+
     def dispatch(self, run_id: str, *, lease_id: str | None = None,
                  fencing_token: int | None = None) -> dict[str, Any]:
         with self._dispatch_lock:
@@ -147,6 +207,8 @@ class TaskCoordinator:
             if completion and message.type == "response" \
                     and (not message.data.get("success", False) or completion == "response"):
                 self._raw_requests.pop(request_id, None)
+                if request_id == self._stop_request_id:
+                    self._stop_request_id = None
             elif completion and message.type == "progress" and completion != "outcome":
                 progress = float(message.data.get("progress", 0.0) or 0.0)
                 if progress <= 0.0 or progress >= 1.0:

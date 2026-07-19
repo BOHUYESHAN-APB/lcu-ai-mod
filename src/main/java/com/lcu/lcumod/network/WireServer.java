@@ -312,7 +312,13 @@ public class WireServer {
                                 if (cmd.cmd() != null) {
                                     LOGGER.log(System.Logger.Level.INFO, "[WireServer] Received command: {0} id={1}", cmd.cmd(), cmd.id());
                                     if ("control_external".equals(cmd.cmd()) || "control_builtin".equals(cmd.cmd())) {
-                                        commandQueue.submitControl(cmd);
+                                        for (WireCommand discarded : commandQueue.submitControl(cmd)) {
+                                            rejectPreempted(discarded);
+                                        }
+                                    } else if ("stop_all".equals(cmd.cmd())) {
+                                        for (WireCommand discarded : commandQueue.submitStop(cmd)) {
+                                            rejectPreempted(discarded);
+                                        }
                                     } else {
                                         commandQueue.submitBackend(cmd);
                                     }
@@ -346,6 +352,28 @@ public class WireServer {
             }
             if (value == -1 && line.isEmpty()) return null;
             return line.toString();
+        }
+
+        private void rejectPreempted(WireCommand discarded) {
+            if (discarded.id() == null || discarded.id().isBlank()) return;
+            if ("cancel_operation".equals(discarded.cmd())) {
+                JsonObject data = new JsonObject();
+                data.addProperty("message", "cancel request superseded by stop_all");
+                WireServer.this.sendResponse(discarded.id(), true, data, null);
+                return;
+            }
+            if (switch (discarded.cmd()) {
+                case "move_to", "mine_block", "mine_block_at", "follow_player",
+                     "collect_blocks", "craft_item", "eat" -> true;
+                default -> false;
+            }) {
+                WireServer.this.sendOutcome(
+                    discarded.id(), "cancelled", "QUEUE_PREEMPTED", "operation preempted by stop_all");
+                return;
+            }
+            JsonObject data = new JsonObject();
+            data.addProperty("message", "command preempted by stop_all");
+            WireServer.this.sendResponse(discarded.id(), false, data, "QUEUE_PREEMPTED");
         }
 
         void close() {

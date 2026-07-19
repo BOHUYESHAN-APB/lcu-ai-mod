@@ -45,6 +45,13 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(session.runtime["entities"], [])
         self.assertEqual(session.runtime["persona"]["name"], "Maid")
 
+    def test_stop_intent_uses_explicit_words_not_substrings(self):
+        self.assertTrue(Session.is_stop_intent("stop now"))
+        self.assertTrue(Session.is_stop_intent("先停下"))
+        self.assertFalse(Session.is_stop_intent("my stopwatch is ready"))
+        self.assertFalse(Session.is_stop_intent("不要停下来"))
+        self.assertFalse(Session.is_stop_intent("do not stop now"))
+
 
 if __name__ == "__main__":
     unittest.main()

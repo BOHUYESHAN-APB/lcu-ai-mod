@@ -241,10 +241,23 @@ admission under its dispatch lock and creates no resumable queued run when the b
 Decision request, failure, invalidation, rejection, expiration, and dispatch records enter the
 durable event stream.
 
+Chat Planner execution uses the same boundary. The model may emit one complete top-level
+`tool(name, JSON)` action, which becomes a typed `SkillProposal`; Planner never invokes Skills
+directly. TaskCoordinator admits only durable, non-combat manifests and records admission or
+rejection. Legacy substring actions, fenced actions, multiline action syntax, prose containing
+action syntax, and responses with multiple actions fail closed before any proposal is emitted.
+An interrupt generation invalidates an LLM result produced after a newer stop intent.
+
+`core.stop` remains deterministic and may bypass a busy planning lock. A permitted in-game chat
+stop is recognized in the wire receive callback, admitted through TaskCoordinator, and marked so
+normal event draining records and acknowledges it without planning again. Java queues `stop_all`
+at CONTROL priority, atomically drains lower-priority queued work, preserves FIFO within CONTROL,
+and emits a terminal response or cancellation for each discarded request.
+
 ## Current Migration Order
 
 1. Advertise and reconcile deterministic Java capabilities.
-2. Route chat Planner actions through TaskCoordinator durable runs.
+2. Route chat Planner actions through TaskCoordinator durable runs. (implemented)
 3. Add explicit operation outcomes and correlated cancellation.
 4. Persist parent/child workflow execution and atomic step advancement.
 5. Route open-ended Planner goals through typed proposals and TaskCoordinator instead of direct Skills.

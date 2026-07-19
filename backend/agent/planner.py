@@ -14,11 +14,19 @@ Planner — 规划器。
 import json
 import logging
 import re
+import threading
 import time
+from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger("planner")
-TOOL_CALL_RE = re.compile(r"tool\(\s*([a-zA-Z_]+)\s*,\s*(\{.*?\})\s*\)", re.DOTALL)
+TOOL_CALL_RE = re.compile(r"^\s*tool\(\s*([a-zA-Z_]+)\s*,\s*(\{.*\})\s*\)\s*$")
+REPLY_RE = re.compile(r"^\s*reply\((.*)\)\s*$")
+ACTION_SYNTAX_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:tool|reply|finish|move_to|follow|attack|mine(?:_block)?|place(?:_block)?|craft|collect|"
+    r"equip|get_inventory|explore|trade|sleep|eat|drop|sort_inventory|build|stop)\s*\(",
+    re.IGNORECASE,
+)
 
 ITEM_ALIASES = {
     "木剑": "wooden_sword",
@@ -50,6 +58,16 @@ def _clip(value: Any, limit: int) -> str:
     return text if len(text) <= limit else text[:limit] + "..."
 
 
+@dataclass(frozen=True)
+class SkillProposal:
+    skill_id: str
+    input: dict[str, Any]
+    source: str
+
+    def public_dict(self) -> dict[str, Any]:
+        return {"skill_id": self.skill_id, "input": dict(self.input), "source": self.source}
+
+
 class Planner:
     """
     规划器：决定 AI 应该做什么。
@@ -59,16 +77,35 @@ class Planner:
     2. Planner: 回复什么？做什么？
     """
     
-    def __init__(self, llm_service, memory, skills):
+    def __init__(self, llm_service, memory, skills=None):
         self.llm = llm_service
         self.memory = memory
         self.skills = skills
+        self._proposal_dispatcher: Callable[[SkillProposal], bool] | None = None
+        self._seen_proposals: set[str] = set()
+        self._proposal_emitted = False
+        self._proposal_attempted = False
+        self._generation = 0
+        self._planning_lock = threading.RLock()
         self._is_planning = False
         self._last_plan_time = 0.0
         self._last_plan_executed_action = False
         self._last_plan_preview = ""
         self._last_execution_source = "none"
         self._last_protocol_error = ""
+
+    def set_proposal_dispatcher(self, dispatcher: Callable[[SkillProposal], bool] | None) -> None:
+        self._proposal_dispatcher = dispatcher
+
+    def dispatch_proposal(self, proposal: SkillProposal) -> bool:
+        if self._proposal_dispatcher is None:
+            self._last_protocol_error = "planner proposal dispatcher is not configured"
+            return False
+        try:
+            return bool(self._proposal_dispatcher(proposal))
+        except Exception as exc:
+            self._last_protocol_error = str(exc)[:500]
+            return False
     
     def plan_and_execute(self, sender: str, message: str, 
                          context: dict, bot_name: str = "AI") -> Optional[str]:
@@ -81,8 +118,10 @@ class Planner:
             logger.warning("[Planner] LLM 未配置，无法规划")
             return None
         
-        self._is_planning = True
-        self._last_plan_time = time.time()
+        with self._planning_lock:
+            generation = self._generation
+            self._is_planning = True
+            self._last_plan_time = time.time()
         
         try:
             # 构建规划提示
@@ -91,27 +130,33 @@ class Planner:
             # 调用 LLM 规划
             result = self.llm.chat([{"role": "user", "content": prompt}], agent="planner")
             plan_text = result.get("content", "")
-            self._last_plan_preview = str(plan_text)[:500]
-            
-            if not plan_text:
-                logger.warning("[Planner] LLM 返回空内容")
-                return None
-            
-            logger.info("[Planner] LLM 规划: %s", plan_text[:100])
-            
-            # 解析规划结果
-            response = self._execute_plan(plan_text, sender, message, context)
-            if not self._last_plan_executed_action:
-                self._execute_direct_intent_fallback(sender, message, context)
+            with self._planning_lock:
+                if generation != self._generation:
+                    return None
+                self._last_plan_preview = str(plan_text)[:500]
+                if not plan_text:
+                    logger.warning("[Planner] LLM 返回空内容")
+                    return None
+                logger.info("[Planner] LLM 规划: %s", plan_text[:100])
+
+                # Keep parsing and proposal emission atomic with respect to interrupt().
+                response = self._execute_plan(plan_text, sender, message, context)
+                if not self._last_plan_executed_action and not self._proposal_attempted \
+                        and not self._last_protocol_error:
+                    self._execute_direct_intent_fallback(sender, message, context)
             
             return response
             
         except Exception as e:
-            self._last_protocol_error = str(e)
+            with self._planning_lock:
+                if generation == self._generation:
+                    self._last_protocol_error = str(e)
             logger.error("[Planner] 规划失败: %s", e)
             return None
         finally:
-            self._is_planning = False
+            with self._planning_lock:
+                if generation == self._generation:
+                    self._is_planning = False
     
     def _build_planner_prompt(self, sender: str, message: str, 
                                context: dict, bot_name: str) -> str:
@@ -219,18 +264,11 @@ class Planner:
 
 可用动作：
 - reply(内容): 生成一条回复
-- move_to(x, y, z): 移动到指定坐标
-- follow(player_name): 跟随一个玩家
-- attack(): 攻击附近的敌人
-- mine_block(): 挖掘方块
-- place_block(): 放置方块
+- tool(move_to, {{"x":0,"y":64,"z":0}}): 移动到明确坐标
 - tool(craft_item, {{"item":"minecraft:iron_pickaxe","count":1}}): 合成物品；缺少材料时继续执行确定性的取料和制作链
 - tool(collect_blocks, {{"block_type":"minecraft:iron_ore","count":3}}): 收集指定数量的方块
-- equip(slot): 装备物品（mainhand, offhand, head, chest, legs, feet）
-- get_inventory(): 查看背包
-- eat(): 吃东西
-- drop(item, count): 丢弃物品
-- stop(): 停止当前动作（例如停止跟随/停止自动移动）
+- tool(eat, {{}}): 吃东西
+- tool(stop, {{}}): 确定性停止当前动作
 - finish(): 结束本轮
 
 重要规则：
@@ -239,7 +277,7 @@ class Planner:
 3. 不要过度解释自己在做什么，直接做就行
 4. 如果玩家让你做某事，必须输出对应的 tool()；可以同时 reply() 简短确认，但不能只答应而不调用工具
 5. 回复要简短，不要长篇大论
-6. 如果需要多步操作，可以连续执行多个动作
+6. 每轮最多输出一个动作；多步骤目标交给 durable workflow，不要连续输出多个动作
 7. tool()/动作参数必须是可执行的真实参数，不能写“随机位置”“附近”“合适的地方”这种占位词
 8. 如果用户要求停止跟随或停止当前动作，优先使用 stop()
 9. 中文具体物品名转换为 registry ID；类别词使用标签，例如 铁镐=minecraft:iron_pickaxe，原木=#minecraft:logs，木板=#minecraft:planks，木头=#lcu:wood
@@ -269,209 +307,103 @@ finish()
         self._last_plan_executed_action = False
         self._last_execution_source = "none"
         self._last_protocol_error = ""
-        plan_lower = plan_text.lower()
+        self._seen_proposals = set()
+        self._proposal_emitted = False
+        self._proposal_attempted = False
+        lines = [line.strip() for line in plan_text.splitlines() if line.strip()]
+        invalid_line = next((
+            line for line in lines
+            if line.startswith("```")
+            or ACTION_SYNTAX_RE.search(line) is not None
+            and REPLY_RE.fullmatch(line) is None
+            and TOOL_CALL_RE.fullmatch(line) is None
+            and line.lower() != "finish()"
+        ), None)
+        if invalid_line is not None:
+            self._last_protocol_error = "planner response does not match the top-level action grammar"
+            return None
+        action_lines = [line for line in lines if TOOL_CALL_RE.fullmatch(line) or line.lower() == "finish()"]
+        if action_lines and any(
+            REPLY_RE.fullmatch(line) is None
+            and TOOL_CALL_RE.fullmatch(line) is None
+            and line.lower() != "finish()"
+            for line in lines
+        ):
+            self._last_protocol_error = "planner response contains text outside the top-level grammar"
+            return None
+        if len(action_lines) > 1:
+            self._last_protocol_error = "planner response contains more than one top-level action"
+            return None
+        action_text = "\n".join(action_lines)
         reply_text: Optional[str] = None
-        executed_any_action = self._execute_tool_calls(plan_text, context)
+        executed_any_action = self._execute_tool_calls(action_text, context)
         
         # 回复
-        if "reply(" in plan_lower:
-            content = self._extract_between(plan_text, "reply(", ")")
-            if content:
-                reply_text = content.strip()
+        for line in lines:
+            match = REPLY_RE.fullmatch(line)
+            if match:
+                reply_text = match.group(1).strip() or None
+                break
 
         if executed_any_action:
             self._last_plan_executed_action = True
             self._last_execution_source = "model_tool"
             return reply_text
-        
-        # 移动
-        if "move_to(" in plan_lower:
-            coords = self._extract_coords(plan_text, "move_to(")
-            if coords and len(coords) >= 3:
-                self.skills.move_to(coords[0], coords[1], coords[2])
-                logger.info("[Planner] 移动到 (%.0f, %.0f, %.0f)", coords[0], coords[1], coords[2])
-                executed_any_action = True
-        
-        # 跟随玩家
-        if "follow(" in plan_lower:
-            player_name = self._extract_between(plan_text, "follow(", ")")
-            if player_name:
-                normalized_target = player_name.strip()
-                if not self._is_duplicate_task(context, {"follow"}, normalized_target):
-                    self.skills.follow_player(normalized_target)
-                    logger.info("[Planner] 跟随 %s", normalized_target)
-                    executed_any_action = True
-        
-        # 攻击
-        if "attack()" in plan_lower:
-            self.skills.attack()
-            logger.info("[Planner] 攻击")
-            executed_any_action = True
-        
-        # 挖掘
-        if "mine_block()" in plan_lower or "mine(" in plan_lower:
-            self.skills.mine_block()
-            logger.info("[Planner] 挖掘")
-            executed_any_action = True
-        
-        # 放置方块
-        if "place_block()" in plan_lower or "place(" in plan_lower:
-            self.skills.place_block()
-            logger.info("[Planner] 放置")
-            executed_any_action = True
-        
-        # 合成
-        if "craft(" in plan_lower:
-            item_name = self._extract_between(plan_text, "craft(", ")")
-            if item_name:
-                parts = [part.strip() for part in item_name.split(",") if part.strip()]
-                normalized_item = self._normalize_item_name(parts[0])
-                craft_count = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
-                if not self._is_duplicate_task(context, {"craft"}, normalized_item):
-                    self.skills.craft_item(normalized_item, craft_count)
-                    logger.info("[Planner] 合成 %s x%d", normalized_item, craft_count)
-                    executed_any_action = True
-        
-        # 收集
-        if "collect(" in plan_lower:
-            args = self._extract_between(plan_text, "collect(", ")")
-            if args:
-                parts = args.split(",")
-                block_type = parts[0].strip() if len(parts) > 0 else ""
-                count = int(parts[1].strip()) if len(parts) > 1 else 1
-                normalized_block = self._normalize_block_name(block_type)
-                if not self._is_duplicate_task(context, {"collect"}, normalized_block):
-                    self.skills.collect_blocks(normalized_block, count)
-                    logger.info("[Planner] 收集 %s x%d", normalized_block, count)
-                    executed_any_action = True
-        
-        # 装备
-        if "equip(" in plan_lower:
-            slot = self._extract_between(plan_text, "equip(", ")")
-            if slot:
-                self.skills.equip(slot.strip())
-                logger.info("[Planner] 装备 %s", slot.strip())
-                executed_any_action = True
-        
-        # 查看背包
-        if "get_inventory()" in plan_lower:
-            self.skills.get_inventory()
-            logger.info("[Planner] 查看背包")
-            executed_any_action = True
-        
-        # 探索
-        if "explore(" in plan_lower:
-            radius_str = self._extract_between(plan_text, "explore(", ")")
-            if radius_str:
-                try:
-                    radius = int(radius_str.strip())
-                    self.skills.explore(radius)
-                    logger.info("[Planner] 探索 %d 格", radius)
-                except ValueError:
-                    self.skills.explore(16)
-                executed_any_action = True
-        
-        # 交易
-        if "trade(" in plan_lower:
-            villager_type = self._extract_between(plan_text, "trade(", ")")
-            if villager_type:
-                self.skills.trade(villager_type.strip())
-                logger.info("[Planner] 交易 %s", villager_type.strip())
-                executed_any_action = True
-        
-        # 睡觉
-        if "sleep()" in plan_lower:
-            self.skills.sleep()
-            logger.info("[Planner] 睡觉")
-            executed_any_action = True
-        
-        # 吃东西
-        if "eat()" in plan_lower:
-            self.skills.eat()
-            logger.info("[Planner] 吃东西")
-            executed_any_action = True
-        
-        # 丢弃物品
-        if "drop(" in plan_lower:
-            args = self._extract_between(plan_text, "drop(", ")")
-            if args:
-                parts = args.split(",")
-                item = parts[0].strip() if len(parts) > 0 else ""
-                count = int(parts[1].strip()) if len(parts) > 1 else 1
-                self.skills.drop_item(item, count)
-                logger.info("[Planner] 丢弃 %s x%d", item, count)
-                executed_any_action = True
-        
-        # 整理背包
-        if "sort_inventory()" in plan_lower:
-            self.skills.sort_inventory()
-            logger.info("[Planner] 整理背包")
-            executed_any_action = True
-
-        # 建造
-        if "build(" in plan_lower:
-            args = self._extract_between(plan_text, "build(", ")")
-            if args:
-                parts = args.split(",")
-                if len(parts) >= 4:
-                    try:
-                        x, y, z = float(parts[0]), float(parts[1]), float(parts[2])
-                        structure = parts[3].strip()
-                        self.skills.build(x, y, z, structure)
-                        logger.info("[Planner] 建造 %s 在 (%.0f, %.0f, %.0f)", structure, x, y, z)
-                        executed_any_action = True
-                    except ValueError:
-                        pass
-
-        if "stop()" in plan_lower:
-            self.skills.stop_all()
-            logger.info("[Planner] 停止所有动作")
-            executed_any_action = True
-        
-        # 结束
-        if "finish()" in plan_lower:
-            logger.info("[Planner] 结束本轮")
-            return reply_text
-
-        if executed_any_action:
-            self._last_plan_executed_action = True
-            self._last_execution_source = "model_legacy_action"
+        if self._proposal_attempted:
+            self._last_execution_source = "proposal_rejected"
             return reply_text
 
         if reply_text:
             return reply_text
-        
-        # 如果没有匹配到任何动作，将整个文本作为回复
+        if action_text.lower() == "finish()":
+            return None
+        if action_text:
+            self._last_protocol_error = "planner response contains unsupported top-level syntax"
+            return None
         logger.info("[Planner] 未匹配到动作，作为回复: %s", plan_text[:50])
         return plan_text
 
     def _execute_direct_intent_fallback(self, sender: str, message: str, context: dict) -> bool:
         compact = re.sub(r"\s+", "", message)
         lowered = compact.casefold()
-        if any(phrase in compact for phrase in ("停下", "停止", "别跟了", "先别做了")):
-            self.skills.stop_all()
-            self._last_plan_executed_action = True
-            self._last_execution_source = "direct_intent_fallback"
+        negated_stop = any(phrase in compact for phrase in ("不要停", "别停", "不用停", "无需停止")) \
+            or re.search(r"\b(?:do\s+not|don't|dont)\s+stop\b", message, re.IGNORECASE)
+        if not negated_stop and (
+            any(phrase in compact for phrase in ("停下", "停止", "别跟了", "先别做了"))
+            or re.search(r"\bstop\b", message, re.IGNORECASE)
+        ):
+            accepted = self._emit_skill("core.stop", {}, "direct_intent_fallback")
+            self._last_plan_executed_action = accepted
+            self._last_execution_source = "direct_intent_fallback" if accepted else "none"
             logger.info("[Planner] 直接意图兜底: stop")
-            return True
+            return accepted
 
         if "跟着" in compact or "跟随" in compact:
             target = self._resolve_follow_target(sender, compact, lowered, context)
             if target:
-                self.skills.follow_player(target)
-                self._last_plan_executed_action = True
-                self._last_execution_source = "direct_intent_fallback"
+                if self._is_duplicate_task(context, {"follow"}, target):
+                    return False
+                accepted = self._emit_skill(
+                    "general.follow_player", {"player": target}, "direct_intent_fallback",
+                )
+                self._last_plan_executed_action = accepted
+                self._last_execution_source = "direct_intent_fallback" if accepted else "none"
                 logger.info("[Planner] 直接意图兜底: follow %s", target)
-                return True
+                return accepted
 
         if any(verb in compact for verb in ("制作", "合成", "做一个", "做个", "做一把", "做把")):
             for alias in sorted(ITEM_ALIASES, key=len, reverse=True):
                 if alias in compact:
-                    self.skills.craft_item(self._normalize_item_name(alias), 1)
-                    self._last_plan_executed_action = True
-                    self._last_execution_source = "direct_intent_fallback"
+                    item = self._normalize_item_name(alias)
+                    if self._is_duplicate_task(context, {"craft"}, item):
+                        return False
+                    accepted = self._emit_skill(
+                        "general.craft_item", {"item": item, "count": 1}, "direct_intent_fallback",
+                    )
+                    self._last_plan_executed_action = accepted
+                    self._last_execution_source = "direct_intent_fallback" if accepted else "none"
                     logger.info("[Planner] 直接意图兜底: craft %s", alias)
-                    return True
+                    return accepted
         return False
 
     def _resolve_follow_target(self, sender: str, compact: str, lowered: str, context: dict) -> Optional[str]:
@@ -518,7 +450,10 @@ finish()
     def _execute_tool_calls(self, text: str, context: dict) -> bool:
         executed = False
         seen_calls: set[str] = set()
-        for match in TOOL_CALL_RE.finditer(text):
+        for line in text.splitlines():
+            match = TOOL_CALL_RE.fullmatch(line)
+            if not match:
+                continue
             tool_name = match.group(1).strip().lower()
             payload_text = match.group(2).strip()
             try:
@@ -536,73 +471,95 @@ finish()
                 continue
             seen_calls.add(call_key)
             if self._dispatch_tool_call(tool_name, payload, context):
-                executed = True
+                return True
+            if self._proposal_attempted:
+                return False
         return executed
 
     def _dispatch_tool_call(self, tool_name: str, payload: dict, context: dict) -> bool:
         if tool_name == "move_to":
             if {"x", "y", "z"}.issubset(payload):
-                self.skills.move_to(float(payload["x"]), float(payload["y"]), float(payload["z"]))
-                return True
+                return self._emit_skill("core.move_to", {
+                    "x": float(payload["x"]), "y": float(payload["y"]), "z": float(payload["z"]),
+                }, "model_tool")
         elif tool_name == "follow":
             player = payload.get("player") or payload.get("player_name")
             if player and not self._is_duplicate_task(context, {"follow"}, str(player)):
-                self.skills.follow_player(str(player))
-                return True
+                return self._emit_skill("general.follow_player", {"player": str(player)}, "model_tool")
         elif tool_name == "attack":
-            self.skills.attack()
-            return True
+            return self._emit_skill("core.attack", {}, "model_tool")
         elif tool_name == "mine_block":
-            self.skills.mine_block()
-            return True
+            return self._emit_skill("core.mine_block", {}, "model_tool")
         elif tool_name == "place_block":
-            self.skills.place_block()
-            return True
+            return self._emit_skill("legacy.place_block", {}, "model_tool")
         elif tool_name in {"craft", "craft_item"}:
             item = payload.get("item") or payload.get("item_name")
             normalized_item = self._normalize_item_name(str(item)) if item else ""
             if item and not self._is_duplicate_task(context, {"craft"}, normalized_item):
-                self.skills.craft_item(normalized_item, int(payload.get("count", 1)))
-                return True
+                return self._emit_skill("general.craft_item", {
+                    "item": normalized_item, "count": int(payload.get("count", 1)),
+                }, "model_tool")
         elif tool_name in {"collect", "collect_blocks"}:
             block_type = payload.get("block_type") or payload.get("block")
             normalized_block = self._normalize_block_name(str(block_type)) if block_type else ""
             if block_type and not self._is_duplicate_task(context, {"collect"}, normalized_block):
-                self.skills.collect_blocks(normalized_block, int(payload.get("count", 1)))
-                return True
+                return self._emit_skill("general.collect_blocks", {
+                    "block_type": normalized_block, "count": int(payload.get("count", 1)),
+                }, "model_tool")
         elif tool_name == "get_inventory":
-            self.skills.get_inventory()
-            return True
+            return self._emit_skill("legacy.get_inventory", {}, "model_tool")
         elif tool_name == "explore":
-            self.skills.explore(int(payload.get("radius", 16)))
-            return True
+            return self._emit_skill("general.explore", {"radius": int(payload.get("radius", 16))}, "model_tool")
         elif tool_name == "trade":
             villager = payload.get("villager_type") or payload.get("type")
             if villager:
-                self.skills.trade(str(villager))
-                return True
+                return self._emit_skill("legacy.trade", {"villager_type": str(villager)}, "model_tool")
         elif tool_name == "sleep":
-            self.skills.sleep()
-            return True
+            return self._emit_skill("legacy.sleep", {}, "model_tool")
         elif tool_name == "eat":
-            self.skills.eat()
-            return True
+            return self._emit_skill("general.eat", {}, "model_tool")
         elif tool_name == "drop_item":
             item = payload.get("item")
             if item:
-                self.skills.drop_item(str(item), int(payload.get("count", 1)))
-                return True
+                return self._emit_skill("inventory.drop_item", {
+                    "item": str(item), "count": int(payload.get("count", 1)),
+                }, "model_tool")
         elif tool_name == "sort_inventory":
-            self.skills.sort_inventory()
-            return True
+            return self._emit_skill("legacy.sort_inventory", {}, "model_tool")
         elif tool_name == "build":
             if {"x", "y", "z", "structure"}.issubset(payload):
-                self.skills.build(float(payload["x"]), float(payload["y"]), float(payload["z"]), str(payload["structure"]))
-                return True
+                return self._emit_skill("legacy.build", {
+                    "x": float(payload["x"]), "y": float(payload["y"]), "z": float(payload["z"]),
+                    "structure": str(payload["structure"]),
+                }, "model_tool")
         elif tool_name == "stop":
-            self.skills.stop_all()
-            return True
+            return self._emit_skill("core.stop", {}, "model_tool")
+        self._proposal_attempted = True
+        self._last_protocol_error = f"unsupported planner tool: {tool_name}"
         return False
+
+    def _emit_skill(self, skill_id: str, input_data: dict[str, Any], source: str) -> bool:
+        if self._proposal_emitted:
+            return False
+        proposal = SkillProposal(skill_id, dict(input_data), source)
+        key = json.dumps(proposal.public_dict(), ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        if key in self._seen_proposals:
+            return False
+        self._seen_proposals.add(key)
+        self._proposal_attempted = True
+        if self._proposal_dispatcher is None:
+            self._last_protocol_error = "planner proposal dispatcher is not configured"
+            return False
+        try:
+            accepted = bool(self._proposal_dispatcher(proposal))
+        except Exception as exc:
+            self._last_protocol_error = str(exc)[:500]
+            return False
+        if not accepted:
+            self._last_protocol_error = "planner proposal was rejected by admission"
+            return False
+        self._proposal_emitted = True
+        return True
 
     def _normalize_item_name(self, item_name: str) -> str:
         stripped = item_name.strip().replace(" ", "")
@@ -627,7 +584,10 @@ finish()
     
     def interrupt(self):
         """中断当前规划。"""
-        self._is_planning = False
+        with self._planning_lock:
+            self._generation += 1
+            self._is_planning = False
+            self._last_protocol_error = "planner result invalidated by newer control intent"
         logger.info("[Planner] 规划被中断")
     
     def get_status(self) -> dict:
@@ -638,4 +598,5 @@ finish()
             "last_plan_executed_action": self._last_plan_executed_action,
             "last_execution_source": self._last_execution_source,
             "last_protocol_error": self._last_protocol_error,
+            "last_proposal_attempted": self._proposal_attempted,
         }
