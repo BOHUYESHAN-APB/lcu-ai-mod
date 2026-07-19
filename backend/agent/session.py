@@ -468,6 +468,9 @@ class Session:
         self.memory.save()
         self.message_db.close()
         self.memory_overlay.close()
+        close_llm = getattr(self.llm, "close", None)
+        if callable(close_llm):
+            close_llm()
         logger.info("[Session] Stopped: %s", self.id)
 
     # ── Status ──

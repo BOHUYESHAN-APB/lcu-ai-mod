@@ -60,6 +60,7 @@ class LLMService:
         self.model = DEFAULT_MODEL
         self._client = httpx.Client(timeout=120)
         self._agent_configs: dict[str, dict[str, Any]] = {}
+        self._config_lock = threading.RLock()
 
         # Token tracking
         self.total_prompt_tokens = 0
@@ -75,59 +76,65 @@ class LLMService:
         self._latest_compression: dict[str, Any] | None = None
 
     def set_api_key(self, key: str):
-        self.api_key = key
+        with self._config_lock:
+            self.api_key = key
         logger.info("[LLM] API key configured")
         return self
 
     def set_model(self, model: str):
-        self.model = model
+        with self._config_lock:
+            self.model = model
         logger.info("[LLM] Model set to: %s", model)
         return self
 
     def set_base_url(self, url: str):
-        self.base_url = url.rstrip('/')
+        with self._config_lock:
+            self.base_url = url.rstrip('/')
         logger.info("[LLM] Base URL set to: %s", self.base_url)
         return self
 
     def configure(self, config: dict[str, Any]):
         """Apply a single LLM configuration to the default client."""
-        if config.get("base_url"):
-            self.set_base_url(config["base_url"])
-        if config.get("api_key") and config.get("api_key") != "***":
-            self.set_api_key(config["api_key"])
-        if config.get("model"):
-            self.set_model(config["model"])
+        with self._config_lock:
+            if config.get("base_url"):
+                self.set_base_url(config["base_url"])
+            if config.get("api_key") and config.get("api_key") != "***":
+                self.set_api_key(config["api_key"])
+            if config.get("model"):
+                self.set_model(config["model"])
         return self
 
     def set_agent_config(self, agent: str, config: dict[str, Any]):
         """Configure a named agent without changing other agent settings."""
-        current = self._agent_configs.get(agent, {})
-        merged = {**current, **{k: v for k, v in config.items() if v is not None}}
-        if "max_tokens" in merged and "max_output_tokens" not in merged:
-            merged["max_output_tokens"] = merged["max_tokens"]
-        merged.pop("max_tokens", None)
-        if merged.get("base_url"):
-            merged["base_url"] = str(merged["base_url"]).rstrip("/")
-        self._agent_configs[agent] = merged
-        if agent in {"default", "session"}:
-            self.configure(merged)
+        with self._config_lock:
+            current = self._agent_configs.get(agent, {})
+            merged = {**current, **{k: v for k, v in config.items() if v is not None}}
+            if "max_tokens" in merged and "max_output_tokens" not in merged:
+                merged["max_output_tokens"] = merged["max_tokens"]
+            merged.pop("max_tokens", None)
+            if merged.get("base_url"):
+                merged["base_url"] = str(merged["base_url"]).rstrip("/")
+            self._agent_configs[agent] = merged
+            if agent in {"default", "session"}:
+                self.configure(merged)
         return self
 
     def get_config(self) -> dict:
         """Get current LLM configuration."""
-        return {
-            "configured": self.is_configured("default"),
-            "base_url": self.base_url,
-            "model": self.model,
-            "agents": {k: self._redact_config(v) for k, v in self._agent_configs.items()},
-        }
+        with self._config_lock:
+            return {
+                "configured": self.is_configured("default"),
+                "base_url": self.base_url,
+                "model": self.model,
+                "agents": {k: self._redact_config(v) for k, v in self._agent_configs.items()},
+            }
 
     # ── Chat ──
 
     def chat(self, messages: list[dict], agent: str | None = None, **kwargs) -> dict:
         """Send a chat completion request. Returns parsed response."""
         config = self._resolve_config(agent)
-        if not self.is_configured(agent):
+        if not self._is_configured_snapshot(config):
             self._reject(agent or "default", config, "not_configured", "model provider is not configured")
         data, request_meta = self._prepare_request(messages, agent, config, stream=False, **kwargs)
         try:
@@ -142,7 +149,7 @@ class LLMService:
     def chat_stream(self, messages: list[dict], agent: str | None = None, **kwargs) -> Generator[str, None, None]:
         """Stream a chat completion. Yields content chunks."""
         config = self._resolve_config(agent)
-        if not self.is_configured(agent):
+        if not self._is_configured_snapshot(config):
             self._reject(agent or "default", config, "not_configured", "model provider is not configured")
         data, request_meta = self._prepare_request(messages, agent, config, stream=True, **kwargs)
         url = f"{config['base_url']}/chat/completions"
@@ -489,24 +496,29 @@ class LLMService:
         return headers
 
     def _resolve_config(self, agent: str | None) -> dict[str, Any]:
-        config = dict(self._agent_configs.get("default", {}))
-        if agent and agent in self._agent_configs:
-            config.update(self._agent_configs[agent])
-        resolved = {
-            "provider": config.get("provider", "openai"),
-            "base_url": str(config.get("base_url") or self.base_url).rstrip("/"),
-            "model": config.get("model") or self.model,
-            "api_key": config.get("api_key", self.api_key),
-            "temperature": config.get("temperature", 0.7),
-        }
-        for key, default in DEFAULT_LIMITS.items():
-            resolved[key] = config.get(key, default)
-        if "max_output_tokens" not in config and "max_tokens" in config:
-            resolved["max_output_tokens"] = config["max_tokens"]
-        return resolved
+        with self._config_lock:
+            config = dict(self._agent_configs.get("default", {}))
+            if agent and agent in self._agent_configs:
+                config.update(self._agent_configs[agent])
+            resolved = {
+                "provider": config.get("provider", "openai"),
+                "base_url": str(config.get("base_url") or self.base_url).rstrip("/"),
+                "model": config.get("model") or self.model,
+                "api_key": config.get("api_key", self.api_key),
+                "temperature": config.get("temperature", 0.7),
+            }
+            for key, default in DEFAULT_LIMITS.items():
+                resolved[key] = config.get(key, default)
+            if "max_output_tokens" not in config and "max_tokens" in config:
+                resolved["max_output_tokens"] = config["max_tokens"]
+            return resolved
 
     def is_configured(self, agent: str | None = None) -> bool:
         config = self._resolve_config(agent)
+        return self._is_configured_snapshot(config)
+
+    @staticmethod
+    def _is_configured_snapshot(config: dict[str, Any]) -> bool:
         provider = str(config.get("provider", "")).lower()
         keyless = provider in {"ollama", "custom"}
         return bool(config.get("base_url") and config.get("model") and (config.get("api_key") or keyless))

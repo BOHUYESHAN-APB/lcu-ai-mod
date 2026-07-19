@@ -138,7 +138,9 @@ with LCUClient("http://127.0.0.1:8080", api_token="token") as client:
 
 `GET /api/status`、`GET /api/session` 和 WebSocket `session.snapshot` 保留原有运行时字段，并新增 `world_model` 元数据。该元数据公开 observation schema/revision、连接与陈旧状态、无效更新计数，以及每类规范事实的来源、时间和 TTL。原始实时 `state_update` WebSocket 事件保持 Java producer schema，不会被静默替换成规范投影。
 
-`world_model.journal` 公开当前 bounded semantic journal 数量、最新 sequence 和待处理 decision-trigger 数量。具体 journal 事件当前只进入预算化模型 observation；独立 trigger 查询/确认 API 将与异步决策调度器一起提供，不能通过状态轮询隐式触发身体动作。
+`world_model.journal` 公开当前 bounded semantic journal 数量、最新 sequence 和待处理 decision-trigger 数量。具体 journal 事件当前只进入预算化模型 observation；trigger 查询/确认仅在进程内调度边界使用，不提供能通过状态轮询隐式触发身体动作的写 API。
+
+异步 decision scheduler 的状态位于 `GET /api/status` 的 `decision_scheduler`。`state` 为 `idle`、`thinking`、`invalidated` 或 `proposal`，并提供 request ID、semantic sequence、当前 typed proposal、错误和最近 disposition。完整生命周期同时写入 `/api/v2/events`。当前自动执行策略只允许契约固定且再次验证饥饿状态的 `general.eat`；其他模型建议返回 `rejected`，不会创建 queued run。
 
 只有 manifest 中 `durable=true`、具备可靠终态事件的 Skill 可创建 Task Run。任务预设本身不执行代码，只保存参数 schema、输入模板、示例和有序 durable Skill 步骤；渲染后的每一步仍会再次经过 SkillRegistry 和身体 capability 校验。
 

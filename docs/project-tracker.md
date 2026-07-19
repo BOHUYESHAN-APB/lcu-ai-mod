@@ -598,7 +598,7 @@ The following foundation already exists and must not regress:
 
 Latest recorded verification:
 
-- Python tests: 177 passed with 1 intentional opt-in integration skip on 2026-07-19.
+- Python tests: 189 passed with 1 intentional opt-in integration skip on 2026-07-19.
 - Gradle: `clean build` passed on 2026-07-19.
 - Explicit production Java-to-Python wire integration: 1 passed.
 - NeoForge `runServer` smoke reached `Done` and logged both side-neutral common and
@@ -726,3 +726,8 @@ Pending headed-body verification, deferred to the next test session:
   churn is suppressed; inventory deltas remain informational while safety thresholds, dimension
   transitions, task terminal/blocking states, and established control transitions become typed
   decision boundaries without directly invoking a model or executor.
+- Added an asynchronous proposal-only decision scheduler with world/body epoch binding, actual
+  completion TTL, bounded retries, disconnect invalidation, durable lifecycle events, pinned
+  Skill contracts, and atomic TaskCoordinator admission. Automatic execution is intentionally
+  limited to revalidated `general.eat`; broader Planner actions remain blocked pending typed
+  effect admission and deterministic safety arbitration.

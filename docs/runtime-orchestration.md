@@ -224,7 +224,22 @@ weather, task, behavior, control, and connection changes. Only dangerous health 
 hunger crossings, dimension changes, task terminal/blocking states, and established control
 changes enter the bounded decision-trigger queue. Consumers must explicitly acknowledge
 triggers by sequence. Creating a trigger does not call the model or bypass TaskCoordinator;
-the future asynchronous decision scheduler is the sole intended consumer.
+the asynchronous decision scheduler is the sole consumer.
+
+The decision scheduler copies one bounded context and runs the model on a daemon worker. The
+model can only return a strict `none` or `run_skill` proposal; it never receives a body executor.
+Each request is bound to a world scope, body connection epoch, observation revision, semantic
+sequence, completion timestamp, and proposal TTL. Disconnect invalidates in-flight work. Model
+or parse failures retain the trigger and retry with bounded exponential backoff; terminal
+dispositions explicitly acknowledge it.
+
+Automatic execution is fail-closed. The first policy admits only the pinned `general.eat`
+manifest contract and verifies current hunger again before execution. Combat, movement,
+resource mutation, chat, UI operations, and `core.stop` are not model-automatic. The latter
+belongs in deterministic safety arbitration. TaskCoordinator performs atomic automatic
+admission under its dispatch lock and creates no resumable queued run when the body is busy.
+Decision request, failure, invalidation, rejection, expiration, and dispatch records enter the
+durable event stream.
 
 ## Current Migration Order
 
@@ -232,6 +247,6 @@ the future asynchronous decision scheduler is the sole intended consumer.
 2. Route chat Planner actions through TaskCoordinator durable runs.
 3. Add explicit operation outcomes and correlated cancellation.
 4. Persist parent/child workflow execution and atomic step advancement.
-5. Add an asynchronous decision scheduler that consumes acknowledged semantic boundaries.
+5. Route open-ended Planner goals through typed proposals and TaskCoordinator instead of direct Skills.
 6. Move autonomy and specialists behind the same admission/effects gate.
 7. Add bounded image artifacts, screen identity, capture, and verified UI input tools.

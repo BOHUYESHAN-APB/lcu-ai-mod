@@ -106,6 +106,9 @@ class FakeLLM:
     def build_system_prompt(self, context, commands_docs=""):
         return "You are a private conversation companion."
 
+    def close(self):
+        return None
+
 
 class FakeOrchestrator:
     def __init__(self, body=None, **_options):
@@ -115,6 +118,7 @@ class FakeOrchestrator:
         self.ticked = threading.Event()
         self.start_calls = 0
         self.stop_calls = 0
+        self.close_calls = 0
         self.tick_calls = 0
         self.task_coordinator = None
 
@@ -135,6 +139,9 @@ class FakeOrchestrator:
     def on_body_disconnect(self):
         if self.task_coordinator:
             self.task_coordinator.on_disconnect()
+
+    def close(self):
+        self.close_calls += 1
 
     @contextmanager
     def session_context(self):
@@ -565,6 +572,7 @@ class ServerSDKTests(unittest.TestCase):
         self.assertEqual(body.disconnect_calls, 1)
         self.assertGreater(orchestrators[0].tick_calls, 0)
         self.assertEqual(orchestrators[0].stop_calls, 1)
+        self.assertEqual(orchestrators[0].close_calls, 1)
         self.assertEqual(orchestrators[0].session.stop_calls, 1)
 
     def test_v2_external_lease_fences_actions_and_runs_typed_skill(self):

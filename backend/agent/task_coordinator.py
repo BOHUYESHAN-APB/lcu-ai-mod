@@ -77,6 +77,28 @@ class TaskCoordinator:
                 self.dispatch(run["active_child_id"], lease_id=lease_id, fencing_token=fencing_token)
                 return self.state.get_run(run["id"])
 
+    def admit_automatic_run(self, skill_id: str, input_data: dict[str, Any]) -> dict[str, Any]:
+        """Atomically admit an autonomous proposal without leaving a resumable queued run."""
+        with self._dispatch_lock:
+            manifest = self.registry.validate_input(skill_id, input_data)
+            if not manifest.durable:
+                raise ValueError("automatic decision requires a durable skill")
+            if not self.body.is_connected:
+                raise ConnectionError("companion body is not connected")
+            if not self._body_armed:
+                raise ValueError("companion body is not armed")
+            if self.state.has_active_runs() or self._raw_requests or self._session_busy:
+                raise ValueError("the companion is already executing a command or task run")
+            with self.state.control_guard(None, None):
+                run = self.state.create_run(
+                    manifest.public_dict(), input_data, scope_id=self._clock_scope,
+                )
+                dispatched = self.dispatch(run["id"])
+            if dispatched["status"] == "queued":
+                self.state.fail_run(run["id"], "automatic admission changed before dispatch")
+                raise ConnectionError("automatic run could not be dispatched")
+            return dispatched
+
     def dispatch(self, run_id: str, *, lease_id: str | None = None,
                  fencing_token: int | None = None) -> dict[str, Any]:
         with self._dispatch_lock:

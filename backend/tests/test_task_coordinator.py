@@ -131,6 +131,15 @@ class TaskCoordinatorTests(unittest.TestCase):
         self.assertEqual(second["status"], "queued")
         self.assertEqual(len(self.body.commands), 1)
 
+    def test_automatic_admission_rejects_busy_body_without_creating_queued_run(self):
+        active = self.coordinator.create_run("core.move_to", {"x": 1, "y": 64, "z": 2})
+
+        with self.assertRaisesRegex(ValueError, "already executing"):
+            self.coordinator.admit_automatic_run("general.eat", {})
+
+        roots = self.state.list_runs(root_only=True)
+        self.assertEqual([run["id"] for run in roots], [active["id"]])
+
     def test_workflow_dispatches_steps_in_order_and_completes_parent(self):
         workflow = self.presets.render("workflow.starter_chest", {})
         parent = self.coordinator.create_workflow(workflow)

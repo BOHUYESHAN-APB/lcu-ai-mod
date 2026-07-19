@@ -606,6 +606,7 @@ async def shutdown():
     if connection_thread and connection_thread.is_alive():
         await asyncio.to_thread(connection_thread.join, 6.0)
     if orchestrator:
+        orchestrator.close()
         with orchestrator.session_context() as session:
             session.stop()
 

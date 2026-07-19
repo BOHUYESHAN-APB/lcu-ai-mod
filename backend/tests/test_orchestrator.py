@@ -2,8 +2,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from agent.agent_state import AgentStateDB
+from agent.decision_scheduler import DecisionScheduler
 from agent.orchestrator import Orchestrator
+from agent.skill_registry import SkillRegistry
+from agent.task_coordinator import TaskCoordinator
 from protocol import BodyAdapter, BodyEvent
+from tests.test_decision_scheduler import FakeLLM as DecisionLLM, ImmediateExecutor
 
 
 class FakeBody:
@@ -92,6 +97,93 @@ class OrchestratorBodyTests(unittest.TestCase):
             self.assertEqual(orchestrator.session.runtime["player"]["health"], 17)
             self.assertEqual(orchestrator.session.world_model.invalid_updates, 1)
             orchestrator.session.stop()
+
+    def test_decision_scheduler_dispatches_allowlisted_skill_through_task_coordinator(self):
+        body = FakeBody()
+        body.pending.extend([
+            BodyEvent("event", {"event": "state_update", "data": {
+                "player": {"health": 20, "hunger": 8}, "control_state": {"ai_controlled": True},
+            }}),
+            BodyEvent("event", {"event": "state_update", "data": {
+                "player": {"health": 3, "hunger": 5}, "control_state": {"ai_controlled": True},
+            }}),
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            state = AgentStateDB(Path(tmp) / "agent_state.db")
+            state.set_scheduler_clock(None, None, "default\0default")
+            orchestrator = Orchestrator(body, storage_root=Path(tmp) / "session", legacy_root=None)
+            coordinator = TaskCoordinator(state, SkillRegistry(), body, initial_scope="default\0default")
+            orchestrator.set_task_coordinator(coordinator)
+            orchestrator.session.llm.is_configured = lambda _agent=None: True
+            orchestrator.decision_scheduler.close()
+            orchestrator.decision_scheduler = DecisionScheduler(
+                DecisionLLM('{"decision":"run_skill","skill_id":"general.eat","input":{},"reason":"critical health"}'),
+                executor=ImmediateExecutor(),
+            )
+            orchestrator.start()
+
+            orchestrator.tick()
+
+            self.assertEqual(body.commands, [("eat", {})])
+            self.assertEqual(state.list_runs(root_only=True)[0]["skill_id"], "general.eat")
+            self.assertEqual(orchestrator.decision_scheduler.get_status()["history"][-1]["disposition"], "dispatched")
+            self.assertEqual(orchestrator.session.pending_decision_triggers(), [])
+            decision_events = [event["type"] for event in state.list_events() if event["aggregate_type"] == "decision"]
+            self.assertEqual(decision_events, ["decision.requested", "decision.dispatched"])
+            orchestrator.close()
+            orchestrator.session.stop()
+            state.close()
+
+    def test_none_proposal_from_changed_control_epoch_is_resolved_stale(self):
+        body = FakeBody()
+        with tempfile.TemporaryDirectory() as tmp:
+            state = AgentStateDB(Path(tmp) / "agent_state.db")
+            orchestrator = Orchestrator(body, storage_root=Path(tmp) / "session", legacy_root=None)
+            coordinator = TaskCoordinator(state, SkillRegistry(), body, initial_scope="default\0default")
+            orchestrator.set_task_coordinator(coordinator)
+            orchestrator.decision_scheduler.close()
+            orchestrator.decision_scheduler = DecisionScheduler(
+                DecisionLLM('{"decision":"none","reason":"stable"}'), executor=ImmediateExecutor(),
+            )
+            orchestrator.decision_scheduler.submit(
+                [{"sequence": 1}], {}, scope_id="default\0default", body_epoch=0,
+                observation_revision=1,
+            )
+            orchestrator.session.set_control_mode("external", fencing_token=1)
+
+            orchestrator._apply_decision_result()
+
+            history = orchestrator.decision_scheduler.get_status()["history"]
+            self.assertEqual(history[-1]["disposition"], "stale")
+            self.assertEqual(body.commands, [])
+            orchestrator.close()
+            orchestrator.session.stop()
+            state.close()
+
+    def test_decision_scheduler_rejects_skill_outside_automatic_allowlist(self):
+        body = FakeBody()
+        with tempfile.TemporaryDirectory() as tmp:
+            state = AgentStateDB(Path(tmp) / "agent_state.db")
+            orchestrator = Orchestrator(body, storage_root=Path(tmp) / "session", legacy_root=None)
+            coordinator = TaskCoordinator(state, SkillRegistry(), body, initial_scope="default\0default")
+            orchestrator.set_task_coordinator(coordinator)
+            orchestrator.decision_scheduler.close()
+            orchestrator.decision_scheduler = DecisionScheduler(
+                DecisionLLM('{"decision":"run_skill","skill_id":"general.craft_item","input":{"item":"minecraft:tnt","count":1}}'),
+                executor=ImmediateExecutor(),
+            )
+            orchestrator.decision_scheduler.submit(
+                [{"sequence": 1}], {}, scope_id="default\0default", body_epoch=0,
+                observation_revision=1, submitted_at=10,
+            )
+
+            orchestrator._apply_decision_result()
+
+            self.assertEqual(body.commands, [])
+            self.assertEqual(orchestrator.decision_scheduler.get_status()["history"][-1]["disposition"], "rejected")
+            orchestrator.close()
+            orchestrator.session.stop()
+            state.close()
 
 
 if __name__ == "__main__":
