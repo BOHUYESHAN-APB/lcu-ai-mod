@@ -39,5 +39,13 @@ backend/dist/
 backend/.venv/
 backend/venv/
 
+# Local credentials and generated configuration, regardless of working directory
+**/.local/
+**/.api_key
+**/.env
+**/.env.*
+!**/.env.example
+/.api_key
+
 # Token logs
 backend/token_usage.csv
