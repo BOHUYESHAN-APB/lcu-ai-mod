@@ -16,6 +16,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from .access_policy import evaluate as evaluate_access, normalize_policy
+
 
 DEFAULT_AGENT = "default"
 DEFAULT_CONFIG_PATH = Path(__file__).parent.parent / ".local" / "config.json"
@@ -143,8 +145,11 @@ def _default_config() -> dict[str, Any]:
         "version": CONFIG_VERSION,
         "llm": {
             "default_agent": DEFAULT_AGENT,
-            "agents": {
-                DEFAULT_AGENT: {
+                "agents": {
+                    DEFAULT_AGENT: {
+                    "provider_profile": "mimo-default",
+                    "routing_mode": "manual",
+                    "fallback_profiles": [],
                     "provider": preset["id"],
                     "base_url": preset["base_url"],
                     "model": preset["default_model"],
@@ -161,8 +166,19 @@ def _default_config() -> dict[str, Any]:
                     "recent_messages_to_keep": 24,
                     "summary_model_agent": DEFAULT_AGENT,
                     "summary_max_output_tokens": 4096,
-                }
-            },
+                    }
+                },
+                "provider_profiles": {
+                    "mimo-default": {
+                        "id": "mimo-default",
+                        "name": "MiMo 默认",
+                        "provider": preset["id"],
+                        "base_url": preset["base_url"],
+                        "model": preset["default_model"],
+                        "api_key": "",
+                        "enabled": True,
+                    },
+                },
         },
         "persona": {
             "name": "AI",
@@ -186,6 +202,14 @@ def _default_config() -> dict[str, Any]:
         },
         "whitelist": [],
         "listen_public": True,
+        "access": {
+            "version": 1,
+            "default_role": "player",
+            "public_chat": True,
+            "private_chat": True,
+            "role_skills": {},
+            "principals": [],
+        },
         "patrol_radius": 8,
     }
 
@@ -231,6 +255,22 @@ class ConfigStore:
                     if "max_tokens" in config:
                         config.pop("max_tokens")
                         self._migration_pending = True
+            if "access" not in loaded and ("whitelist" in loaded or "listen_public" in loaded):
+                legacy_principals = [
+                    {
+                        "id": f"legacy-name:{name}",
+                        "name": str(name),
+                        "role": "friend",
+                        "skills": {"chat.reply": "allow"},
+                    }
+                    for name in loaded.get("whitelist", [])
+                    if str(name).strip()
+                ]
+                loaded["access"] = {
+                    "public_chat": bool(loaded.get("listen_public", True)),
+                    "principals": legacy_principals,
+                }
+                self._migration_pending = True
             if loaded.get("version") != CONFIG_VERSION:
                 loaded["version"] = CONFIG_VERSION
                 self._migration_pending = True
@@ -253,8 +293,102 @@ class ConfigStore:
             data = copy.deepcopy(self._data)
         return self._redact(data) if redact else data
 
+    def get_access_policy(self) -> dict[str, Any]:
+        with self._lock:
+            return normalize_policy(self._data.get("access", {}))
+
+    def set_access_policy(self, payload: dict[str, Any]) -> dict[str, Any]:
+        policy = normalize_policy(payload)
+        with self._lock:
+            self._data["access"] = policy
+            self.save()
+            return copy.deepcopy(policy)
+
+    def upsert_access_principal(self, principal: dict[str, Any]) -> dict[str, Any]:
+        principal_id = str(principal.get("id", "")).strip()
+        if not principal_id:
+            raise ValueError("principal id must not be empty")
+        with self._lock:
+            policy = self.get_access_policy()
+            existing = next((item for item in policy["principals"] if item["id"] == principal_id), None)
+            if existing is None:
+                policy["principals"].append(copy.deepcopy(principal))
+            else:
+                existing.update(copy.deepcopy(principal))
+            policy = normalize_policy(policy)
+            self._data["access"] = policy
+            self.save()
+            return copy.deepcopy(next(item for item in policy["principals"] if item["id"] == principal_id))
+
+    def delete_access_principal(self, principal_id: str) -> bool:
+        with self._lock:
+            policy = self.get_access_policy()
+            before = len(policy["principals"])
+            policy["principals"] = [item for item in policy["principals"] if item["id"] != principal_id]
+            if len(policy["principals"]) == before:
+                return False
+            self._data["access"] = normalize_policy(policy)
+            self.save()
+            return True
+
+    def evaluate_access(self, requester: dict[str, Any], *, channel: str, skill: str,
+                        server_id: str = "", body_id: str = "") -> dict[str, Any]:
+        return evaluate_access(
+            self.get_access_policy(), requester, channel=channel, skill=skill,
+            server_id=server_id, body_id=body_id,
+        )
+
     def list_provider_presets(self) -> list[dict[str, Any]]:
         return [copy.deepcopy(p) for p in PROVIDER_PRESETS.values()]
+
+    def list_provider_profiles(self, redact: bool = True) -> list[dict[str, Any]]:
+        with self._lock:
+            profiles = list(copy.deepcopy(self._data.setdefault("llm", {}).setdefault("provider_profiles", {})).values())
+        return [self._redact(profile) for profile in profiles] if redact else profiles
+
+    def upsert_provider_profile(self, profile: dict[str, Any]) -> dict[str, Any]:
+        profile_id = str(profile.get("id", "")).strip()
+        if not profile_id:
+            raise ValueError("provider profile id must not be empty")
+        provider = str(profile.get("provider", "")).strip()
+        if provider not in PROVIDER_PRESETS:
+            raise ValueError(f"Unknown LLM provider: {provider}")
+        with self._lock:
+            profiles = self._data.setdefault("llm", {}).setdefault("provider_profiles", {})
+            current = copy.deepcopy(profiles.get(profile_id, {
+                "id": profile_id,
+                "name": profile_id,
+                "provider": provider,
+                "base_url": PROVIDER_PRESETS[provider].get("base_url", ""),
+                "model": PROVIDER_PRESETS[provider].get("default_model", ""),
+                "api_key": "",
+                "enabled": True,
+            }))
+            for key in ("name", "provider", "base_url", "model", "api_key", "enabled"):
+                if key in profile and profile[key] is not None:
+                    current[key] = profile[key]
+            if current["provider"] not in PROVIDER_PRESETS:
+                raise ValueError(f"Unknown LLM provider: {current['provider']}")
+            current["id"] = profile_id
+            current["name"] = str(current.get("name", profile_id)).strip() or profile_id
+            current["base_url"] = str(current.get("base_url", "")).rstrip("/")
+            current["model"] = str(current.get("model", "")).strip()
+            if not isinstance(current.get("enabled", True), bool):
+                raise ValueError("provider profile enabled must be a boolean")
+            profiles[profile_id] = current
+            self.save()
+            return self._redact(copy.deepcopy(current))
+
+    def delete_provider_profile(self, profile_id: str) -> bool:
+        with self._lock:
+            profiles = self._data.setdefault("llm", {}).setdefault("provider_profiles", {})
+            if profile_id not in profiles:
+                return False
+            if any(config.get("provider_profile") == profile_id for config in self._data.get("llm", {}).get("agents", {}).values()):
+                raise ValueError("provider profile is assigned to an agent")
+            del profiles[profile_id]
+            self.save()
+            return True
 
     def get_agent_llm_config(self, agent: str | None = None, redact: bool = True) -> dict[str, Any]:
         agent_name = agent or self._data["llm"].get("default_agent", DEFAULT_AGENT)
@@ -263,6 +397,18 @@ class ConfigStore:
             if agent_name not in agents:
                 agents[agent_name] = copy.deepcopy(agents.get(DEFAULT_AGENT, _default_config()["llm"]["agents"][DEFAULT_AGENT]))
             config = copy.deepcopy(agents[agent_name])
+            profile_id = config.get("provider_profile")
+            profile = self._data.get("llm", {}).get("provider_profiles", {}).get(profile_id)
+            if isinstance(profile, dict) and profile.get("enabled", True):
+                for key in ("provider", "base_url", "model", "api_key"):
+                    if profile.get(key) is not None:
+                        config[key] = profile[key]
+            config["fallback_configs"] = [
+                copy.deepcopy(candidate)
+                for candidate_id in config.get("fallback_profiles", [])
+                if isinstance((candidate := self._data.get("llm", {}).get("provider_profiles", {}).get(candidate_id)), dict)
+                and candidate.get("enabled", True)
+            ]
         return self._redact(config) if redact else config
 
     def set_agent_llm_config(self, agent: str | None, payload: dict[str, Any]) -> dict[str, Any]:
@@ -275,6 +421,10 @@ class ConfigStore:
             normalized_payload = dict(payload)
             if "max_tokens" in normalized_payload and "max_output_tokens" not in normalized_payload:
                 normalized_payload["max_output_tokens"] = normalized_payload["max_tokens"]
+            if "provider_profile" not in normalized_payload and any(
+                key in normalized_payload for key in ("provider", "base_url", "model", "api_key")
+            ):
+                current.pop("provider_profile", None)
 
             if provider_id:
                 preset = PROVIDER_PRESETS.get(provider_id)
@@ -287,6 +437,7 @@ class ConfigStore:
                     current["model"] = preset["default_model"]
 
             for key in (
+                "provider_profile", "routing_mode", "fallback_profiles",
                 "base_url", "api_key", "model", "temperature",
                 *LLM_INTEGER_FIELDS, "compression_enabled", "summary_model_agent",
             ):
@@ -294,6 +445,19 @@ class ConfigStore:
                     current[key] = normalized_payload[key]
 
             current.pop("max_tokens", None)
+
+            profile_id = str(current.get("provider_profile", "")).strip()
+            if profile_id:
+                if profile_id not in self._data.setdefault("llm", {}).setdefault("provider_profiles", {}):
+                    raise ValueError(f"Unknown provider profile: {profile_id}")
+                current["provider_profile"] = profile_id
+            routing_mode = current.get("routing_mode", "manual")
+            if routing_mode not in {"manual", "priority", "scheduled"}:
+                raise ValueError("routing_mode must be manual, priority, or scheduled")
+            fallback_profiles = current.get("fallback_profiles", [])
+            if not isinstance(fallback_profiles, list) or any(str(item) not in self._data["llm"]["provider_profiles"] for item in fallback_profiles):
+                raise ValueError("fallback_profiles must reference configured provider profiles")
+            current["fallback_profiles"] = [str(item) for item in fallback_profiles]
 
             raw_temperature = current.get("temperature", 0.7)
             try:

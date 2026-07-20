@@ -150,6 +150,7 @@ class Orchestrator:
 
     def set_task_coordinator(self, coordinator) -> None:
         self.task_coordinator = coordinator
+        self.session.skills.set_command_dispatcher(coordinator.dispatch_internal_command)
         self.session.set_planner_proposal_dispatcher(self._dispatch_planner_proposal)
 
     def _dispatch_planner_proposal(self, proposal: SkillProposal) -> bool:
@@ -300,9 +301,12 @@ class Orchestrator:
         if not isinstance(data, dict) or self.session.control_mode == "external":
             return False
         sender = str(data.get("sender", "?"))
+        sender_id = str(data.get("uuid", ""))
         is_system = bool(data.get("is_system", False))
         message = str(data.get("message", ""))
-        if not self.session._check_chat_permission(sender, is_system) or not self.session.is_stop_intent(message):
+        if not self.session._check_chat_permission(sender, is_system, sender_id) or not self.session.is_stop_intent(message):
+            return False
+        if not self.session.check_chat_skill_permission(sender, is_system, sender_id, "safety.stop"):
             return False
         self.session.planner.interrupt()
         accepted = self._dispatch_planner_proposal(

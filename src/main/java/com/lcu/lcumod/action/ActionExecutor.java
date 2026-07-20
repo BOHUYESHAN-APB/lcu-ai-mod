@@ -304,8 +304,8 @@ public class ActionExecutor {
         boolean aiNow = InputIsolation.isAiControlled();
         if (!aiNow) {
             InputIsolation.clearAiControls();
+            Pathfinder.cancelActiveOperation("USER_OVERRIDE", "navigation canceled: user override");
             MovementSystem.stop();
-            Pathfinder.stop();
             followTargetName = null;
             backendDisconnectStopRequested = true;
         } else {
@@ -1643,6 +1643,10 @@ public class ActionExecutor {
             sendResponse(cmd.id(), false, "CONFLICT: craft operation currently owns movement and inventory");
             return;
         }
+        if (Pathfinder.hasActiveOperation()) {
+            sendResponse(cmd.id(), false, "CONFLICT: move operation currently owns navigation");
+            return;
+        }
         Pathfinder.stop();
         MovementSystem.stop();
         JavaAutonomousBehavior.resetCurrentState();
@@ -1831,6 +1835,8 @@ public class ActionExecutor {
         data.addProperty("pending_collect_current_count", pendingCollectItem == null ? 0 : countInventoryItem(Minecraft.getInstance(), pendingCollectItem));
         data.addProperty("last_craft_plan", lastCraftPlanDetail);
         data.addProperty("navigating", Pathfinder.isNavigating());
+        data.addProperty("navigation_status", Pathfinder.getStatusString());
+        data.addProperty("navigation_failure", Pathfinder.getLastFailureReason());
         data.addProperty("active_behavior", JavaAutonomousBehavior.getState().name().toLowerCase());
         data.addProperty("movement_owner", currentMovementOwner());
         LCUMod.WIRE.sendEvent("behavior_state", data);
@@ -1842,7 +1848,8 @@ public class ActionExecutor {
     }
 
     private boolean hasManualTask() {
-        return followTargetName != null
+        return Pathfinder.hasActiveOperation()
+                || followTargetName != null
                 || pendingCraftItem != null
                 || pendingEatReqId != null
                 || pendingCollectItem != null
@@ -1851,6 +1858,7 @@ public class ActionExecutor {
     }
 
     private String currentMovementOwner() {
+        if (Pathfinder.hasActiveOperation()) return "operation";
         if (followTargetName != null) return "follow";
         if (hasManualTask()) return "task";
         if (JavaAutonomousBehavior.getState() != JavaAutonomousBehavior.BehaviorState.IDLE) return "autonomy";

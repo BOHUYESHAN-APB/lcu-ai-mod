@@ -10,6 +10,7 @@ Features:
 - Multiple model support
 """
 
+import copy
 import json
 import logging
 import math
@@ -74,6 +75,7 @@ class LLMService:
         self._usage_by_agent: dict[str, dict[str, int]] = {}
         self._latest_rejection: dict[str, Any] | None = None
         self._latest_compression: dict[str, Any] | None = None
+        self._provider_health: dict[str, dict[str, Any]] = {}
 
     def set_api_key(self, key: str):
         with self._config_lock:
@@ -136,15 +138,36 @@ class LLMService:
         config = self._resolve_config(agent)
         if not self._is_configured_snapshot(config):
             self._reject(agent or "default", config, "not_configured", "model provider is not configured")
-        data, request_meta = self._prepare_request(messages, agent, config, stream=False, **kwargs)
-        try:
-            response = self._post("chat/completions", data, config=config)
-            result = self._parse_response(response)
-        except Exception as exc:
-            self._record_request(request_meta, "failed", error=str(exc))
-            raise
-        self._track_usage(response, request_meta)
-        return result
+        candidates = self._candidate_configs(config)
+        if not candidates:
+            self._reject(
+                agent or "default", config, "provider_cooldown",
+                "all configured model providers are cooling down",
+                {"providers": self._provider_health_snapshot()},
+            )
+        last_error: Exception | None = None
+        for attempt, candidate in enumerate(candidates, start=1):
+            data, request_meta = self._prepare_request(messages, agent, candidate, stream=False, **kwargs)
+            request_meta.update({
+                "provider": candidate.get("provider"),
+                "profile_id": candidate.get("id") or candidate.get("provider_profile"),
+                "attempt": attempt,
+                "fallback_from": (candidates[0].get("id") or candidates[0].get("provider_profile")) if attempt > 1 else None,
+            })
+            try:
+                response = self._post("chat/completions", data, config=candidate)
+                result = self._parse_response(response)
+            except Exception as exc:
+                last_error = exc
+                self._mark_provider_failure(candidate, str(exc))
+                self._record_request(request_meta, "failed", error=str(exc))
+                continue
+            self._mark_provider_success(candidate)
+            self._track_usage(response, request_meta)
+            return result
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("no configured model provider is available")
 
     def chat_stream(self, messages: list[dict], agent: str | None = None, **kwargs) -> Generator[str, None, None]:
         """Stream a chat completion. Yields content chunks."""
@@ -506,12 +529,86 @@ class LLMService:
                 "model": config.get("model") or self.model,
                 "api_key": config.get("api_key", self.api_key),
                 "temperature": config.get("temperature", 0.7),
+                "provider_profile": config.get("provider_profile"),
+                "routing_mode": config.get("routing_mode", "manual"),
+                "fallback_configs": copy.deepcopy(config.get("fallback_configs", [])),
             }
             for key, default in DEFAULT_LIMITS.items():
                 resolved[key] = config.get(key, default)
             if "max_output_tokens" not in config and "max_tokens" in config:
                 resolved["max_output_tokens"] = config["max_tokens"]
             return resolved
+
+    def _candidate_configs(self, config: dict[str, Any]) -> list[dict[str, Any]]:
+        configured = [dict(config)]
+        if config.get("routing_mode") == "priority":
+            for fallback in config.get("fallback_configs", []):
+                candidate = dict(config)
+                candidate.update(fallback)
+                candidate["fallback_configs"] = []
+                if self._is_configured_snapshot(candidate):
+                    configured.append(candidate)
+        now = time.time()
+        candidates = [candidate for candidate in configured if self._provider_cooldown_until(candidate) <= now]
+        return candidates
+
+    @staticmethod
+    def _provider_health_key(config: dict[str, Any]) -> str:
+        return str(config.get("id") or config.get("provider_profile") or config.get("base_url") or config.get("provider"))
+
+    def _provider_cooldown_until(self, config: dict[str, Any]) -> float:
+        key = self._provider_health_key(config)
+        with self._usage_lock:
+            return float(self._provider_health.get(key, {}).get("cooldown_until", 0.0))
+
+    def _mark_provider_failure(self, config: dict[str, Any], error: str) -> None:
+        key = self._provider_health_key(config)
+        now = time.time()
+        with self._usage_lock:
+            current = self._provider_health.get(key, {})
+            failures = int(current.get("consecutive_failures", 0)) + 1
+            cooldown_seconds = min(300, 5 * (2 ** (failures - 1)))
+            self._provider_health[key] = {
+                "profile_id": config.get("id") or config.get("provider_profile"),
+                "provider": config.get("provider"),
+                "model": config.get("model"),
+                "base_url": config.get("base_url"),
+                "status": "cooldown",
+                "consecutive_failures": failures,
+                "last_failure_at": now,
+                "last_error": error[:500],
+                "cooldown_until": now + cooldown_seconds,
+            }
+
+    def _mark_provider_success(self, config: dict[str, Any]) -> None:
+        key = self._provider_health_key(config)
+        now = time.time()
+        with self._usage_lock:
+            current = self._provider_health.get(key, {})
+            self._provider_health[key] = {
+                "profile_id": config.get("id") or config.get("provider_profile"),
+                "provider": config.get("provider"),
+                "model": config.get("model"),
+                "base_url": config.get("base_url"),
+                "status": "healthy",
+                "consecutive_failures": 0,
+                "last_failure_at": current.get("last_failure_at"),
+                "last_error": current.get("last_error"),
+                "last_success_at": now,
+                "cooldown_until": 0.0,
+            }
+
+    def _provider_health_snapshot(self) -> list[dict[str, Any]]:
+        now = time.time()
+        with self._usage_lock:
+            return [
+                {
+                    **dict(value),
+                    "key": key,
+                    "cooldown_remaining_seconds": max(0.0, float(value.get("cooldown_until", 0.0)) - now),
+                }
+                for key, value in sorted(self._provider_health.items())
+            ]
 
     def is_configured(self, agent: str | None = None) -> bool:
         config = self._resolve_config(agent)
@@ -605,6 +702,7 @@ class LLMService:
                 "recent_requests": [dict(record) for record in self._usage_history[-20:]],
                 "latest_rejection": dict(self._latest_rejection) if self._latest_rejection else None,
                 "latest_compression": dict(self._latest_compression) if self._latest_compression else None,
+                "provider_health": self._provider_health_snapshot(),
             }
 
     def close(self):

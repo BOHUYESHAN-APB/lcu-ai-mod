@@ -14,6 +14,19 @@ class DummyWire:
 
 
 class SkillsTests(unittest.TestCase):
+    def test_configured_dispatcher_owns_command_emission(self):
+        body = DummyWire()
+        skills = Skills(body)
+        calls = []
+        skills.set_command_dispatcher(lambda command, args, context: calls.append((command, args, context)) or "intent-1")
+
+        result = skills.jump()
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["req_id"], "intent-1")
+        self.assertEqual(calls, [("jump", {}, "default")])
+        self.assertEqual(body.sent, [])
+
     def test_command_context_is_reported_to_observer(self):
         wire = DummyWire()
         skills = Skills(wire)

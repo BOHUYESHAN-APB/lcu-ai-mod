@@ -609,14 +609,20 @@ class ServerSDKTests(unittest.TestCase):
         body = FakeBody()
         orchestrator = FakeOrchestrator()
         diagnostics = BodyRequestDiagnostics()
-        with (
-            patch.dict(os.environ, {"SDK_API_TOKEN": ""}),
-            patch.object(server, "body", body),
-            patch.object(server, "orchestrator", orchestrator),
-            patch.object(server, "body_request_diagnostics", diagnostics),
-        ):
-            client = TestClient(server.app, base_url="http://127.0.0.1:8080", client=("127.0.0.1", 50000))
-            response = client.post("/api/sdk/command", json={"command": "jump", "args": {}})
+        with tempfile.TemporaryDirectory() as tmp:
+            state = AgentStateDB(Path(tmp) / "agent_state.db")
+            coordinator = TaskCoordinator(state, server.skill_registry, body)
+            coordinator.set_body_armed(True)
+            with (
+                patch.dict(os.environ, {"SDK_API_TOKEN": ""}),
+                patch.object(server, "body", body),
+                patch.object(server, "orchestrator", orchestrator),
+                patch.object(server, "task_coordinator", coordinator),
+                patch.object(server, "body_request_diagnostics", diagnostics),
+            ):
+                client = TestClient(server.app, base_url="http://127.0.0.1:8080", client=("127.0.0.1", 50000))
+                response = client.post("/api/sdk/command", json={"command": "jump", "args": {}})
+            state.close()
 
         self.assertEqual(response.status_code, 200)
         request_id = response.json()["request_id"]
@@ -624,33 +630,50 @@ class ServerSDKTests(unittest.TestCase):
         self.assertEqual(body.commands, [("jump", {})])
         self.assertEqual(orchestrator.session.commands, [("jump", request_id, {}, "sdk")])
 
+    def test_sdk_command_fails_closed_without_coordinator(self):
+        with (
+            patch.dict(os.environ, {"SDK_API_TOKEN": ""}),
+            patch.object(server, "body", FakeBody()),
+            patch.object(server, "task_coordinator", None),
+        ):
+            client = TestClient(server.app, base_url="http://127.0.0.1:8080", client=("127.0.0.1", 50000))
+            response = client.post("/api/sdk/command", json={"command": "jump", "args": {}})
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("coordinator", response.json()["detail"].lower())
+
     def test_body_request_diagnostics_tracks_events_redacts_and_retains_terminal_record(self):
         body = FakeBody()
         diagnostics = BodyRequestDiagnostics()
-        with (
-            patch.dict(os.environ, {"SDK_API_TOKEN": ""}),
-            patch.object(server, "body", body),
-            patch.object(server, "orchestrator", None),
-            patch.object(server, "task_coordinator", None),
-            patch.object(server, "body_request_diagnostics", diagnostics),
-        ):
-            client = TestClient(server.app, base_url="http://127.0.0.1:8080", client=("127.0.0.1", 50000))
-            accepted = client.post("/api/sdk/command", json={
-                "command": "craft_item",
-                "args": {"item": "minecraft:torch", "api_token": "do-not-return"},
-            })
-            request_id = accepted.json()["request_id"]
-            server._capture_control_response(BodyEvent("response", {
-                "id": request_id, "success": True, "data": {"message": "queued", "password": "hidden"},
-            }))
-            server._capture_control_response(BodyEvent("progress", {
-                "id": request_id, "progress": 0.5, "message": "crafting",
-            }))
-            server._capture_control_response(BodyEvent("outcome", {
-                "id": request_id, "status": "succeeded", "message": "crafted", "token": "hidden",
-            }))
-            result = client.get(f"/api/v2/body-requests/{request_id}")
-            missing = client.get("/api/v2/body-requests/missing")
+        with tempfile.TemporaryDirectory() as tmp:
+            state = AgentStateDB(Path(tmp) / "agent_state.db")
+            coordinator = TaskCoordinator(state, server.skill_registry, body)
+            coordinator.set_body_armed(True)
+            with (
+                patch.dict(os.environ, {"SDK_API_TOKEN": ""}),
+                patch.object(server, "body", body),
+                patch.object(server, "orchestrator", None),
+                patch.object(server, "task_coordinator", coordinator),
+                patch.object(server, "body_request_diagnostics", diagnostics),
+            ):
+                client = TestClient(server.app, base_url="http://127.0.0.1:8080", client=("127.0.0.1", 50000))
+                accepted = client.post("/api/sdk/command", json={
+                    "command": "craft_item",
+                    "args": {"item": "minecraft:torch", "api_token": "do-not-return"},
+                })
+                request_id = accepted.json()["request_id"]
+                server._capture_control_response(BodyEvent("response", {
+                    "id": request_id, "success": True, "data": {"message": "queued", "password": "hidden"},
+                }))
+                server._capture_control_response(BodyEvent("progress", {
+                    "id": request_id, "progress": 0.5, "message": "crafting",
+                }))
+                server._capture_control_response(BodyEvent("outcome", {
+                    "id": request_id, "status": "succeeded", "message": "crafted", "token": "hidden",
+                }))
+                result = client.get(f"/api/v2/body-requests/{request_id}")
+                missing = client.get("/api/v2/body-requests/missing")
+            state.close()
 
         payload = result.json()
         self.assertEqual(result.status_code, 200)
@@ -677,16 +700,21 @@ class ServerSDKTests(unittest.TestCase):
             return request_id
 
         body.send_command = send_immediately
-        with (
-            patch.dict(os.environ, {"SDK_API_TOKEN": ""}),
-            patch.object(server, "body", body),
-            patch.object(server, "orchestrator", None),
-            patch.object(server, "task_coordinator", None),
-            patch.object(server, "body_request_diagnostics", diagnostics),
-        ):
-            client = TestClient(server.app, base_url="http://127.0.0.1:8080", client=("127.0.0.1", 50000))
-            accepted = client.post("/api/sdk/command", json={"command": "jump"})
-            result = client.get(f"/api/v2/body-requests/{accepted.json()['request_id']}")
+        with tempfile.TemporaryDirectory() as tmp:
+            state = AgentStateDB(Path(tmp) / "agent_state.db")
+            coordinator = TaskCoordinator(state, server.skill_registry, body)
+            coordinator.set_body_armed(True)
+            with (
+                patch.dict(os.environ, {"SDK_API_TOKEN": ""}),
+                patch.object(server, "body", body),
+                patch.object(server, "orchestrator", None),
+                patch.object(server, "task_coordinator", coordinator),
+                patch.object(server, "body_request_diagnostics", diagnostics),
+            ):
+                client = TestClient(server.app, base_url="http://127.0.0.1:8080", client=("127.0.0.1", 50000))
+                accepted = client.post("/api/sdk/command", json={"command": "jump"})
+                result = client.get(f"/api/v2/body-requests/{accepted.json()['request_id']}")
+            state.close()
 
         self.assertEqual(result.json()["status"], "succeeded")
         self.assertTrue(result.json()["terminal"])

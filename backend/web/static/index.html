@@ -116,10 +116,14 @@ textarea{width:100%;min-height:68px;resize:vertical;background:#0d1117;border:1p
 
 <div class="tabs">
   <button class="tab active" onclick="showPage('dashboard',this)">仪表盘</button>
+  <button class="tab" onclick="showPage('bodies',this)">Bodies</button>
   <button class="tab" onclick="showPage('operations',this)">操作</button>
   <button class="tab" onclick="showPage('chat',this)">聊天</button>
   <button class="tab" onclick="showPage('memory',this)">记忆</button>
-  <button class="tab" onclick="showPage('settings',this)">设置</button>
+  <button class="tab" onclick="showPage('providers',this)">模型服务商</button>
+  <button class="tab" onclick="showPage('access',this)">访问权限</button>
+  <button class="tab" onclick="showPage('settings',this)">基础设置</button>
+  <button class="tab" onclick="showPage('diagnostics',this)">Diagnostics</button>
   <button class="tab" onclick="showPage('debug',this)">调试</button>
 </div>
 
@@ -155,6 +159,14 @@ textarea{width:100%;min-height:68px;resize:vertical;background:#0d1117;border:1p
           <div class="label">状态新鲜度</div>
           <div class="value" id="stateFreshness">-</div>
         </div>
+        <div class="stat">
+          <div class="label">移动所有权</div>
+          <div class="value" id="movementOwner">-</div>
+        </div>
+        <div class="stat">
+          <div class="label">导航状态</div>
+          <div class="value" id="navigationStatus">-</div>
+        </div>
       </div>
       <div style="margin-top:12px">
         <button class="btn primary" onclick="toggleAutonomy()">切换自主模式</button>
@@ -184,6 +196,19 @@ textarea{width:100%;min-height:68px;resize:vertical;background:#0d1117;border:1p
   </div>
 </div>
 
+<!-- Bodies Page -->
+<div id="page-bodies" class="page">
+  <div class="card">
+    <h3>AI Bodies</h3>
+    <div class="hint" style="margin-bottom:12px">一个后端可以托管多个身体。当前 body_client 已使用同一注册表，server_fake_player 后续按 body_id 接入。</div>
+    <div id="bodyRegistryList" class="data-list"><div class="empty">正在加载...</div></div>
+  </div>
+  <div class="card">
+    <h3>Body Detail</h3>
+    <div id="bodyRegistryDetail" class="memory-detail-grid"><div class="empty">选择一个身体查看详情</div></div>
+  </div>
+</div>
+
 <!-- Operations Page -->
 <div id="page-operations" class="page">
   <div class="ops-grid">
@@ -193,6 +218,8 @@ textarea{width:100%;min-height:68px;resize:vertical;background:#0d1117;border:1p
         <div class="stats">
           <div class="stat"><div class="label">模式</div><div class="value" id="opsControlMode">builtin</div></div>
           <div class="stat"><div class="label">租约所有者</div><div class="value" id="opsLeaseOwner">-</div></div>
+          <div class="stat"><div class="label">身体准入</div><div class="value" id="opsBodyAdmission">-</div></div>
+          <div class="stat"><div class="label">Intent / Run</div><div class="value" id="opsIntentState">-</div></div>
         </div>
         <div class="form-row" style="margin-top:10px"><label for="leaseOwner">控制器</label><input id="leaseOwner" value="dashboard" maxlength="128"></div>
         <div class="form-row"><label for="leaseTtl">TTL 秒</label><input id="leaseTtl" type="number" min="5" max="300" value="30"></div>
@@ -324,6 +351,71 @@ textarea{width:100%;min-height:68px;resize:vertical;background:#0d1117;border:1p
   </section>
 </div>
 
+<!-- Providers Page -->
+<div id="page-providers" class="page">
+  <div class="ops-grid">
+    <section class="card">
+      <h3>Provider Profiles</h3>
+      <div id="providerProfileList" class="data-list"><div class="empty">正在加载...</div></div>
+    </section>
+    <div>
+      <section class="card">
+        <h3>编辑服务商</h3>
+        <div class="form-row"><label for="profileId">Profile ID</label><input id="profileId" placeholder="deepseek-backup"></div>
+        <div class="form-row"><label for="profileName">显示名称</label><input id="profileName" placeholder="DeepSeek 备用"></div>
+        <div class="form-row"><label for="profileProvider">服务商</label><select id="profileProvider"></select></div>
+        <div class="form-row"><label for="profileBaseUrl">Base URL</label><input id="profileBaseUrl" placeholder="https://api.example.com/v1"></div>
+        <div class="form-row"><label for="profileModel">模型</label><input id="profileModel" placeholder="model-name"></div>
+        <div class="form-row"><label for="profileApiKey">API Key</label><input id="profileApiKey" type="password" placeholder="留空表示不修改"></div>
+        <label class="toggle-field" for="profileEnabled"><span>启用此服务商</span><input id="profileEnabled" type="checkbox" checked></label>
+        <div class="form-actions"><button class="btn" onclick="clearProviderProfileForm()">新建</button><button class="btn primary" onclick="saveProviderProfile()">保存</button></div>
+        <div id="providerProfileStatus" class="hint">API Key 只会显示为脱敏状态。</div>
+      </section>
+      <section class="card">
+        <h3>Agent 路由</h3>
+        <div class="form-row"><label for="routeAgent">Agent</label><select id="routeAgent" onchange="loadAgentRoute()"></select></div>
+        <div class="form-row"><label for="routePrimary">主 Profile</label><select id="routePrimary"></select></div>
+        <div class="form-row"><label for="routeMode">路由模式</label><select id="routeMode"><option value="manual">手动固定</option><option value="priority">失败后按优先级切换</option><option value="scheduled">计划切换（预留）</option></select></div>
+        <div class="form-row"><label for="routeFallbacks">备用顺序</label><input id="routeFallbacks" placeholder="profile-a,profile-b"></div>
+        <div class="form-actions"><button class="btn primary" onclick="saveAgentRoute()">保存路由</button></div>
+        <div id="agentRouteStatus" class="hint">priority 模式只在当前请求失败时尝试备用服务商。</div>
+      </section>
+      <section class="card">
+        <h3>Provider Health</h3>
+        <div id="providerHealthList" class="data-list"><div class="empty">尚无请求健康数据</div></div>
+      </section>
+    </div>
+  </div>
+</div>
+
+<!-- Access Page -->
+<div id="page-access" class="page">
+  <div class="ops-grid">
+    <section class="card">
+      <h3>授权主体</h3>
+      <div class="form-row"><label for="accessPublicChat">公共聊天</label><select id="accessPublicChat" onchange="saveAccessPolicyHeader()"><option value="true">允许</option><option value="false">拒绝</option></select></div>
+      <div class="form-row"><label for="accessPrivateChat">对话客户端</label><select id="accessPrivateChat" onchange="saveAccessPolicyHeader()"><option value="true">允许</option><option value="false">拒绝</option></select></div>
+      <div class="hint" style="margin-bottom:12px">公共聊天只授予 chat.reply，不授予移动、资源、背包、战斗或管理能力。</div>
+      <div id="accessPrincipalList" class="data-list"><div class="empty">正在加载...</div></div>
+    </section>
+    <section class="card">
+      <h3>编辑 Master / Friend / Operator</h3>
+      <div class="field-grid">
+        <div class="compact-field"><label for="principalId">Principal ID</label><input id="principalId" placeholder="alice"></div>
+        <div class="compact-field"><label for="principalRole">角色</label><select id="principalRole"><option value="player">player</option><option value="friend">friend</option><option value="master">master</option><option value="owner">owner</option><option value="server_moderator">server_moderator</option><option value="operator">operator</option><option value="server_admin">server_admin</option></select></div>
+        <div class="compact-field"><label for="principalName">显示名</label><input id="principalName" placeholder="Alice"></div>
+        <div class="compact-field"><label for="principalUuid">Minecraft UUID</label><input id="principalUuid" placeholder="UUID 优先"></div>
+        <div class="compact-field"><label for="principalServers">Server Scope</label><input id="principalServers" placeholder="survival-1,creative-1"></div>
+        <div class="compact-field"><label for="principalBodies">Body Scope</label><input id="principalBodies" placeholder="server-ai-1"></div>
+      </div>
+      <label class="toggle-field" for="principalEnabled"><span>启用授权</span><input id="principalEnabled" type="checkbox" checked></label>
+      <div class="compact-field"><label for="principalSkills">Skill Overrides JSON</label><textarea id="principalSkills" placeholder='{"task.inventory":"allow","task.combat":"deny"}'></textarea></div>
+      <div class="form-actions"><button class="btn" onclick="clearAccessPrincipalForm()">新建</button><button class="btn primary" onclick="saveAccessPrincipal()">保存</button></div>
+      <div id="accessStatus" class="hint">未指定 scope 表示适用于此后端可见的所有服务器或身体。</div>
+    </section>
+  </div>
+</div>
+
 <!-- Settings Page -->
 <div id="page-settings" class="page">
   <div class="responsive-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
@@ -442,6 +534,15 @@ textarea{width:100%;min-height:68px;resize:vertical;background:#0d1117;border:1p
   </div>
 </div>
 
+<!-- Diagnostics Page -->
+<div id="page-diagnostics" class="page">
+  <div class="responsive-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+    <section class="card"><h3>Access Audit</h3><div id="accessAuditList" class="data-list"><div class="empty">正在加载...</div></div></section>
+    <section class="card"><h3>Provider Audit</h3><div id="providerAuditList" class="data-list"><div class="empty">正在加载...</div></div></section>
+  </div>
+  <div class="card"><div class="form-actions"><button class="btn" onclick="loadDiagnostics()">刷新审计</button></div><div class="hint">审计日志为本机 append-only JSONL，API key、token、secret 和 password 字段写入前会脱敏。</div></div>
+</div>
+
 <!-- Debug Page -->
 <div id="page-debug" class="page">
   <div class="card">
@@ -486,6 +587,8 @@ window.fetch = (input, init = {}) => {
 let ws = null;
 let reconnectTimer = null;
 let providerPresets = [];
+let providerProfiles = [];
+let accessPolicy = null;
 let llmConfig = null;
 let sessionPollInFlight = false;
 let skillManifests = [];
@@ -496,6 +599,7 @@ let lastEventCursor = 0;
 let operationEvents = [];
 let bodyConnected = false;
 let bodyArmed = false;
+let registeredBodies = [];
 let selectedRunId = null;
 let operationsRefreshTimer = null;
 let executionDraft = {mode:'preset',presetId:'',presetFields:{},skillId:'',skillFields:{}};
@@ -540,6 +644,10 @@ function showPage(name, tab) {
   }
   if (name === 'memory' && !memoryState.loaded) loadMemoryPage();
   if (name === 'chat') loadInbox();
+  if (name === 'bodies') loadBodies();
+  if (name === 'providers') loadProviderProfiles();
+  if (name === 'access') loadAccessPolicy();
+  if (name === 'diagnostics') loadDiagnostics();
 }
 
 function startOperationsPolling() {
@@ -552,6 +660,61 @@ function startOperationsPolling() {
 function stopOperationsPolling() {
   if (operationsRefreshTimer) clearInterval(operationsRefreshTimer);
   operationsRefreshTimer = null;
+}
+
+async function loadBodies() {
+  try {
+    const data = await apiFetch('/api/v2/bodies');
+    registeredBodies = data.bodies || [];
+    renderDataRows('bodyRegistryList', registeredBodies, body => ({
+      title: `${body.id} · ${body.runtime_role}`,
+      meta: `${body.server_id}/${body.world_id} · ${body.connected ? '在线' : '离线'} · ${body.armed ? '已武装' : '未武装'} · ${body.stale ? '状态过期' : '状态新鲜'}`,
+      actions: [['查看', () => showBodyDetail(body.id)]]
+    }));
+    if (registeredBodies.length === 1) showBodyDetail(registeredBodies[0].id);
+  } catch (error) {
+    document.getElementById('bodyRegistryList').innerHTML = `<div class="empty">加载失败：${escapeHtml(error.message)}</div>`;
+  }
+}
+
+function showBodyDetail(bodyId) {
+  const body = registeredBodies.find(item => item.id === bodyId);
+  if (!body) return;
+  const target = document.getElementById('bodyRegistryDetail');
+  target.replaceChildren();
+  const fields = [
+    ['Body ID', body.id], ['运行角色', body.runtime_role], ['Owner', `${body.owner_type}:${body.owner_id}`],
+    ['Server', body.server_id], ['World', body.world_id], ['连接', body.connected ? 'online' : 'offline'],
+    ['武装', body.armed ? 'armed' : 'disarmed'], ['控制模式', body.control_mode],
+    ['状态年龄', body.state_age_seconds == null ? '-' : `${Number(body.state_age_seconds).toFixed(2)}s`],
+    ['控制租约', body.lease ? `${body.lease.owner} / ${body.lease.id}` : 'none'],
+    ['能力', (body.capabilities || []).join(', ') || '-'], ['更新时间', body.updated_at ? new Date(body.updated_at * 1000).toLocaleString('zh-CN') : '-']
+  ];
+  fields.forEach(([key, value]) => {
+    const label = document.createElement('div'); label.className = 'memory-detail-key'; label.textContent = key;
+    const content = document.createElement('div'); content.className = 'memory-detail-value'; content.textContent = String(value);
+    target.append(label, content);
+  });
+}
+
+async function loadDiagnostics() {
+  try {
+    const [access, provider] = await Promise.all([
+      apiFetch('/api/v2/audit?category=access&limit=100'),
+      apiFetch('/api/v2/audit?category=provider&limit=100')
+    ]);
+    renderAuditEvents('accessAuditList', access.events || []);
+    renderAuditEvents('providerAuditList', provider.events || []);
+  } catch (error) {
+    ['accessAuditList','providerAuditList'].forEach(id => { document.getElementById(id).innerHTML = `<div class="empty">加载失败：${escapeHtml(error.message)}</div>`; });
+  }
+}
+
+function renderAuditEvents(targetId, events) {
+  renderDataRows(targetId, events, event => ({
+    title: `${event.action} · ${event.outcome}`,
+    meta: `${event.target || '-'} · ${event.actor} · ${event.occurred_at ? new Date(event.occurred_at * 1000).toLocaleString('zh-CN') : '-'}`
+  }));
 }
 
 // ── Local Settings Cache ──
@@ -592,6 +755,8 @@ function handleEvent(type, data, occurredAt) {
   } else if (type === 'control_state') {
     setBodyConnection(true);
     updateDashboard({control_state:data});
+  } else if (type === 'behavior_state') {
+    updateDashboard({behavior_state:data});
   } else if (type === 'player_chat') {
     addChatMessage(data.sender, data.message);
   }
@@ -641,6 +806,11 @@ function updateDashboard(data) {
   }
   const ownerMode = data.control_mode || data.controlMode || 'builtin';
   document.getElementById('controlMode').textContent = bodyArmed ? (ownerMode === 'external' ? '外部 AI' : 'AI 已武装') : '玩家控制';
+  const behavior = data.behavior_state || {};
+  if (Object.keys(behavior).length) {
+    document.getElementById('movementOwner').textContent = behavior.movement_owner || 'none';
+    document.getElementById('navigationStatus').textContent = behavior.navigation_failure || behavior.navigation_status || (behavior.navigating ? 'navigating' : 'idle');
+  }
   const task = data.task_state || {};
   const action = data.action || {};
   document.getElementById('taskQueue').textContent = task.status && task.status !== 'idle'
@@ -818,6 +988,10 @@ async function loadOperations() {
     ]);
     document.getElementById('opsControlMode').textContent = control.mode || 'builtin';
     document.getElementById('opsLeaseOwner').textContent = control.lease?.owner || '-';
+    document.getElementById('opsBodyAdmission').textContent = control.coordinator?.body_armed ? 'armed' : 'disarmed';
+    document.getElementById('opsIntentState').textContent = control.coordinator
+      ? `${control.coordinator.raw_request_count || 0} raw / ${control.coordinator.durable_run_active ? 1 : 0} run`
+      : 'unavailable';
     document.getElementById('executionMode').value = executionDraft.mode;
     skillManifests = skillData.skills || [];
     taskPresets = presetData.presets || [];
@@ -1442,6 +1616,188 @@ function formatMemoryTime(timestamp) {
   return new Date(Number(timestamp) * 1000).toLocaleString('zh-CN');
 }
 
+// ── Provider Profiles ──
+async function loadProviderProfiles() {
+  try {
+    const data = await apiFetch('/api/v2/llm/profiles');
+    providerProfiles = data.profiles || [];
+    const providerSelect = document.getElementById('profileProvider');
+    providerSelect.replaceChildren(...providerPresets.map(item => new Option(item.name, item.id)));
+    const profileOptions = providerProfiles.map(item => new Option(`${item.name} (${item.id})`, item.id));
+    document.getElementById('routePrimary').replaceChildren(...profileOptions);
+    const agents = Object.keys(llmConfig?.agents || {default:{}});
+    document.getElementById('routeAgent').replaceChildren(...agents.map(name => new Option(name, name)));
+    renderProviderProfiles();
+    renderProviderHealth(llmConfig?.usage?.provider_health || []);
+    loadAgentRoute();
+  } catch (error) {
+    document.getElementById('providerProfileStatus').textContent = `加载失败：${error.message}`;
+  }
+}
+
+function renderProviderProfiles() {
+  renderDataRows('providerProfileList', providerProfiles, profile => ({
+    title: `${profile.name} · ${profile.enabled === false ? '停用' : '启用'}`,
+    meta: `${profile.id} · ${profile.provider} · ${profile.model || '-'} · ${profile.base_url || '-'}`,
+    actions: [['编辑', () => editProviderProfile(profile.id)], ['删除', () => deleteProviderProfile(profile.id)]]
+  }));
+}
+
+function renderProviderHealth(items) {
+  renderDataRows('providerHealthList', items, item => ({
+    title: `${item.profile_id || item.key} · ${item.status}`,
+    meta: `${item.provider || '-'} · ${item.model || '-'} · failures ${item.consecutive_failures || 0} · cooldown ${Math.ceil(item.cooldown_remaining_seconds || 0)}s${item.last_error ? ` · ${item.last_error}` : ''}`
+  }));
+}
+
+function editProviderProfile(profileId) {
+  const profile = providerProfiles.find(item => item.id === profileId);
+  if (!profile) return;
+  document.getElementById('profileId').value = profile.id;
+  document.getElementById('profileName').value = profile.name || '';
+  document.getElementById('profileProvider').value = profile.provider || 'custom';
+  document.getElementById('profileBaseUrl').value = profile.base_url || '';
+  document.getElementById('profileModel').value = profile.model || '';
+  document.getElementById('profileApiKey').value = '';
+  document.getElementById('profileEnabled').checked = profile.enabled !== false;
+}
+
+function clearProviderProfileForm() {
+  ['profileId','profileName','profileBaseUrl','profileModel','profileApiKey'].forEach(id => { document.getElementById(id).value = ''; });
+  document.getElementById('profileProvider').value = providerPresets[0]?.id || 'custom';
+  document.getElementById('profileEnabled').checked = true;
+}
+
+async function saveProviderProfile() {
+  const id = document.getElementById('profileId').value.trim();
+  if (!id) { document.getElementById('providerProfileStatus').textContent = 'Profile ID 不能为空'; return; }
+  const payload = {
+    id,
+    name: document.getElementById('profileName').value.trim() || id,
+    provider: document.getElementById('profileProvider').value,
+    base_url: document.getElementById('profileBaseUrl').value.trim(),
+    model: document.getElementById('profileModel').value.trim(),
+    enabled: document.getElementById('profileEnabled').checked
+  };
+  const apiKey = document.getElementById('profileApiKey').value;
+  if (apiKey) payload.api_key = apiKey;
+  try {
+    await apiFetch('/api/v2/llm/profiles', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    document.getElementById('providerProfileStatus').textContent = `${id} 已保存`;
+    document.getElementById('profileApiKey').value = '';
+    await loadLLMConfig(); await loadProviderProfiles();
+  } catch (error) { document.getElementById('providerProfileStatus').textContent = `保存失败：${error.message}`; }
+}
+
+async function deleteProviderProfile(profileId) {
+  if (!confirm(`删除 Provider Profile ${profileId}？`)) return;
+  try {
+    await apiFetch(`/api/v2/llm/profiles/${encodeURIComponent(profileId)}`, {method:'DELETE'});
+    await loadProviderProfiles();
+  } catch (error) { document.getElementById('providerProfileStatus').textContent = `删除失败：${error.message}`; }
+}
+
+function loadAgentRoute() {
+  const agent = document.getElementById('routeAgent').value || 'default';
+  const config = llmConfig?.agents?.[agent] || llmConfig?.agents?.default || {};
+  document.getElementById('routePrimary').value = config.provider_profile || providerProfiles[0]?.id || '';
+  document.getElementById('routeMode').value = config.routing_mode || 'manual';
+  document.getElementById('routeFallbacks').value = (config.fallback_profiles || []).join(',');
+}
+
+async function saveAgentRoute() {
+  const agent = document.getElementById('routeAgent').value || 'default';
+  const payload = {
+    agent,
+    provider_profile: document.getElementById('routePrimary').value,
+    routing_mode: document.getElementById('routeMode').value,
+    fallback_profiles: document.getElementById('routeFallbacks').value.split(',').map(value => value.trim()).filter(Boolean)
+  };
+  try {
+    await apiFetch('/api/llm/config', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    document.getElementById('agentRouteStatus').textContent = `${agent} 路由已保存`;
+    await loadLLMConfig(); loadAgentRoute();
+  } catch (error) { document.getElementById('agentRouteStatus').textContent = `保存失败：${error.message}`; }
+}
+
+// ── Access Policy ──
+async function loadAccessPolicy() {
+  try {
+    accessPolicy = await apiFetch('/api/v2/access/policy');
+    document.getElementById('accessPublicChat').value = String(accessPolicy.public_chat !== false);
+    document.getElementById('accessPrivateChat').value = String(accessPolicy.private_chat !== false);
+    renderAccessPrincipals();
+  } catch (error) { document.getElementById('accessStatus').textContent = `加载失败：${error.message}`; }
+}
+
+function renderAccessPrincipals() {
+  renderDataRows('accessPrincipalList', accessPolicy?.principals || [], principal => ({
+    title: `${principal.name || principal.id} · ${principal.role} · ${principal.enabled === false ? '停用' : '启用'}`,
+    meta: `${principal.uuid || '无 UUID'} · servers: ${(principal.server_ids || []).join(',') || '*'} · bodies: ${(principal.body_ids || []).join(',') || '*'}`,
+    actions: [['编辑', () => editAccessPrincipal(principal.id)], ['删除', () => deleteAccessPrincipal(principal.id)]]
+  }));
+}
+
+function editAccessPrincipal(principalId) {
+  const principal = accessPolicy?.principals?.find(item => item.id === principalId);
+  if (!principal) return;
+  document.getElementById('principalId').value = principal.id;
+  document.getElementById('principalRole').value = principal.role;
+  document.getElementById('principalName').value = principal.name || '';
+  document.getElementById('principalUuid').value = principal.uuid || '';
+  document.getElementById('principalServers').value = (principal.server_ids || []).join(',');
+  document.getElementById('principalBodies').value = (principal.body_ids || []).join(',');
+  document.getElementById('principalEnabled').checked = principal.enabled !== false;
+  document.getElementById('principalSkills').value = JSON.stringify(principal.skills || {}, null, 2);
+}
+
+function clearAccessPrincipalForm() {
+  ['principalId','principalName','principalUuid','principalServers','principalBodies','principalSkills'].forEach(id => { document.getElementById(id).value = ''; });
+  document.getElementById('principalRole').value = 'friend';
+  document.getElementById('principalEnabled').checked = true;
+}
+
+async function saveAccessPolicyHeader() {
+  if (!accessPolicy) return;
+  accessPolicy.public_chat = document.getElementById('accessPublicChat').value === 'true';
+  accessPolicy.private_chat = document.getElementById('accessPrivateChat').value === 'true';
+  try {
+    accessPolicy = await apiFetch('/api/v2/access/policy', {method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(accessPolicy)});
+    document.getElementById('accessStatus').textContent = '公共聊天策略已保存';
+  } catch (error) { document.getElementById('accessStatus').textContent = `保存失败：${error.message}`; }
+}
+
+async function saveAccessPrincipal() {
+  const id = document.getElementById('principalId').value.trim();
+  if (!id) { document.getElementById('accessStatus').textContent = 'Principal ID 不能为空'; return; }
+  let skills = {};
+  try { skills = JSON.parse(document.getElementById('principalSkills').value || '{}'); }
+  catch (_) { document.getElementById('accessStatus').textContent = 'Skill Overrides 必须是 JSON 对象'; return; }
+  const payload = {
+    id,
+    role: document.getElementById('principalRole').value,
+    name: document.getElementById('principalName').value.trim(),
+    uuid: document.getElementById('principalUuid').value.trim(),
+    server_ids: document.getElementById('principalServers').value.split(',').map(value => value.trim()).filter(Boolean),
+    body_ids: document.getElementById('principalBodies').value.split(',').map(value => value.trim()).filter(Boolean),
+    enabled: document.getElementById('principalEnabled').checked,
+    skills
+  };
+  try {
+    await apiFetch('/api/v2/access/principals', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    document.getElementById('accessStatus').textContent = `${id} 已保存`;
+    await loadAccessPolicy();
+  } catch (error) { document.getElementById('accessStatus').textContent = `保存失败：${error.message}`; }
+}
+
+async function deleteAccessPrincipal(principalId) {
+  if (!confirm(`删除授权主体 ${principalId}？`)) return;
+  try {
+    await apiFetch(`/api/v2/access/principals/${encodeURIComponent(principalId)}`, {method:'DELETE'});
+    await loadAccessPolicy();
+  } catch (error) { document.getElementById('accessStatus').textContent = `删除失败：${error.message}`; }
+}
+
 // ── Settings ──
 function numericValue(id) {
   const value = Number(document.getElementById(id).value);
@@ -1513,6 +1869,7 @@ function loadLLMConfig() {
     const agent = recallSetting('agent', d.default_agent || 'default');
     document.getElementById('agentSelect').value = agent;
     loadAgentLLMConfig();
+    if (document.getElementById('providerHealthList')) renderProviderHealth(d.usage?.provider_health || []);
   }).catch(()=>{});
 }
 

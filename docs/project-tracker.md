@@ -389,7 +389,8 @@ Acceptance gates:
 
 ### Phase 7: Multiplayer Governance And Task Admission
 
-Status: `planned`; current whitelist and command permissions are not sufficient for OP operation.
+Status: `active`; the first scoped identity and skill-policy layer is implemented, but
+durable audit, rate limits, weighted admission, and OP command capability enforcement remain open.
 
 Required identity groups:
 
@@ -600,7 +601,7 @@ The following foundation already exists and must not regress:
 
 Latest recorded verification:
 
-- Python tests: 216 passed with 1 intentional opt-in integration skip on 2026-07-19.
+- Python tests: 236 passed with 1 intentional opt-in integration skip on 2026-07-20.
 - Gradle: `clean build` passed on 2026-07-19.
 - Explicit production Java-to-Python wire integration: 1 passed.
 - NeoForge `runServer` smoke reached `Done` and logged both side-neutral common and
@@ -773,3 +774,34 @@ Pending headed-body verification, deferred to the next test session:
   do not block those safety commands, WireServer rejects blank tokens and isolates outbound frames
   by authenticated connection, pending sockets are closed during replacement/shutdown, and client
   world/logout/player lifecycle events invalidate active body work before reuse.
+- Added scoped access principals for `friend`, `master`, `owner`, moderation, operator, admin,
+  and system roles. Decisions combine UUID/identity, server scope, body scope, channel, role,
+  skill class, and explicit allow/deny overrides; UUID-bound entries cannot be impersonated by name.
+- Split public Minecraft chat from private `player_client` conversation admission. Servers can
+  independently disable either channel while retaining explicit principal grants, and legacy
+  whitelist/listen settings migrate into the new policy.
+- Added named provider profiles with redacted credentials, per-agent primary profile selection,
+  manual/priority routing configuration, ordered fallback profiles, and request telemetry that
+  records provider, profile, attempt, and fallback source.
+- Added first-class dashboard pages for provider profile/routing management and access-principal
+  CRUD, including master/friend/operator roles, UUID, server/body scopes, and skill overrides.
+- Added a backend `BodyRegistry` and Bodies API/UI. The current headed body now has an explicit
+  body ID, runtime role from Wire authentication, owner, server/world scope, connection, armed
+  state, control mode, lease, capabilities, and freshness record; future fake players use the
+  same list-based contract instead of reusing the client singleton.
+- Added an append-only local administrative audit log with recursive credential redaction,
+  access/provider event filtering, REST access, and a Diagnostics dashboard page.
+- Routed production Session Skills, modes, self-prompter commands, SDK/WebSocket raw commands,
+  and reserved control transitions through TaskCoordinator-owned emission. Low-level command APIs
+  now fail closed when the coordinator is unavailable, while sideband observation/chat commands
+  remain explicitly classified.
+- Added provider failure health with exponential cooldown and priority-route skipping. Runtime
+  telemetry and the Providers page expose health, consecutive failures, recent errors, and
+  remaining cooldown.
+- Added coordinator admission telemetry to the control API and Operations page, plus regression
+  coverage proving a late duplicate outcome cannot replace or duplicate an existing terminal run.
+- Added request-owned navigation sessions for headed `move_to`. Internal follow/autonomy retargets
+  cannot replace an accepted operation, direct moves suppress optional autonomy, user takeover emits
+  `USER_OVERRIDE`, arrival uses the resolved standing goal, stuck recovery is bounded to three
+  repaths, and distance-based deadlines terminate with `TIMEOUT`. Dashboard state now exposes the
+  movement owner and navigation status/failure.

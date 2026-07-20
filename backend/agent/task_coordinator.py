@@ -18,6 +18,7 @@ from .skill_registry import SkillRegistry
 FENCING_FIELD = "__lcu_fencing_token"
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled", "unknown"}
 COMMAND_TIMEOUT_SECONDS = 30 * 60
+SIDEBAND_COMMANDS = {"send_chat", "get_state", "get_inventory", "get_container", "get_recipes"}
 
 
 class TaskCoordinator:
@@ -280,6 +281,20 @@ class TaskCoordinator:
         with self._dispatch_lock:
             return self.state.has_active_runs() or bool(self._raw_requests)
 
+    def get_status(self) -> dict[str, Any]:
+        now = time.monotonic()
+        with self._dispatch_lock:
+            ages = [max(0.0, now - started_at) for _, started_at in self._raw_requests.values()]
+            return {
+                "body_armed": self._body_armed,
+                "session_busy": self._session_busy,
+                "durable_run_active": self.state.has_active_runs(),
+                "raw_request_count": len(self._raw_requests),
+                "cancel_request_count": len(self._cancel_requests),
+                "oldest_raw_request_age_seconds": max(ages) if ages else None,
+                "clock_scope": self._clock_scope,
+            }
+
     def set_session_busy(self, busy: bool) -> None:
         with self._dispatch_lock:
             self._session_busy = busy
@@ -330,6 +345,48 @@ class TaskCoordinator:
                     on_failed(request_id)
                 raise ConnectionError("body did not preserve raw request id")
             return request_id
+
+    def dispatch_internal_command(self, command: str, args: dict[str, Any], context: str) -> str:
+        """Admit Session-owned commands without exposing the raw body to Skills."""
+        if command == "stop_all":
+            return self.preempt_all(f"{context} stop")["request_id"]
+        with self._dispatch_lock:
+            if not self.body.is_connected:
+                raise ConnectionError("companion body is not connected")
+            if command == "disarm":
+                return self.dispatch_raw_command(command, dict(args))
+            sideband = command in SIDEBAND_COMMANDS
+            if not sideband and not self._body_armed:
+                raise ValueError("companion body is not armed")
+            if not sideband and self.state.has_active_runs():
+                raise ValueError("a durable task run owns the companion body")
+            if not sideband and self.state.get_active_lease() is not None:
+                raise LeaseConflictError("an external control lease owns the companion body")
+            if not sideband and self._raw_requests and context != "mode":
+                raise ValueError("the companion is already executing an internal command")
+            return self.dispatch_raw_command(command, dict(args))
+
+    def dispatch_control_command(self, command: str, args: dict[str, Any], request_id: str) -> str:
+        """Emit a reserved control transition through the coordinator boundary."""
+        with self._dispatch_lock:
+            if not self.body.is_connected:
+                raise ConnectionError("companion body is not connected")
+            self.register_raw_command(command, request_id)
+            try:
+                returned_id = self.body.send_command(command, dict(args), request_id=request_id)
+            except Exception:
+                self._raw_requests.pop(request_id, None)
+                raise
+            if returned_id != request_id:
+                self._raw_requests.pop(request_id, None)
+                raise ConnectionError("body did not preserve control request id")
+            return request_id
+
+    def release_raw_command(self, request_id: str) -> None:
+        with self._dispatch_lock:
+            self._raw_requests.pop(request_id, None)
+            if request_id == self._stop_request_id:
+                self._stop_request_id = None
 
     def cancel(self, run_id: str, *, lease_id: str | None = None,
                fencing_token: int | None = None) -> dict[str, Any]:

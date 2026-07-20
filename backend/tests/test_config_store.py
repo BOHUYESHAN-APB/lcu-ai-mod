@@ -175,6 +175,51 @@ class ConfigStoreTests(unittest.TestCase):
             self.assertEqual(result["persistence"]["scope"], "world")
             self.assertEqual(result["persistence"]["server_id"], "example.org")
 
+    def test_provider_profiles_supply_effective_agent_credentials(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConfigStore(Path(tmp) / "config.json")
+            store.upsert_provider_profile({
+                "id": "deepseek-backup",
+                "name": "DeepSeek backup",
+                "provider": "deepseek",
+                "api_key": "profile-secret",
+            })
+            store.set_agent_llm_config("planner", {
+                "provider_profile": "deepseek-backup",
+                "routing_mode": "priority",
+                "fallback_profiles": ["mimo-default"],
+            })
+
+            effective = store.get_agent_llm_config("planner", redact=False)
+            public_profiles = store.list_provider_profiles()
+
+            self.assertEqual(effective["provider"], "deepseek")
+            self.assertEqual(effective["api_key"], "profile-secret")
+            self.assertEqual(effective["fallback_profiles"], ["mimo-default"])
+            self.assertEqual(next(item for item in public_profiles if item["id"] == "deepseek-backup")["api_key"], "***")
+
+    def test_assigned_provider_profile_cannot_be_deleted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConfigStore(Path(tmp) / "config.json")
+
+            with self.assertRaisesRegex(ValueError, "assigned"):
+                store.delete_provider_profile("mimo-default")
+
+    def test_legacy_whitelist_migrates_to_scoped_access_policy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps({
+                "version": 2,
+                "whitelist": ["Alice"],
+                "listen_public": False,
+            }), encoding="utf-8")
+
+            policy = ConfigStore(path).get_access_policy()
+
+            self.assertFalse(policy["public_chat"])
+            self.assertEqual(policy["principals"][0]["name"], "Alice")
+            self.assertEqual(policy["principals"][0]["role"], "friend")
+
 
 if __name__ == "__main__":
     unittest.main()

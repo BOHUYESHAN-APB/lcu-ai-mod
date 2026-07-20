@@ -29,6 +29,7 @@ class Skills:
 
     def __init__(self, body: BodyAdapter | None = None):
         self.body = body
+        self._command_dispatcher = None
         self._command_observer = None
         self._command_context = "default"
 
@@ -37,6 +38,9 @@ class Skills:
 
     def set_command_observer(self, observer):
         self._command_observer = observer
+
+    def set_command_dispatcher(self, dispatcher):
+        self._command_dispatcher = dispatcher
 
     @contextmanager
     def command_context(self, context: str):
@@ -278,10 +282,17 @@ class Skills:
 
     def _send_cmd(self, cmd: str, args: dict) -> dict:
         """Send a command to the active body and return immediately."""
-        if not self.body:
+        if self._command_dispatcher:
+            try:
+                req_id = self._command_dispatcher(cmd, args, self._command_context)
+            except (ConnectionError, RuntimeError, ValueError) as exc:
+                logger.info("[Skills] Rejected %s: %s", cmd, exc)
+                return {"success": False, "message": str(exc)}
+        elif self.body:
+            req_id = self.body.send_command(cmd, args)
+        else:
             logger.warning("[Skills] No body, skipping %s", cmd)
             return {"success": False, "message": "No body connection"}
-        req_id = self.body.send_command(cmd, args)
         if self._command_observer:
             try:
                 self._command_observer(cmd, req_id, self._command_context, args)

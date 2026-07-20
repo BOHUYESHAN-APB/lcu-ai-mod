@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from protocol import BodyAdapter
+from .access_policy import classify_skill, evaluate as evaluate_access, load_policy
 from .config_store import DEFAULT_CONFIG_PATH
 from .action_manager import ActionManager
 from .memory import Memory
@@ -107,6 +108,8 @@ class Session:
         self._manual_task_kind: Optional[str] = None
         self._stopped = False
         self._current_requester: tuple[str, str] | None = None
+        self._current_request_channel: str | None = None
+        self._planner_proposal_dispatcher = None
         self._pending_commands: dict[str, dict] = {}
         self.control_mode = "builtin"
         self.control_fencing_token = 0
@@ -138,7 +141,7 @@ class Session:
                 sender_id = str(data.get("uuid", ""))
 
                 # Chat permission check (whitelist)
-                if not self._check_chat_permission(sender, is_system):
+                if not self._check_chat_permission(sender, is_system, sender_id):
                     logger.debug("[Chat] Ignored: %s (not in whitelist)", sender)
                     return
 
@@ -165,7 +168,9 @@ class Session:
                     return
 
                 if self._external_task_busy:
-                    if self.is_stop_intent(message) and self.dispatch_stop_intent():
+                    if self.is_stop_intent(message) and self.check_chat_skill_permission(
+                        sender, is_system, sender_id, "safety.stop"
+                    ) and self.dispatch_stop_intent():
                         with self.skills.command_context("chat_reply"):
                             self.skills.send_chat("停下了")
                     return
@@ -199,6 +204,7 @@ class Session:
                         message,
                         command_context=planner_context,
                         sender_id=sender_id,
+                        requester_channel="chat.public",
                         record_interaction=False,
                     )
                     if response:
@@ -306,38 +312,24 @@ class Session:
                 return merged
         return [bot_name]
 
-    def _check_chat_permission(self, sender: str, is_system: bool) -> bool:
+    def _check_chat_permission(self, sender: str, is_system: bool, sender_id: str = "") -> bool:
         """Check if a chat sender is allowed to talk to this AI."""
-        # Load whitelist from config
-        try:
-            import json
-            config_path = DEFAULT_CONFIG_PATH
-            if config_path.exists():
-                config = json.loads(config_path.read_text(encoding="utf-8"))
-            else:
-                config = {}
-        except Exception:
-            config = {}
+        return self.check_chat_skill_permission(sender, is_system, sender_id, "chat.reply")
 
-        whitelist = config.get("whitelist", [])
-        listen_public = config.get("listen_public", True)
-
-        # Empty whitelist = listen to everyone
-        if not whitelist:
-            return True
-
-        # Check if sender is in whitelist
-        if sender in whitelist:
-            return True
-
-        # Check public chat permission
-        if listen_public and not is_system:
-            return True
-
-        return False
+    def check_chat_skill_permission(self, sender: str, is_system: bool, sender_id: str, skill: str) -> bool:
+        decision = evaluate_access(
+            load_policy(DEFAULT_CONFIG_PATH),
+            {"name": sender, "uuid": sender_id},
+            channel="chat.system" if is_system else "chat.public",
+            skill=skill,
+            server_id=self.identity.server_id,
+            body_id=self.identity.companion_id,
+        )
+        return bool(decision["allowed"])
 
     def handle_chat(self, sender: str, message: str, command_context: str = "chat",
-                    sender_id: str = "", record_interaction: bool = True) -> Optional[str]:
+                    sender_id: str = "", requester_channel: str | None = None,
+                    record_interaction: bool = True) -> Optional[str]:
         """
         Process a chat message through the LLM.
         Uses Planner for intelligent action planning.
@@ -355,7 +347,9 @@ class Session:
         
         # Use Planner to plan and execute
         previous_requester = self._current_requester
+        previous_channel = self._current_request_channel
         self._current_requester = (sender, sender_id)
+        self._current_request_channel = requester_channel
         try:
             with self.skills.command_context(command_context):
                 response = self.planner.plan_and_execute(
@@ -363,6 +357,7 @@ class Session:
                 )
         finally:
             self._current_requester = previous_requester
+            self._current_request_channel = previous_channel
         
         if response and record_interaction:
             self.memory.attach_response(sender, message, response)
@@ -547,7 +542,27 @@ class Session:
         return self._ensure_world_model().acknowledge_decision_triggers(through_sequence)
 
     def set_planner_proposal_dispatcher(self, dispatcher) -> None:
-        self.planner.set_proposal_dispatcher(dispatcher)
+        self._planner_proposal_dispatcher = dispatcher
+        self.planner.set_proposal_dispatcher(self._dispatch_authorized_proposal if dispatcher else None)
+
+    def _dispatch_authorized_proposal(self, proposal: SkillProposal) -> bool:
+        if self._planner_proposal_dispatcher is None:
+            return False
+        channel = self._current_request_channel
+        requester = self._current_requester
+        if channel and requester:
+            decision = evaluate_access(
+                load_policy(DEFAULT_CONFIG_PATH),
+                {"name": requester[0], "uuid": requester[1]},
+                channel=channel,
+                skill=classify_skill(proposal.skill_id),
+                server_id=self.identity.server_id,
+                body_id=self.identity.companion_id,
+            )
+            if not decision["allowed"]:
+                logger.info("[Access] Denied %s for %s (%s)", proposal.skill_id, requester[0], decision["role"])
+                return False
+        return bool(self._planner_proposal_dispatcher(proposal))
 
     def dispatch_stop_intent(self) -> bool:
         return self.planner.dispatch_proposal(SkillProposal("core.stop", {}, "direct_stop_intent"))

@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from agent.agent_state import AgentStateDB
 from agent.decision_scheduler import DecisionScheduler
@@ -240,7 +241,8 @@ class OrchestratorBodyTests(unittest.TestCase):
                 "data": {"sender": "Alice", "message": "先停下", "is_system": False},
             })
 
-            accepted = orchestrator.handle_priority_body_event(event)
+            with patch.object(orchestrator.session, "check_chat_skill_permission", return_value=True):
+                accepted = orchestrator.handle_priority_body_event(event)
 
             self.assertTrue(accepted)
             self.assertEqual([command for command, _ in body.commands], ["move_to", "stop_all"])

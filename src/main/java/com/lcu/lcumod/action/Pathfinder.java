@@ -55,17 +55,32 @@ public class Pathfinder {
     private static Vec3 lastPosition = null;
     private static int stuckTicks = 0;
     private static String lastFailureReason = "";
-    private static String activeRequestId = null;
+    private static Vec3 resolvedGoalPos = null;
+    private static final NavigationSession navigationSession = new NavigationSession();
 
     public static boolean navigateTo(String requestId, double x, double y, double z) {
-        targetPos = new Vec3(x, y, z);
+        Minecraft mc = Minecraft.getInstance();
+        Vec3 requestedTarget = new Vec3(x, y, z);
+        double distance = mc.player == null ? 0.0 : mc.player.position().distanceTo(requestedTarget);
+        int currentTick = mc.player == null ? 0 : mc.player.tickCount;
+        NavigationSession.StartDecision decision = navigationSession.begin(requestId, currentTick, distance);
+        if (decision == NavigationSession.StartDecision.CONFLICT) {
+            lastFailureReason = "navigation is owned by request " + navigationSession.requestId();
+            return false;
+        }
+        boolean retargeted = decision == NavigationSession.StartDecision.RETARGETED;
+        if (decision == NavigationSession.StartDecision.STARTED && isNavigating) {
+            clearNavigationState();
+        }
+        targetPos = requestedTarget;
         currentPath.clear();
         currentPathIndex = 0;
         isNavigating = true;
-        lastPosition = null;
-        stuckTicks = 0;
+        if (!retargeted) {
+            lastPosition = null;
+            stuckTicks = 0;
+        }
         lastFailureReason = "";
-        activeRequestId = requestId;
         boolean found = calculatePath();
         if (!found) stop();
         return found;
@@ -109,8 +124,13 @@ public class Pathfinder {
     }
 
     public static void stop() {
-        activeRequestId = null;
+        navigationSession.clear();
+        clearNavigationState();
+    }
+
+    private static void clearNavigationState() {
         targetPos = null;
+        resolvedGoalPos = null;
         currentPath.clear();
         currentPathIndex = 0;
         isNavigating = false;
@@ -134,7 +154,15 @@ public class Pathfinder {
         }
 
         Vec3 playerPos = mc.player.position();
-        if (isReached(playerPos, targetPos)) {
+        if (navigationSession.isTimedOut(mc.player.tickCount)) {
+            reportProgress(0.0, "navigation timed out");
+            reportOutcome("failed", "TIMEOUT", "navigation timed out");
+            stop();
+            return;
+        }
+
+        Vec3 completionTarget = resolvedGoalPos == null ? targetPos : resolvedGoalPos;
+        if (isReached(playerPos, completionTarget)) {
             reportProgress(1.0, "arrived");
             reportOutcome("succeeded", "ARRIVED", "arrived");
             stop();
@@ -142,8 +170,20 @@ public class Pathfinder {
         }
 
         if (isStuck(playerPos)) {
+            if (!navigationSession.consumeRepathAttempt()) {
+                reportProgress(0.0, "navigation stuck after bounded retries");
+                reportOutcome("failed", "STUCK", "navigation stuck after bounded retries");
+                stop();
+                return;
+            }
             LCUMod.LOGGER.warn("[Pathfinder] Stuck, recalculating path...");
-            calculatePath();
+            if (!calculatePath()) {
+                String reason = lastFailureReason.isBlank() ? "no path found after getting stuck" : lastFailureReason;
+                reportProgress(0.0, reason);
+                reportOutcome("failed", "NO_PATH", reason);
+                stop();
+                return;
+            }
             stuckTicks = 0;
         }
 
@@ -181,6 +221,7 @@ public class Pathfinder {
         currentPathIndex = 0;
 
         if (start == null || goal == null) {
+            resolvedGoalPos = null;
             lastFailureReason = start == null && goal == null
                 ? "could not resolve start and goal stand positions"
                 : start == null
@@ -189,6 +230,7 @@ public class Pathfinder {
             LCUMod.LOGGER.warn("[Pathfinder] {}", lastFailureReason);
             return false;
         }
+        resolvedGoalPos = goal.standingPos;
 
         if (isGoal(start, goal)) {
             currentPath.add(goal.standingPos);
@@ -444,7 +486,12 @@ public class Pathfinder {
         double dz = target.z - current.z;
         double dy = target.y - current.y;
         double horizontalDistance = Math.sqrt(dx * dx + dz * dz);
-        if (horizontalDistance < 0.01) return;
+        if (horizontalDistance < 0.01) {
+            InputIsolation.setAiControlState("forward", false);
+            InputIsolation.setAiControlState("sprint", false);
+            InputIsolation.setAiControlState("jump", false);
+            return;
+        }
 
         float targetYaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
         float targetPitch = (float) Math.toDegrees(-Math.atan2(dy, horizontalDistance));
@@ -515,8 +562,10 @@ public class Pathfinder {
         if (!isNavigating || targetPos == null) {
             return "Idle";
         }
-        return String.format("Navigating to (%.0f, %.0f, %.0f) path=%d idx=%d",
-            targetPos.x, targetPos.y, targetPos.z, currentPath.size(), currentPathIndex);
+        return String.format("Navigating to (%.0f, %.0f, %.0f) path=%d idx=%d owner=%s repaths=%d",
+            targetPos.x, targetPos.y, targetPos.z, currentPath.size(), currentPathIndex,
+            navigationSession.requestId() == null ? "internal" : navigationSession.requestId(),
+            navigationSession.repathAttempts());
     }
 
     public static String getLastFailureReason() {
@@ -524,14 +573,15 @@ public class Pathfinder {
     }
 
     public static boolean cancelOperation(String operationId, String reason) {
-        if (operationId == null || activeRequestId == null || !activeRequestId.equals(operationId)) return false;
+        if (operationId == null || navigationSession.requestId() == null
+                || !navigationSession.requestId().equals(operationId)) return false;
         reportOutcome("cancelled", "CANCELLED", reason == null || reason.isBlank() ? "operation cancelled" : reason);
         stop();
         return true;
     }
 
     public static void cancelActiveOperation(String code, String reason) {
-        if (activeRequestId == null) {
+        if (navigationSession.requestId() == null) {
             stop();
             return;
         }
@@ -540,15 +590,19 @@ public class Pathfinder {
     }
 
     private static void reportProgress(double progress, String message) {
-        if (activeRequestId != null && LCUMod.WIRE != null) {
-            LCUMod.WIRE.sendProgress(activeRequestId, progress, message);
+        if (navigationSession.requestId() != null && LCUMod.WIRE != null) {
+            LCUMod.WIRE.sendProgress(navigationSession.requestId(), progress, message);
         }
     }
 
     private static void reportOutcome(String status, String code, String message) {
-        if (activeRequestId != null && LCUMod.WIRE != null) {
-            LCUMod.WIRE.sendOutcome(activeRequestId, status, code, message);
+        if (navigationSession.requestId() != null && LCUMod.WIRE != null) {
+            LCUMod.WIRE.sendOutcome(navigationSession.requestId(), status, code, message);
         }
+    }
+
+    public static boolean hasActiveOperation() {
+        return navigationSession.hasOwnedOperation();
     }
 
     private record StandingNode(BlockPos supportPos, Vec3 standingPos) {}

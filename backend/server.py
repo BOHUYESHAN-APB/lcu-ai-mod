@@ -3,6 +3,7 @@ FastAPI web server.
 Serves dashboard, WebSocket, and REST API for the Session-based architecture.
 """
 
+import copy
 import hashlib
 import hmac
 import json
@@ -26,6 +27,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from agent import LLMService
 from agent.agent_state import AgentStateDB, LeaseConflictError, LeaseNotFoundError
+from agent.audit_log import AuditLog
+from agent.body_registry import BodyRegistry, RUNTIME_ROLES
 from agent.config_store import ConfigStore, DEFAULT_CONFIG_PATH
 from agent.memory_catalog import MEMORY_CATEGORIES, MemoryCatalog, MemoryQuery
 from agent.memory_management import MemoryPreviewError, MemoryPreviewStore, evaluate_retention
@@ -47,6 +50,7 @@ app = FastAPI(title="LCUMod Backend", version="0.1.0")
 storage_policy = enforce_storage_policy()
 CONFIG_PATH = DEFAULT_CONFIG_PATH
 config_store = ConfigStore(CONFIG_PATH)
+audit_log = AuditLog(CONFIG_PATH.parent / "audit.jsonl")
 
 
 def _sdk_api_token() -> str:
@@ -127,7 +131,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins(),
     allow_credentials=False,
-    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
 
@@ -378,6 +382,7 @@ control_transition_lock = threading.RLock()
 control_response_lock = threading.Lock()
 control_response_waiters: dict[str, tuple[threading.Event, dict[str, Any]]] = {}
 body_request_diagnostics = BodyRequestDiagnostics()
+body_registry = BodyRegistry()
 
 CONTROL_DOMAINS = {"persona", "memory", "planner", "autonomy", "actions"}
 RESERVED_BODY_COMMANDS = {"control_external", "control_builtin", "toggle_ai", "shutdown"}
@@ -403,7 +408,8 @@ def _capture_control_response(event) -> None:
 
 def _send_control_command(command: str, fencing_token: int) -> bool:
     active_body = body
-    if not active_body or not active_body.is_connected:
+    coordinator = task_coordinator
+    if not active_body or not active_body.is_connected or coordinator is None:
         return False
     request_id = str(uuid.uuid4())
     ready = threading.Event()
@@ -411,7 +417,7 @@ def _send_control_command(command: str, fencing_token: int) -> bool:
     with control_response_lock:
         control_response_waiters[request_id] = (ready, result)
     try:
-        active_body.send_command(command, {FENCING_FIELD: fencing_token}, request_id=request_id)
+        coordinator.dispatch_control_command(command, {FENCING_FIELD: fencing_token}, request_id)
         if not ready.wait(3.0):
             return False
         response = result.get("response", {})
@@ -419,6 +425,7 @@ def _send_control_command(command: str, fencing_token: int) -> bool:
     except ConnectionError:
         return False
     finally:
+        coordinator.release_raw_command(request_id)
         with control_response_lock:
             control_response_waiters.pop(request_id, None)
 
@@ -499,11 +506,14 @@ def _apply_config_to_llm_services():
     """Sync persisted LLM config into global and session LLM services."""
     default_config = config_store.get_agent_llm_config("default", redact=False)
     llm_service.set_agent_config("default", default_config)
-    for agent_name, config in config_store.raw(redact=False).get("llm", {}).get("agents", {}).items():
+    agent_names = config_store.raw(redact=False).get("llm", {}).get("agents", {})
+    for agent_name in agent_names:
+        config = config_store.get_agent_llm_config(agent_name, redact=False)
         llm_service.set_agent_config(agent_name, config)
     if orchestrator and orchestrator.session:
         with orchestrator.session_context() as session:
-            for agent_name, config in config_store.raw(redact=False).get("llm", {}).get("agents", {}).items():
+            for agent_name in agent_names:
+                config = config_store.get_agent_llm_config(agent_name, redact=False)
                 session.llm.set_agent_config(agent_name, config)
 
 
@@ -524,6 +534,38 @@ def _configured_identity() -> dict[str, str]:
         "server_id": persistence.get("server_id", "default"),
         "world_id": persistence.get("world_id", "default"),
     }
+
+
+def _sync_current_body_record() -> dict[str, Any]:
+    identity = _configured_identity()
+    peer = copy.deepcopy(getattr(body, "peer_info", {}) or {}) if body else {}
+    runtime_role = str(peer.get("role", "body_client"))
+    if runtime_role not in RUNTIME_ROLES:
+        runtime_role = "body_client"
+    body_registry.register(
+        identity["companion_id"],
+        runtime_role=runtime_role,
+        server_id=identity["server_id"],
+        world_id=identity["world_id"],
+        owner_type="backend",
+        owner_id=identity["companion_id"],
+    )
+    status_getter = getattr(orchestrator, "get_status", None)
+    session_status = status_getter().get("session", {}) if callable(status_getter) else {}
+    body_status = session_status.get("body", {})
+    lease = agent_state.get_active_lease()
+    capabilities = peer.get("capabilities", []) if isinstance(peer.get("capabilities", []), list) else []
+    return body_registry.update(
+        identity["companion_id"],
+        connected=bool(body and body.is_connected),
+        armed=bool(body_status.get("armed", False)),
+        control_mode=session_status.get("control_mode", "builtin"),
+        state_age_seconds=body_status.get("state_age_seconds"),
+        stale=body_status.get("stale", True),
+        lease=lease,
+        capabilities=capabilities,
+        peer=peer,
+    )
 
 # Static files
 STATIC_DIR = Path(__file__).parent / "web" / "static"
@@ -562,6 +604,7 @@ async def startup():
     _apply_config_to_llm_services()
     _apply_persona_to_session()
     _reconcile_control_mode()
+    _sync_current_body_record()
 
     # Store event loop for background thread scheduling
     loop = asyncio.get_event_loop()
@@ -612,6 +655,7 @@ async def startup():
                 skill_registry.set_body_tools(getattr(active_body, "tool_catalog", None))
                 o.start()
                 _reconcile_control_mode(force_body=True)
+                _sync_current_body_record()
                 # Event loop: drain body events and tick orchestrator
                 while active_body.is_connected and not stop_event.is_set():
                     o.tick()
@@ -623,6 +667,7 @@ async def startup():
                 o.tick()  # Drain terminal messages queued immediately before socket closure.
                 o.stop()
                 o.on_body_disconnect()
+                _sync_current_body_record()
                 body_request_diagnostics.mark_inflight_unknown(
                     "companion body disconnected before terminal event"
                 )
@@ -650,6 +695,7 @@ async def shutdown():
     shutdown_event.set()
     if body:
         body.disconnect()
+        _sync_current_body_record()
     if connection_thread and connection_thread.is_alive():
         await asyncio.to_thread(connection_thread.join, 6.0)
     if orchestrator:
@@ -706,12 +752,13 @@ async def websocket_endpoint(ws: WebSocket):
                 args = msg.get("args", {})
                 if body:
                     try:
+                        if task_coordinator is None:
+                            raise ConnectionError("body command coordinator is not available")
                         _validate_public_command(cmd, args)
                         guard = (
                             task_coordinator.coordination_guard()
-                            if task_coordinator and _command_is_emergency(cmd)
+                            if _command_is_emergency(cmd)
                             else task_coordinator.raw_command_guard()
-                            if task_coordinator else nullcontext()
                         )
                         session_guard = (
                             nullcontext(None) if _command_is_emergency(cmd)
@@ -725,7 +772,7 @@ async def websocket_endpoint(ws: WebSocket):
                                     lease_id, fencing_token = _emergency_lease_credentials()
                                 with agent_state.control_guard(lease_id, fencing_token) as lease:
                                     command_args = _fenced_args(args, lease)
-                                    if task_coordinator and session:
+                                    if session:
                                         def register_raw(req_id: str) -> None:
                                             session.register_external_command(cmd, req_id, args, requester="web")
                                         def unregister_raw(req_id: str) -> None:
@@ -733,12 +780,8 @@ async def websocket_endpoint(ws: WebSocket):
                                         request_id = task_coordinator.dispatch_raw_command(
                                             cmd, command_args, on_reserved=register_raw, on_failed=unregister_raw,
                                         )
-                                    elif task_coordinator:
-                                        request_id = task_coordinator.dispatch_raw_command(cmd, command_args)
                                     else:
-                                        request_id = body.send_command(cmd, command_args)
-                                if session and not task_coordinator:
-                                    session.register_external_command(cmd, request_id, args, requester="web")
+                                        request_id = task_coordinator.dispatch_raw_command(cmd, command_args)
                         await ws.send_text(json.dumps({"type": "command_accepted", "id": request_id}))
                     except (ConnectionError, LeaseConflictError, HTTPException, ValueError) as exc:
                         error = exc.detail if isinstance(exc, HTTPException) else str(exc)
@@ -783,6 +826,23 @@ async def get_status():
     return {"running": False}
 
 
+@app.get("/api/v2/bodies")
+async def list_bodies():
+    if orchestrator:
+        _sync_current_body_record()
+    return {"bodies": body_registry.list()}
+
+
+@app.get("/api/v2/bodies/{body_id}")
+async def get_body(body_id: str):
+    if orchestrator and body_id == _configured_identity()["companion_id"]:
+        _sync_current_body_record()
+    record = body_registry.get(body_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Body not found")
+    return record
+
+
 @app.get("/api/session")
 async def get_session():
     """REST endpoint for session details."""
@@ -819,6 +879,19 @@ def _authorize_player_scope(request: Request, player_id: str, server_id: str) ->
         raise HTTPException(status_code=403, detail="Player token is not valid for this identity scope")
 
 
+def _authorize_player_conversation_access(player_id: str, server_id: str) -> None:
+    companion = config_store.get_companion_config()
+    decision = config_store.evaluate_access(
+        {"id": player_id, "uuid": player_id},
+        channel="chat.private",
+        skill="chat.reply",
+        server_id=server_id,
+        body_id=companion["id"],
+    )
+    if not decision["allowed"]:
+        raise HTTPException(status_code=403, detail="Player is not allowed to contact this AI")
+
+
 def _direct_conversation_id(contact_id: str) -> str:
     return f"direct_{hashlib.sha256(contact_id.encode('utf-8')).hexdigest()[:24]}"
 
@@ -830,6 +903,7 @@ async def get_player_contacts(
     server_id: str = Query(min_length=1, max_length=256),
 ):
     _authorize_player_scope(request, player_id, server_id)
+    _authorize_player_conversation_access(player_id, server_id)
     if not orchestrator or not orchestrator.session:
         raise HTTPException(status_code=503, detail="Companion session is not available")
     contact_id = _player_contact_id(player_id, server_id)
@@ -887,6 +961,7 @@ async def get_player_conversation_messages(
     limit: int = Query(default=100, ge=1, le=200),
 ):
     _authorize_player_scope(request, player_id, server_id)
+    _authorize_player_conversation_access(player_id, server_id)
     if not orchestrator or not orchestrator.session:
         raise HTTPException(status_code=503, detail="Companion session is not available")
     contact_id = _player_contact_id(player_id, server_id)
@@ -926,6 +1001,7 @@ async def send_player_conversation_message(data: PlayerConversationRequest, requ
     if not orchestrator or not orchestrator.session:
         raise HTTPException(status_code=503, detail="Companion session is not available")
     _authorize_player_scope(request, data.player_id, data.server_id)
+    _authorize_player_conversation_access(data.player_id, data.server_id)
     contact_id = _player_contact_id(data.player_id, data.server_id)
     request_hash = MessageDB.player_message_request_hash(data.player_name, data.message)
     with orchestrator.session_context() as session:
@@ -1022,6 +1098,7 @@ async def set_llm_config(data: dict):
             agent = data.get("agent", "default")
             saved = config_store.set_agent_llm_config(agent, data)
             _apply_config_to_llm_services()
+            audit_log.append("provider", "agent.config.updated", target=agent, details=data)
         return {"status": "ok", "agent": agent, "config": saved}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -1031,6 +1108,49 @@ async def set_llm_config(data: dict):
 async def get_llm_providers():
     """List known OpenAI-compatible provider presets."""
     return {"providers": config_store.list_provider_presets()}
+
+
+@app.get("/api/v2/llm/profiles")
+async def get_llm_profiles():
+    return {"profiles": config_store.list_provider_profiles()}
+
+
+@app.post("/api/v2/llm/profiles")
+async def create_llm_profile(data: dict):
+    try:
+        with _configuration_guard():
+            profile = config_store.upsert_provider_profile(data)
+            audit_log.append("provider", "profile.updated", target=profile["id"], details=data)
+            return profile
+    except (HTTPException, ValueError) as exc:
+        error = exc.detail if isinstance(exc, HTTPException) else str(exc)
+        raise HTTPException(status_code=400, detail=error) from exc
+
+
+@app.patch("/api/v2/llm/profiles/{profile_id}")
+async def update_llm_profile(profile_id: str, data: dict):
+    try:
+        with _configuration_guard():
+            profile = config_store.upsert_provider_profile({**data, "id": profile_id})
+            audit_log.append("provider", "profile.updated", target=profile_id, details=data)
+            return profile
+    except (HTTPException, ValueError) as exc:
+        error = exc.detail if isinstance(exc, HTTPException) else str(exc)
+        raise HTTPException(status_code=400, detail=error) from exc
+
+
+@app.delete("/api/v2/llm/profiles/{profile_id}")
+async def delete_llm_profile(profile_id: str):
+    try:
+        with _configuration_guard():
+            deleted = config_store.delete_provider_profile(profile_id)
+    except (HTTPException, ValueError) as exc:
+        error = exc.detail if isinstance(exc, HTTPException) else str(exc)
+        raise HTTPException(status_code=409 if "assigned" in str(error) else 400, detail=error) from exc
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Provider profile not found")
+    audit_log.append("provider", "profile.deleted", target=profile_id)
+    return {"status": "deleted", "id": profile_id}
 
 
 @app.get("/api/memory")
@@ -1348,6 +1468,79 @@ async def set_config(data: dict):
     return {"status": "ok", "config": config}
 
 
+@app.get("/api/v2/access/policy")
+async def get_access_policy():
+    return config_store.get_access_policy()
+
+
+@app.put("/api/v2/access/policy")
+async def set_access_policy(data: dict):
+    try:
+        with _configuration_guard():
+            policy = config_store.set_access_policy(data)
+            audit_log.append("access", "policy.updated", target="global", details=data)
+            return policy
+    except (HTTPException, ValueError) as exc:
+        error = exc.detail if isinstance(exc, HTTPException) else str(exc)
+        raise HTTPException(status_code=400, detail=error) from exc
+
+
+@app.post("/api/v2/access/principals")
+async def create_access_principal(data: dict):
+    try:
+        with _configuration_guard():
+            principal = config_store.upsert_access_principal(data)
+            audit_log.append("access", "principal.updated", target=principal["id"], details=data)
+            return principal
+    except (HTTPException, ValueError) as exc:
+        error = exc.detail if isinstance(exc, HTTPException) else str(exc)
+        raise HTTPException(status_code=400, detail=error) from exc
+
+
+@app.post("/api/v2/access/evaluate")
+async def evaluate_access_policy(data: dict):
+    requester = data.get("requester")
+    if not isinstance(requester, dict):
+        raise HTTPException(status_code=422, detail="requester must be an object")
+    return config_store.evaluate_access(
+        requester,
+        channel=str(data.get("channel", "chat.public")),
+        skill=str(data.get("skill", "chat.reply")),
+        server_id=str(data.get("server_id", "")),
+        body_id=str(data.get("body_id", "")),
+    )
+
+
+@app.patch("/api/v2/access/principals/{principal_id}")
+async def update_access_principal(principal_id: str, data: dict):
+    try:
+        with _configuration_guard():
+            principal = config_store.upsert_access_principal({**data, "id": principal_id})
+            audit_log.append("access", "principal.updated", target=principal_id, details=data)
+            return principal
+    except (HTTPException, ValueError) as exc:
+        error = exc.detail if isinstance(exc, HTTPException) else str(exc)
+        raise HTTPException(status_code=400, detail=error) from exc
+
+
+@app.delete("/api/v2/access/principals/{principal_id}")
+async def delete_access_principal(principal_id: str):
+    with _configuration_guard():
+        deleted = config_store.delete_access_principal(principal_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Access principal not found")
+    audit_log.append("access", "principal.deleted", target=principal_id)
+    return {"status": "deleted", "id": principal_id}
+
+
+@app.get("/api/v2/audit")
+async def get_audit_events(
+    category: str = Query(default="", max_length=64),
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    return {"events": audit_log.list(category=category, limit=limit)}
+
+
 @app.get("/api/llm/models")
 async def get_llm_models():
     """Get available LLM models."""
@@ -1444,7 +1637,11 @@ async def get_v2_control():
     public_lease = None if lease is None else {
         key: value for key, value in lease.items() if key != "fencing_token"
     }
-    return {"mode": lease["mode"] if lease else "builtin", "lease": public_lease}
+    return {
+        "mode": lease["mode"] if lease else "builtin",
+        "lease": public_lease,
+        "coordinator": task_coordinator.get_status() if task_coordinator else None,
+    }
 
 
 @app.post("/api/v2/control/leases")
@@ -1811,13 +2008,14 @@ async def sdk_command(data: SDKCommandRequest):
     """Send an authorized low-level command to the active client body."""
     if not body or not body.is_connected:
         raise HTTPException(status_code=503, detail="Companion body is not connected")
+    if task_coordinator is None:
+        raise HTTPException(status_code=503, detail="Body command coordinator is not available")
     try:
         _validate_public_command(data.command, data.args)
         guard = (
             task_coordinator.coordination_guard()
-            if task_coordinator and _command_is_emergency(data.command)
+            if _command_is_emergency(data.command)
             else task_coordinator.raw_command_guard()
-            if task_coordinator else nullcontext()
         )
         session_guard = (
             nullcontext(None) if _command_is_emergency(data.command)
@@ -1830,7 +2028,7 @@ async def sdk_command(data: SDKCommandRequest):
                     lease_id, fencing_token = _emergency_lease_credentials()
                 with agent_state.control_guard(lease_id, fencing_token) as lease:
                     command_args = _fenced_args(data.args, lease)
-                    if task_coordinator and session:
+                    if session:
                         def register_raw(req_id: str) -> None:
                             body_request_diagnostics.register(
                                 req_id, data.command, data.args, "sdk", _raw_command_completion(data.command),
@@ -1842,7 +2040,7 @@ async def sdk_command(data: SDKCommandRequest):
                         request_id = task_coordinator.dispatch_raw_command(
                             data.command, command_args, on_reserved=register_raw, on_failed=unregister_raw,
                         )
-                    elif task_coordinator:
+                    else:
                         request_id = task_coordinator.dispatch_raw_command(
                             data.command, command_args,
                             on_reserved=lambda req_id: body_request_diagnostics.register(
@@ -1850,21 +2048,6 @@ async def sdk_command(data: SDKCommandRequest):
                             ),
                             on_failed=body_request_diagnostics.remove,
                         )
-                    else:
-                        request_id = str(uuid.uuid4())
-                        body_request_diagnostics.register(
-                            request_id, data.command, data.args, "sdk", _raw_command_completion(data.command),
-                        )
-                        try:
-                            returned_id = body.send_command(data.command, command_args, request_id=request_id)
-                        except Exception:
-                            body_request_diagnostics.remove(request_id)
-                            raise
-                        if returned_id != request_id:
-                            body_request_diagnostics.remove(request_id)
-                            raise ConnectionError("body did not preserve raw request id")
-                if session and not task_coordinator:
-                    session.register_external_command(data.command, request_id, data.args, requester="sdk")
     except ConnectionError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except LeaseConflictError as exc:

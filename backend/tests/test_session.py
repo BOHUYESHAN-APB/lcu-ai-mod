@@ -1,5 +1,9 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
+from agent.access_policy import default_access_policy
+from agent.planner import SkillProposal
 from agent.session import Session
 
 
@@ -51,6 +55,20 @@ class SessionTests(unittest.TestCase):
         self.assertFalse(Session.is_stop_intent("my stopwatch is ready"))
         self.assertFalse(Session.is_stop_intent("不要停下来"))
         self.assertFalse(Session.is_stop_intent("do not stop now"))
+
+    def test_public_chat_cannot_dispatch_body_skill_without_grant(self):
+        session = Session.__new__(Session)
+        session.identity = SimpleNamespace(server_id="survival", companion_id="server-ai")
+        session._current_requester = ("Bob", "uuid-b")
+        session._current_request_channel = "chat.public"
+        admitted = []
+        session._planner_proposal_dispatcher = lambda proposal: admitted.append(proposal) or True
+
+        with patch("agent.session.load_policy", return_value=default_access_policy()):
+            result = session._dispatch_authorized_proposal(SkillProposal("core.move_to", {}, "test"))
+
+        self.assertFalse(result)
+        self.assertEqual(admitted, [])
 
 
 if __name__ == "__main__":

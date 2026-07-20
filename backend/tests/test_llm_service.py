@@ -91,6 +91,58 @@ class LLMServiceTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "not_configured")
         post.assert_not_called()
 
+    def test_priority_routing_falls_back_to_next_provider(self):
+        service = LLMService()
+        service.set_agent_config("default", {
+            "provider": "openai",
+            "provider_profile": "primary",
+            "base_url": "https://primary.test/v1",
+            "model": "primary-model",
+            "api_key": "primary-key",
+            "routing_mode": "priority",
+            "fallback_configs": [{
+                "id": "backup",
+                "provider": "deepseek",
+                "base_url": "https://backup.test/v1",
+                "model": "backup-model",
+                "api_key": "backup-key",
+            }],
+        })
+        response = {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}], "usage": {}}
+
+        with patch.object(service, "_post", side_effect=[RuntimeError("primary failed"), response]) as post:
+            result = service.chat([{"role": "user", "content": "hello"}])
+
+        self.assertEqual(result["content"], "ok")
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(post.call_args_list[1].kwargs["config"]["base_url"], "https://backup.test/v1")
+        usage = service.get_usage()["recent_requests"]
+        self.assertEqual(usage[-1]["profile_id"], "backup")
+        self.assertEqual(usage[-1]["attempt"], 2)
+
+    def test_failed_provider_is_skipped_during_cooldown(self):
+        service = LLMService()
+        service.set_agent_config("default", {
+            "provider": "openai", "provider_profile": "primary",
+            "base_url": "https://primary.test/v1", "model": "primary-model", "api_key": "primary-key",
+            "routing_mode": "priority",
+            "fallback_configs": [{
+                "id": "backup", "provider": "deepseek", "base_url": "https://backup.test/v1",
+                "model": "backup-model", "api_key": "backup-key",
+            }],
+        })
+        response = {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}], "usage": {}}
+
+        with patch.object(service, "_post", side_effect=[RuntimeError("primary failed"), response, response]) as post:
+            service.chat([{"role": "user", "content": "first"}])
+            service.chat([{"role": "user", "content": "second"}])
+
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual(post.call_args_list[2].kwargs["config"]["base_url"], "https://backup.test/v1")
+        health = {item["key"]: item for item in service.get_usage()["provider_health"]}
+        self.assertEqual(health["primary"]["status"], "cooldown")
+        self.assertEqual(health["backup"]["status"], "healthy")
+
     def test_prepare_request_compacts_old_optional_messages_without_mutating_input(self):
         service = LLMService()
         service.set_agent_config("planner", {

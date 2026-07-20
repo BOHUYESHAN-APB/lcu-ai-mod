@@ -70,6 +70,27 @@ class TaskCoordinatorTests(unittest.TestCase):
         event_types = [event["type"] for event in self.state.list_events()]
         self.assertEqual(event_types[-5:], ["run.created", "run.dispatched", "run.started", "run.progress", "run.succeeded"])
 
+    def test_internal_session_command_uses_coordinator_raw_tracking(self):
+        request_id = self.coordinator.dispatch_internal_command("jump", {}, "mode")
+
+        self.assertEqual(self.body.commands, [("jump", {})])
+        self.assertTrue(self.coordinator.is_busy())
+        self.assertEqual(self.coordinator.get_status()["raw_request_count"], 1)
+
+        self.coordinator.handle_body_message(BodyEvent("response", {
+            "id": request_id, "success": True, "data": {},
+        }))
+        self.assertFalse(self.coordinator.is_busy())
+        self.assertEqual(self.coordinator.get_status()["raw_request_count"], 0)
+
+    def test_internal_body_action_is_rejected_while_external_lease_exists(self):
+        self.state.acquire_lease("controller", "external", ["actions"], 30)
+
+        with self.assertRaisesRegex(RuntimeError, "external control lease"):
+            self.coordinator.dispatch_internal_command("jump", {}, "mode")
+
+        self.assertEqual(self.body.commands, [])
+
     def test_explicit_outcome_produces_terminal_run(self):
         run = self.coordinator.create_run(
             "general.craft_item", {"item": "minecraft:torch", "count": 4}
@@ -86,6 +107,26 @@ class TaskCoordinatorTests(unittest.TestCase):
         restored = self.state.get_run(run["id"])
         self.assertEqual(restored["status"], "failed")
         self.assertEqual(restored["error"], "NO_SOURCE")
+
+    def test_late_duplicate_outcome_cannot_replace_terminal_result(self):
+        run = self.coordinator.create_run(
+            "general.craft_item", {"item": "minecraft:torch", "count": 1}
+        )
+        self.coordinator.handle_body_message(BodyEvent("response", {
+            "id": run["request_id"], "success": True, "data": {},
+        }))
+        self.coordinator.handle_body_message(BodyEvent("outcome", {
+            "id": run["request_id"], "status": "succeeded", "code": "CRAFTED", "message": "done",
+        }))
+        event_count = len(self.state.list_events())
+
+        self.coordinator.handle_body_message(BodyEvent("outcome", {
+            "id": run["request_id"], "status": "failed", "code": "LATE", "message": "late",
+        }))
+
+        restored = self.state.get_run(run["id"])
+        self.assertEqual(restored["status"], "succeeded")
+        self.assertEqual(len(self.state.list_events()), event_count)
 
     def test_cancel_uses_operation_id_and_waits_for_outcome(self):
         run = self.coordinator.create_run("core.move_to", {"x": 1, "y": 64, "z": 2})
