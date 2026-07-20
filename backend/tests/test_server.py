@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
+from fastapi import HTTPException
 from starlette.websockets import WebSocketDisconnect
 
 import server
@@ -150,6 +151,12 @@ class FakeOrchestrator:
 
 
 class ServerSDKTests(unittest.TestCase):
+    def test_public_commands_reject_remote_arm_and_hidden_shutdown(self):
+        for command in ("toggle_ai", "shutdown"):
+            with self.assertRaises(HTTPException) as context:
+                server._validate_public_command(command, {})
+            self.assertEqual(context.exception.status_code, 403)
+
     def test_player_conversation_round_trip_is_persistent_idempotent_and_action_isolated(self):
         with tempfile.TemporaryDirectory() as tmp:
             body = FakeBody(False)

@@ -95,7 +95,7 @@ dialog{width:min(680px,calc(100vw - 24px));max-height:calc(100dvh - 24px);margin
 .data-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:9px 10px}
 .data-title{font-size:12px;font-weight:600;overflow-wrap:anywhere}.data-meta{font-size:11px;color:#8b949e;margin-top:3px;overflow-wrap:anywhere}
 .empty{font-size:12px;color:#8b949e;padding:12px 0}.field-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px}.field-grid input{width:100%}
-.debug-actions{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-bottom:12px}.debug-command{display:flex;gap:8px;margin-bottom:12px}.debug-command input{min-width:0}
+.debug-actions{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-bottom:12px}.debug-command{display:flex;gap:8px;margin-bottom:12px}.debug-command input{min-width:0}.safety-actions{display:flex;gap:6px;margin-left:8px}.safety-actions .btn{border-color:#f85149;color:#ffb4ae;font-weight:700}
 textarea{width:100%;min-height:68px;resize:vertical;background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:7px 10px;color:#c9d1d9;font:12px monospace}
 @media(max-width:760px){.topbar{padding:8px 12px}.page{padding:12px}.ops-grid,.responsive-grid,.memory-layout,.inbox-layout,.inventory-layout{grid-template-columns:1fr!important}.inbox-contacts,.inbox-messages{max-height:none}.memory-toolbar{grid-template-columns:1fr 1fr}.memory-toolbar .compact-field:first-child{grid-column:1/-1}.memory-list,.memory-detail{max-height:none}.form-row{align-items:flex-start;flex-direction:column}.form-row label{min-width:0}.form-row input,.form-row select{width:100%}.field-grid{grid-template-columns:1fr}.usage-strip{grid-template-columns:repeat(2,minmax(0,1fr))}.tabs{scrollbar-width:thin}.tab{padding:10px 14px}.chat-input,.debug-command{flex-wrap:wrap}.debug-actions{grid-template-columns:repeat(2,minmax(0,1fr))}.debug-command input{width:100%!important}}
 </style>
@@ -107,6 +107,10 @@ textarea{width:100%;min-height:68px;resize:vertical;background:#0d1117;border:1p
   <div class="online">
     <span id="connectionStatus" class="status offline">后台离线</span>
     <span id="bodyStatus" class="status offline">身体离线</span>
+    <div class="safety-actions">
+      <button class="btn" onclick="sendSafetyCommand('stop_all')">STOP ALL</button>
+      <button class="btn" onclick="sendSafetyCommand('disarm')">解除武装</button>
+    </div>
   </div>
 </div>
 
@@ -154,7 +158,7 @@ textarea{width:100%;min-height:68px;resize:vertical;background:#0d1117;border:1p
       </div>
       <div style="margin-top:12px">
         <button class="btn primary" onclick="toggleAutonomy()">切换自主模式</button>
-        <button class="btn" onclick="toggleControl()">切换控制权</button>
+         <span class="hint">AI 武装只能在 Minecraft 客户端本地通过绑定按键确认</span>
       </div>
     </div>
     
@@ -443,10 +447,8 @@ textarea{width:100%;min-height:68px;resize:vertical;background:#0d1117;border:1p
   <div class="card">
     <h3>🔧 调试控制</h3>
     <div class="debug-actions">
-      <button class="btn" onclick="dbgCmd('move_to',{x:0,y:0,z:1})">前进</button>
-      <button class="btn" onclick="dbgCmd('move_to',{x:0,y:0,z:-1})">后退</button>
-      <button class="btn" onclick="dbgCmd('move_to',{x:-1,y:0,z:0})">左移</button>
-      <button class="btn" onclick="dbgCmd('move_to',{x:1,y:0,z:0})">右移</button>
+      <button class="btn" onclick="sendSafetyCommand('stop_all')">STOP ALL</button>
+      <button class="btn" onclick="sendSafetyCommand('disarm')">解除武装</button>
       <button class="btn" onclick="dbgCmd('jump',{})">跳跃</button>
       <button class="btn" onclick="dbgCmd('attack',{})">攻击</button>
       <button class="btn" onclick="dbgCmd('mine_block',{})">挖掘</button>
@@ -774,10 +776,10 @@ function toggleAutonomy() {
   dbgLog('切换自主模式');
 }
 
-function toggleControl() {
+function sendSafetyCommand(command) {
   if (!wsOpen()) return;
-  ws.send(JSON.stringify({type:'command', cmd:'toggle_ai', args:{}}));
-  dbgLog('切换控制权');
+  ws.send(JSON.stringify({type:'command', cmd:command, args:{}}));
+  dbgLog(command === 'disarm' ? '已请求解除武装' : '已请求停止全部操作');
 }
 
 // ── V2 Operations ──

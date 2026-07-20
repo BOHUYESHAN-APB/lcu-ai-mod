@@ -30,6 +30,31 @@ class PriorityCommandQueueTest {
     }
 
     @Test
+    void disarmAtomicallyDiscardsQueuedWorkAndRunsAtControlPriority() {
+        PriorityCommandQueue queue = new PriorityCommandQueue();
+        queue.submitBackend(command("move", "move_to"));
+        queue.submitBackend(command("craft", "craft_item"));
+
+        var discarded = queue.submitStop(command("disarm", "disarm"));
+
+        assertEquals(java.util.List.of("move", "craft"),
+                discarded.stream().map(WireServer.WireCommand::id).toList());
+        assertEquals("disarm", queue.poll().id());
+    }
+
+    @Test
+    void laterStopCannotDowngradeQueuedDisarm() {
+        PriorityCommandQueue queue = new PriorityCommandQueue();
+        queue.submitStop(command("disarm", "disarm"));
+
+        var discarded = queue.submitStop(command("stop", "stop_all"));
+
+        assertEquals(java.util.List.of("stop"),
+                discarded.stream().map(WireServer.WireCommand::id).toList());
+        assertEquals("disarm", queue.poll().id());
+    }
+
+    @Test
     void laterControlTransitionDoesNotDiscardQueuedStop() {
         PriorityCommandQueue queue = new PriorityCommandQueue();
         queue.submitStop(command("stop", "stop_all"));

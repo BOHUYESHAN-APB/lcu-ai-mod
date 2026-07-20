@@ -12,6 +12,9 @@ import net.neoforged.fml.common.Mod;
 import net.neoforged.fml.event.lifecycle.FMLClientSetupEvent;
 import net.neoforged.neoforge.common.NeoForge;
 import net.neoforged.neoforge.event.GameShuttingDownEvent;
+import net.neoforged.neoforge.client.event.ClientPlayerNetworkEvent;
+import net.neoforged.neoforge.event.level.LevelEvent;
+import net.minecraft.client.multiplayer.ClientLevel;
 
 // Client-only mod class.
 @Mod(value = LCUMod.MODID, dist = Dist.CLIENT)
@@ -19,6 +22,10 @@ import net.neoforged.neoforge.event.GameShuttingDownEvent;
 public class LCUModClient {
     public LCUModClient(ModContainer container) {
         NeoForge.EVENT_BUS.addListener(LCUModClient::onGameShuttingDown);
+        NeoForge.EVENT_BUS.addListener(LCUModClient::onLoggingOut);
+        NeoForge.EVENT_BUS.addListener(LCUModClient::onClientPlayerClone);
+        NeoForge.EVENT_BUS.addListener(LCUModClient::onLevelLoad);
+        NeoForge.EVENT_BUS.addListener(LCUModClient::onLevelUnload);
     }
 
     /**
@@ -46,5 +53,22 @@ public class LCUModClient {
 
     private static void onGameShuttingDown(GameShuttingDownEvent event) {
         ClientBodyRuntime.stop();
+    }
+
+    private static void onLoggingOut(ClientPlayerNetworkEvent.LoggingOut event) {
+        ClientBodyRuntime.invalidateWorld();
+    }
+
+    private static void onClientPlayerClone(ClientPlayerNetworkEvent.Clone event) {
+        ClientBodyRuntime.invalidateWorld();
+        ClientBodyRuntime.activateWorld();
+    }
+
+    private static void onLevelLoad(LevelEvent.Load event) {
+        if (event.getLevel() instanceof ClientLevel) ClientBodyRuntime.activateWorld();
+    }
+
+    private static void onLevelUnload(LevelEvent.Unload event) {
+        if (event.getLevel() instanceof ClientLevel) ClientBodyRuntime.invalidateWorld();
     }
 }

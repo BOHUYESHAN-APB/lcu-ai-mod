@@ -79,9 +79,9 @@ class Skills:
         """Stop all movement and actions."""
         return self._send_cmd("stop_all", {})
 
-    def toggle_ai(self) -> dict:
-        """Toggle AI/User control mode."""
-        return self._send_cmd("toggle_ai", {})
+    def disarm(self) -> dict:
+        """Stop all work and return control to the local player."""
+        return self._send_cmd("disarm", {})
 
     # ── Combat (mineflayer entities.js, mindcraft commands) ────
 

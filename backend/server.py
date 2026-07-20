@@ -380,7 +380,8 @@ control_response_waiters: dict[str, tuple[threading.Event, dict[str, Any]]] = {}
 body_request_diagnostics = BodyRequestDiagnostics()
 
 CONTROL_DOMAINS = {"persona", "memory", "planner", "autonomy", "actions"}
-RESERVED_BODY_COMMANDS = {"control_external", "control_builtin"}
+RESERVED_BODY_COMMANDS = {"control_external", "control_builtin", "toggle_ai", "shutdown"}
+EMERGENCY_BODY_COMMANDS = {"stop_all", "disarm"}
 FENCING_FIELD = "__lcu_fencing_token"
 
 
@@ -473,6 +474,17 @@ def _fenced_args(args: dict[str, Any], lease: dict[str, Any] | None) -> dict[str
 def _validate_public_command(command: str, args: dict[str, Any]) -> None:
     if command in RESERVED_BODY_COMMANDS or FENCING_FIELD in args:
         raise HTTPException(status_code=403, detail="Reserved control command or argument")
+
+
+def _command_is_emergency(command: str) -> bool:
+    return command in EMERGENCY_BODY_COMMANDS
+
+
+def _emergency_lease_credentials() -> tuple[str | None, int | None]:
+    lease = agent_state.get_active_lease()
+    if lease is None:
+        return None, None
+    return lease["id"], lease["fencing_token"]
 
 
 @contextmanager
@@ -695,11 +707,23 @@ async def websocket_endpoint(ws: WebSocket):
                 if body:
                     try:
                         _validate_public_command(cmd, args)
-                        guard = task_coordinator.raw_command_guard() if task_coordinator else nullcontext()
-                        session_guard = orchestrator.session_context() if orchestrator else nullcontext(None)
+                        guard = (
+                            task_coordinator.coordination_guard()
+                            if task_coordinator and _command_is_emergency(cmd)
+                            else task_coordinator.raw_command_guard()
+                            if task_coordinator else nullcontext()
+                        )
+                        session_guard = (
+                            nullcontext(None) if _command_is_emergency(cmd)
+                            else orchestrator.session_context() if orchestrator else nullcontext(None)
+                        )
                         with session_guard as session:
                             with guard:
-                                with agent_state.control_guard(msg.get("lease_id"), msg.get("fencing_token")) as lease:
+                                lease_id = msg.get("lease_id")
+                                fencing_token = msg.get("fencing_token")
+                                if _command_is_emergency(cmd):
+                                    lease_id, fencing_token = _emergency_lease_credentials()
+                                with agent_state.control_guard(lease_id, fencing_token) as lease:
                                     command_args = _fenced_args(args, lease)
                                     if task_coordinator and session:
                                         def register_raw(req_id: str) -> None:
@@ -1789,11 +1813,23 @@ async def sdk_command(data: SDKCommandRequest):
         raise HTTPException(status_code=503, detail="Companion body is not connected")
     try:
         _validate_public_command(data.command, data.args)
-        guard = task_coordinator.raw_command_guard() if task_coordinator else nullcontext()
-        session_guard = orchestrator.session_context() if orchestrator else nullcontext(None)
+        guard = (
+            task_coordinator.coordination_guard()
+            if task_coordinator and _command_is_emergency(data.command)
+            else task_coordinator.raw_command_guard()
+            if task_coordinator else nullcontext()
+        )
+        session_guard = (
+            nullcontext(None) if _command_is_emergency(data.command)
+            else orchestrator.session_context() if orchestrator else nullcontext(None)
+        )
         with session_guard as session:
             with guard:
-                with agent_state.control_guard(None, None):
+                lease_id, fencing_token = (None, None)
+                if _command_is_emergency(data.command):
+                    lease_id, fencing_token = _emergency_lease_credentials()
+                with agent_state.control_guard(lease_id, fencing_token) as lease:
+                    command_args = _fenced_args(data.args, lease)
                     if task_coordinator and session:
                         def register_raw(req_id: str) -> None:
                             body_request_diagnostics.register(
@@ -1804,11 +1840,11 @@ async def sdk_command(data: SDKCommandRequest):
                             body_request_diagnostics.remove(req_id)
                             session.unregister_external_command(req_id)
                         request_id = task_coordinator.dispatch_raw_command(
-                            data.command, data.args, on_reserved=register_raw, on_failed=unregister_raw,
+                            data.command, command_args, on_reserved=register_raw, on_failed=unregister_raw,
                         )
                     elif task_coordinator:
                         request_id = task_coordinator.dispatch_raw_command(
-                            data.command, data.args,
+                            data.command, command_args,
                             on_reserved=lambda req_id: body_request_diagnostics.register(
                                 req_id, data.command, data.args, "sdk", _raw_command_completion(data.command),
                             ),
@@ -1820,7 +1856,7 @@ async def sdk_command(data: SDKCommandRequest):
                             request_id, data.command, data.args, "sdk", _raw_command_completion(data.command),
                         )
                         try:
-                            returned_id = body.send_command(data.command, data.args, request_id=request_id)
+                            returned_id = body.send_command(data.command, command_args, request_id=request_id)
                         except Exception:
                             body_request_diagnostics.remove(request_id)
                             raise

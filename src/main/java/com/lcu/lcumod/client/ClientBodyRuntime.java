@@ -22,17 +22,30 @@ public final class ClientBodyRuntime {
         LCUMod.WIRE = new WireServer(
             ModConfig.WIRE_PORT.getAsInt(), ModConfig.WIRE_TOKEN.get(), "body_client",
             ActionExecutor::requestBackendDisconnectStop, ServerPolicy::snapshot);
+        LCUMod.WIRE.setCommandAdmissionEnabled(false);
         LCUMod.WIRE.start();
         started = true;
         LCUMod.LOGGER.info("[LCUMod] Headed body client ready on wire port {}", LCUMod.WIRE.getBoundPort());
     }
 
     public static synchronized void stop() {
+        if (ACTION != null) ACTION.invalidateRuntime();
         if (LCUMod.WIRE != null) LCUMod.WIRE.stop();
         LCUMod.WIRE = null;
         ACTION = null;
         BEHAVIORS = null;
         started = false;
+    }
+
+    public static synchronized void invalidateWorld() {
+        if (LCUMod.WIRE != null) {
+            LCUMod.WIRE.setCommandAdmissionEnabled(false);
+        }
+        if (ACTION != null) ACTION.invalidateRuntime();
+    }
+
+    public static synchronized void activateWorld() {
+        if (LCUMod.WIRE != null) LCUMod.WIRE.setCommandAdmissionEnabled(true);
     }
 
     public static boolean isBodyClient() {

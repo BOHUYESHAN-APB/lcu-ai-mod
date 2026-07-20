@@ -41,6 +41,7 @@ public final class ToolCatalog {
         tools.add(tool("send_chat", "immediate", false, "response", List.of("chat.send"),
             strings("message"), List.of("message")));
         tools.add(tool("stop_all", "immediate", false, "response", List.of("body.move", "inventory.ui"), emptyProperties(), List.of()));
+        tools.add(tool("disarm", "immediate", false, "response", List.of("body.move", "inventory.ui"), emptyProperties(), List.of()));
         tools.add(tool("cancel_operation", "immediate", false, "response", List.of("operation.cancel"),
             strings("operation_id"), List.of("operation_id")));
         tools.add(tool("follow_player", "operation", true, "outcome", List.of("body.move"),

@@ -41,6 +41,8 @@ class WireServerSocketTest {
                 .anyMatch(tool -> tool.getAsJsonObject().get("command").getAsString().equals("craft_item")));
             assertTrue(auth.getAsJsonArray("tools").asList().stream()
                 .anyMatch(tool -> tool.getAsJsonObject().get("command").getAsString().equals("cancel_operation")));
+            assertTrue(auth.getAsJsonArray("tools").asList().stream()
+                .anyMatch(tool -> tool.getAsJsonObject().get("command").getAsString().equals("disarm")));
             JsonObject attack = auth.getAsJsonArray("tools").asList().stream()
                 .map(tool -> tool.getAsJsonObject())
                 .filter(tool -> tool.get("command").getAsString().equals("attack"))
@@ -51,6 +53,8 @@ class WireServerSocketTest {
             assertFalse(auth.getAsJsonObject("policy").get("allowAutomatedCombat").getAsBoolean());
             assertFalse(auth.getAsJsonArray("tools").asList().stream()
                 .anyMatch(tool -> tool.getAsJsonObject().get("command").getAsString().equals("drop_item")));
+            assertFalse(auth.getAsJsonArray("tools").asList().stream()
+                .anyMatch(tool -> tool.getAsJsonObject().get("command").getAsString().equals("shutdown")));
 
             peer.send("""
                     {"type":"command","id":"req-1","cmd":"jump","args":{"message":"你好"}}
@@ -79,6 +83,46 @@ class WireServerSocketTest {
             assertFalse(auth.get("success").getAsBoolean());
             assertNull(WireServer.commandQueue.poll());
             assertFalse(server.isConnected());
+        }
+    }
+
+    @Test
+    void rejectsBlankConfiguredTokenAndHiddenShutdownCommand() throws Exception {
+        server = new WireServer(0, "", "body_client", () -> {});
+        server.start();
+
+        try (Peer peer = new Peer(server.getBoundPort())) {
+            JsonObject auth = peer.authenticate("");
+            assertFalse(auth.get("success").getAsBoolean());
+            assertFalse(server.isConnected());
+        }
+
+        server.stop();
+        server = new WireServer(0, "token", "body_client", () -> {});
+        server.start();
+        try (Peer peer = new Peer(server.getBoundPort())) {
+            assertTrue(peer.authenticate("token").get("success").getAsBoolean());
+            peer.send("{\"type\":\"command\",\"id\":\"shutdown-1\",\"cmd\":\"shutdown\",\"args\":{}}");
+            JsonObject response = peer.read();
+            assertFalse(response.get("success").getAsBoolean());
+            assertEquals("UNKNOWN_COMMAND", response.get("error").getAsString());
+            assertNull(WireServer.commandQueue.poll());
+        }
+    }
+
+    @Test
+    void rejectsCommandsWhileClientWorldIsUnavailable() throws Exception {
+        server = new WireServer(0, "token", "body_client", () -> {});
+        server.setCommandAdmissionEnabled(false);
+        server.start();
+
+        try (Peer peer = new Peer(server.getBoundPort())) {
+            assertTrue(peer.authenticate("token").get("success").getAsBoolean());
+            peer.send("{\"type\":\"command\",\"id\":\"jump-1\",\"cmd\":\"jump\",\"args\":{}}");
+            JsonObject response = peer.read();
+            assertFalse(response.get("success").getAsBoolean());
+            assertEquals("BODY_UNAVAILABLE", response.get("error").getAsString());
+            assertNull(WireServer.commandQueue.poll());
         }
     }
 

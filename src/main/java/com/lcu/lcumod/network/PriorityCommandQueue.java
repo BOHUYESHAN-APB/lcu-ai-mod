@@ -38,7 +38,7 @@ public class PriorityCommandQueue {
         boolean stopRetained = false;
         for (PriorityEntry entry : entries) {
             if (entry.priority == CommandPriority.CONTROL) {
-                if ("stop_all".equals(entry.action)) {
+                if (isEmergency(entry.action)) {
                     if (stopRetained) {
                         discarded.add(entry.cmd());
                         continue;
@@ -51,23 +51,28 @@ public class PriorityCommandQueue {
             }
         }
 
-        boolean incomingStop = "stop_all".equals(cmd.cmd());
+        boolean incomingStop = isEmergency(cmd.cmd());
         if (incomingStop && stopRetained) {
             for (int i = 0; i < retained.size(); i++) {
-                if ("stop_all".equals(retained.get(i).action)) {
-                    discarded.add(retained.remove(i).cmd());
+                PriorityEntry existing = retained.get(i);
+                if (isEmergency(existing.action)) {
+                    if ("disarm".equals(existing.action) && !"disarm".equals(cmd.cmd())) {
+                        discarded.add(cmd);
+                    } else {
+                        discarded.add(retained.remove(i).cmd());
+                        retained.add(new PriorityEntry(
+                            CommandPriority.CONTROL, sequence.getAndIncrement(), cmd.id(), cmd.cmd(), cmd.args()));
+                    }
                     break;
                 }
             }
-            retained.add(new PriorityEntry(
-                CommandPriority.CONTROL, sequence.getAndIncrement(), cmd.id(), cmd.cmd(), cmd.args()));
         } else if (!incomingStop && retained.size() >= MAX_PENDING_COMMANDS) {
             discarded.add(cmd);
         } else {
             if (incomingStop && retained.size() >= MAX_PENDING_COMMANDS) {
                 int removable = -1;
                 for (int i = 0; i < retained.size(); i++) {
-                    if (!"stop_all".equals(retained.get(i).action)) {
+                    if (!isEmergency(retained.get(i).action)) {
                         removable = i;
                         break;
                     }
@@ -136,6 +141,10 @@ public class PriorityCommandQueue {
     }
 
     public boolean hasEntries() { return !isEmpty(); }
+
+    private static boolean isEmergency(String action) {
+        return "stop_all".equals(action) || "disarm".equals(action);
+    }
 
     private record PriorityEntry(int priority, long sequence, String id, String action, JsonObject args) {
         WireServer.WireCommand cmd() {

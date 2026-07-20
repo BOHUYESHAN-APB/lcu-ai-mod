@@ -12,6 +12,7 @@ import java.security.MessageDigest;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Supplier;
 
 /**
@@ -30,6 +31,7 @@ public class WireServer {
     private final Runnable disconnectHandler;
     private final Supplier<Map<String, Boolean>> policySupplier;
     private final AtomicBoolean running = new AtomicBoolean(false);
+    private volatile boolean commandAdmissionEnabled = true;
     private final Gson gson = new Gson();
     private Thread serverThread;
     private volatile ServerSocket serverSocket;
@@ -38,7 +40,9 @@ public class WireServer {
     private volatile CountDownLatch readyLatch = new CountDownLatch(1);
     private volatile Connection activeConnection;
     private Thread sendThread;
-    private final BlockingQueue<String> sendQueue = new ArrayBlockingQueue<>(SEND_QUEUE_CAPACITY);
+    private final BlockingQueue<OutboundFrame> sendQueue = new ArrayBlockingQueue<>(SEND_QUEUE_CAPACITY);
+    private final Set<Connection> pendingConnections = ConcurrentHashMap.newKeySet();
+    private long connectionEpoch;
 
     public static final PriorityCommandQueue commandQueue = new PriorityCommandQueue();
 
@@ -98,6 +102,8 @@ public class WireServer {
         Connection connection = activeConnection;
         if (connection != null) connection.close();
         activeConnection = null;
+        for (Connection pending : pendingConnections.toArray(Connection[]::new)) pending.close();
+        pendingConnections.clear();
         commandQueue.clear();
         sendQueue.clear();
         if (sendThread != null) sendThread.interrupt();
@@ -127,9 +133,24 @@ public class WireServer {
         return activeConnection != null && activeConnection.isOpen();
     }
 
+    public synchronized void setCommandAdmissionEnabled(boolean enabled) {
+        commandAdmissionEnabled = enabled;
+        if (!enabled) {
+            discardQueuedCommands("BODY_UNAVAILABLE", "queued command cancelled because no client world is active");
+        }
+    }
+
+    public synchronized void discardQueuedCommands(String code, String message) {
+        for (WireCommand discarded : commandQueue.drain()) {
+            rejectDiscarded(discarded, code, message);
+        }
+    }
+
     /** Async send — queues message, returns immediately. NEVER blocks the calling thread. */
     public void send(JsonObject msg) {
-        if (!sendQueue.offer(gson.toJson(msg))) {
+        Connection target = activeConnection;
+        if (target == null || !target.isOpen()) return;
+        if (!sendQueue.offer(new OutboundFrame(target, target.epoch, gson.toJson(msg)))) {
             LOGGER.log(System.Logger.Level.WARNING, "[WireServer] Dropped outbound frame because the send queue is full");
         }
     }
@@ -138,12 +159,10 @@ public class WireServer {
     private void sendLoop() {
         while (running.get()) {
             try {
-                String line = sendQueue.poll(1, TimeUnit.SECONDS);
-                if (line != null) {
-                    Connection conn = activeConnection;
-                    if (conn != null && conn.isOpen()) {
-                        conn.send(line);
-                    }
+                OutboundFrame frame = sendQueue.poll(1, TimeUnit.SECONDS);
+                if (frame != null && frame.target() == activeConnection
+                        && frame.target().epoch == frame.epoch() && frame.target().isOpen()) {
+                    frame.target().send(frame.line());
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -209,8 +228,14 @@ public class WireServer {
                 try {
                     Socket sock = ss.accept();
                     LOGGER.log(System.Logger.Level.INFO, "[WireServer] Backend connection pending from {0}", sock.getRemoteSocketAddress());
-                    Connection conn = new Connection(sock);
-                    conn.startReader();
+                    try {
+                        Connection conn = new Connection(sock);
+                        pendingConnections.add(conn);
+                        conn.startReader();
+                    } catch (IOException exception) {
+                        try { sock.close(); } catch (IOException ignored) {}
+                        LOGGER.log(System.Logger.Level.WARNING, "[WireServer] Failed to initialize connection: {0}", exception.getMessage());
+                    }
                 } catch (IOException e) {
                     if (running.get()) {
                         LOGGER.log(System.Logger.Level.ERROR, "[WireServer] Accept error: {0}", e.getMessage());
@@ -231,20 +256,28 @@ public class WireServer {
     }
 
     private synchronized void activate(Connection conn) {
+        if (!running.get() || !pendingConnections.remove(conn)) {
+            conn.close();
+            return;
+        }
         Connection old = activeConnection;
+        activeConnection = conn;
+        conn.activated = true;
+        conn.epoch = ++connectionEpoch;
+        commandQueue.clear();
+        sendQueue.clear();
         if (old != null && old != conn) {
-            commandQueue.clear();
-            disconnectHandler.run();
             old.close();
         }
-        activeConnection = conn;
+        for (Connection pending : pendingConnections.toArray(Connection[]::new)) pending.close();
         LOGGER.log(System.Logger.Level.INFO, "[WireServer] Authenticated backend connected from {0}", conn.socket.getRemoteSocketAddress());
     }
 
     private boolean validToken(String candidate) {
+        if (authToken.isBlank() || candidate == null || candidate.isBlank()) return false;
         return MessageDigest.isEqual(
                 authToken.getBytes(StandardCharsets.UTF_8),
-                (candidate == null ? "" : candidate).getBytes(StandardCharsets.UTF_8)
+                candidate.getBytes(StandardCharsets.UTF_8)
         );
     }
 
@@ -253,6 +286,9 @@ public class WireServer {
         final BufferedReader reader;
         final BufferedWriter writer;
         final AtomicBoolean open = new AtomicBoolean(true);
+        final AtomicBoolean disconnectNotified = new AtomicBoolean(false);
+        volatile boolean activated;
+        volatile long epoch;
 
         Connection(Socket socket) throws IOException {
             this.socket = socket;
@@ -318,7 +354,7 @@ public class WireServer {
 
                     String line;
                     while (open.get() && (line = readLineLimited()) != null) {
-                        if (line.isBlank()) continue;
+                    if (line.isBlank()) continue;
                         try {
                             JsonObject msg = gson.fromJson(line, JsonObject.class);
                             if (msg != null && "command".equals(msg.get("type") != null ? msg.get("type").getAsString() : null)) {
@@ -329,19 +365,30 @@ public class WireServer {
                                 );
                                 if (cmd.cmd() != null) {
                                     LOGGER.log(System.Logger.Level.INFO, "[WireServer] Received command: {0} id={1}", cmd.cmd(), cmd.id());
-                                    if ("control_external".equals(cmd.cmd()) || "control_builtin".equals(cmd.cmd())) {
-                                        for (WireCommand discarded : commandQueue.submitControl(cmd)) {
-                                            rejectPreempted(discarded);
-                                        }
-                                    } else if ("stop_all".equals(cmd.cmd())) {
-                                        for (WireCommand discarded : commandQueue.submitStop(cmd)) {
-                                            rejectPreempted(discarded);
-                                        }
-                                    } else {
-                                        if (!commandQueue.submitBackend(cmd)) {
+                                    synchronized (WireServer.this) {
+                                        if (activeConnection != this || !open.get()) break;
+                                        if (!commandAdmissionEnabled) {
                                             JsonObject data = new JsonObject();
-                                            data.addProperty("message", "command queue is full");
-                                            WireServer.this.sendResponse(cmd.id(), false, data, "QUEUE_FULL");
+                                            data.addProperty("message", "no client world is active");
+                                            WireServer.this.sendResponse(cmd.id(), false, data, "BODY_UNAVAILABLE");
+                                        } else if ("shutdown".equals(cmd.cmd())) {
+                                            JsonObject data = new JsonObject();
+                                            data.addProperty("message", "shutdown is not available");
+                                            WireServer.this.sendResponse(cmd.id(), false, data, "UNKNOWN_COMMAND");
+                                        } else if ("control_external".equals(cmd.cmd()) || "control_builtin".equals(cmd.cmd())) {
+                                            for (WireCommand discarded : commandQueue.submitControl(cmd)) {
+                                                rejectDiscarded(discarded, "QUEUE_PREEMPTED", "command preempted by control transition");
+                                            }
+                                        } else if ("stop_all".equals(cmd.cmd()) || "disarm".equals(cmd.cmd())) {
+                                            for (WireCommand discarded : commandQueue.submitStop(cmd)) {
+                                                rejectDiscarded(discarded, "QUEUE_PREEMPTED", "command preempted by emergency control");
+                                            }
+                                        } else {
+                                            if (!commandQueue.submitBackend(cmd)) {
+                                                JsonObject data = new JsonObject();
+                                                data.addProperty("message", "command queue is full");
+                                                WireServer.this.sendResponse(cmd.id(), false, data, "QUEUE_FULL");
+                                            }
                                         }
                                     }
                                 }
@@ -376,39 +423,52 @@ public class WireServer {
             return line.toString();
         }
 
-        private void rejectPreempted(WireCommand discarded) {
-            if (discarded.id() == null || discarded.id().isBlank()) return;
-            if ("cancel_operation".equals(discarded.cmd())) {
-                JsonObject data = new JsonObject();
-                data.addProperty("message", "cancel request superseded by stop_all");
-                WireServer.this.sendResponse(discarded.id(), true, data, null);
-                return;
-            }
-            if (switch (discarded.cmd()) {
-                case "move_to", "mine_block", "mine_block_at", "follow_player",
-                     "collect_blocks", "craft_item", "eat" -> true;
-                default -> false;
-            }) {
-                WireServer.this.sendOutcome(
-                    discarded.id(), "cancelled", "QUEUE_PREEMPTED", "operation preempted by stop_all");
-                return;
-            }
-            JsonObject data = new JsonObject();
-            data.addProperty("message", "command preempted by stop_all");
-            WireServer.this.sendResponse(discarded.id(), false, data, "QUEUE_PREEMPTED");
-        }
-
         void close() {
             if (!open.getAndSet(false)) return;
+            boolean wasActive;
+            synchronized (WireServer.this) {
+                wasActive = activeConnection == this;
+                pendingConnections.remove(this);
+                if (wasActive) {
+                    activeConnection = null;
+                    commandQueue.clear();
+                    sendQueue.clear();
+                }
+            }
             try { socket.close(); } catch (IOException ignored) {}
             LOGGER.log(System.Logger.Level.INFO, "[WireServer] Connection closed");
-            if (activeConnection == this) {
-                activeConnection = null;
-                commandQueue.clear();
-                disconnectHandler.run();
+            if (wasActive && activated && disconnectNotified.compareAndSet(false, true)) {
+                try {
+                    disconnectHandler.run();
+                } catch (RuntimeException exception) {
+                    LOGGER.log(System.Logger.Level.WARNING, "[WireServer] Disconnect handler failed: {0}", exception.getMessage());
+                }
             }
         }
     }
+
+    private void rejectDiscarded(WireCommand discarded, String code, String message) {
+        if (discarded.id() == null || discarded.id().isBlank()) return;
+        if ("cancel_operation".equals(discarded.cmd())) {
+            JsonObject data = new JsonObject();
+            data.addProperty("message", message);
+            sendResponse(discarded.id(), true, data, null);
+            return;
+        }
+        if (switch (discarded.cmd()) {
+            case "move_to", "mine_block", "mine_block_at", "follow_player",
+                 "collect_blocks", "craft_item", "eat" -> true;
+            default -> false;
+        }) {
+            sendOutcome(discarded.id(), "cancelled", code, message);
+            return;
+        }
+        JsonObject data = new JsonObject();
+        data.addProperty("message", message);
+        sendResponse(discarded.id(), false, data, code);
+    }
+
+    private record OutboundFrame(Connection target, long epoch, String line) {}
 
     public record WireCommand(String id, String cmd, JsonObject args) {}
 }

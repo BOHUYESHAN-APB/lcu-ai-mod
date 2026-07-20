@@ -10,7 +10,6 @@ import com.lcu.lcumod.network.WireServer;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
-import net.minecraft.network.chat.Component;
 import net.minecraft.network.protocol.game.ServerboundClientCommandPacket;
 import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
 import net.minecraft.world.InteractionHand;
@@ -396,7 +395,7 @@ public class ActionExecutor {
 
     private boolean isSafetyControl(String command) {
         return switch (command) {
-            case "stop_all", "stop_digging", "cancel_operation", "control_external",
+             case "stop_all", "disarm", "stop_digging", "cancel_operation", "control_external",
                  "control_builtin", "behavior_disable" -> true;
             default -> false;
         };
@@ -464,18 +463,13 @@ public class ActionExecutor {
                 case "attack" -> handleAttack(cmd);
                 case "stop_digging" -> handleStopDigging(cmd);
                 case "get_state" -> handleGetState(cmd);
-                case "shutdown" -> handleShutdown();
                 case "set_control_state" -> handleSetControlState(cmd);
                 case "auto_equip" -> handleAutoEquip(cmd);
                 case "get_inventory" -> handleGetInventory(cmd);
                 case "get_recipes" -> handleGetRecipes(cmd);
                 case "stop_all" -> handleStopAll(cmd);
                 case "cancel_operation" -> handleCancelOperation(cmd);
-                // AI/User control toggle
-                case "toggle_ai" -> {
-                    toggleAiControl();
-                    sendResponse(cmd.id(), true, "AI=" + isAiControlled());
-                }
+                 case "disarm" -> handleDisarm(cmd);
                 // Container interaction (mineflayer-style)
                 case "use_on" -> handleUseOn(cmd);       // right-click block/entity
                 case "interact_block_at" -> handleInteractBlockAt(cmd);
@@ -1084,6 +1078,15 @@ public class ActionExecutor {
         sendResponse(cmd.id(), true, "All stopped");
     }
 
+    private void handleDisarm(WireServer.WireCommand cmd) {
+        stopAllRuntime();
+        setAiControlled(false);
+        if (ClientBodyRuntime.BEHAVIORS != null) ClientBodyRuntime.BEHAVIORS.setEnabled(false);
+        JavaAutonomousBehavior.setEnabled(false);
+        sendResponse(cmd.id(), true, "Body disarmed");
+        sendControlStateToBackend();
+    }
+
     private void handleCancelOperation(WireServer.WireCommand cmd) {
         var args = cmd.args();
         if (args == null || !args.has("operation_id")) {
@@ -1127,7 +1130,7 @@ public class ActionExecutor {
         sendResponse(cmd.id(), cancelled, cancelled ? "Operation cancelled" : "Operation is not active");
     }
 
-    private void stopAllRuntime() {
+    public void stopAllRuntime() {
         var mc = Minecraft.getInstance();
         cancelActiveOperations("STOP_ALL", "all operations stopped");
         followTargetName = null;
@@ -1163,6 +1166,13 @@ public class ActionExecutor {
         sendBehaviorSnapshot();
     }
 
+    public void invalidateRuntime() {
+        stopAllRuntime();
+        setAiControlled(false);
+        if (ClientBodyRuntime.BEHAVIORS != null) ClientBodyRuntime.BEHAVIORS.setEnabled(false);
+        JavaAutonomousBehavior.setEnabled(false);
+    }
+
     private void cancelActiveOperations(String code, String message) {
         java.util.Set<String> requestIds = new java.util.HashSet<>();
         if (diggingReqId != null) requestIds.add(diggingReqId);
@@ -1184,7 +1194,7 @@ public class ActionExecutor {
     private boolean requiresArmedBody(String command) {
         return switch (command) {
             case "control_external", "control_builtin", "get_state", "get_inventory", "get_container",
-                 "stop_all", "cancel_operation", "toggle_ai", "behavior_disable", "send_chat" -> false;
+                 "stop_all", "disarm", "cancel_operation", "behavior_disable", "send_chat" -> false;
             default -> true;
         };
     }
@@ -1794,17 +1804,6 @@ public class ActionExecutor {
             return;
         }
         sendResponse(cmd.id(), false, "UNSUPPORTED: protected-region-aware building is not implemented");
-    }
-
-    private void handleShutdown() {
-        var mc = Minecraft.getInstance();
-        LCUMod.LOGGER.info("[Shutdown] Shutdown requested");
-        if (mc.getSingleplayerServer() != null) {
-            mc.getSingleplayerServer().halt(false);
-        } else {
-            var conn = mc.getConnection();
-            if (conn != null) conn.getConnection().disconnect(Component.literal("AI Shutdown"));
-        }
     }
 
     // ── State Sync ──
