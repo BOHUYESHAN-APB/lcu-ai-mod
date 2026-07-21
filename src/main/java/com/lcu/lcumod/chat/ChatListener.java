@@ -1,6 +1,7 @@
 package com.lcu.lcumod.chat;
 
 import com.google.gson.JsonObject;
+import com.google.gson.JsonArray;
 import com.lcu.lcumod.LCUMod;
 import com.lcu.lcumod.client.ClientBodyRuntime;
 import net.minecraft.client.Minecraft;
@@ -28,16 +29,25 @@ public class ChatListener {
             if (!ClientBodyRuntime.isBodyClient()) return;
             if (LCUMod.WIRE == null || !LCUMod.WIRE.isConnected()) return;
 
-            // Skip system messages (death, teleport, etc.) to avoid backend noise
-            if (event.isSystem()) return;
-
             Component msgComponent = event.getMessage();
             if (msgComponent == null) return;
-            String message = msgComponent.getString();
+            JsonArray clickActions = new JsonArray();
+            collectClickActions(msgComponent, clickActions);
+            if (event.isSystem()) {
+                if (!clickActions.isEmpty()) {
+                    JsonObject data = new JsonObject();
+                    data.addProperty("message", msgComponent.getString());
+                    data.addProperty("is_system", true);
+                    data.add("actions", clickActions);
+                    LCUMod.WIRE.sendEvent("chat_clicks", data);
+                }
+                return;
+            }
+            String senderName = resolveSender(event);
+            String message = extractMessageBody(msgComponent.getString(), senderName);
             if (message == null || message.isEmpty()) return;
 
             // Skip messages sent by our own AI player (server echo of send_chat)
-            String senderName = resolveSender(event);
             var mc = Minecraft.getInstance();
             if (mc.player != null && senderName.equals(mc.player.getName().getString())) return;
 
@@ -50,6 +60,7 @@ public class ChatListener {
             data.addProperty("message", message);
             data.addProperty("is_system", event.isSystem());
             data.addProperty("type", event.isSystem() ? "system_chat" : "player_chat");
+            if (!clickActions.isEmpty()) data.add("actions", clickActions);
 
             LCUMod.WIRE.sendEvent("player_chat", data);
         } catch (Exception e) {
@@ -73,5 +84,31 @@ public class ChatListener {
             }
         }
         return event.getSender() != null ? event.getSender().toString() : "system";
+    }
+
+    static String extractMessageBody(String rendered, String sender) {
+        if (rendered == null) return "";
+        String text = rendered.trim();
+        String bracketPrefix = "<" + sender + ">";
+        if (!sender.isBlank() && text.regionMatches(true, 0, bracketPrefix, 0, bracketPrefix.length())) {
+            return text.substring(bracketPrefix.length()).trim();
+        }
+        String colonPrefix = sender + ":";
+        if (!sender.isBlank() && text.regionMatches(true, 0, colonPrefix, 0, colonPrefix.length())) {
+            return text.substring(colonPrefix.length()).trim();
+        }
+        return text;
+    }
+
+    private static void collectClickActions(Component component, JsonArray actions) {
+        var click = component.getStyle().getClickEvent();
+        if (click != null) {
+            JsonObject action = new JsonObject();
+            action.addProperty("action", click.getAction().name().toLowerCase(java.util.Locale.ROOT));
+            action.addProperty("value", click.getValue());
+            action.addProperty("text", component.getString());
+            actions.add(action);
+        }
+        for (Component sibling : component.getSiblings()) collectClickActions(sibling, actions);
     }
 }

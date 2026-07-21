@@ -18,7 +18,20 @@ from .skill_registry import SkillRegistry
 FENCING_FIELD = "__lcu_fencing_token"
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled", "unknown"}
 COMMAND_TIMEOUT_SECONDS = 30 * 60
-SIDEBAND_COMMANDS = {"send_chat", "get_state", "get_inventory", "get_container", "get_recipes"}
+FARM_MAX_SCANS = 3
+FARM_MAX_CANDIDATE_ATTEMPTS = 768
+FARM_RESCAN_CODES = {
+    "STALE_TARGET", "TARGET_REPLACED", "NAVIGATION_FAILED", "TARGET_NOT_VISIBLE",
+    "HARVEST_NOT_CONFIRMED", "TIMEOUT",
+}
+FARM_RESTORATION_CODES = {
+    "REPLANT_BLOCKED", "SEED_MISSING", "SOIL_NOT_VISIBLE", "REPLANT_NOT_CONFIRMED",
+    "CANCELLED_AFTER_HARVEST",
+}
+SIDEBAND_COMMANDS = {
+    "send_chat", "get_state", "get_inventory", "get_container", "get_recipes",
+    "inspect_block", "scan_crops",
+}
 
 
 class TaskCoordinator:
@@ -41,7 +54,10 @@ class TaskCoordinator:
         self._clock_scope = initial_scope or clock["scope_id"]
         if scope_changed:
             self.state.set_scheduler_clock(None, None, initial_scope)
-        self.state.mark_inflight_unknown("backend restarted before terminal event")
+        restart_detail = "backend restarted before terminal event"
+        self.state.mark_dynamic_harvests_unknown(restart_detail)
+        self.state.reset_dynamic_scan_requests("backend restarted; crop scan may be resent")
+        self.state.mark_inflight_unknown(restart_detail)
 
     def create_run(self, skill_id: str, input_data: dict[str, Any], *,
                    lease_id: str | None = None, fencing_token: int | None = None) -> dict[str, Any]:
@@ -64,19 +80,39 @@ class TaskCoordinator:
         with self._dispatch_lock:
             if workflow.get("kind") != "workflow":
                 raise ValueError("task preset is not a workflow")
-            for step in workflow.get("steps", []):
-                manifest = self.registry.validate_input(step["skill_id"], step["input"])
-                if not manifest.durable or manifest.version != step["skill_version"]:
-                    raise ValueError(f"workflow step contract changed: {step['key']}")
+            handler = workflow.get("dynamic_handler")
+            if handler:
+                if handler != "farm_region":
+                    raise ValueError(f"unknown dynamic workflow handler: {handler}")
+                radius = workflow.get("parameters", {}).get("radius")
+                self.registry.validate_input("world.scan_crops", {"radius": radius})
+                harvest = self.registry.get("world.harvest_crop_at")
+                if not harvest.durable:
+                    raise ValueError("farm_region requires durable harvest skill")
+            else:
+                for step in workflow.get("steps", []):
+                    manifest = self.registry.validate_input(step["skill_id"], step["input"])
+                    if not manifest.durable or manifest.version != step["skill_version"]:
+                        raise ValueError(f"workflow step contract changed: {step['key']}")
             with self.state.control_guard(lease_id, fencing_token):
                 if lease_id and self.is_busy():
                     raise ValueError("another task run is active")
-                run = self.state.create_workflow_run(
-                    workflow, scope_id=self._clock_scope, lease_id=lease_id, fencing_token=fencing_token,
-                )
+                if handler == "farm_region":
+                    run = self.state.create_dynamic_workflow_run(
+                        workflow, {
+                            "phase": "needs_scan", "radius": radius, "scan_attempts": 0,
+                            "candidate_attempts": 0, "candidates": [], "next_candidate": 0,
+                            "harvested": 0, "failures": [], "restoration_obligations": [],
+                        }, scope_id=self._clock_scope, lease_id=lease_id, fencing_token=fencing_token,
+                    )
+                else:
+                    run = self.state.create_workflow_run(
+                        workflow, scope_id=self._clock_scope, lease_id=lease_id, fencing_token=fencing_token,
+                    )
                 if self.state.has_active_runs() or self._session_busy or self._raw_requests or not self._body_armed:
                     return run
-                self.dispatch(run["active_child_id"], lease_id=lease_id, fencing_token=fencing_token)
+                self.dispatch(run["id"] if handler else run["active_child_id"],
+                              lease_id=lease_id, fencing_token=fencing_token)
                 return self.state.get_run(run["id"])
 
     def admit_automatic_run(self, skill_id: str, input_data: dict[str, Any]) -> dict[str, Any]:
@@ -165,6 +201,8 @@ class TaskCoordinator:
         with self._dispatch_lock:
             run = self.state.get_run(run_id)
             if run["run_kind"] == "workflow":
+                if run.get("workflow_spec", {}).get("dynamic_handler") == "farm_region":
+                    return self._dispatch_farm_region(run)
                 if not run["active_child_id"]:
                     return run
                 self.dispatch(
@@ -203,6 +241,11 @@ class TaskCoordinator:
     def handle_body_message(self, message: BodyEvent) -> dict[str, Any] | None:
         request_id = str(message.data.get("id", ""))
         with self._dispatch_lock:
+            if message.type == "response":
+                dynamic = self.state.get_run_by_pending_request(request_id)
+                if dynamic is not None:
+                    self._raw_requests.pop(request_id, None)
+                    return self._handle_farm_scan_response(dynamic, message.data)
             raw_request = self._raw_requests.get(request_id)
             completion = raw_request[0] if raw_request else None
             if completion and message.type == "response" \
@@ -256,6 +299,9 @@ class TaskCoordinator:
         if not parent_id:
             return
         parent = self.state.get_run(parent_id)
+        if parent.get("workflow_spec", {}).get("dynamic_handler") == "farm_region":
+            self._handle_farm_child(parent, run)
+            return
         child_id = parent.get("active_child_id")
         if parent["status"] != "queued" or not child_id or child_id == run["id"]:
             return
@@ -263,12 +309,214 @@ class TaskCoordinator:
             child_id, lease_id=parent.get("lease_id"), fencing_token=parent.get("fencing_token"),
         )
 
+    def _dispatch_farm_region(self, parent: dict[str, Any]) -> dict[str, Any]:
+        if parent["status"] not in {"queued", "running"}:
+            return parent
+        if parent.get("active_child_id"):
+            child = self.dispatch(
+                parent["active_child_id"], lease_id=parent.get("lease_id"),
+                fencing_token=parent.get("fencing_token"),
+            )
+            if child["status"] == "unknown":
+                self.state.finalize_dynamic_unknown_children("harvest dispatch state is uncertain")
+            return self.state.get_run(parent["id"])
+        if parent.get("pending_request_id") or not self.body.is_connected or not self._body_armed:
+            return parent
+        if self.state.has_active_runs() or self._raw_requests or self._session_busy:
+            return parent
+        task_state = dict(parent.get("task_state") or {})
+        if int(task_state.get("scan_attempts", 0)) >= FARM_MAX_SCANS:
+            return self._finish_farm(parent["id"], task_state)
+        task_state["phase"] = "scanning"
+        task_state["scan_attempts"] = int(task_state.get("scan_attempts", 0)) + 1
+
+        def reserve(request_id: str) -> None:
+            self.state.update_dynamic_workflow(
+                parent["id"], task_state, status="running", pending_request_id=request_id,
+                detail=f"crop scan {task_state['scan_attempts']} of {FARM_MAX_SCANS}",
+            )
+
+        def failed(_request_id: str) -> None:
+            task_state["phase"] = "needs_scan"
+            self.state.update_dynamic_workflow(
+                parent["id"], task_state, status="queued", detail="crop scan dispatch failed",
+            )
+
+        try:
+            scan_args = {"radius": int(task_state["radius"])}
+            if parent.get("fencing_token") is not None:
+                scan_args[FENCING_FIELD] = int(parent["fencing_token"])
+            self.dispatch_raw_command(
+                "scan_crops", scan_args,
+                on_reserved=reserve, on_failed=failed,
+            )
+        except ConnectionError:
+            pass
+        return self.state.get_run(parent["id"])
+
+    def _handle_farm_scan_response(self, parent: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+        task_state = dict(parent.get("task_state") or {})
+        payload = data.get("data")
+        if not data.get("success", False) or not isinstance(payload, dict) or not isinstance(payload.get("crops"), list):
+            self._append_farm_failure(task_state, {
+                "code": str(data.get("error") or "SCAN_FAILED"),
+                "detail": str(payload if payload is not None else data.get("error", "crop scan failed")),
+            })
+            task_state["phase"] = "needs_scan"
+            self.state.update_dynamic_workflow(parent["id"], task_state, status="queued")
+            refreshed = self.state.get_run(parent["id"])
+            if int(task_state.get("scan_attempts", 0)) >= FARM_MAX_SCANS:
+                return self._finish_farm(parent["id"], task_state)
+            return self._dispatch_farm_region(refreshed)
+
+        candidates = []
+        for crop in payload["crops"][:256]:
+            if not isinstance(crop, dict) or not isinstance(crop.get("crop"), dict):
+                continue
+            crop_data = crop["crop"]
+            if crop_data.get("mature") is not True:
+                continue
+            coordinates = (crop.get("x"), crop.get("y"), crop.get("z"))
+            age = crop_data.get("age")
+            if any(isinstance(value, bool) or not isinstance(value, int) for value in (*coordinates, age)):
+                continue
+            if not isinstance(crop.get("block_id"), str) or not crop["block_id"] \
+                    or not isinstance(crop.get("target_token"), str) or not crop["target_token"]:
+                continue
+            try:
+                distance = float(crop.get("distance", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(distance):
+                continue
+            candidates.append({
+                "x": coordinates[0], "y": coordinates[1], "z": coordinates[2],
+                "block_id": crop["block_id"], "age": age, "target_token": crop["target_token"],
+                "distance": distance,
+            })
+        candidates.sort(key=lambda item: (
+            item["distance"], item["x"], item["y"], item["z"], item["block_id"],
+            item["age"], item["target_token"],
+        ))
+        task_state.update({
+            "phase": "harvesting", "candidates": candidates, "next_candidate": 0,
+        })
+        self.state.update_dynamic_workflow(parent["id"], task_state, status="running")
+        return self._dispatch_next_farm_candidate(parent["id"])
+
+    def _dispatch_next_farm_candidate(self, parent_id: str) -> dict[str, Any]:
+        parent = self.state.get_run(parent_id)
+        task_state = dict(parent.get("task_state") or {})
+        index = int(task_state.get("next_candidate", 0))
+        candidates = task_state.get("candidates", [])
+        attempts = int(task_state.get("candidate_attempts", 0))
+        if index >= len(candidates) or attempts >= FARM_MAX_CANDIDATE_ATTEMPTS:
+            return self._finish_farm(parent_id, task_state)
+        candidate = dict(candidates[index])
+        candidate.pop("distance", None)
+        self.registry.validate_input("world.harvest_crop_at", candidate)
+        task_state["next_candidate"] = index + 1
+        task_state["candidate_attempts"] = attempts + 1
+        task_state["active_candidate"] = candidate
+        manifest = self.registry.get("world.harvest_crop_at")
+        child = self.state.create_dynamic_workflow_child(parent_id, {
+            "key": f"harvest_{attempts + 1}", "title": "Harvest crop",
+            "skill_id": manifest.id, "skill_version": manifest.version,
+            "completion": manifest.completion, "input": candidate,
+        }, task_state)
+        dispatched = self.dispatch(
+            child["id"], lease_id=parent.get("lease_id"), fencing_token=parent.get("fencing_token"),
+        )
+        if dispatched["status"] == "unknown":
+            self.state.finalize_dynamic_unknown_children("harvest dispatch state is uncertain")
+        return self.state.get_run(parent_id)
+
+    def _handle_farm_child(self, parent: dict[str, Any], child: dict[str, Any]) -> None:
+        if child["status"] not in TERMINAL_STATUSES:
+            return
+        task_state = dict(parent.get("task_state") or {})
+        candidate = dict(task_state.get("active_candidate") or child.get("input") or {})
+        task_state.pop("active_candidate", None)
+        if child["status"] == "unknown":
+            self.state.finalize_dynamic_unknown_children("harvest terminal state is uncertain")
+            return
+        if parent.get("cancel_requested_at") is not None or child["status"] == "cancelled":
+            code = str(child.get("error") or "")
+            if code in FARM_RESTORATION_CODES:
+                failure = {**candidate, "code": code, "detail": str(child.get("detail", ""))}
+                obligations = list(task_state.get("restoration_obligations", []))
+                obligations.append(failure)
+                task_state["restoration_obligations"] = obligations[:FARM_MAX_CANDIDATE_ATTEMPTS]
+            result = self._farm_result(task_state, "cancelled")
+            self.state.finish_dynamic_workflow(parent["id"], "cancelled", result, "cancelled by controller")
+            return
+
+        code = str(child.get("error") or "")
+        if child["status"] == "succeeded":
+            task_state["harvested"] = int(task_state.get("harvested", 0)) + 1
+        else:
+            failure = {**candidate, "code": code or "HARVEST_FAILED", "detail": str(child.get("detail", ""))}
+            self._append_farm_failure(task_state, failure)
+            if code in FARM_RESTORATION_CODES:
+                task_state["harvested"] = int(task_state.get("harvested", 0)) + 1
+                obligations = list(task_state.get("restoration_obligations", []))
+                obligations.append(failure)
+                task_state["restoration_obligations"] = obligations[:FARM_MAX_CANDIDATE_ATTEMPTS]
+
+        task_state["phase"] = "harvesting"
+        self.state.update_dynamic_workflow(parent["id"], task_state, status="running")
+        refreshed = self.state.get_run(parent["id"])
+        if child["status"] == "failed" and code in FARM_RESCAN_CODES \
+                and int(task_state.get("scan_attempts", 0)) < FARM_MAX_SCANS:
+            task_state.update({"phase": "needs_scan", "candidates": [], "next_candidate": 0})
+            self.state.update_dynamic_workflow(parent["id"], task_state, status="queued")
+            self._dispatch_farm_region(self.state.get_run(parent["id"]))
+            return
+        self._dispatch_next_farm_candidate(refreshed["id"])
+
+    @staticmethod
+    def _append_farm_failure(task_state: dict[str, Any], failure: dict[str, Any]) -> None:
+        failures = list(task_state.get("failures", []))
+        failures.append(failure)
+        task_state["failures"] = failures[:FARM_MAX_CANDIDATE_ATTEMPTS + FARM_MAX_SCANS]
+
+    @staticmethod
+    def _farm_result(task_state: dict[str, Any], status: str) -> dict[str, Any]:
+        return {
+            "status": status,
+            "harvested": int(task_state.get("harvested", 0)),
+            "candidate_attempts": int(task_state.get("candidate_attempts", 0)),
+            "scan_attempts": int(task_state.get("scan_attempts", 0)),
+            "restoration_obligations": list(task_state.get("restoration_obligations", [])),
+            "failures": list(task_state.get("failures", [])),
+        }
+
+    def _finish_farm(self, parent_id: str, task_state: dict[str, Any]) -> dict[str, Any]:
+        obligations = task_state.get("restoration_obligations", [])
+        harvested = int(task_state.get("harvested", 0))
+        failures = task_state.get("failures", [])
+        if obligations:
+            result_status, run_status = "partial", "failed"
+            detail = "farm completed with restoration obligations"
+        elif failures and harvested == 0:
+            result_status, run_status = "failed", "failed"
+            detail = "no crop transaction completed"
+        else:
+            result_status, run_status = "succeeded", "succeeded"
+            detail = f"harvested {harvested} crop(s)"
+        return self.state.finish_dynamic_workflow(
+            parent_id, run_status, self._farm_result(task_state, result_status), detail,
+        )
+
     def on_disconnect(self) -> int:
         with self._dispatch_lock:
             self._raw_requests.clear()
             self._cancel_requests.clear()
             self._body_armed = False
-        return self.state.mark_inflight_unknown("companion body disconnected before terminal event")
+        detail = "companion body disconnected before terminal event"
+        changed = self.state.mark_dynamic_harvests_unknown(detail)
+        self.state.reset_dynamic_scan_requests("companion disconnected; crop scan may be resent")
+        return changed + self.state.mark_inflight_unknown(detail)
 
     def on_control_transition(self) -> int:
         with self._dispatch_lock:
@@ -399,10 +647,22 @@ class TaskCoordinator:
                     return run
                 parent = run if run["run_kind"] == "workflow" else None
                 if parent:
+                    if parent.get("workflow_spec", {}).get("dynamic_handler") == "farm_region" \
+                            and not parent["active_child_id"]:
+                        result = self._farm_result(parent.get("task_state") or {}, "cancelled")
+                        return self.state.finish_dynamic_workflow(
+                            parent["id"], "cancelled", result, "cancelled by controller",
+                        )
                     if not parent["active_child_id"]:
                         return self.state.cancel_run(parent["id"])
                     run = self.state.get_run(parent["active_child_id"])
                     if run["status"] == "queued":
+                        if parent.get("workflow_spec", {}).get("dynamic_handler") == "farm_region":
+                            self.state.cancel_run(run["id"])
+                            result = self._farm_result(parent.get("task_state") or {}, "cancelled")
+                            return self.state.finish_dynamic_workflow(
+                                parent["id"], "cancelled", result, "cancelled by controller",
+                            )
                         return self.state.cancel_queued_workflow(parent["id"])
                 elif run["status"] == "queued":
                     return self.state.cancel_run(run["id"])
@@ -449,7 +709,9 @@ class TaskCoordinator:
                     raise ValueError("companion body is not armed")
                 if run["run_kind"] == "workflow":
                     self.state.set_workflow_control(run["id"], lease_id, fencing_token)
-                    self.dispatch(run["active_child_id"], lease_id=lease_id, fencing_token=fencing_token)
+                    target_id = run["id"] if run.get("workflow_spec", {}).get("dynamic_handler") \
+                        else run["active_child_id"]
+                    self.dispatch(target_id, lease_id=lease_id, fencing_token=fencing_token)
                     return self.state.get_run(run["id"])
                 return self.dispatch(run["id"], lease_id=lease_id, fencing_token=fencing_token)
 
@@ -465,9 +727,15 @@ class TaskCoordinator:
             ]
             for request_id in stale_raw:
                 self._raw_requests.pop(request_id, None)
+                parent = self.state.get_run_by_pending_request(request_id)
+                if parent is not None:
+                    self._handle_farm_scan_response(parent, {
+                        "id": request_id, "success": False, "error": "TIMEOUT",
+                    })
             self.state.expire_stale_runs(
                 COMMAND_TIMEOUT_SECONDS, "terminal event timeout; body state is uncertain",
             )
+            self.state.finalize_dynamic_unknown_children("terminal event timeout; harvest state is uncertain")
         lease = self.state.get_active_lease()
 
         world = runtime.get("world", {}) if isinstance(runtime.get("world"), dict) else {}

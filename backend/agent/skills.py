@@ -154,6 +154,48 @@ class Skills:
         """Get full player inventory."""
         return self._send_cmd("get_inventory", {})
 
+    def inspect_block(self, x: int, y: int, z: int) -> dict:
+        """Inspect one loaded block and its structured state properties."""
+        return self._send_cmd("inspect_block", {"x": x, "y": y, "z": z})
+
+    def scan_crops(self, radius: int = 8) -> dict:
+        """Scan nearby loaded blocks for supported vanilla crops."""
+        return self._send_cmd("scan_crops", {"radius": radius})
+
+    def harvest_crop_at(self, x: int, y: int, z: int, block_id: str, age: int,
+                        target_token: str) -> dict:
+        """Harvest and replant one observed mature vanilla crop."""
+        return self._send_cmd("harvest_crop_at", {
+            "x": x, "y": y, "z": z, "block_id": block_id, "age": age,
+            "target_token": target_token,
+        })
+
+    def break_block_at(self, x: int, y: int, z: int, target_token: str,
+                       face: str | None = None) -> dict:
+        payload = {"x": x, "y": y, "z": z, "target_token": target_token}
+        if face:
+            payload["face"] = face
+        return self._send_cmd("break_block_at", payload)
+
+    def use_block_at(self, x: int, y: int, z: int, target_token: str,
+                     face: str | None = None) -> dict:
+        payload = {"x": x, "y": y, "z": z, "target_token": target_token}
+        if face:
+            payload["face"] = face
+        return self._send_cmd("use_block_at", payload)
+
+    def place_block_at(self, x: int, y: int, z: int, target_token: str,
+                       place_x: int, place_y: int, place_z: int, item_id: str,
+                       face: str | None = None) -> dict:
+        payload = {
+            "x": x, "y": y, "z": z, "target_token": target_token,
+            "place_x": place_x, "place_y": place_y, "place_z": place_z,
+            "item_id": item_id,
+        }
+        if face:
+            payload["face"] = face
+        return self._send_cmd("place_block_at", payload)
+
     def get_recipes(self, item: str) -> dict:
         return self._send_cmd("get_recipes", {"item": item})
 
@@ -220,11 +262,27 @@ class Skills:
         """Get full player/world state."""
         return self._send_cmd("get_state", {})
 
+    def observe_gui(self, include_image: bool = False) -> dict:
+        return self._send_cmd("observe_gui", {"include_image": include_image})
+
+    def get_keybindings(self) -> dict:
+        return self._send_cmd("get_keybindings", {})
+
+    def ui_click(self, screen_revision: int, x: float, y: float, button: int = 0) -> dict:
+        return self._send_cmd("ui_click", {"screen_revision": screen_revision, "x": x, "y": y, "button": button})
+
+    def key_press(self, screen_revision: int, mapping_id: str) -> dict:
+        return self._send_cmd("key_press", {"screen_revision": screen_revision, "mapping_id": mapping_id})
+
     # ── Chat ────────────────────────────────────────────────────
 
     def send_chat(self, message: str) -> dict:
         """Send a chat message (rate-limited at 1.5s)."""
         return self._send_cmd("send_chat", {"message": message})
+
+    def server_command(self, family: str, command: str) -> dict:
+        """Send a backend-evaluated, narrowly allowlisted server command."""
+        return self._send_cmd("server_command", {"family": family, "command": command})
 
     # ── Behavior Control (mindcraft modes.js) ───────────────────
 

@@ -203,6 +203,22 @@ class AgentStateDB:
                 self._conn.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)", (6, time.time())
                 )
+            if 7 not in applied:
+                run_columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(task_runs)")}
+                additions = {
+                    "task_state_json": "TEXT",
+                    "result_json": "TEXT",
+                    "pending_request_id": "TEXT",
+                }
+                for name, definition in additions.items():
+                    if name not in run_columns:
+                        self._conn.execute(f"ALTER TABLE task_runs ADD COLUMN {name} {definition}")
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_task_runs_pending_request ON task_runs(pending_request_id)"
+                )
+                self._conn.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)", (7, time.time())
+                )
             self._conn.commit()
         except Exception:
             self._conn.rollback()
@@ -285,6 +301,175 @@ class AgentStateDB:
                 "skill_id": first["skill_id"], "parent_run_id": run_id, "step_index": 0,
             }, now)
         return self.get_run(run_id)
+
+    def create_dynamic_workflow_run(self, workflow: dict[str, Any], task_state: dict[str, Any], *,
+                                    scope_id: str | None = None, lease_id: str | None = None,
+                                    fencing_token: int | None = None) -> dict[str, Any]:
+        run_id = str(uuid.uuid4())
+        now = time.time()
+        with self._lock, self._conn:
+            self._conn.execute("""
+                INSERT INTO task_runs(
+                    id, skill_id, skill_version, input_json, completion, status, created_at,
+                    scope_id, run_kind, root_run_id, workflow_spec_json, task_state_json,
+                    lease_id, fencing_token
+                ) VALUES (?, ?, ?, ?, 'workflow', 'queued', ?, ?, 'workflow', ?, ?, ?, ?, ?)
+            """, (
+                run_id, workflow["id"], workflow["version"],
+                json.dumps(workflow.get("parameters", {}), ensure_ascii=False, sort_keys=True),
+                now, scope_id, run_id, json.dumps(workflow, ensure_ascii=False, sort_keys=True),
+                json.dumps(task_state, ensure_ascii=False, sort_keys=True), lease_id, fencing_token,
+            ))
+            self._append_event("run.created", "run", run_id, {
+                "run_kind": "workflow", "dynamic_handler": workflow.get("dynamic_handler"),
+            }, now)
+        return self.get_run(run_id)
+
+    def update_dynamic_workflow(self, run_id: str, task_state: dict[str, Any], *,
+                                status: str | None = None, pending_request_id: str | None = None,
+                                active_child_id: str | None = None, detail: str = "") -> dict[str, Any]:
+        now = time.time()
+        next_status = status or "running"
+        with self._lock, self._conn:
+            cursor = self._conn.execute("""
+                UPDATE task_runs SET task_state_json=?, status=?, pending_request_id=?,
+                    active_child_id=?, detail=?, started_at=COALESCE(started_at, ?)
+                WHERE id=? AND run_kind='workflow' AND status IN ('queued', 'running')
+            """, (
+                json.dumps(task_state, ensure_ascii=False, sort_keys=True), next_status,
+                pending_request_id, active_child_id, detail, now, run_id,
+            ))
+            if cursor.rowcount != 1:
+                raise ValueError("dynamic workflow is not active")
+        return self.get_run(run_id)
+
+    def create_dynamic_workflow_child(self, parent_id: str, step: dict[str, Any],
+                                      task_state: dict[str, Any]) -> dict[str, Any]:
+        child_id = str(uuid.uuid4())
+        now = time.time()
+        with self._lock, self._conn:
+            parent = self._conn.execute("SELECT * FROM task_runs WHERE id=?", (parent_id,)).fetchone()
+            if parent is None or parent["status"] not in {"queued", "running"} or parent["active_child_id"]:
+                raise ValueError("dynamic workflow cannot queue a child")
+            step_index = int(parent["current_step"] or 0)
+            self._insert_workflow_child(
+                child_id, parent_id, parent["root_run_id"] or parent_id, step_index,
+                step, parent["scope_id"], now,
+            )
+            self._conn.execute("""
+                UPDATE task_runs SET status='queued', active_child_id=?, current_step=?,
+                    task_state_json=?, pending_request_id=NULL, detail=''
+                WHERE id=?
+            """, (
+                child_id, step_index + 1,
+                json.dumps(task_state, ensure_ascii=False, sort_keys=True), parent_id,
+            ))
+            self._append_event("run.created", "run", child_id, {
+                "skill_id": step["skill_id"], "parent_run_id": parent_id, "step_index": step_index,
+            }, now)
+            self._append_event("workflow.step_queued", "run", parent_id, {
+                "child_run_id": child_id, "step_index": step_index,
+            }, now)
+        return self.get_run(child_id)
+
+    def finish_dynamic_workflow(self, run_id: str, status: str, result: dict[str, Any],
+                                detail: str = "", error: str = "") -> dict[str, Any]:
+        if status not in {"succeeded", "failed", "cancelled", "unknown"}:
+            raise ValueError("invalid dynamic workflow status")
+        now = time.time()
+        progress = 1.0 if status == "succeeded" else 0.0
+        with self._lock, self._conn:
+            cursor = self._conn.execute("""
+                UPDATE task_runs SET status=?, progress=?, detail=?, error=?, result_json=?,
+                    pending_request_id=NULL, active_child_id=NULL, finished_at=?
+                WHERE id=? AND run_kind='workflow' AND status IN ('queued', 'running')
+            """, (
+                status, progress, detail, error,
+                json.dumps(result, ensure_ascii=False, sort_keys=True), now, run_id,
+            ))
+            if cursor.rowcount:
+                self._append_event(f"run.{status}", "run", run_id, {
+                    "detail": detail, "code": error, "result": result,
+                }, now)
+        return self.get_run(run_id)
+
+    def reset_dynamic_scan_requests(self, detail: str) -> int:
+        with self._lock, self._conn:
+            cursor = self._conn.execute("""
+                UPDATE task_runs SET status='queued', pending_request_id=NULL, detail=?
+                WHERE run_kind='workflow' AND status IN ('queued', 'running')
+                  AND pending_request_id IS NOT NULL AND active_child_id IS NULL
+            """, (detail,))
+        return cursor.rowcount
+
+    def get_run_by_pending_request(self, request_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id FROM task_runs WHERE pending_request_id=?", (request_id,)
+            ).fetchone()
+        return self.get_run(row["id"]) if row is not None else None
+
+    def mark_dynamic_harvests_unknown(self, detail: str) -> int:
+        now = time.time()
+        with self._lock, self._conn:
+            rows = list(self._conn.execute("""
+                SELECT child.*, parent.task_state_json AS parent_task_state_json
+                FROM task_runs child JOIN task_runs parent ON parent.id=child.parent_run_id
+                WHERE child.skill_id='world.harvest_crop_at'
+                  AND child.status IN ('dispatched', 'running')
+                  AND parent.run_kind='workflow' AND parent.status IN ('queued', 'running')
+                  AND json_extract(parent.workflow_spec_json, '$.dynamic_handler')='farm_region'
+            """))
+            for row in rows:
+                self._conn.execute("""
+                    UPDATE task_runs SET status='unknown', detail=?, finished_at=? WHERE id=?
+                """, (detail, now, row["id"]))
+                task_state = json.loads(row["parent_task_state_json"] or "{}")
+                result_status = "partial_unknown" if task_state.get("harvested", 0) else "unknown"
+                result = self._dynamic_farm_result(task_state, result_status)
+                self._conn.execute("""
+                    UPDATE task_runs SET status='unknown', detail=?, result_json=?,
+                        active_child_id=NULL, pending_request_id=NULL, finished_at=? WHERE id=?
+                """, (result_status, json.dumps(result, ensure_ascii=False, sort_keys=True), now, row["parent_run_id"]))
+                self._append_event("run.unknown", "run", row["id"], {"detail": detail}, now)
+                self._append_event("run.unknown", "run", row["parent_run_id"], {
+                    "detail": result_status, "child_run_id": row["id"], "result": result,
+                }, now)
+        return len(rows)
+
+    def finalize_dynamic_unknown_children(self, detail: str) -> int:
+        now = time.time()
+        with self._lock, self._conn:
+            rows = list(self._conn.execute("""
+                SELECT child.*, parent.task_state_json AS parent_task_state_json
+                FROM task_runs child JOIN task_runs parent ON parent.id=child.parent_run_id
+                WHERE child.status='unknown' AND parent.active_child_id=child.id
+                  AND parent.status IN ('queued', 'running')
+                  AND json_extract(parent.workflow_spec_json, '$.dynamic_handler')='farm_region'
+            """))
+            for row in rows:
+                task_state = json.loads(row["parent_task_state_json"] or "{}")
+                result_status = "partial_unknown" if task_state.get("harvested", 0) else "unknown"
+                result = self._dynamic_farm_result(task_state, result_status)
+                self._conn.execute("""
+                    UPDATE task_runs SET status='unknown', detail=?, result_json=?,
+                        active_child_id=NULL, pending_request_id=NULL, finished_at=? WHERE id=?
+                """, (result_status, json.dumps(result, ensure_ascii=False, sort_keys=True), now, row["parent_run_id"]))
+                self._append_event("run.unknown", "run", row["parent_run_id"], {
+                    "detail": detail, "child_run_id": row["id"], "result": result,
+                }, now)
+        return len(rows)
+
+    @staticmethod
+    def _dynamic_farm_result(task_state: dict[str, Any], status: str) -> dict[str, Any]:
+        return {
+            "status": status,
+            "harvested": int(task_state.get("harvested", 0)),
+            "candidate_attempts": int(task_state.get("candidate_attempts", 0)),
+            "scan_attempts": int(task_state.get("scan_attempts", 0)),
+            "restoration_obligations": list(task_state.get("restoration_obligations", [])),
+            "failures": list(task_state.get("failures", [])),
+        }
 
     def set_workflow_control(self, run_id: str, lease_id: str | None,
                              fencing_token: int | None) -> dict[str, Any]:
@@ -434,6 +619,8 @@ class AgentStateDB:
         if parent["active_child_id"] != child["id"]:
             return None
         workflow = json.loads(parent["workflow_spec_json"] or "{}")
+        if workflow.get("dynamic_handler"):
+            return None
         steps = workflow.get("steps", [])
         if child_status == "unknown":
             parent_status = "unknown"
@@ -796,6 +983,10 @@ class AgentStateDB:
         result["input"] = json.loads(result.pop("input_json"))
         spec = result.pop("workflow_spec_json", None)
         result["workflow_spec"] = json.loads(spec) if spec else None
+        task_state = result.pop("task_state_json", None)
+        result["task_state"] = json.loads(task_state) if task_state else None
+        stored_result = result.pop("result_json", None)
+        result["result"] = json.loads(stored_result) if stored_result else None
         return result
 
     @staticmethod

@@ -193,6 +193,7 @@ class MemoryCatalog:
         return {
             "id": record_id,
             "category": category,
+            "tier": "summary" if category == "summary" else "durable",
             "scope": self._scope(),
             "state": "active",
             "occurred_at": occurred_at,

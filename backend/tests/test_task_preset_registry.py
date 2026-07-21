@@ -46,6 +46,20 @@ class TaskPresetRegistryTests(unittest.TestCase):
         self.assertEqual([step["key"] for step in rendered["steps"]], ["collect_logs", "craft_chest"])
         self.assertEqual(rendered["steps"][1]["input"], {"item": "minecraft:chest", "count": 1})
 
+    def test_farm_region_renders_dynamic_workflow_with_bounded_radius(self):
+        listed = next(item for item in self.registry.list("farming") if item["id"] == "farm.region")
+        rendered = self.registry.render("farm.region", {"radius": 8})
+
+        self.assertEqual(listed["kind"], "workflow")
+        self.assertEqual([skill["id"] for skill in listed["skills"]], [
+            "world.scan_crops", "world.harvest_crop_at",
+        ])
+        self.assertEqual(rendered["dynamic_handler"], "farm_region")
+        self.assertEqual(rendered["parameters"], {"radius": 8})
+        self.assertEqual(rendered["steps"], [])
+        with self.assertRaisesRegex(TaskPresetValidationError, "must be <="):
+            self.registry.render("farm.region", {"radius": 17})
+
     def test_rejects_missing_unknown_and_invalid_parameters(self):
         with self.assertRaisesRegex(TaskPresetValidationError, "missing parameters"):
             self.registry.render("collect.logs", {})

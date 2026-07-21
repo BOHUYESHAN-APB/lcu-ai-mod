@@ -23,7 +23,9 @@ class AgentStateTests(unittest.TestCase):
             state.close()
             conn = sqlite3.connect(path)
             try:
-                self.assertEqual(conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 6)
+                self.assertEqual(conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 7)
+                columns = {row[1] for row in conn.execute("PRAGMA table_info(task_runs)")}
+                self.assertTrue({"task_state_json", "result_json", "pending_request_id"} <= columns)
             finally:
                 conn.close()
 
@@ -129,6 +131,32 @@ class AgentStateTests(unittest.TestCase):
             cancelled = state.create_workflow_run(workflow)
             state.cancel_queued_workflow(cancelled["id"])
             self.assertEqual(state.get_run(cancelled["id"])["status"], "cancelled")
+            state.close()
+
+    def test_dynamic_workflow_state_and_result_are_persisted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = AgentStateDB(Path(tmp) / "agent_state.db")
+            workflow = {
+                "id": "farm.region", "version": "1.0.0", "kind": "workflow",
+                "dynamic_handler": "farm_region", "parameters": {"radius": 8}, "steps": [],
+            }
+            parent = state.create_dynamic_workflow_run(workflow, {
+                "radius": 8, "scan_attempts": 0, "harvested": 0,
+            })
+            state.update_dynamic_workflow(
+                parent["id"], {"radius": 8, "scan_attempts": 1, "harvested": 0},
+                pending_request_id="scan-1",
+            )
+
+            restored = state.get_run(parent["id"])
+            self.assertEqual(restored["task_state"]["scan_attempts"], 1)
+            self.assertEqual(restored["pending_request_id"], "scan-1")
+
+            finished = state.finish_dynamic_workflow(
+                parent["id"], "succeeded", {"status": "succeeded", "harvested": 0},
+            )
+            self.assertEqual(finished["result"], {"status": "succeeded", "harvested": 0})
+            self.assertIsNone(finished["pending_request_id"])
             state.close()
 
 

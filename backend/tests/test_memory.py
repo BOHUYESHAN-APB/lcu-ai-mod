@@ -34,7 +34,7 @@ class MemoryTests(unittest.TestCase):
             memory.save()
             saved = json.loads(path.read_text(encoding="utf-8"))
 
-            self.assertEqual(saved["schema_version"], 4)
+            self.assertEqual(saved["schema_version"], 5)
             self.assertEqual(memory.recent_messages[0]["message"], "legacy")
             self.assertEqual(memory.player_relationships, {})
             self.assertEqual(memory.task_outcomes, [])
@@ -187,6 +187,22 @@ class MemoryTests(unittest.TestCase):
 
             self.assertEqual(restored.summaries[0]["id"], "summary-one")
             self.assertIn("Alice needs diamonds", context["durable_summaries"])
+
+    def test_working_context_is_not_persisted_and_preferences_are_durable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "memory.json"
+            memory = Memory(path)
+            memory.remember_preference("Alice", "uuid-a", "food", "vegetarian", confidence=0.8)
+            memory.save()
+            restored = Memory(path)
+
+            context = restored.build_context(
+                current_player="Alice", player_id="uuid-a",
+                working_context=[{"role": "user", "content": "temporary request"}],
+            )
+            self.assertIn("temporary request", context["working_context"])
+            self.assertIn("vegetarian", context["player_preferences"])
+            self.assertNotIn("working_context", json.loads(path.read_text(encoding="utf-8")))
 
     def test_long_task_is_only_recorded_after_outcome(self):
         with tempfile.TemporaryDirectory() as tmp:

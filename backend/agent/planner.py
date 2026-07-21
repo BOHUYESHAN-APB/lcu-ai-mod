@@ -114,6 +114,9 @@ class Planner:
         
         返回: 回复文本，或 None（如果不回复）
         """
+        with self._planning_lock:
+            if self._execute_direct_control_intent(sender, message, context):
+                return None
         if not self.llm or not self.llm.is_configured("planner"):
             logger.warning("[Planner] LLM 未配置，无法规划")
             return None
@@ -157,6 +160,25 @@ class Planner:
             with self._planning_lock:
                 if generation == self._generation:
                     self._is_planning = False
+
+    def _execute_direct_control_intent(self, sender: str, message: str, context: dict) -> bool:
+        """Execute only unambiguous body-control commands without involving the model."""
+        compact = re.sub(r"[\s，。！？,.!?]+", "", message)
+        follow_match = re.fullmatch(r"(?:请|麻烦你?)?(?:一直)?(?:跟着|跟随)我", compact)
+        if not follow_match:
+            return False
+        self._last_plan_executed_action = False
+        self._last_execution_source = "none"
+        self._last_protocol_error = ""
+        self._seen_proposals = set()
+        self._proposal_emitted = False
+        self._proposal_attempted = False
+        accepted = self._emit_skill(
+            "general.follow_player", {"player": sender}, "direct_control_intent",
+        )
+        self._last_plan_executed_action = accepted
+        self._last_execution_source = "direct_control_intent" if accepted else "proposal_rejected"
+        return accepted
     
     def _build_planner_prompt(self, sender: str, message: str, 
                                context: dict, bot_name: str) -> str:
@@ -482,7 +504,7 @@ finish()
                 return self._emit_skill("core.move_to", {
                     "x": float(payload["x"]), "y": float(payload["y"]), "z": float(payload["z"]),
                 }, "model_tool")
-        elif tool_name == "follow":
+        elif tool_name in {"follow", "follow_player"}:
             player = payload.get("player") or payload.get("player_name")
             if player and not self._is_duplicate_task(context, {"follow"}, str(player)):
                 return self._emit_skill("general.follow_player", {"player": str(player)}, "model_tool")

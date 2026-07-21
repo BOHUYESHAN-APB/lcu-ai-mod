@@ -11,7 +11,7 @@ import net.minecraft.client.Options;
  * 1. AI control: releaseMouse() — cursor visible, no camera control
  * 2. User control: grabMouse() — cursor hidden, camera control
  * 3. Switching requires F12 key press
- * 4. Auto-return to AI after 10 seconds of user inactivity
+ * 4. Manual takeover is explicit; focus changes never change ownership
  */
 public class InputIsolation {
 
@@ -25,7 +25,7 @@ public class InputIsolation {
     private static boolean aiSprint = false;
 
     // Control mode
-    private static boolean aiControlled = false;
+    private static boolean aiControlled = true;
     private static long lastUserActivity = 0;
     private static final long USER_TIMEOUT_MS = 10000;  // 10 seconds
     private static boolean autoReturnEnabled = false;
@@ -73,6 +73,26 @@ public class InputIsolation {
             }
             LCUMod.LOGGER.info("[Input] Switched to AI control (mouse released)");
         }
+    }
+
+    /** Set ownership during world lifecycle changes without synthesizing a user takeover. */
+    public static void setAiControlled(boolean enabled) {
+        if (aiControlled == enabled) return;
+        aiControlled = enabled;
+        clearAiControls();
+        if (enabled) {
+            clearUserControls();
+            releaseMouseWithoutFocus();
+            appliedMouseState = Boolean.TRUE;
+        } else {
+            lastUserActivity = System.currentTimeMillis();
+            appliedMouseState = Boolean.FALSE;
+        }
+    }
+
+    private static void releaseMouseWithoutFocus() {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc != null && mc.mouseHandler != null) mc.mouseHandler.releaseMouse();
     }
 
     /**
@@ -157,8 +177,9 @@ public class InputIsolation {
         if (aiControlled && !Boolean.TRUE.equals(appliedMouseState)) {
             mc.mouseHandler.releaseMouse();
             appliedMouseState = Boolean.TRUE;
-        } else if (!aiControlled && !Boolean.FALSE.equals(appliedMouseState)) {
-            mc.mouseHandler.grabMouse();
+        } else if (!aiControlled && appliedMouseState == null) {
+            // Manual mode must never make an unfocused window active. F12 owns the
+            // explicit transition and may capture the mouse when appropriate.
             appliedMouseState = Boolean.FALSE;
         }
     }
@@ -187,12 +208,6 @@ public class InputIsolation {
         if (mc.player == null) return;
 
         ensureControlModeApplied(mc);
-
-        // Check for user timeout (auto-return to AI)
-        if (hasUserTimedOut()) {
-            toggleControl();
-            return;
-        }
 
         // Apply AI controls if AI is controlling
         if (aiControlled) {

@@ -93,7 +93,34 @@ class ConfigStoreTests(unittest.TestCase):
 
             self.assertEqual(config["max_output_tokens"], 777)
             self.assertNotIn("max_tokens", persisted["llm"]["agents"]["default"])
-            self.assertEqual(persisted["version"], 2)
+            self.assertEqual(persisted["version"], 3)
+
+    def test_version_two_inline_provider_migrates_without_changing_effective_connection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps({
+                "version": 2,
+                "llm": {"agents": {"default": {
+                    "provider": "openai",
+                    "base_url": "https://example.test/v1",
+                    "model": "existing-model",
+                    "api_key": "existing-secret",
+                    "temperature": 0.2,
+                }}},
+            }), encoding="utf-8")
+
+            store = ConfigStore(path)
+            effective = store.get_agent_llm_config("default", redact=False)
+            persisted = store.raw(redact=False)
+
+            self.assertEqual(effective["provider"], "openai")
+            self.assertEqual(effective["base_url"], "https://example.test/v1")
+            self.assertEqual(effective["model"], "existing-model")
+            self.assertEqual(effective["api_key"], "existing-secret")
+            self.assertEqual(persisted["version"], 3)
+            profile_id = persisted["llm"]["agents"]["default"]["provider_profile"]
+            self.assertEqual(persisted["llm"]["provider_profiles"][profile_id]["provider"], "openai")
+            self.assertNotIn("api_key", persisted["llm"]["agents"]["default"])
 
     def test_model_budget_cross_field_validation_is_atomic(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -204,6 +231,43 @@ class ConfigStoreTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "assigned"):
                 store.delete_provider_profile("mimo-default")
+
+    def test_fallback_provider_profile_cannot_be_deleted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConfigStore(Path(tmp) / "config.json")
+            store.upsert_provider_profile({"id": "fallback", "provider": "openai"})
+            store.set_agent_llm_config("planner", {"fallback_profiles": ["fallback"]})
+
+            with self.assertRaisesRegex(ValueError, "assigned"):
+                store.delete_provider_profile("fallback")
+
+    def test_profile_patch_preserves_secret_and_allows_missing_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConfigStore(Path(tmp) / "config.json")
+            store.upsert_provider_profile({"id": "remote", "provider": "openai", "api_key": "secret"})
+            updated = store.upsert_provider_profile({"id": "remote", "enabled": False, "api_key": "***"})
+
+            self.assertFalse(updated["enabled"])
+            self.assertEqual(store.get_provider_profile("remote", redact=False)["api_key"], "secret")
+
+    def test_reading_unknown_agent_does_not_mutate_store(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConfigStore(Path(tmp) / "config.json")
+            before = store.raw(redact=False)
+
+            store.get_agent_llm_config("not-configured", redact=False)
+
+            self.assertEqual(store.raw(redact=False), before)
+
+    def test_provider_profile_can_be_loaded_with_or_without_redaction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConfigStore(Path(tmp) / "config.json")
+            store.upsert_provider_profile({
+                "id": "remote", "provider": "openai", "api_key": "profile-secret",
+            })
+
+            self.assertEqual(store.get_provider_profile("remote")["api_key"], "***")
+            self.assertEqual(store.get_provider_profile("remote", redact=False)["api_key"], "profile-secret")
 
     def test_legacy_whitelist_migrates_to_scoped_access_policy(self):
         with tempfile.TemporaryDirectory() as tmp:

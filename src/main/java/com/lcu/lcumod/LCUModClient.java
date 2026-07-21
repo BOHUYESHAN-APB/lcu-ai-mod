@@ -44,10 +44,8 @@ public class LCUModClient {
             }
             ClientBodyRuntime.start();
             var options = Minecraft.getInstance().options;
-            options.pauseOnLostFocus = !ServerPolicy.backgroundExecutionAllowed();
-            if (!options.pauseOnLostFocus) {
-                LCUMod.LOGGER.warn("[LCUMod] Background execution enabled by explicit server-policy configuration");
-            }
+            options.pauseOnLostFocus = false;
+            LCUMod.LOGGER.info("[LCUMod] Body client continues while unfocused; focus never changes control ownership");
         });
     }
 

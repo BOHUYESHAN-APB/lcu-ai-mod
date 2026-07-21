@@ -29,7 +29,7 @@ class Memory:
     4. 位置记忆（命名位置）— 记住重要坐标
     """
     
-    SCHEMA_VERSION = 4
+    SCHEMA_VERSION = 5
     FLUSH_INTERVAL = 5.0
     WORLD_FLUSH_INTERVAL = 120.0
 
@@ -56,6 +56,7 @@ class Memory:
 
         # Structured durable memory
         self.player_relationships: dict[str, dict] = {}
+        self.player_preferences: dict[str, dict[str, dict[str, Any]]] = {}
         self.experiences: dict[str, dict] = {"servers": {}, "worlds": {}}
         self.task_outcomes: list[dict] = []
         self.max_task_outcomes = 100
@@ -161,6 +162,44 @@ class Memory:
             relationship["message_count"] += 1
         self._mark_dirty()
 
+    def remember_preference(self, name: str, player_id: str, key: str, value: Any,
+                            *, confidence: float = 1.0, source: str = "conversation") -> dict[str, Any]:
+        """Persist an explicit player preference for durable 2G retrieval."""
+        identity_key = f"uuid:{player_id}" if player_id else f"name:{name.casefold()}"
+        preference_key = str(key).strip()
+        if not preference_key:
+            raise ValueError("preference key must not be empty")
+        try:
+            confidence_value = float(confidence)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("preference confidence must be numeric") from exc
+        if not 0 <= confidence_value <= 1:
+            raise ValueError("preference confidence must be between 0 and 1")
+        preference = {
+            "key": preference_key,
+            "value": value,
+            "confidence": confidence_value,
+            "source": str(source or "conversation"),
+            "updated_at": time.time(),
+            "server_id": self.server_id,
+            "world_id": self.world_id,
+        }
+        self.player_preferences.setdefault(identity_key, {})[preference_key] = preference
+        self.observe_player(name, player_id)
+        self._mark_dirty()
+        return dict(preference)
+
+    def get_player_preferences(self, name: str = "", player_id: str = "") -> list[dict[str, Any]]:
+        keys = []
+        if player_id:
+            keys.append(f"uuid:{player_id}")
+        if name:
+            keys.append(f"name:{name.casefold()}")
+        preferences: dict[str, dict[str, Any]] = {}
+        for identity_key in keys:
+            preferences.update(self.player_preferences.get(identity_key, {}))
+        return sorted(preferences.values(), key=lambda item: (item.get("key", ""), -float(item.get("updated_at", 0))))
+
     def observe_world(self, state: dict) -> None:
         """Aggregate world experience without appending high-frequency events."""
         now = time.time()
@@ -248,6 +287,13 @@ class Memory:
         content = str(summary.get("content", "")).strip()
         if not summary_id or not content:
             raise ValueError("summary id and content are required")
+        tier = str(summary.get("tier", "summary"))
+        if tier != "summary":
+            raise ValueError("summaries must use tier=summary")
+        summary.setdefault("scope", {"server_id": self.server_id, "world_id": self.world_id})
+        summary.setdefault("subject", {})
+        summary.setdefault("source_ids", [])
+        summary.setdefault("summary_level", "conversation")
         if any(item.get("id") == summary_id for item in self.summaries):
             return
         stored = dict(summary)
@@ -314,9 +360,12 @@ class Memory:
     
     # ── 上下文构建 ──
     
-    def build_context(self, current_player: str | None = None, max_chars: int = 4000) -> dict:
+    def build_context(self, current_player: str | None = None, max_chars: int = 4000,
+                      *, player_id: str = "", working_context: list[dict] | None = None) -> dict:
         """Build deterministic, bounded context for LLM prompts."""
         sections = {
+            "working_context": self._build_working_context(working_context),
+            "player_preferences": self._build_player_preferences(current_player or "", player_id),
             "relationship_summary": self._build_relationship_summary(current_player),
             "task_outcomes": self._build_task_outcomes_summary(),
             "world_experience": self._build_world_experience_summary(),
@@ -337,6 +386,27 @@ class Memory:
             context[key] = compact[:remaining]
             remaining -= len(context[key])
         return context
+
+    @staticmethod
+    def _build_working_context(working_context: list[dict] | None) -> str:
+        if not working_context:
+            return "暂无工作上下文"
+        lines = []
+        for item in working_context[-12:]:
+            role = str(item.get("role", "observation"))
+            content = str(item.get("content", "")).strip()
+            if content:
+                lines.append(f"{role}: {content[:500]}")
+        return "\n".join(lines) or "暂无工作上下文"
+
+    def _build_player_preferences(self, name: str, player_id: str) -> str:
+        preferences = self.get_player_preferences(name, player_id)
+        if not preferences:
+            return "暂无明确用户偏好"
+        return "\n".join(
+            f"{item.get('key')}: {item.get('value')} (confidence={float(item.get('confidence', 0)):.2f})"
+            for item in preferences[:12]
+        )
 
     def _build_relationship_summary(self, current_player: str | None) -> str:
         relationships = list(self.player_relationships.values())
@@ -488,6 +558,10 @@ class Memory:
             self.player_profiles = player_profiles
             self.locations = locations
             self.player_relationships = player_relationships
+            player_preferences = data.get("player_preferences", {})
+            if not isinstance(player_preferences, dict):
+                raise ValueError("player_preferences must be an object")
+            self.player_preferences = player_preferences
             self.experiences = experiences
             self.task_outcomes = task_outcomes[-self.max_task_outcomes:]
             self.summaries = summaries[-self.max_summaries:]
@@ -537,6 +611,7 @@ class Memory:
             "player_profiles": self.player_profiles,
             "locations": self.locations,
             "player_relationships": self.player_relationships,
+            "player_preferences": self.player_preferences,
             "experiences": self.experiences,
             "task_outcomes": self.task_outcomes,
             "summaries": self.summaries,

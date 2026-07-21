@@ -46,6 +46,7 @@ public final class ClientBodyRuntime {
 
     public static synchronized void activateWorld() {
         if (LCUMod.WIRE != null) LCUMod.WIRE.setCommandAdmissionEnabled(true);
+        if (ACTION != null) ACTION.armForWorld();
     }
 
     public static boolean isBodyClient() {

@@ -37,9 +37,10 @@ class TaskPreset:
     examples: tuple[dict[str, Any], ...] = ()
     tags: tuple[str, ...] = ()
     steps: tuple[TaskPresetStep, ...] = ()
+    dynamic_handler: str = ""
 
     def public_dict(self) -> dict[str, Any]:
-        return {**asdict(self), "kind": "workflow" if self.steps else "skill"}
+        return {**asdict(self), "kind": "workflow" if self.steps or self.dynamic_handler else "skill"}
 
 
 def _schema(properties: dict[str, dict[str, Any]], required: list[str] | None = None) -> dict[str, Any]:
@@ -107,6 +108,13 @@ BUILTIN_TASK_PRESETS = [
             }),
         ),
     ),
+    TaskPreset(
+        "farm.region", "1.0.0", "收获农田区域",
+        "扫描附近成熟作物，逐个收获并补种。", "farming", "",
+        _schema({"radius": {"type": "integer", "minimum": 1, "maximum": 16}}, ["radius"]), {},
+        examples=({"name": "附近农田", "parameters": {"radius": 8}},),
+        tags=("vanilla", "farming", "multi-step"), dynamic_handler="farm_region",
+    ),
 ]
 
 
@@ -127,17 +135,21 @@ class TaskPresetRegistry:
             if category and preset.category != category:
                 continue
             public = preset.public_dict()
-            skill_ids = [step.skill_id for step in preset.steps] if preset.steps else [preset.skill_id]
+            if preset.dynamic_handler == "farm_region":
+                skill_ids = ["world.scan_crops", "world.harvest_crop_at"]
+            else:
+                skill_ids = [step.skill_id for step in preset.steps] if preset.steps else [preset.skill_id]
             skills = [skill_status.get(skill_id, {}) for skill_id in skill_ids]
             unavailable = [skill for skill in skills if skill.get("available", True) is False]
             public["available"] = not unavailable
             public["availability_reason"] = "; ".join(
                 dict.fromkeys(skill.get("availability_reason", "") for skill in unavailable if skill.get("availability_reason"))
             )
-            public["skill"] = skills[0] if not preset.steps else None
+            public["skill"] = skills[0] if not preset.steps and not preset.dynamic_handler else None
             public["skills"] = skills
-            public["step_count"] = len(preset.steps) if preset.steps else 1
-            public["schedulable"] = not preset.steps and bool(skills[0].get("schedulable", False))
+            public["step_count"] = len(preset.steps) if preset.steps else 0 if preset.dynamic_handler else 1
+            public["schedulable"] = not preset.steps and not preset.dynamic_handler \
+                and bool(skills[0].get("schedulable", False))
             result.append(public)
         return result
 
@@ -150,6 +162,15 @@ class TaskPresetRegistry:
     def render(self, preset_id: str, parameters: dict[str, Any]) -> dict[str, Any]:
         preset = self.get(preset_id)
         self._validate_parameters(preset.parameter_schema, parameters)
+        if preset.dynamic_handler:
+            return {
+                "id": preset.id,
+                "version": preset.version,
+                "kind": "workflow",
+                "dynamic_handler": preset.dynamic_handler,
+                "parameters": dict(parameters),
+                "steps": [],
+            }
         definitions = preset.steps or (
             TaskPresetStep("run", preset.title, preset.skill_id, preset.input_template),
         )
@@ -179,11 +200,21 @@ class TaskPresetRegistry:
         }
 
     def _validate_manifest(self, preset: TaskPreset) -> None:
-        if bool(preset.skill_id) == bool(preset.steps):
-            raise ValueError(f"task preset must define one skill or workflow steps: {preset.id}")
         definitions = preset.steps or (
             TaskPresetStep("run", preset.title, preset.skill_id, preset.input_template),
         )
+        if sum(bool(value) for value in (preset.skill_id, preset.steps, preset.dynamic_handler)) != 1:
+            raise ValueError(f"task preset must define one skill or workflow steps: {preset.id}")
+        if preset.dynamic_handler:
+            if preset.dynamic_handler != "farm_region":
+                raise ValueError(f"unknown dynamic task handler: {preset.dynamic_handler}")
+            self.skills.get("world.scan_crops")
+            harvest = self.skills.get("world.harvest_crop_at")
+            if not harvest.durable:
+                raise ValueError("farm_region requires durable harvest skill")
+            for example in preset.examples:
+                self._validate_parameters(preset.parameter_schema, example.get("parameters", {}))
+            return
         keys = [step.key for step in definitions]
         if len(keys) != len(set(keys)):
             raise ValueError(f"task preset step keys must be unique: {preset.id}")

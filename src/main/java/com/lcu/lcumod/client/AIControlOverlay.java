@@ -1,7 +1,6 @@
 package com.lcu.lcumod.client;
 
 import com.lcu.lcumod.LCUMod;
-import com.lcu.lcumod.action.ActionExecutor;
 import com.lcu.lcumod.action.InputIsolation;
 import net.minecraft.client.Minecraft;
 import net.neoforged.api.distmarker.Dist;
@@ -16,9 +15,8 @@ import net.neoforged.neoforge.client.event.RenderGuiLayerEvent;
  * KEY DESIGN:
  * 1. Renders the button in top-left corner
  * 2. When AI is controlling: mouse is released (cursor visible)
- * 3. Click on button = switch to user control
- * 4. F12 = switch control mode
- * 5. When user is controlling: mouse is grabbed (cursor hidden)
+ * 3. The overlay is informational only
+ * 4. F12 = the sole manual takeover path
  */
 @EventBusSubscriber(modid = LCUMod.MODID, value = Dist.CLIENT)
 public class AIControlOverlay {
@@ -74,26 +72,7 @@ public class AIControlOverlay {
             InputIsolation.recordUserActivity();
         }
 
-        // Only handle left click release (action = 1)
-        if (event.getButton() != 0 || event.getAction() != 1) return; // 0 = left button, 1 = released
-
-        // Only check when AI is controlling (mouse is released)
-        if (!InputIsolation.isAiControlled()) return;
-
-        // Get mouse position
-        double mouseX = mc.mouseHandler.xpos();
-        double mouseY = mc.mouseHandler.ypos();
-
-        // Scale to GUI coordinates
-        double scale = mc.getWindow().getGuiScale();
-        double guiX = mouseX / scale;
-        double guiY = mouseY / scale;
-
-        // Check if click is on the button
-        if (isClickInButton(guiX, guiY)) {
-            handleClick();
-            event.setCanceled(true); // Cancel the event so it doesn't trigger other actions
-        }
+        if (InputIsolation.isAiControlled()) event.setCanceled(true);
     }
 
     /**
@@ -123,20 +102,4 @@ public class AIControlOverlay {
         }
     }
 
-    /**
-     * Check if a click is within the button area.
-     */
-    public static boolean isClickInButton(double mouseX, double mouseY) {
-        return mouseX >= MARGIN && mouseX <= MARGIN + BUTTON_WIDTH
-            && mouseY >= MARGIN && mouseY <= MARGIN + BUTTON_HEIGHT;
-    }
-
-    /**
-     * Handle button click - toggle AI/User control.
-     */
-    public static void handleClick() {
-        ActionExecutor.toggleAiControl();
-        boolean newState = ActionExecutor.isAiControlled();
-        LCUMod.LOGGER.info("[HUD] AI control toggled: {}", newState);
-    }
 }

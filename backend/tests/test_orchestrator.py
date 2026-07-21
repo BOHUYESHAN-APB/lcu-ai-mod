@@ -184,7 +184,7 @@ class OrchestratorBodyTests(unittest.TestCase):
             orchestrator.session.stop()
             state.close()
 
-    def test_chat_planner_rejects_non_durable_follow_without_body_command(self):
+    def test_chat_planner_admits_durable_follow_operation(self):
         body = FakeBody()
         with tempfile.TemporaryDirectory() as tmp:
             state = AgentStateDB(Path(tmp) / "agent_state.db")
@@ -197,12 +197,12 @@ class OrchestratorBodyTests(unittest.TestCase):
                 'tool(follow, {"player":"Alice"})', sender="Alice", message="跟着我", context={},
             )
 
-            self.assertEqual(body.commands, [])
-            self.assertEqual(state.list_runs(root_only=True), [])
-            self.assertIn("durable", orchestrator.session.planner.get_status()["last_protocol_error"])
+            self.assertEqual(body.commands, [("follow_player", {"player": "Alice"})])
+            run = state.list_runs(root_only=True)[0]
+            self.assertEqual((run["skill_id"], run["status"]), ("general.follow_player", "dispatched"))
             self.assertEqual(
                 [event["type"] for event in state.list_events() if event["aggregate_type"] == "planner"],
-                ["planner.proposal_rejected"],
+                ["planner.proposal_admitted"],
             )
             orchestrator.close()
             orchestrator.session.stop()

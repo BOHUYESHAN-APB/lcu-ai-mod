@@ -49,6 +49,50 @@ class SkillsTests(unittest.TestCase):
         self.assertEqual(wire.sent[0][0], "craft_item")
         self.assertEqual(wire.sent[0][1], {"item": "wooden_sword", "count": 3})
 
+    def test_inspect_block_sends_integer_position(self):
+        wire = DummyWire()
+        skills = Skills(wire)
+
+        skills.inspect_block(10, 64, -3)
+
+        self.assertEqual(wire.sent[0][0], "inspect_block")
+        self.assertEqual(wire.sent[0][1], {"x": 10, "y": 64, "z": -3})
+
+    def test_scan_crops_sends_bounded_radius(self):
+        wire = DummyWire()
+        skills = Skills(wire)
+
+        skills.scan_crops(12)
+
+        self.assertEqual(wire.sent[0][0], "scan_crops")
+        self.assertEqual(wire.sent[0][1], {"radius": 12})
+
+    def test_harvest_crop_sends_observed_identity(self):
+        wire = DummyWire()
+        skills = Skills(wire)
+
+        skills.harvest_crop_at(10, 64, -3, "minecraft:wheat", 7, "token-1")
+
+        self.assertEqual(wire.sent[0][0], "harvest_crop_at")
+        self.assertEqual(wire.sent[0][1], {
+            "x": 10, "y": 64, "z": -3, "block_id": "minecraft:wheat", "age": 7,
+            "target_token": "token-1",
+        })
+
+    def test_verified_block_actions_carry_target_token(self):
+        wire = DummyWire()
+        skills = Skills(wire)
+
+        skills.break_block_at(1, 2, 3, "token", "up")
+        skills.use_block_at(4, 5, 6, "token-2")
+        skills.place_block_at(7, 8, 9, "token-3", 7, 9, 9, "minecraft:stone", "up")
+
+        self.assertEqual(wire.sent[0][0], "break_block_at")
+        self.assertEqual(wire.sent[0][1]["target_token"], "token")
+        self.assertEqual(wire.sent[1][0], "use_block_at")
+        self.assertEqual(wire.sent[2][0], "place_block_at")
+        self.assertEqual(wire.sent[2][1]["item_id"], "minecraft:stone")
+
 
 if __name__ == "__main__":
     unittest.main()

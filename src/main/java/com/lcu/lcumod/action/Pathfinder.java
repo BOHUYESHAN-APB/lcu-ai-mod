@@ -59,11 +59,22 @@ public class Pathfinder {
     private static final NavigationSession navigationSession = new NavigationSession();
 
     public static boolean navigateTo(String requestId, double x, double y, double z) {
+        return navigateTo(requestId, true, x, y, z);
+    }
+
+    public static boolean navigateChild(String ownerId, double x, double y, double z) {
+        if (ownerId == null || ownerId.isBlank()) return false;
+        return navigateTo(ownerId, false, x, y, z);
+    }
+
+    private static boolean navigateTo(String requestId, boolean reportsLifecycle, double x, double y, double z) {
         Minecraft mc = Minecraft.getInstance();
         Vec3 requestedTarget = new Vec3(x, y, z);
         double distance = mc.player == null ? 0.0 : mc.player.position().distanceTo(requestedTarget);
         int currentTick = mc.player == null ? 0 : mc.player.tickCount;
-        NavigationSession.StartDecision decision = navigationSession.begin(requestId, currentTick, distance);
+        NavigationSession.StartDecision decision = navigationSession.begin(
+            requestId, currentTick, distance, reportsLifecycle
+        );
         if (decision == NavigationSession.StartDecision.CONFLICT) {
             lastFailureReason = "navigation is owned by request " + navigationSession.requestId();
             return false;
@@ -500,7 +511,8 @@ public class Pathfinder {
         boolean alignedEnoughToWalk = Math.abs(yawDiff) < 65.0f;
         boolean alignedEnoughToSprint = Math.abs(yawDiff) < 18.0f;
         InputIsolation.setAiControlState("forward", alignedEnoughToWalk);
-        InputIsolation.setAiControlState("sprint", alignedEnoughToSprint && horizontalDistance > 4.0 && Math.abs(dy) < 0.2);
+        InputIsolation.setAiControlState("sprint", MovementSystem.getLastSpeed() >= 1.0f
+            && alignedEnoughToSprint && horizontalDistance > 4.0 && Math.abs(dy) < 0.2);
 
         boolean shouldJump = dy > STEP_UP_HEIGHT || (dy > 0.18 && horizontalDistance < 1.2);
         if (!shouldJump && mc.player != null && mc.player.onGround()) {
@@ -520,7 +532,7 @@ public class Pathfinder {
         while (yawDiff < -180) yawDiff += 360;
 
         float pitchDiff = targetPitch - currentPitch;
-        float yawStep = Math.max(-10.0f, Math.min(10.0f, yawDiff));
+        float yawStep = Math.max(-6.0f, Math.min(6.0f, yawDiff));
         float pitchStep = Math.max(-6.0f, Math.min(6.0f, pitchDiff));
 
         mc.player.setYRot(currentYaw + yawStep);
@@ -590,20 +602,28 @@ public class Pathfinder {
     }
 
     private static void reportProgress(double progress, String message) {
-        if (navigationSession.requestId() != null && LCUMod.WIRE != null) {
+        if (navigationSession.reportsLifecycle() && navigationSession.requestId() != null && LCUMod.WIRE != null) {
             LCUMod.WIRE.sendProgress(navigationSession.requestId(), progress, message);
         }
     }
 
     private static void reportOutcome(String status, String code, String message) {
-        if (navigationSession.requestId() != null && LCUMod.WIRE != null) {
+        if (navigationSession.reportsLifecycle() && navigationSession.requestId() != null && LCUMod.WIRE != null) {
             LCUMod.WIRE.sendOutcome(navigationSession.requestId(), status, code, message);
         }
     }
 
     public static boolean hasActiveOperation() {
-        return navigationSession.hasOwnedOperation();
+        return navigationSession.hasOwnedOperation() && navigationSession.reportsLifecycle();
     }
+
+    public static boolean isOwnedBy(String operationId) {
+        return operationId != null && operationId.equals(navigationSession.requestId());
+    }
+
+    public static void suspend(int currentTick) { navigationSession.suspend(currentTick); }
+
+    public static void resume(int currentTick) { navigationSession.resume(currentTick); }
 
     private record StandingNode(BlockPos supportPos, Vec3 standingPos) {}
 

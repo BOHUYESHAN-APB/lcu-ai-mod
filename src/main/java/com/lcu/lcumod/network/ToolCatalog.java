@@ -40,6 +40,8 @@ public final class ToolCatalog {
             strings("item"), List.of("item")));
         tools.add(tool("send_chat", "immediate", false, "response", List.of("chat.send"),
             strings("message"), List.of("message")));
+        tools.add(tool("server_command", "immediate", false, "response", List.of("server.command"),
+            strings("family", "command"), List.of("family", "command")));
         tools.add(tool("stop_all", "immediate", false, "response", List.of("body.move", "inventory.ui"), emptyProperties(), List.of()));
         tools.add(tool("disarm", "immediate", false, "response", List.of("body.move", "inventory.ui"), emptyProperties(), List.of()));
         tools.add(tool("cancel_operation", "immediate", false, "response", List.of("operation.cancel"),
@@ -52,6 +54,30 @@ public final class ToolCatalog {
             stringAndCount("item"), List.of("item", "count")));
         tools.add(tool("eat", "operation", true, "outcome", List.of("inventory.consume"), emptyProperties(), List.of()));
         tools.add(tool("get_inventory", "immediate", false, "response", List.of("inventory.read"), emptyProperties(), List.of()));
+        tools.add(tool("inspect_block", "immediate", false, "response", List.of("world.read"),
+            integerProperties("x", "y", "z"), List.of("x", "y", "z")));
+        tools.add(tool("scan_crops", "immediate", false, "response", List.of("world.read"),
+            boundedIntegerProperties("radius", 1, 16), List.of("radius")));
+        JsonObject harvestCrop = integerProperties("x", "y", "z", "age");
+        harvestCrop.add("block_id", stringProperty());
+        harvestCrop.add("target_token", stringProperty());
+        tools.add(tool("harvest_crop_at", "operation", true, "outcome",
+            List.of("body.move", "world.break", "inventory.consume", "world.interact"),
+            harvestCrop, List.of("x", "y", "z", "block_id", "age", "target_token")));
+        tools.add(tool("break_block_at", "operation", true, "outcome", List.of("body.move", "world.break"),
+            verifiedBlockTargetProperties(), List.of("x", "y", "z", "target_token")));
+        tools.add(tool("use_block_at", "operation", true, "outcome", List.of("body.move", "world.interact"),
+            verifiedBlockTargetProperties(), List.of("x", "y", "z", "target_token")));
+        tools.add(tool("place_block_at", "operation", true, "outcome",
+            List.of("body.move", "world.interact", "inventory.consume"), verifiedPlacementProperties(),
+            List.of("x", "y", "z", "target_token", "place_x", "place_y", "place_z", "item_id")));
+        tools.add(tool("observe_gui", "immediate", false, "response", List.of("gui.observe"),
+            booleanProperties("include_image"), List.of()));
+        tools.add(tool("get_keybindings", "immediate", false, "response", List.of("input.read"), emptyProperties(), List.of()));
+        tools.add(tool("ui_click", "immediate", false, "response", List.of("gui.input"),
+            guiClickProperties(), List.of("screen_revision", "x", "y")));
+        tools.add(tool("key_press", "immediate", false, "response", List.of("input.key"),
+            keyPressProperties(), List.of("screen_revision", "mapping_id")));
         tools.add(tool("get_recipes", "immediate", false, "response", List.of("recipes.read"),
             strings("item"), List.of("item")));
         tools.add(tool("get_state", "immediate", false, "response", List.of("state.read"), emptyProperties(), List.of()));
@@ -131,12 +157,17 @@ public final class ToolCatalog {
             case "mine_block", "mine_block_at", "use_on", "use_on_entity", "interact_block_at" ->
                 List.of("allowWorldAutomation");
             case "collect_blocks" -> List.of("allowMovementAutomation", "allowWorldAutomation");
+            case "harvest_crop_at" -> List.of(
+                "allowMovementAutomation", "allowWorldAutomation", "allowInventoryAutomation");
+            case "break_block_at", "use_block_at" -> List.of("allowMovementAutomation", "allowWorldAutomation");
+            case "place_block_at" -> List.of("allowMovementAutomation", "allowWorldAutomation", "allowInventoryAutomation");
             case "craft_item" -> List.of(
                 "allowMovementAutomation", "allowWorldAutomation", "allowInventoryAutomation");
             case "use_item", "equip_item", "select_hotbar", "inventory_click", "container_button",
                  "place_recipe", "take_item", "put_item", "eat" -> List.of("allowInventoryAutomation");
             case "attack", "attack_entity" -> List.of("allowAutomatedCombat");
-            case "send_chat" -> List.of("allowChatAutomation");
+            case "send_chat", "server_command" -> List.of("allowChatAutomation");
+            case "inspect_block", "scan_crops" -> List.of("collectSurroundings");
             default -> List.of();
         };
     }
@@ -151,6 +182,8 @@ public final class ToolCatalog {
     private static String versionFor(String command) {
         return switch (command) {
             case "move_to", "mine_block", "follow_player", "collect_blocks", "craft_item", "eat",
+                 "harvest_crop_at",
+                 "break_block_at", "use_block_at", "place_block_at",
                  "get_container", "inventory_click", "container_button", "place_recipe", "take_item", "put_item" -> "2.0.0";
             default -> "1.0.0";
         };
@@ -170,6 +203,29 @@ public final class ToolCatalog {
         return properties;
     }
 
+    private static JsonObject booleanProperties(String... names) {
+        JsonObject properties = new JsonObject();
+        for (String name : names) {
+            JsonObject value = new JsonObject();
+            value.addProperty("type", "boolean");
+            properties.add(name, value);
+        }
+        return properties;
+    }
+
+    private static JsonObject guiClickProperties() {
+        JsonObject properties = numbers("screen_revision", "x", "y", "button");
+        return properties;
+    }
+
+    private static JsonObject keyPressProperties() {
+        JsonObject properties = numbers("screen_revision");
+        JsonObject mapping = new JsonObject();
+        mapping.addProperty("type", "string");
+        properties.add("mapping_id", mapping);
+        return properties;
+    }
+
     private static JsonObject strings(String... names) {
         JsonObject properties = new JsonObject();
         for (String name : names) {
@@ -179,6 +235,12 @@ public final class ToolCatalog {
             properties.add(name, value);
         }
         return properties;
+    }
+
+    private static JsonObject stringProperty() {
+        JsonObject value = new JsonObject();
+        value.addProperty("type", "string");
+        return value;
     }
 
     private static JsonObject stringAndCount(String stringName) {
@@ -212,6 +274,16 @@ public final class ToolCatalog {
         return properties;
     }
 
+    private static JsonObject boundedIntegerProperties(String name, int minimum, int maximum) {
+        JsonObject properties = new JsonObject();
+        JsonObject value = new JsonObject();
+        value.addProperty("type", "integer");
+        value.addProperty("minimum", minimum);
+        value.addProperty("maximum", maximum);
+        properties.add(name, value);
+        return properties;
+    }
+
     private static JsonObject blockTargetProperties() {
         JsonObject properties = integerProperties("x", "y", "z");
         JsonObject face = new JsonObject();
@@ -220,6 +292,21 @@ public final class ToolCatalog {
         for (String value : List.of("down", "up", "north", "south", "west", "east")) values.add(value);
         face.add("enum", values);
         properties.add("face", face);
+        return properties;
+    }
+
+    private static JsonObject verifiedBlockTargetProperties() {
+        JsonObject properties = blockTargetProperties();
+        properties.add("target_token", stringProperty());
+        return properties;
+    }
+
+    private static JsonObject verifiedPlacementProperties() {
+        JsonObject properties = verifiedBlockTargetProperties();
+        for (var entry : integerProperties("place_x", "place_y", "place_z").entrySet()) {
+            properties.add(entry.getKey(), entry.getValue());
+        }
+        properties.add("item_id", stringProperty());
         return properties;
     }
 

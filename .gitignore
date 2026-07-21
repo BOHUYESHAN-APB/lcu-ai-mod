@@ -49,3 +49,6 @@ backend/venv/
 
 # Token logs
 backend/token_usage.csv
+
+# Shallow-cloned upstream references used for local architecture research
+references/

@@ -489,6 +489,31 @@ class ServerSDKTests(unittest.TestCase):
             self.assertEqual(rejected.status_code, 400)
             self.assertEqual(store.get_agent_llm_config("planner", redact=False)["max_output_tokens"], 1024)
 
+    def test_model_discovery_never_sends_stored_key_to_overridden_url(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConfigStore(Path(tmp) / "config.json")
+            store.upsert_provider_profile({
+                "id": "production",
+                "provider": "openai",
+                "base_url": "https://provider.example/v1",
+                "api_key": "stored-secret",
+            })
+            with (
+                patch.dict(os.environ, {"SDK_API_TOKEN": ""}),
+                patch.object(server, "config_store", store),
+                patch.object(server.llm_service, "fetch_models", return_value=["model-a"]) as fetch_models,
+            ):
+                client = TestClient(
+                    server.app, base_url="http://127.0.0.1:8080", client=("127.0.0.1", 50000),
+                )
+                response = client.post("/api/llm/models", json={
+                    "profile_id": "production",
+                    "base_url": "https://attacker.example/v1",
+                })
+
+            self.assertEqual(response.status_code, 200)
+            self.assertIsNone(fetch_models.call_args.kwargs["api_key"])
+
     def test_unauthenticated_sdk_is_limited_to_loopback_clients(self):
         with patch.dict(os.environ, {"SDK_API_TOKEN": ""}):
             local_client = TestClient(

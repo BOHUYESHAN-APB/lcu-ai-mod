@@ -55,8 +55,8 @@ public class ModConfig {
             .define("reportProgrammaticActivity", false);
 
     public static final ModConfigSpec.BooleanValue RUN_IN_BACKGROUND = BUILDER
-            .comment("Keep the body running while Minecraft is unfocused. Defaults off for public-server safety.")
-            .define("runInBackground", false);
+            .comment("Keep the body running while Minecraft is unfocused. AI body clients require this.")
+            .define("runInBackground", true);
 
     public static final ModConfigSpec.BooleanValue AUTO_RESPAWN = BUILDER
             .comment("Automatically send respawn requests after death. Defaults off for public-server safety.")

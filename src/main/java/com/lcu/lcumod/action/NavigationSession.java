@@ -16,16 +16,26 @@ final class NavigationSession {
     private String requestId;
     private int deadlineTick;
     private int repathAttempts;
+    private boolean reportsLifecycle;
+    private int suspendedAtTick = -1;
 
     StartDecision begin(String incomingRequestId, int currentTick, double distance) {
+        return begin(incomingRequestId, currentTick, distance, true);
+    }
+
+    StartDecision begin(String incomingRequestId, int currentTick, double distance, boolean incomingReportsLifecycle) {
         if (active && requestId != null && !requestId.equals(incomingRequestId)) {
             return StartDecision.CONFLICT;
+        }
+        if (active && requestId != null && requestId.equals(incomingRequestId)) {
+            return StartDecision.RETARGETED;
         }
         if (active && requestId == null && incomingRequestId == null) {
             return StartDecision.RETARGETED;
         }
         active = true;
         requestId = incomingRequestId;
+        reportsLifecycle = incomingReportsLifecycle;
         repathAttempts = 0;
         deadlineTick = currentTick + deadlineTicks(distance);
         return StartDecision.STARTED;
@@ -40,7 +50,18 @@ final class NavigationSession {
     }
 
     boolean isTimedOut(int currentTick) {
-        return active && currentTick >= deadlineTick;
+        return active && suspendedAtTick < 0 && currentTick >= deadlineTick;
+    }
+
+    void suspend(int currentTick) {
+        if (active && suspendedAtTick < 0) suspendedAtTick = currentTick;
+    }
+
+    void resume(int currentTick) {
+        if (active && suspendedAtTick >= 0) {
+            deadlineTick += Math.max(0, currentTick - suspendedAtTick);
+            suspendedAtTick = -1;
+        }
     }
 
     boolean hasOwnedOperation() {
@@ -55,11 +76,17 @@ final class NavigationSession {
         return repathAttempts;
     }
 
+    boolean reportsLifecycle() {
+        return reportsLifecycle;
+    }
+
     void clear() {
         active = false;
         requestId = null;
         deadlineTick = 0;
         repathAttempts = 0;
+        reportsLifecycle = false;
+        suspendedAtTick = -1;
     }
 
     static int deadlineTicks(double distance) {

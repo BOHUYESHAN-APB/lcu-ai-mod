@@ -203,6 +203,37 @@ class PlannerTests(unittest.TestCase):
             "general.follow_player", {"player": "MixedCase_Player"},
         ))
 
+    def test_unambiguous_follow_command_bypasses_model(self):
+        planner, proposals = planner_with_proposals()
+
+        executed = planner._execute_direct_control_intent("MixedCase_Player", "请一直跟着我！", {})
+
+        self.assertTrue(executed)
+        self.assertEqual((proposals[0].skill_id, proposals[0].input), (
+            "general.follow_player", {"player": "MixedCase_Player"},
+        ))
+        self.assertEqual(planner.get_status()["last_execution_source"], "direct_control_intent")
+
+    def test_follow_discussion_is_not_a_direct_control_command(self):
+        planner, proposals = planner_with_proposals()
+
+        executed = planner._execute_direct_control_intent("Alice", "你为什么不跟着我", {})
+
+        self.assertFalse(executed)
+        self.assertEqual(proposals, [])
+
+    def test_structured_follow_player_alias_emits_follow_skill(self):
+        planner, proposals = planner_with_proposals()
+
+        planner._execute_plan(
+            'tool(follow_player, {"player":"BoHuYeShan"})',
+            sender="BoHuYeShan", message="跟着我", context={},
+        )
+
+        self.assertEqual((proposals[0].skill_id, proposals[0].input), (
+            "general.follow_player", {"player": "BoHuYeShan"},
+        ))
+
     def test_direct_follow_fallback_canonicalizes_online_player_case(self):
         planner, proposals = planner_with_proposals()
 

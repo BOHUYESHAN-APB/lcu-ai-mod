@@ -37,6 +37,7 @@ from agent.message_db import MessageDB
 from agent.llm_service import LLMRequestRejected
 from agent.orchestrator import Orchestrator
 from agent.skill_registry import SkillRegistry, SkillValidationError
+from agent.scoped_knowledge import ScopedKnowledgeStore
 from agent.storage_policy import enforce_storage_policy
 from agent.task_coordinator import TaskCoordinator
 from agent.task_preset_registry import TaskPresetRegistry, TaskPresetValidationError
@@ -51,6 +52,7 @@ storage_policy = enforce_storage_policy()
 CONFIG_PATH = DEFAULT_CONFIG_PATH
 config_store = ConfigStore(CONFIG_PATH)
 audit_log = AuditLog(CONFIG_PATH.parent / "audit.jsonl")
+scoped_knowledge = ScopedKnowledgeStore(CONFIG_PATH.parent / "scoped_knowledge.json")
 
 
 def _sdk_api_token() -> str:
@@ -1110,6 +1112,63 @@ async def get_llm_providers():
     return {"providers": config_store.list_provider_presets()}
 
 
+@app.get("/api/v2/server-commands/policy")
+async def get_server_command_policy():
+    return config_store.get_server_command_policy()
+
+
+@app.post("/api/v2/server-commands/policy")
+async def set_server_command_policy(data: dict):
+    try:
+        with _configuration_guard():
+            policy = config_store.set_server_command_policy(data)
+            audit_log.append("server_command", "policy.updated", details=policy)
+            return policy
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/v2/server-commands/evaluate")
+async def evaluate_server_command(data: dict):
+    from agent.server_command_policy import evaluate
+    try:
+        result = evaluate(str(data.get("command", "")), config_store.get_server_command_policy())
+        return {"allowed": True, **result}
+    except ValueError as exc:
+        return {"allowed": False, "reason": str(exc)}
+
+
+@app.get("/api/v2/chat-actions")
+async def list_chat_actions():
+    if not orchestrator or not orchestrator.session:
+        return {"actions": []}
+    with orchestrator.session_context() as session:
+        actions = list(getattr(session, "_pending_chat_actions", []))
+    return {"actions": actions}
+
+
+@app.post("/api/v2/chat-actions/{action_id}/execute")
+async def execute_chat_action(action_id: str):
+    from agent.server_command_policy import evaluate
+    if not orchestrator or not orchestrator.session:
+        raise HTTPException(status_code=503, detail="AI session is not running")
+    with orchestrator.session_context() as session:
+        action = next((item for item in session._pending_chat_actions if item["id"] == action_id), None)
+    if action is None:
+        raise HTTPException(status_code=404, detail="Chat action not found")
+    if action["action"].casefold() != "run_command":
+        raise HTTPException(status_code=400, detail="Only RUN_COMMAND actions can be executed")
+    try:
+        normalized = evaluate(action["value"], config_store.get_server_command_policy())
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    return await _create_v2_skill_run(
+        "core.server_command",
+        {"family": normalized["family"], "command": normalized["command"]},
+        None, None,
+    )
+
+
 @app.get("/api/v2/llm/profiles")
 async def get_llm_profiles():
     return {"profiles": config_store.list_provider_profiles()}
@@ -1120,6 +1179,7 @@ async def create_llm_profile(data: dict):
     try:
         with _configuration_guard():
             profile = config_store.upsert_provider_profile(data)
+            _apply_config_to_llm_services()
             audit_log.append("provider", "profile.updated", target=profile["id"], details=data)
             return profile
     except (HTTPException, ValueError) as exc:
@@ -1132,6 +1192,7 @@ async def update_llm_profile(profile_id: str, data: dict):
     try:
         with _configuration_guard():
             profile = config_store.upsert_provider_profile({**data, "id": profile_id})
+            _apply_config_to_llm_services()
             audit_log.append("provider", "profile.updated", target=profile_id, details=data)
             return profile
     except (HTTPException, ValueError) as exc:
@@ -1144,6 +1205,7 @@ async def delete_llm_profile(profile_id: str):
     try:
         with _configuration_guard():
             deleted = config_store.delete_provider_profile(profile_id)
+            _apply_config_to_llm_services()
     except (HTTPException, ValueError) as exc:
         error = exc.detail if isinstance(exc, HTTPException) else str(exc)
         raise HTTPException(status_code=409 if "assigned" in str(error) else 400, detail=error) from exc
@@ -1169,6 +1231,38 @@ async def get_memory():
                 "task_outcomes": mem.task_outcomes[-20:],
                 "recent": mem.build_context(),
             }
+
+
+@app.get("/api/v2/memory/preferences")
+async def get_memory_preferences(player_name: str = "", player_id: str = ""):
+    if not orchestrator or not orchestrator.session:
+        return {"preferences": []}
+    with orchestrator.session_context() as session:
+        return {
+            "player_name": player_name,
+            "player_id": player_id,
+            "preferences": session.memory.get_player_preferences(player_name, player_id),
+        }
+
+
+@app.post("/api/v2/memory/preferences")
+async def set_memory_preference(data: dict):
+    if not orchestrator or not orchestrator.session:
+        raise HTTPException(status_code=503, detail="AI session is not running")
+    try:
+        with orchestrator.session_context() as session:
+            preference = session.memory.remember_preference(
+                str(data.get("player_name", "")),
+                str(data.get("player_id", "")),
+                str(data.get("key", "")),
+                data.get("value"),
+                confidence=data.get("confidence", 1.0),
+                source=str(data.get("source", "operator")),
+            )
+            session.memory.save()
+            return {"status": "ok", "preference": preference}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"interactions": 0}
 
 
@@ -1558,12 +1652,24 @@ async def fetch_llm_models(data: dict):
     """Fetch available models for a selected agent or explicit provider config."""
     try:
         agent = data.get("agent", "default")
-        config = config_store.get_agent_llm_config(agent, redact=False)
+        profile_id = str(data.get("profile_id", "")).strip()
+        config = (
+            config_store.get_provider_profile(profile_id, redact=False)
+            if profile_id else config_store.get_agent_llm_config(agent, redact=False)
+        )
         base_url = data.get("base_url") or config.get("base_url")
         explicit_base_url = data.get("base_url")
-        api_key = data.get("api_key") if "api_key" in data else None if explicit_base_url else config.get("api_key")
+        explicit_api_key = str(data.get("api_key", "")).strip()
+        api_key = explicit_api_key or config.get("api_key")
+        if explicit_base_url:
+            stored_base_url = str(config.get("base_url", "")).rstrip("/")
+            requested_base_url = str(explicit_base_url).rstrip("/")
+            if requested_base_url != stored_base_url and not explicit_api_key:
+                api_key = None
         models = llm_service.fetch_models(agent=agent, base_url=base_url, api_key=api_key)
-        return {"models": models, "source": "remote"}
+        return {"models": models, "source": "remote", "profile_id": profile_id or None}
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to fetch models: {e}") from e
 
@@ -1713,6 +1819,51 @@ async def release_v2_control(lease_id: str, data: ControlLeaseRelease):
 async def list_v2_skills(category: str | None = None):
     skills = skill_registry.list(category)
     return {"skills": skills, "count": len(skills)}
+
+
+def _active_scope_context() -> tuple[dict[str, Any], list[str]]:
+    companion = config_store.get_companion_config()
+    runtime_context: dict[str, Any] = {}
+    if orchestrator and orchestrator.session:
+        with orchestrator.session_context() as session:
+            runtime_context = dict(session.runtime.get("runtime_context", {}))
+            runtime_context.setdefault("server_id", session.identity.server_id)
+            runtime_context.setdefault("world_id", session.identity.world_id)
+    chain = scoped_knowledge.scope_chain(companion["id"], runtime_context)
+    return runtime_context, chain
+
+
+@app.get("/api/v2/context")
+async def get_v2_context():
+    context, chain = _active_scope_context()
+    return {"context": context, "scope_chain": chain}
+
+
+@app.get("/api/v2/gui-skill-templates")
+async def list_gui_skill_templates(resolution: str = "effective"):
+    _, chain = _active_scope_context()
+    if resolution not in {"effective", "all"}:
+        raise HTTPException(status_code=400, detail="resolution must be effective or all")
+    templates = scoped_knowledge.resolve(chain) if resolution == "effective" else scoped_knowledge.list_all(chain)
+    return {"templates": templates, "count": len(templates), "scope_chain": chain}
+
+
+@app.put("/api/v2/gui-skill-templates/{template_id}")
+async def put_gui_skill_template(template_id: str, data: dict):
+    _, chain = _active_scope_context()
+    write_scope = str(data.get("write_scope", "")).strip()
+    marker = f":{write_scope}"
+    scope_key = next((scope for scope in chain if marker in scope), None)
+    if write_scope not in {"global", "pack", "server", "world"} or scope_key is None:
+        raise HTTPException(status_code=400, detail="write_scope is unavailable in the active context")
+    try:
+        template = scoped_knowledge.put(scope_key, template_id, data)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    audit_log.append("gui_skill", "template.updated", target=template_id, details={
+        "scope_key": scope_key, "state": template["state"],
+    })
+    return template
 
 
 @app.get("/api/v2/task-presets")

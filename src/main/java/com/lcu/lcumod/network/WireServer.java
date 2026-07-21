@@ -457,7 +457,8 @@ public class WireServer {
         }
         if (switch (discarded.cmd()) {
             case "move_to", "mine_block", "mine_block_at", "follow_player",
-                 "collect_blocks", "craft_item", "eat" -> true;
+                 "collect_blocks", "craft_item", "eat", "harvest_crop_at" -> true;
+            case "break_block_at", "use_block_at", "place_block_at" -> true;
             default -> false;
         }) {
             sendOutcome(discarded.id(), "cancelled", code, message);

@@ -16,6 +16,7 @@ Session — 核心管理单元。
 """
 
 import asyncio
+from collections import deque
 import logging
 import re
 import time
@@ -117,6 +118,9 @@ class Session:
         self._body_connected = False
         self._last_state_at: float | None = None
         self._state_sequence = 0
+        # 1G working context: process-local and intentionally not persisted.
+        self._working_context: deque[dict[str, Any]] = deque(maxlen=24)
+        self._pending_chat_actions: deque[dict[str, Any]] = deque(maxlen=20)
 
     # ── Event handlers ──
 
@@ -225,6 +229,22 @@ class Session:
                         )
                 except Exception as e:
                     logger.error("[Chat] LLM error: %s", e)
+            case "chat_clicks":
+                if self.control_mode == "external":
+                    return
+                now = time.time()
+                for index, action in enumerate(data.get("actions", [])):
+                    if not isinstance(action, dict):
+                        continue
+                    self._pending_chat_actions.append({
+                        "id": f"chat-action-{int(now * 1000)}-{index}",
+                        "message": str(data.get("message", "")),
+                        "action": str(action.get("action", "")),
+                        "value": str(action.get("value", "")),
+                        "text": str(action.get("text", "")),
+                        "created_at": now,
+                    })
+                self.runtime["chat_actions"] = list(self._pending_chat_actions)
             case "player_death":
                 logger.info("[Session] Player died at %s", data.get("position"))
                 if self.control_mode != "external":
@@ -342,8 +362,12 @@ class Session:
             self.memory.add_interaction(sender=sender, message=message)
             self.memory.observe_player(sender, sender_id, message)
             self.message_db.add_message(sender=sender, message=message, is_ai=False)
+        self._working_context.append({
+            "role": "user", "sender": sender, "player_id": sender_id,
+            "content": message, "at": time.time(),
+        })
 
-        context = self.build_planner_context(current_player=sender)
+        context = self.build_planner_context(current_player=sender, current_player_id=sender_id)
         
         # Use Planner to plan and execute
         previous_requester = self._current_requester
@@ -362,6 +386,8 @@ class Session:
         if response and record_interaction:
             self.memory.attach_response(sender, message, response)
             self.message_db.add_message(sender="AI", message=response, is_ai=True)
+        if response:
+            self._working_context.append({"role": "assistant", "content": response, "at": time.time()})
         
         return response
 
@@ -502,6 +528,7 @@ class Session:
             "inventory": self.runtime.get("inventory", []),
             "equipment": self.runtime.get("equipment", {}),
             "integrations": self.runtime.get("integrations", {}),
+            "runtime_context": self.runtime.get("runtime_context", {}),
             "nearby_workstations": self.runtime.get("nearby_workstations", []),
             "nearby_storage": self.runtime.get("nearby_storage", []),
             "entities": self.runtime.get("entities", []),
@@ -527,8 +554,13 @@ class Session:
         self._ensure_world_model().set_connected(connected)
 
     def build_planner_context(self, current_player: str | None = None,
+                              current_player_id: str = "",
                               observation_max_chars: int = 8000) -> dict[str, Any]:
-        context = self.memory.build_context(current_player=current_player)
+        context = self.memory.build_context(
+            current_player=current_player,
+            player_id=current_player_id,
+            working_context=list(self._working_context),
+        )
         context.update(self._ensure_world_model().observation_slice(
             self.runtime, max_chars=observation_max_chars,
         ))
@@ -632,7 +664,8 @@ class Session:
         self._manual_action_reqs.add(req_id)
         self._manual_task_kind = cmd
         extension = 20.0
-        if cmd in {"follow_player", "craft_item", "eat", "collect_blocks", "move_to", "explore", "build"}:
+        if cmd in {"follow_player", "craft_item", "eat", "collect_blocks", "move_to", "explore", "build",
+                   "harvest_crop_at", "break_block_at", "use_block_at", "place_block_at"}:
             extension = 45.0
         elif cmd == "stop_all":
             self._manual_action_reqs.clear()
@@ -642,7 +675,8 @@ class Session:
 
     @staticmethod
     def _outcome_commands() -> set[str]:
-        return {"craft_item", "eat", "collect_blocks", "move_to", "mine_block", "mine_block_at", "follow_player"}
+        return {"craft_item", "eat", "collect_blocks", "move_to", "mine_block", "mine_block_at", "follow_player",
+                "harvest_crop_at", "break_block_at", "use_block_at", "place_block_at"}
 
     @classmethod
     def _deferred_terminal_commands(cls) -> set[str]:

@@ -27,6 +27,9 @@ import net.neoforged.neoforge.client.event.ClientTickEvent;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 
 /**
  * Collects player and world state, pushes to wire via LAN server.
@@ -36,6 +39,7 @@ import java.util.List;
  */
 @EventBusSubscriber(modid = LCUMod.MODID, value = net.neoforged.api.distmarker.Dist.CLIENT)
 public class StateCollector {
+    private static String packFingerprint;
     private static int tickCounter = 0;
     
     // Last sent state for change detection
@@ -143,6 +147,12 @@ public class StateCollector {
         player.addProperty("yaw", p.getYRot());
         player.addProperty("pitch", p.getXRot());
         player.addProperty("on_ground", p.onGround());
+        player.addProperty("on_fire", p.isOnFire());
+        player.addProperty("in_lava", p.isInLava());
+        player.addProperty("under_water", p.isUnderWater());
+        player.addProperty("air", p.getAirSupply());
+        player.addProperty("max_air", p.getMaxAirSupply());
+        player.addProperty("fall_distance", p.fallDistance);
         player.addProperty("dimension", p.level().dimension().location().toString());
         if (p instanceof ServerPlayer sp) {
             player.addProperty("gamemode", sp.gameMode.getGameModeForPlayer().getName());
@@ -163,6 +173,15 @@ public class StateCollector {
         world.addProperty("light_level", mc.level.getMaxLocalRawBrightness(p.blockPosition()));
         world.addProperty("dimension", mc.level.dimension().location().toString());
         state.add("world", world);
+
+        JsonObject runtimeContext = new JsonObject();
+        runtimeContext.addProperty("pack_fingerprint", packFingerprint());
+        runtimeContext.addProperty("minecraft_version", net.minecraft.SharedConstants.getCurrentVersion().getName());
+        runtimeContext.addProperty("loader", "neoforge");
+        runtimeContext.addProperty("server_id", mc.getCurrentServer() == null ? "singleplayer" : mc.getCurrentServer().ip);
+        runtimeContext.addProperty("world_id", mc.level.dimension().location().toString());
+        runtimeContext.addProperty("identity_observed", true);
+        state.add("runtime_context", runtimeContext);
 
         // Inventory
         JsonArray inv = new JsonArray();
@@ -361,6 +380,21 @@ public class StateCollector {
         state.add("nearby_storage", nearbyStorage);
 
         LCUMod.WIRE.sendEvent("state_update", state);
+    }
+
+    private static String packFingerprint() {
+        if (packFingerprint != null) return packFingerprint;
+        String canonical = ModList.get().getMods().stream()
+            .map(mod -> mod.getModId() + "@" + mod.getVersion())
+            .sorted()
+            .reduce("", (left, right) -> left + right + "\n");
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(canonical.getBytes(StandardCharsets.UTF_8));
+            packFingerprint = "sha256:" + java.util.HexFormat.of().formatHex(digest);
+        } catch (NoSuchAlgorithmException exception) {
+            throw new IllegalStateException("SHA-256 is unavailable", exception);
+        }
+        return packFingerprint;
     }
 
     private static JsonObject serializeEquipmentItem(ItemStack stack, String slot) {

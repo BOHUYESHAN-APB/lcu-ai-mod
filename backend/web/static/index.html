@@ -96,8 +96,10 @@ dialog{width:min(680px,calc(100vw - 24px));max-height:calc(100dvh - 24px);margin
 .data-title{font-size:12px;font-weight:600;overflow-wrap:anywhere}.data-meta{font-size:11px;color:#8b949e;margin-top:3px;overflow-wrap:anywhere}
 .empty{font-size:12px;color:#8b949e;padding:12px 0}.field-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px}.field-grid input{width:100%}
 .debug-actions{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-bottom:12px}.debug-command{display:flex;gap:8px;margin-bottom:12px}.debug-command input{min-width:0}.safety-actions{display:flex;gap:6px;margin-left:8px}.safety-actions .btn{border-color:#f85149;color:#ffb4ae;font-weight:700}
+.provider-page-head{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:16px}.provider-page-head h2{font-size:20px;color:#f0f6fc}.provider-page-head p{font-size:12px;color:#8b949e;margin-top:5px}.provider-workspace{display:grid;grid-template-columns:minmax(280px,.72fr) minmax(480px,1.28fr);gap:16px;align-items:start}.provider-sidebar{position:sticky;top:0}.provider-sidebar-head,.provider-editor-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}.provider-sidebar-head h3,.provider-editor-head h3{margin:0}.profile-tile{width:100%;display:flex;align-items:center;gap:11px;text-align:left;background:#0d1117;color:#c9d1d9;border:1px solid #21262d;border-radius:9px;padding:11px;cursor:pointer;margin-bottom:8px}.profile-tile:hover{border-color:#388bfd;background:#111820}.profile-tile.active{border-color:#58a6ff;box-shadow:0 0 0 1px rgba(88,166,255,.18)}.profile-mark{width:34px;height:34px;display:grid;place-items:center;border-radius:9px;background:linear-gradient(135deg,#1f6feb,#8957e5);color:#fff;font-size:12px;font-weight:700;flex:none}.profile-copy{min-width:0;flex:1}.profile-title{font-size:12px;font-weight:650;color:#f0f6fc}.profile-subtitle{font-size:10px;color:#8b949e;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.profile-health-dot{width:8px;height:8px;border-radius:50%;background:#3fb950;box-shadow:0 0 0 3px rgba(63,185,80,.12)}.profile-health-dot.off{background:#8b949e;box-shadow:none}.provider-form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.provider-field{display:flex;flex-direction:column;gap:6px;min-width:0}.provider-field.full{grid-column:1/-1}.provider-field label{font-size:11px;color:#8b949e}.provider-field input,.provider-field select{width:100%;background:#0d1117;border:1px solid #30363d;border-radius:7px;padding:9px 11px;color:#f0f6fc;font-size:12px}.provider-field input:focus,.provider-field select:focus{outline:none;border-color:#58a6ff;box-shadow:0 0 0 2px rgba(88,166,255,.12)}.provider-advanced{margin-top:12px;border-top:1px solid #21262d;padding-top:10px}.provider-advanced summary{font-size:11px;color:#8b949e;cursor:pointer;user-select:none}.provider-advanced .provider-form-grid{margin-top:10px}.model-discovery{margin-top:16px;padding:14px;border:1px solid #30363d;border-radius:10px;background:linear-gradient(145deg,rgba(31,111,235,.08),rgba(137,87,229,.04))}.model-discovery-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:11px}.model-discovery-head strong{font-size:13px;color:#f0f6fc}.model-discovery-head span{font-size:10px;color:#8b949e}.model-picker-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px}.model-picker-row select{min-width:0;background:#0d1117;border:1px solid #388bfd;border-radius:7px;padding:9px 11px;color:#f0f6fc}.model-custom{margin-top:8px}.provider-editor-actions{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:16px}.provider-editor-actions .form-actions{margin:0}.connection-state{font-size:11px;color:#8b949e}.connection-state.ok{color:#3fb950}.connection-state.error{color:#f85149}.connection-state.loading{color:#d29922}.model-count{display:inline-flex;align-items:center;padding:2px 7px;border-radius:999px;background:rgba(88,166,255,.12);color:#79c0ff;font-size:10px}
 textarea{width:100%;min-height:68px;resize:vertical;background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:7px 10px;color:#c9d1d9;font:12px monospace}
-@media(max-width:760px){.topbar{padding:8px 12px}.page{padding:12px}.ops-grid,.responsive-grid,.memory-layout,.inbox-layout,.inventory-layout{grid-template-columns:1fr!important}.inbox-contacts,.inbox-messages{max-height:none}.memory-toolbar{grid-template-columns:1fr 1fr}.memory-toolbar .compact-field:first-child{grid-column:1/-1}.memory-list,.memory-detail{max-height:none}.form-row{align-items:flex-start;flex-direction:column}.form-row label{min-width:0}.form-row input,.form-row select{width:100%}.field-grid{grid-template-columns:1fr}.usage-strip{grid-template-columns:repeat(2,minmax(0,1fr))}.tabs{scrollbar-width:thin}.tab{padding:10px 14px}.chat-input,.debug-command{flex-wrap:wrap}.debug-actions{grid-template-columns:repeat(2,minmax(0,1fr))}.debug-command input{width:100%!important}}
+@media(max-width:900px){.provider-workspace{grid-template-columns:1fr}.provider-sidebar{position:static}.provider-form-grid{grid-template-columns:1fr}.provider-field.full{grid-column:auto}}
+@media(max-width:760px){.topbar{padding:8px 12px}.page{padding:12px}.ops-grid,.responsive-grid,.memory-layout,.inbox-layout,.inventory-layout{grid-template-columns:1fr!important}.inbox-contacts,.inbox-messages{max-height:none}.memory-toolbar{grid-template-columns:1fr 1fr}.memory-toolbar .compact-field:first-child{grid-column:1/-1}.memory-list,.memory-detail{max-height:none}.form-row{align-items:flex-start;flex-direction:column}.form-row label{min-width:0}.form-row input,.form-row select{width:100%}.field-grid{grid-template-columns:1fr}.usage-strip{grid-template-columns:repeat(2,minmax(0,1fr))}.tabs{scrollbar-width:thin}.tab{padding:10px 14px}.chat-input,.debug-command{flex-wrap:wrap}.debug-actions{grid-template-columns:repeat(2,minmax(0,1fr))}.debug-command input{width:100%!important}.provider-page-head{align-items:flex-start;flex-direction:column}.model-picker-row{grid-template-columns:1fr}.provider-editor-actions{align-items:flex-start;flex-direction:column}}
 </style>
 </head>
 <body>
@@ -353,38 +355,64 @@ textarea{width:100%;min-height:68px;resize:vertical;background:#0d1117;border:1p
 
 <!-- Providers Page -->
 <div id="page-providers" class="page">
-  <div class="ops-grid">
-    <section class="card">
-      <h3>Provider Profiles</h3>
-      <div id="providerProfileList" class="data-list"><div class="empty">正在加载...</div></div>
+  <div class="provider-page-head">
+    <div><h2>模型服务商</h2><p>配置连接，自动发现模型，然后保存为可复用的 Profile。</p></div>
+    <button class="btn" onclick="loadProviderProfiles()">刷新</button>
+  </div>
+  <div class="provider-workspace">
+    <section class="card provider-sidebar">
+      <div class="provider-sidebar-head"><h3>连接配置</h3><button class="btn" onclick="clearProviderProfileForm()">新增</button></div>
+      <div id="providerProfileList"><div class="empty-state">正在加载...</div></div>
     </section>
-    <div>
-      <section class="card">
-        <h3>编辑服务商</h3>
-        <div class="form-row"><label for="profileId">Profile ID</label><input id="profileId" placeholder="deepseek-backup"></div>
-        <div class="form-row"><label for="profileName">显示名称</label><input id="profileName" placeholder="DeepSeek 备用"></div>
-        <div class="form-row"><label for="profileProvider">服务商</label><select id="profileProvider"></select></div>
-        <div class="form-row"><label for="profileBaseUrl">Base URL</label><input id="profileBaseUrl" placeholder="https://api.example.com/v1"></div>
-        <div class="form-row"><label for="profileModel">模型</label><input id="profileModel" placeholder="model-name"></div>
-        <div class="form-row"><label for="profileApiKey">API Key</label><input id="profileApiKey" type="password" placeholder="留空表示不修改"></div>
-        <label class="toggle-field" for="profileEnabled"><span>启用此服务商</span><input id="profileEnabled" type="checkbox" checked></label>
-        <div class="form-actions"><button class="btn" onclick="clearProviderProfileForm()">新建</button><button class="btn primary" onclick="saveProviderProfile()">保存</button></div>
-        <div id="providerProfileStatus" class="hint">API Key 只会显示为脱敏状态。</div>
-      </section>
-      <section class="card">
-        <h3>Agent 路由</h3>
-        <div class="form-row"><label for="routeAgent">Agent</label><select id="routeAgent" onchange="loadAgentRoute()"></select></div>
-        <div class="form-row"><label for="routePrimary">主 Profile</label><select id="routePrimary"></select></div>
-        <div class="form-row"><label for="routeMode">路由模式</label><select id="routeMode"><option value="manual">手动固定</option><option value="priority">失败后按优先级切换</option><option value="scheduled">计划切换（预留）</option></select></div>
-        <div class="form-row"><label for="routeFallbacks">备用顺序</label><input id="routeFallbacks" placeholder="profile-a,profile-b"></div>
-        <div class="form-actions"><button class="btn primary" onclick="saveAgentRoute()">保存路由</button></div>
-        <div id="agentRouteStatus" class="hint">priority 模式只在当前请求失败时尝试备用服务商。</div>
-      </section>
-      <section class="card">
-        <h3>Provider Health</h3>
-        <div id="providerHealthList" class="data-list"><div class="empty">尚无请求健康数据</div></div>
-      </section>
-    </div>
+    <section class="card">
+      <div class="provider-editor-head">
+        <div><h3 id="providerEditorTitle">新建 Profile</h3><div class="muted-block" style="margin:4px 0 0">密钥只保存在后端，页面不会回显。</div></div>
+        <span class="badge" id="providerEnabledBadge">ENABLED</span>
+      </div>
+      <div class="provider-form-grid">
+        <div class="provider-field"><label for="profileName">显示名称</label><input id="profileName" placeholder="Primary OpenAI"></div>
+        <div class="provider-field"><label for="profileProvider">Provider</label><select id="profileProvider"></select></div>
+        <div class="provider-field full"><label for="profileBaseUrl">Base URL</label><input id="profileBaseUrl" placeholder="https://api.openai.com/v1"></div>
+        <div class="provider-field full"><label for="profileApiKey">API Key</label><input id="profileApiKey" type="password" autocomplete="new-password" placeholder="已有密钥不会回显；留空则继续使用"></div>
+      </div>
+      <details class="provider-advanced">
+        <summary>高级信息</summary>
+        <div class="provider-form-grid">
+          <div class="provider-field"><label for="profileId">Profile ID</label><input id="profileId" placeholder="自动根据名称生成"></div>
+          <label class="toggle-field" for="profileEnabled"><span>启用此服务商</span><input id="profileEnabled" type="checkbox" checked></label>
+        </div>
+      </details>
+      <div class="model-discovery">
+        <div class="model-discovery-head">
+          <div><strong>选择模型</strong><div><span id="modelDiscoveryHint">填写连接信息后获取模型列表</span></div></div>
+          <span class="model-count" id="profileModelCount">未获取</span>
+        </div>
+        <div class="model-picker-row">
+          <select id="profileModelSelect" aria-label="模型"><option value="">请先获取模型</option></select>
+          <button class="btn" id="refreshProfileModels" onclick="refreshProfileModels()">获取模型</button>
+        </div>
+        <div class="provider-field model-custom" id="profileModelCustomWrap" style="display:none"><label for="profileModelCustom">手动模型 ID</label><input id="profileModelCustom" placeholder="例如 gpt-4o-mini"></div>
+      </div>
+      <div class="provider-editor-actions">
+        <span class="connection-state" id="providerProfileStatus">尚未测试连接</span>
+        <div class="form-actions"><button class="btn primary" onclick="saveProviderProfile()">保存 Profile</button></div>
+      </div>
+    </section>
+  </div>
+  <div class="ops-grid" style="margin-top:16px">
+    <section class="card">
+      <h3>Agent 路由</h3>
+      <div class="form-row"><label for="routeAgent">Agent</label><select id="routeAgent" onchange="loadAgentRoute()"></select></div>
+      <div class="form-row"><label for="routePrimary">主 Profile</label><select id="routePrimary"></select></div>
+      <div class="form-row"><label for="routeMode">路由模式</label><select id="routeMode"><option value="manual">手动固定</option><option value="priority">失败后按优先级切换</option></select></div>
+      <div class="form-row"><label for="routeFallbacks">备用顺序</label><input id="routeFallbacks" placeholder="profile-a,profile-b"></div>
+      <div class="form-actions"><button class="btn primary" onclick="saveAgentRoute()">保存路由</button></div>
+      <div id="agentRouteStatus" class="hint">priority 模式只在当前请求失败时尝试备用服务商。</div>
+    </section>
+    <section class="card">
+      <h3>Provider Health</h3>
+      <div id="providerHealthList" class="data-list"><div class="empty">尚无请求健康数据</div></div>
+    </section>
   </div>
 </div>
 
@@ -1657,26 +1685,89 @@ function editProviderProfile(profileId) {
   document.getElementById('profileName').value = profile.name || '';
   document.getElementById('profileProvider').value = profile.provider || 'custom';
   document.getElementById('profileBaseUrl').value = profile.base_url || '';
-  document.getElementById('profileModel').value = profile.model || '';
+  document.getElementById('providerEditorTitle').textContent = profile.name || profile.id;
+  document.getElementById('providerEnabledBadge').textContent = profile.enabled === false ? 'DISABLED' : 'ENABLED';
+  setProfileModels(profile.model ? [profile.model] : [], profile.model || '');
   document.getElementById('profileApiKey').value = '';
   document.getElementById('profileEnabled').checked = profile.enabled !== false;
 }
 
 function clearProviderProfileForm() {
-  ['profileId','profileName','profileBaseUrl','profileModel','profileApiKey'].forEach(id => { document.getElementById(id).value = ''; });
+  ['profileId','profileName','profileBaseUrl','profileApiKey','profileModelCustom'].forEach(id => { document.getElementById(id).value = ''; });
   document.getElementById('profileProvider').value = providerPresets[0]?.id || 'custom';
   document.getElementById('profileEnabled').checked = true;
+  document.getElementById('providerEditorTitle').textContent = '新建 Profile';
+  document.getElementById('providerEnabledBadge').textContent = 'ENABLED';
+  setProfileModels([], '');
+  document.getElementById('providerProfileStatus').textContent = '尚未测试连接';
+}
+
+function setProfileModels(models, selected) {
+  const unique = [...new Set((models || []).filter(Boolean))].sort();
+  const select = document.getElementById('profileModelSelect');
+  const options = unique.map(model => new Option(model, model));
+  options.push(new Option('手动输入模型 ID', '__custom__'));
+  select.replaceChildren(...options);
+  if (selected && unique.includes(selected)) {
+    select.value = selected;
+    document.getElementById('profileModelCustomWrap').style.display = 'none';
+  } else if (selected) {
+    select.value = '__custom__';
+    document.getElementById('profileModelCustom').value = selected;
+    document.getElementById('profileModelCustomWrap').style.display = '';
+  } else {
+    select.value = unique[0] || '__custom__';
+    document.getElementById('profileModelCustomWrap').style.display = unique.length ? 'none' : '';
+  }
+  document.getElementById('profileModelCount').textContent = unique.length ? `${unique.length} 个模型` : '手动输入';
+}
+
+document.getElementById('profileModelSelect')?.addEventListener('change', event => {
+  document.getElementById('profileModelCustomWrap').style.display = event.target.value === '__custom__' ? '' : 'none';
+});
+
+async function refreshProfileModels() {
+  const button = document.getElementById('refreshProfileModels');
+  const status = document.getElementById('providerProfileStatus');
+  const payload = {};
+  const profileId = document.getElementById('profileId').value.trim();
+  const baseUrl = document.getElementById('profileBaseUrl').value.trim();
+  const apiKey = document.getElementById('profileApiKey').value.trim();
+  if (profileId && providerProfiles.some(item => item.id === profileId)) payload.profile_id = profileId;
+  if (baseUrl) payload.base_url = baseUrl;
+  if (apiKey) payload.api_key = apiKey;
+  button.disabled = true;
+  status.className = 'connection-state loading';
+  status.textContent = '正在获取模型...';
+  try {
+    const data = await apiFetch('/api/llm/models', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const current = document.getElementById('profileModelSelect').value;
+    setProfileModels(data.models || [], current === '__custom__' ? document.getElementById('profileModelCustom').value.trim() : current);
+    status.className = 'connection-state ok';
+    status.textContent = '连接正常，模型列表已更新';
+  } catch (error) {
+    setProfileModels([], document.getElementById('profileModelCustom').value.trim());
+    status.className = 'connection-state error';
+    status.textContent = `获取失败：${error.message}`;
+  } finally {
+    button.disabled = false;
+  }
 }
 
 async function saveProviderProfile() {
-  const id = document.getElementById('profileId').value.trim();
+  let id = document.getElementById('profileId').value.trim();
+  const name = document.getElementById('profileName').value.trim();
+  if (!id && name) id = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
   if (!id) { document.getElementById('providerProfileStatus').textContent = 'Profile ID 不能为空'; return; }
+  const selectedModel = document.getElementById('profileModelSelect').value;
+  const model = selectedModel === '__custom__' ? document.getElementById('profileModelCustom').value.trim() : selectedModel;
+  if (!model) { document.getElementById('providerProfileStatus').textContent = '请选择或输入模型 ID'; return; }
   const payload = {
     id,
-    name: document.getElementById('profileName').value.trim() || id,
+    name: name || id,
     provider: document.getElementById('profileProvider').value,
     base_url: document.getElementById('profileBaseUrl').value.trim(),
-    model: document.getElementById('profileModel').value.trim(),
+    model,
     enabled: document.getElementById('profileEnabled').checked
   };
   const apiKey = document.getElementById('profileApiKey').value;

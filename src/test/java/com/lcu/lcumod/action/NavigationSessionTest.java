@@ -29,6 +29,29 @@ class NavigationSessionTest {
     }
 
     @Test
+    void childNavigationRetargetsForSameOwnerWithoutReportingLifecycle() {
+        NavigationSession session = new NavigationSession();
+
+        assertEquals(NavigationSession.StartDecision.STARTED, session.begin("farm-1", 0, 5, false));
+        assertFalse(session.reportsLifecycle());
+        assertEquals(NavigationSession.StartDecision.RETARGETED, session.begin("farm-1", 10, 7, false));
+        assertEquals(NavigationSession.StartDecision.CONFLICT, session.begin("move-2", 11, 2, true));
+    }
+
+    @Test
+    void suspensionExtendsDeadlineByPausedTicks() {
+        NavigationSession session = new NavigationSession();
+        session.begin("move-1", 0, 1);
+
+        session.suspend(100);
+        assertFalse(session.isTimedOut(500));
+        session.resume(500);
+
+        assertFalse(session.isTimedOut(639));
+        assertTrue(session.isTimedOut(640));
+    }
+
+    @Test
     void recoveryAndDeadlineAreBounded() {
         NavigationSession session = new NavigationSession();
         session.begin("move-1", 20, 1);

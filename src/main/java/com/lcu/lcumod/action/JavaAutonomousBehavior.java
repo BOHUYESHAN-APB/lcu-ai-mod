@@ -293,7 +293,7 @@ public class JavaAutonomousBehavior {
             // Check if item is food (by checking if it has food properties)
             if (stack.getItem().getFoodProperties(stack, mc.player) != null) {
                 // Select and use
-                inv.selected = i;
+                EquipmentManager.selectHotbarSlot(mc, i);
                 if (mc.gameMode != null) {
                     mc.gameMode.useItem(mc.player, net.minecraft.world.InteractionHand.MAIN_HAND);
                 }

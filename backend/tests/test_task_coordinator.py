@@ -45,6 +45,20 @@ class TaskCoordinatorTests(unittest.TestCase):
         self.state.close()
         self.tmp.cleanup()
 
+    @staticmethod
+    def crop(x, y, z, distance, token, age=7):
+        return {
+            "x": x, "y": y, "z": z, "distance": distance,
+            "block_id": "minecraft:wheat", "target_token": token,
+            "crop": {"mature": True, "age": age},
+        }
+
+    def send_crop_scan(self, parent, crops):
+        request_id = self.state.get_run(parent["id"])["pending_request_id"]
+        return self.coordinator.handle_body_message(BodyEvent("response", {
+            "id": request_id, "success": True, "data": {"crops": crops},
+        }))
+
     def test_response_progress_and_outcome_produce_durable_run_events(self):
         run = self.coordinator.create_run(
             "general.craft_item", {"item": "minecraft:torch", "count": 4}
@@ -233,6 +247,127 @@ class TaskCoordinatorTests(unittest.TestCase):
         restored = self.state.get_run(parent["id"])
         self.assertEqual(restored["status"], "succeeded")
         self.assertEqual([step["status"] for step in restored["steps"]], ["succeeded", "succeeded"])
+
+    def test_farm_region_sorts_mature_candidates_and_harvests_serially(self):
+        parent = self.coordinator.create_workflow(self.presets.render("farm.region", {"radius": 8}))
+        self.assertEqual(self.body.commands, [("scan_crops", {"radius": 8})])
+
+        self.send_crop_scan(parent, [
+            self.crop(5, 64, 0, 5.0, "far"),
+            self.crop(2, 64, 0, 2.0, "near-b"),
+            self.crop(1, 64, 0, 2.0, "near-a"),
+            {**self.crop(0, 64, 0, 1.0, "young", age=3), "crop": {"mature": False, "age": 3}},
+        ])
+
+        self.assertEqual(len(self.body.commands), 2)
+        self.assertEqual(self.body.commands[-1], ("harvest_crop_at", {
+            "x": 1, "y": 64, "z": 0, "block_id": "minecraft:wheat",
+            "age": 7, "target_token": "near-a",
+        }))
+        first_child = self.state.get_run(parent["id"])["active_child_id"]
+        self.coordinator.handle_body_message(BodyEvent("outcome", {
+            "id": first_child, "status": "succeeded", "code": "HARVESTED_AND_REPLANTED",
+            "message": "done",
+        }))
+        self.assertEqual(len(self.body.commands), 3)
+        self.assertEqual(self.body.commands[-1][1]["target_token"], "near-b")
+
+        second_child = self.state.get_run(parent["id"])["active_child_id"]
+        self.coordinator.handle_body_message(BodyEvent("outcome", {
+            "id": second_child, "status": "succeeded", "message": "done",
+        }))
+        third_child = self.state.get_run(parent["id"])["active_child_id"]
+        self.coordinator.handle_body_message(BodyEvent("outcome", {
+            "id": third_child, "status": "succeeded", "message": "done",
+        }))
+
+        restored = self.state.get_run(parent["id"])
+        self.assertEqual(restored["status"], "succeeded")
+        self.assertEqual(restored["result"]["harvested"], 3)
+        self.assertEqual(restored["result"]["candidate_attempts"], 3)
+
+    def test_farm_region_records_restoration_obligation_and_continues(self):
+        parent = self.coordinator.create_workflow(self.presets.render("farm.region", {"radius": 4}))
+        self.send_crop_scan(parent, [
+            self.crop(1, 64, 0, 1.0, "first"), self.crop(2, 64, 0, 2.0, "second"),
+        ])
+        first_child = self.state.get_run(parent["id"])["active_child_id"]
+
+        self.coordinator.handle_body_message(BodyEvent("outcome", {
+            "id": first_child, "status": "failed", "code": "SEED_MISSING",
+            "message": "harvested but no seed",
+        }))
+
+        second_child = self.state.get_run(parent["id"])["active_child_id"]
+        self.assertNotEqual(second_child, first_child)
+        self.assertEqual(self.body.commands[-1][1]["target_token"], "second")
+        self.coordinator.handle_body_message(BodyEvent("outcome", {
+            "id": second_child, "status": "succeeded", "message": "done",
+        }))
+        restored = self.state.get_run(parent["id"])
+        self.assertEqual(restored["status"], "failed")
+        self.assertEqual(restored["result"]["status"], "partial")
+        self.assertEqual(restored["result"]["harvested"], 2)
+        self.assertEqual(restored["result"]["restoration_obligations"][0]["code"], "SEED_MISSING")
+
+    def test_farm_region_bounds_rescans_after_stale_candidates(self):
+        parent = self.coordinator.create_workflow(self.presets.render("farm.region", {"radius": 4}))
+        for attempt in range(3):
+            self.send_crop_scan(parent, [self.crop(1, 64, attempt, 1.0, f"token-{attempt}")])
+            child_id = self.state.get_run(parent["id"])["active_child_id"]
+            self.coordinator.handle_body_message(BodyEvent("outcome", {
+                "id": child_id, "status": "failed", "code": "STALE_TARGET", "message": "stale",
+            }))
+
+        restored = self.state.get_run(parent["id"])
+        self.assertEqual(restored["status"], "failed")
+        self.assertEqual(restored["result"]["scan_attempts"], 3)
+        self.assertEqual([command for command, _ in self.body.commands].count("scan_crops"), 3)
+
+    def test_farm_scan_can_be_resent_after_restart(self):
+        parent = self.coordinator.create_workflow(self.presets.render("farm.region", {"radius": 6}))
+
+        restarted = TaskCoordinator(self.state, self.registry, self.body)
+        restarted.set_body_armed(True)
+        restored = self.state.get_run(parent["id"])
+        self.assertEqual(restored["status"], "queued")
+        self.assertIsNone(restored["pending_request_id"])
+
+        restarted.resume(parent["id"])
+        self.assertEqual([command for command, _ in self.body.commands].count("scan_crops"), 2)
+
+    def test_uncertain_farm_harvest_is_not_replayed_after_restart(self):
+        parent = self.coordinator.create_workflow(self.presets.render("farm.region", {"radius": 4}))
+        self.send_crop_scan(parent, [self.crop(1, 64, 0, 1.0, "token")])
+        child_id = self.state.get_run(parent["id"])["active_child_id"]
+        command_count = len(self.body.commands)
+
+        TaskCoordinator(self.state, self.registry, self.body)
+
+        restored = self.state.get_run(parent["id"])
+        self.assertEqual(self.state.get_run(child_id)["status"], "unknown")
+        self.assertEqual(restored["status"], "unknown")
+        self.assertEqual(restored["result"]["status"], "unknown")
+        self.assertEqual(len(self.body.commands), command_count)
+
+    def test_uncertain_farm_harvest_after_progress_is_partial_unknown(self):
+        parent = self.coordinator.create_workflow(self.presets.render("farm.region", {"radius": 4}))
+        self.send_crop_scan(parent, [
+            self.crop(1, 64, 0, 1.0, "first"), self.crop(2, 64, 0, 2.0, "second"),
+        ])
+        first_child = self.state.get_run(parent["id"])["active_child_id"]
+        self.coordinator.handle_body_message(BodyEvent("outcome", {
+            "id": first_child, "status": "succeeded", "message": "done",
+        }))
+        second_child = self.state.get_run(parent["id"])["active_child_id"]
+
+        TaskCoordinator(self.state, self.registry, self.body)
+
+        restored = self.state.get_run(parent["id"])
+        self.assertEqual(self.state.get_run(second_child)["status"], "unknown")
+        self.assertEqual(restored["status"], "unknown")
+        self.assertEqual(restored["result"]["status"], "partial_unknown")
+        self.assertEqual(restored["result"]["harvested"], 1)
 
     def test_workflow_preserves_external_lease_fencing_across_steps(self):
         lease = self.state.acquire_lease("controller", "external", ["actions"], 30)
