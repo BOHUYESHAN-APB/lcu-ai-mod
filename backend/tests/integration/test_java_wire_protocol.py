@@ -69,10 +69,30 @@ class JavaWireProtocolIntegrationTests(unittest.TestCase):
             orchestrator.set_task_coordinator(coordinator)
             orchestrator.start()
 
-            self._tick_until(
-                orchestrator,
-                lambda: orchestrator.session.runtime.get("fixture") == "java-production-wire",
-            )
+            try:
+                self._tick_until(
+                    orchestrator,
+                    lambda: orchestrator.session.runtime.get("fixture") == "java-production-wire",
+                )
+            except AssertionError:
+                # Diagnostics for platform-specific flakiness: the fixture's
+                # stdout/stderr is captured in the `output` queue and would
+                # otherwise be invisible.
+                print("DIAG wire_connected:", wire.is_connected)
+                print("DIAG drained events:", [
+                    (e.type, e.data.get("event")) for e in wire.drain()
+                ])
+                print("DIAG runtime keys:", sorted(orchestrator.session.runtime.keys()))
+                fixture_lines = []
+                while True:
+                    try:
+                        fixture_lines.append(output.get_nowait())
+                    except Exception:
+                        break
+                print("DIAG fixture output tail:")
+                for line in fixture_lines[-25:]:
+                    print("   |", line)
+                raise
             self.assertEqual(orchestrator.session.runtime["player"]["health"], 20.0)
             self.assertTrue(orchestrator.session.runtime["control_state"]["ai_controlled"])
 
