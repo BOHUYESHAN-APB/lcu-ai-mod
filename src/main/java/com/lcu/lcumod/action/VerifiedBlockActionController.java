@@ -83,6 +83,7 @@ final class VerifiedBlockActionController {
 
     void tick(Minecraft mc) {
         if (!isActive() || mc.player == null || mc.level == null || mc.gameMode == null) return;
+        if (phase != Phase.NAVIGATING && !claimActionChannels()) return;
         ticks++;
         phaseTicks++;
         if (ticks > 400) { fail("TIMEOUT", "verified block action timed out"); return; }
@@ -198,6 +199,7 @@ final class VerifiedBlockActionController {
 
     private void finish(String status, String code, String message) {
         String id = operationId;
+        BodyKernel.release(kernelOwner());
         operationId = null;
         kind = null;
         phase = null;
@@ -209,6 +211,19 @@ final class VerifiedBlockActionController {
         itemId = null;
         requestedFace = null;
         if (id != null && LCUMod.WIRE != null) LCUMod.WIRE.sendOutcome(id, status, code, message);
+    }
+
+    private boolean claimActionChannels() {
+        if (kind == Kind.PLACE) {
+            return BodyKernel.claim(kernelOwner(), BodyPriority.FOREGROUND,
+                BodyChannel.GAZE, BodyChannel.MAIN_HAND, BodyChannel.INVENTORY);
+        }
+        return BodyKernel.claim(kernelOwner(), BodyPriority.FOREGROUND,
+            BodyChannel.GAZE, BodyChannel.MAIN_HAND);
+    }
+
+    private String kernelOwner() {
+        return "block-action:" + operationId;
     }
 
     private void enter(Phase next) { phase = next; phaseTicks = 0; }

@@ -140,7 +140,7 @@ authorized adapter explicitly provides them.
 
 ## Tool Discovery And Lifecycle
 
-Wire protocol v3 advertises Java tool descriptors during authentication. A descriptor
+Wire protocol v4 advertises Java tool descriptors during authentication. A descriptor
 contains command, version, input schema, execution class, completion contract,
 cancellability, availability, and effects. Python reconciles SkillRegistry against the
 connected body and fails unavailable capabilities before dispatch.
@@ -177,7 +177,7 @@ The generic container transaction is:
 5. Transfer one eligible slot and wait for an authoritative inventory delta.
 6. Refresh the content snapshot, then close only the menu owned by the operation.
 
-Wire v3 advertises `get_container`, `take_item`, `put_item`, `close_container`, and
+Wire v4 advertises `get_container`, `take_item`, `put_item`, `close_container`, and
 `drop_item` alongside movement, interaction, inventory, collection, and crafting tools.
 Container mutation commands require the current container ID and slot, preventing stale
 screen actions. Python composes these primitives into retrieval, delivery, sorting, and
@@ -253,6 +253,19 @@ stop is recognized in the wire receive callback, admitted through TaskCoordinato
 normal event draining records and acknowledges it without planning again. Java queues `stop_all`
 at CONTROL priority, atomically drains lower-priority queued work, preserves FIFO within CONTROL,
 and emits a terminal response or cancellation for each discarded request.
+
+## Wire Admission
+
+Wire protocol v4 requires a nonblank request ID for new commands. The body admits one immutable
+command fingerprint per ID, suppresses in-flight duplicates, replays a cached terminal response or
+outcome for an identical retry, and rejects ID reuse with different content. The ledger is bounded
+and retained across controller handoffs so old requests cannot be replayed as new work.
+
+Current body clients publish `body_world_epoch` and `body_control_epoch` in both control-state and
+state-update metadata. The Python wire client attaches a coherent pair as `__lcu_world_epoch` and
+`__lcu_control_epoch` to later commands. Java validates supplied pairs immediately before effects;
+missing pairs remain accepted during protocol migration. `stop_all`, `disarm`, and
+`control_builtin` remain epoch-exempt revocation commands.
 
 ## Current Migration Order
 

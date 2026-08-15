@@ -24,11 +24,15 @@ ROOT = Path(__file__).resolve().parents[3]
 class JavaWireProtocolIntegrationTests(unittest.TestCase):
     def test_java_wire_to_python_orchestrator_durable_run(self):
         token = "java-python-integration"
+        # gradlew has no exec bit in git (100644), so Linux needs `sh gradlew`;
+        # Windows uses gradlew.bat directly.
+        if os.name == "nt":
+            launcher = [str(ROOT / "gradlew.bat")]
+        else:
+            launcher = ["sh", str(ROOT / "gradlew")]
         process = subprocess.Popen(
-            [
-                str(ROOT / "gradlew.bat"), "runWireFixture", "--no-daemon", "-q",
-                "-PwireFixturePort=0", f"-PwireFixtureToken={token}",
-            ],
+            launcher + ["runWireFixture", "--no-daemon", "-q",
+                        "-PwireFixturePort=0", f"-PwireFixtureToken={token}"],
             cwd=ROOT,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,

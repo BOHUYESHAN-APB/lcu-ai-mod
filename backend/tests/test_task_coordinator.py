@@ -105,6 +105,37 @@ class TaskCoordinatorTests(unittest.TestCase):
 
         self.assertEqual(self.body.commands, [])
 
+    def test_internal_sideband_commands_are_available_while_manual(self):
+        self.coordinator.set_body_armed(False)
+
+        chat_id = self.coordinator.dispatch_internal_command(
+            "send_chat", {"message": "manual hello"}, "manual_chat",
+        )
+        disable_id = self.coordinator.dispatch_internal_command("behavior_disable", {}, "manual_chat")
+
+        with self.assertRaisesRegex(ValueError, "companion body is not armed"):
+            self.coordinator.dispatch_internal_command("jump", {}, "manual_chat")
+        self.assertEqual(self.body.commands, [
+            ("send_chat", {"message": "manual hello"}),
+            ("behavior_disable", {}),
+        ])
+        self.assertEqual(self.coordinator.get_status()["raw_request_count"], 2)
+        self.coordinator.handle_body_message(BodyEvent("response", {"id": chat_id, "success": True}))
+        self.coordinator.handle_body_message(BodyEvent("response", {"id": disable_id, "success": True}))
+        self.assertFalse(self.coordinator.is_busy())
+
+    def test_control_transition_preserves_unsent_queued_runs(self):
+        self.coordinator.set_body_armed(False)
+        queued = self.coordinator.create_run("core.jump", {})
+
+        changed = self.coordinator.on_control_transition()
+        self.coordinator.set_body_armed(True)
+        resumed = self.coordinator.resume(queued["id"])
+
+        self.assertEqual(changed, 0)
+        self.assertEqual(resumed["status"], "dispatched")
+        self.assertEqual(self.body.commands, [("jump", {})])
+
     def test_explicit_outcome_produces_terminal_run(self):
         run = self.coordinator.create_run(
             "general.craft_item", {"item": "minecraft:torch", "count": 4}

@@ -82,6 +82,8 @@ public class JavaAutonomousBehavior {
         
         // Priority 1: Survival - flee if health is very low
         if (shouldFlee(mc)) {
+            if (!BodyKernel.claim("java-autonomy", BodyPriority.AUTONOMY,
+                    BodyChannel.LOCOMOTION, BodyChannel.GAZE)) return false;
             if (currentState != BehaviorState.FLEEING) {
                 setState(BehaviorState.FLEEING);
                 flee(mc);
@@ -91,6 +93,9 @@ public class JavaAutonomousBehavior {
         
         // Priority 2: Combat - attack nearby hostile mobs
         if (shouldAttack(mc)) {
+            if (Pathfinder.isNavigating() && !Pathfinder.hasActiveOperation()) MovementSystem.stop();
+            if (!BodyKernel.claim("java-autonomy", BodyPriority.AUTONOMY,
+                    BodyChannel.LOCOMOTION, BodyChannel.GAZE, BodyChannel.MAIN_HAND)) return false;
             if (currentState != BehaviorState.FIGHTING) {
                 setState(BehaviorState.FIGHTING);
             }
@@ -100,11 +105,15 @@ public class JavaAutonomousBehavior {
         
         // Priority 3: Eat if hungry or keep eating until the consume window ends
         if (currentState == BehaviorState.EATING && eatingTicksRemaining > 0) {
+            if (!BodyKernel.claim("java-autonomy", BodyPriority.AUTONOMY,
+                    BodyChannel.INVENTORY, BodyChannel.MAIN_HAND)) return true;
             eatingTicksRemaining--;
             return true;
         }
 
         if (shouldEat(mc)) {
+            if (!BodyKernel.claim("java-autonomy", BodyPriority.AUTONOMY,
+                    BodyChannel.INVENTORY, BodyChannel.MAIN_HAND)) return false;
             if (currentState != BehaviorState.EATING) {
                 setState(BehaviorState.EATING);
                 eatFood(mc);
@@ -114,6 +123,7 @@ public class JavaAutonomousBehavior {
         
         // Priority 4: Track nearby players (head movement)
         if (shouldTrackPlayer(mc)) {
+            if (!BodyKernel.claim("java-autonomy", BodyPriority.AUTONOMY, BodyChannel.GAZE)) return false;
             if (currentState != BehaviorState.TRACKING) {
                 setState(BehaviorState.TRACKING);
             }
@@ -123,6 +133,8 @@ public class JavaAutonomousBehavior {
         
         // Priority 5: Wander if idle too long
         if (shouldWander(mc)) {
+            if (!BodyKernel.claim("java-autonomy", BodyPriority.AUTONOMY,
+                    BodyChannel.LOCOMOTION, BodyChannel.GAZE)) return false;
             if (currentState != BehaviorState.WANDERING) {
                 setState(BehaviorState.WANDERING);
                 chooseWanderTarget(mc);
@@ -144,6 +156,7 @@ public class JavaAutonomousBehavior {
     
     private static void setState(BehaviorState newState) {
         if (currentState != newState) {
+            if (currentState == BehaviorState.EATING) releaseHeldUse();
             currentState = newState;
             stateTicks = 0;
         }
@@ -165,6 +178,7 @@ public class JavaAutonomousBehavior {
     }
 
     public static void resetCurrentState() {
+        if (currentState == BehaviorState.EATING) releaseHeldUse();
         currentState = BehaviorState.IDLE;
         stateTicks = 0;
         idleTicks = 0;
@@ -172,6 +186,14 @@ public class JavaAutonomousBehavior {
         attackTarget = null;
         trackTarget = null;
         eatingTicksRemaining = 0;
+        BodyKernel.release("java-autonomy");
+    }
+
+    private static void releaseHeldUse() {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.player != null && mc.gameMode != null && mc.player.isUsingItem()) {
+            mc.gameMode.releaseUsingItem(mc.player);
+        }
     }
     
     // ── Survival Logic ──
@@ -416,6 +438,11 @@ public class JavaAutonomousBehavior {
         
         wanderTarget = new Vec3(targetX, targetY, targetZ);
         idleTicks = 0;
+        if (!MovementSystem.moveTo(wanderTarget.x, wanderTarget.y, wanderTarget.z, 0.8f)) {
+            wanderTarget = null;
+            wanderCooldown = MIN_WANDER_COOLDOWN;
+            setState(BehaviorState.IDLE);
+        }
     }
     
     private static void wander(Minecraft mc) {
@@ -424,21 +451,11 @@ public class JavaAutonomousBehavior {
             return;
         }
         
-        // Check if we arrived
-        double dx = wanderTarget.x - mc.player.getX();
-        double dy = wanderTarget.y - mc.player.getY();
-        double dz = wanderTarget.z - mc.player.getZ();
-        double dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-        
-        if (dist < 1.0) {
+        if (!MovementSystem.isMoving()) {
             setState(BehaviorState.IDLE);
             wanderCooldown = MIN_WANDER_COOLDOWN + random.nextInt(MAX_WANDER_COOLDOWN - MIN_WANDER_COOLDOWN);
             wanderTarget = null;
-            return;
         }
-        
-        // Move toward target
-        MovementSystem.moveTo(wanderTarget.x, wanderTarget.y, wanderTarget.z, 0.8f);
     }
     
     // ── Status ──

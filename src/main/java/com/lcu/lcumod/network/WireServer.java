@@ -11,6 +11,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Supplier;
@@ -20,11 +21,14 @@ import java.util.function.Supplier;
  */
 public class WireServer {
     private static final System.Logger LOGGER = System.getLogger(WireServer.class.getName());
-    public static final int PROTOCOL_VERSION = 3;
+    public static final int PROTOCOL_VERSION = 4;
     private static final int MAX_FRAME_CHARS = 1024 * 1024;
     private static final int AUTH_TIMEOUT_MILLIS = 5000;
     private static final int START_TIMEOUT_MILLIS = 5000;
     private static final int SEND_QUEUE_CAPACITY = 1024;
+    private static final int REQUEST_LEDGER_CAPACITY = 512;
+    public static final String WORLD_EPOCH_FIELD = "__lcu_world_epoch";
+    public static final String CONTROL_EPOCH_FIELD = "__lcu_control_epoch";
     private final int port;
     private final String authToken;
     private final String role;
@@ -32,6 +36,7 @@ public class WireServer {
     private final Supplier<Map<String, Boolean>> policySupplier;
     private final AtomicBoolean running = new AtomicBoolean(false);
     private volatile boolean commandAdmissionEnabled = true;
+    private volatile boolean sidebandAdmissionEnabled;
     private final Gson gson = new Gson();
     private Thread serverThread;
     private volatile ServerSocket serverSocket;
@@ -42,6 +47,7 @@ public class WireServer {
     private Thread sendThread;
     private final BlockingQueue<OutboundFrame> sendQueue = new ArrayBlockingQueue<>(SEND_QUEUE_CAPACITY);
     private final Set<Connection> pendingConnections = ConcurrentHashMap.newKeySet();
+    private final Map<String, RequestLedgerEntry> requestLedger = new LinkedHashMap<>(64, 0.75f, true);
     private long connectionEpoch;
 
     public static final PriorityCommandQueue commandQueue = new PriorityCommandQueue();
@@ -64,7 +70,13 @@ public class WireServer {
         this.policySupplier = policySupplier == null ? Map::of : policySupplier;
     }
 
-    public synchronized void start() {
+    public void start() {
+        startAsync();
+        awaitStartup();
+    }
+
+    /** Launch binding on daemon threads without blocking the caller's client tick. */
+    public synchronized void startAsync() {
         if (running.getAndSet(true)) return;
         startupError = null;
         boundPort = -1;
@@ -76,6 +88,9 @@ public class WireServer {
         sendThread = new Thread(this::sendLoop, "LCU-WireSend");
         sendThread.setDaemon(true);
         sendThread.start();
+    }
+
+    private void awaitStartup() {
         try {
             if (!readyLatch.await(START_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)) {
                 stop();
@@ -106,6 +121,7 @@ public class WireServer {
         pendingConnections.clear();
         commandQueue.clear();
         sendQueue.clear();
+        clearRequestLedger();
         if (sendThread != null) sendThread.interrupt();
         if (serverThread != null) serverThread.interrupt();
         joinThread(serverThread);
@@ -127,6 +143,8 @@ public class WireServer {
 
     public int getBoundPort() { return boundPort; }
 
+    public Throwable getStartupError() { return startupError; }
+
     public boolean isRunning() { return running.get() && boundPort >= 0; }
 
     public boolean isConnected() {
@@ -138,6 +156,89 @@ public class WireServer {
         if (!enabled) {
             discardQueuedCommands("BODY_UNAVAILABLE", "queued command cancelled because no client world is active");
         }
+    }
+
+    /** Allows read-only and stop commands while a ready body remains under manual control. */
+    public synchronized void setSidebandAdmissionEnabled(boolean enabled) {
+        sidebandAdmissionEnabled = enabled;
+        if (!enabled && !commandAdmissionEnabled) {
+            discardQueuedCommands("BODY_UNAVAILABLE", "queued command cancelled because no client world is active");
+        }
+    }
+
+    public static boolean isSidebandCommand(String command) {
+        return switch (command == null ? "" : command) {
+            case "send_chat", "get_state", "get_inventory", "get_container", "get_recipes", "inspect_block", "scan_crops",
+                 "observe_gui", "get_keybindings", "stop_all", "disarm", "cancel_operation",
+                 "behavior_disable", "control_builtin" -> true;
+            default -> false;
+        };
+    }
+
+    /** Emergency revoke commands stay available even when a sender observed an older epoch. */
+    public static boolean isEpochFenceExemptCommand(String command) {
+        return switch (command == null ? "" : command) {
+            case "stop_all", "disarm", "control_builtin" -> true;
+            default -> false;
+        };
+    }
+
+    private synchronized RequestAdmission admitRequest(WireCommand cmd) {
+        if (cmd.id() == null || cmd.id().isBlank()) return RequestAdmission.MISSING_ID;
+        String fingerprint = (cmd.cmd() == null ? "" : cmd.cmd()) + "\n" + gson.toJson(cmd.args());
+        RequestLedgerEntry existing = requestLedger.get(cmd.id());
+        if (existing == null) {
+            if (requestLedger.size() >= REQUEST_LEDGER_CAPACITY && !evictOldestTerminalRequest()) {
+                return RequestAdmission.SATURATED;
+            }
+            requestLedger.put(cmd.id(), new RequestLedgerEntry(cmd.cmd(), fingerprint, null));
+            return RequestAdmission.ACCEPT;
+        }
+        if (!existing.fingerprint().equals(fingerprint)) return RequestAdmission.CONFLICT;
+        return existing.terminalFrame() == null ? RequestAdmission.IN_FLIGHT : RequestAdmission.REPLAY;
+    }
+
+    private synchronized JsonObject replayTerminalRequest(String requestId) {
+        RequestLedgerEntry entry = requestLedger.get(requestId);
+        return entry == null || entry.terminalFrame() == null ? null : entry.terminalFrame().deepCopy();
+    }
+
+    private synchronized void recordTerminalRequest(String requestId, JsonObject frame) {
+        if (requestId == null || requestId.isBlank() || frame == null) return;
+        RequestLedgerEntry entry = requestLedger.get(requestId);
+        if (entry == null) return;
+        requestLedger.put(requestId, new RequestLedgerEntry(entry.command(), entry.fingerprint(), frame.deepCopy()));
+    }
+
+    private synchronized void recordResponseRequest(String requestId, boolean success, JsonObject frame) {
+        if (requestId == null || requestId.isBlank() || frame == null) return;
+        RequestLedgerEntry entry = requestLedger.get(requestId);
+        if (entry == null || success && requiresOperationOutcome(entry.command())) return;
+        requestLedger.put(requestId, new RequestLedgerEntry(entry.command(), entry.fingerprint(), frame.deepCopy()));
+    }
+
+    private static boolean requiresOperationOutcome(String command) {
+        return switch (command == null ? "" : command) {
+            case "move_to", "mine_block", "mine_block_at", "follow_player", "collect_blocks",
+                 "craft_item", "eat", "harvest_crop_at", "break_block_at", "use_block_at",
+                 "place_block_at" -> true;
+            default -> false;
+        };
+    }
+
+    private synchronized void clearRequestLedger() {
+        requestLedger.clear();
+    }
+
+    private boolean evictOldestTerminalRequest() {
+        var iterator = requestLedger.entrySet().iterator();
+        while (iterator.hasNext()) {
+            if (iterator.next().getValue().terminalFrame() != null) {
+                iterator.remove();
+                return true;
+            }
+        }
+        return false;
     }
 
     public synchronized void discardQueuedCommands(String code, String message) {
@@ -194,6 +295,20 @@ public class WireServer {
         if (data != null) msg.add("data", data);
         if (error != null) msg.addProperty("error", error);
         msg.addProperty("ts", System.currentTimeMillis());
+        recordResponseRequest(id, success, msg);
+        send(msg);
+    }
+
+    private void sendUntrackedResponse(String id, boolean success, String error, String message) {
+        JsonObject data = new JsonObject();
+        data.addProperty("message", message);
+        JsonObject msg = new JsonObject();
+        msg.addProperty("type", "response");
+        msg.addProperty("id", id);
+        msg.addProperty("success", success);
+        msg.add("data", data);
+        if (error != null) msg.addProperty("error", error);
+        msg.addProperty("ts", System.currentTimeMillis());
         send(msg);
     }
 
@@ -216,6 +331,7 @@ public class WireServer {
         if (code != null && !code.isBlank()) msg.addProperty("code", code);
         if (message != null && !message.isBlank()) msg.addProperty("message", message);
         msg.addProperty("ts", System.currentTimeMillis());
+        recordTerminalRequest(id, msg);
         send(msg);
     }
 
@@ -261,10 +377,20 @@ public class WireServer {
             return;
         }
         Connection old = activeConnection;
+        if (old != null && old != conn) {
+            // A newly authenticated controller cannot inherit an old controller's operation.
+            try {
+                disconnectHandler.run();
+            } catch (RuntimeException exception) {
+                LOGGER.log(System.Logger.Level.WARNING, "[WireServer] Connection handoff stop failed: {0}", exception.getMessage());
+            }
+        }
         activeConnection = conn;
         conn.activated = true;
         conn.epoch = ++connectionEpoch;
-        commandQueue.clear();
+        for (WireCommand discarded : commandQueue.drain()) {
+            recordDisconnectedRequest(discarded, "BACKEND_REPLACED", "request cancelled by controller handoff");
+        }
         sendQueue.clear();
         if (old != null && old != conn) {
             old.close();
@@ -337,6 +463,8 @@ public class WireServer {
                     capabilities.add("state");
                     capabilities.add("actions");
                     capabilities.add("progress");
+                    capabilities.add("request_replay");
+                    capabilities.add("epoch_fencing");
                     accepted.add("capabilities", capabilities);
                     Map<String, Boolean> currentPolicy;
                     try {
@@ -367,7 +495,22 @@ public class WireServer {
                                     LOGGER.log(System.Logger.Level.INFO, "[WireServer] Received command: {0} id={1}", cmd.cmd(), cmd.id());
                                     synchronized (WireServer.this) {
                                         if (activeConnection != this || !open.get()) break;
-                                        if (!commandAdmissionEnabled) {
+                                        RequestAdmission requestAdmission = admitRequest(cmd);
+                                        if (requestAdmission == RequestAdmission.MISSING_ID) {
+                                            sendUntrackedResponse(cmd.id(), false, "REQUEST_ID_REQUIRED", "command id is required");
+                                        } else if (requestAdmission == RequestAdmission.SATURATED) {
+                                            sendUntrackedResponse(cmd.id(), false, "REQUEST_LEDGER_FULL", "too many in-flight requests");
+                                        } else if (requestAdmission == RequestAdmission.CONFLICT) {
+                                            sendUntrackedResponse(cmd.id(), false, "REQUEST_ID_CONFLICT",
+                                                "request id was already used for a different command");
+                                        } else if (requestAdmission == RequestAdmission.IN_FLIGHT) {
+                                            sendUntrackedResponse(cmd.id(), false, "REQUEST_IN_FLIGHT",
+                                                "an identical request is already in progress");
+                                        } else if (requestAdmission == RequestAdmission.REPLAY) {
+                                            JsonObject replay = replayTerminalRequest(cmd.id());
+                                            if (replay != null) WireServer.this.send(replay);
+                                        } else if (!commandAdmissionEnabled
+                                                && !(sidebandAdmissionEnabled && isSidebandCommand(cmd.cmd()))) {
                                             JsonObject data = new JsonObject();
                                             data.addProperty("message", "no client world is active");
                                             WireServer.this.sendResponse(cmd.id(), false, data, "BODY_UNAVAILABLE");
@@ -431,7 +574,10 @@ public class WireServer {
                 pendingConnections.remove(this);
                 if (wasActive) {
                     activeConnection = null;
-                    commandQueue.clear();
+                    for (WireCommand discarded : commandQueue.drain()) {
+                        recordDisconnectedRequest(discarded, "BACKEND_DISCONNECTED",
+                            "request cancelled because the backend disconnected");
+                    }
                     sendQueue.clear();
                 }
             }
@@ -469,7 +615,32 @@ public class WireServer {
         sendResponse(discarded.id(), false, data, code);
     }
 
+    private void recordDisconnectedRequest(WireCommand discarded, String code, String message) {
+        if (discarded.id() == null || discarded.id().isBlank()) return;
+        JsonObject data = new JsonObject();
+        data.addProperty("message", message);
+        JsonObject frame = new JsonObject();
+        frame.addProperty("type", "response");
+        frame.addProperty("id", discarded.id());
+        frame.addProperty("success", false);
+        frame.add("data", data);
+        frame.addProperty("error", code);
+        frame.addProperty("ts", System.currentTimeMillis());
+        recordTerminalRequest(discarded.id(), frame);
+    }
+
     private record OutboundFrame(Connection target, long epoch, String line) {}
+
+    private enum RequestAdmission {
+        ACCEPT,
+        MISSING_ID,
+        SATURATED,
+        CONFLICT,
+        IN_FLIGHT,
+        REPLAY
+    }
+
+    private record RequestLedgerEntry(String command, String fingerprint, JsonObject terminalFrame) {}
 
     public record WireCommand(String id, String cmd, JsonObject args) {}
 }

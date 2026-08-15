@@ -16,6 +16,7 @@ import socket
 import threading
 import logging
 import codecs
+import uuid
 from queue import Queue
 from typing import Callable
 
@@ -39,11 +40,15 @@ class WireClient:
         self._running = False
         self._reader_thread: threading.Thread | None = None
         self._id_counter = 0
+        self._id_prefix = uuid.uuid4().hex[:12]
         self._connection_lock = threading.RLock()
         self._send_lock = threading.Lock()
         self._id_lock = threading.Lock()
+        self._epoch_lock = threading.Lock()
         self._event_callback: Callable[[BodyEvent], None] | None = None
         self.peer_info: dict = {}
+        self._body_world_epoch: int | None = None
+        self._body_control_epoch: int | None = None
 
     def connect(self) -> bool:
         """Connect to the mod's wire server."""
@@ -59,6 +64,7 @@ class WireClient:
                 self.sock = sock
                 self._running = True
                 self.peer_info = peer_info
+            self._clear_body_epochs()
             self._reader_thread = threading.Thread(target=self._read_loop, args=(sock,), daemon=True)
             self._reader_thread.start()
             return True
@@ -103,6 +109,7 @@ class WireClient:
             reader_thread = self._reader_thread
             self._reader_thread = None
             self.peer_info = {}
+        self._clear_body_epochs()
         if sock:
             try:
                 sock.shutdown(socket.SHUT_RDWR)
@@ -125,13 +132,20 @@ class WireClient:
         if request_id is None:
             with self._id_lock:
                 self._id_counter += 1
-                req_id = f"req_{self._id_counter}"
+                req_id = f"req_{self._id_prefix}_{self._id_counter}"
         else:
             req_id = request_id
+        payload_args = dict(args or {})
+        with self._epoch_lock:
+            world_epoch = self._body_world_epoch
+            control_epoch = self._body_control_epoch
+        if world_epoch is not None and control_epoch is not None:
+            payload_args.setdefault("__lcu_world_epoch", world_epoch)
+            payload_args.setdefault("__lcu_control_epoch", control_epoch)
         msg = {
             "type": "command",
             "cmd": command,
-            "args": args or {},
+            "args": payload_args,
             "id": req_id,
         }
         if not self._send_line(json.dumps(msg)):
@@ -219,6 +233,7 @@ class WireClient:
                     if line:
                         try:
                             obj = json.loads(line)
+                            self._learn_body_epochs(obj)
                             msg_type = obj.get("type", "unknown")
                             logger.debug(f"← {msg_type}: {obj.get('event') or obj.get('id') or '?'}")
                             event = BodyEvent(
@@ -248,3 +263,45 @@ class WireClient:
                 self._event_queue.get_nowait()
             except Exception:
                 return
+
+    def _clear_body_epochs(self) -> None:
+        with self._epoch_lock:
+            self._body_world_epoch = None
+            self._body_control_epoch = None
+
+    def _learn_body_epochs(self, message: dict) -> None:
+        if message.get("type") != "event":
+            return
+        data = message.get("data")
+        if not isinstance(data, dict):
+            return
+        if message.get("event") == "state_update":
+            runtime_context = data.get("runtime_context")
+            if not isinstance(runtime_context, dict):
+                return
+            world_epoch = self._parse_epoch(runtime_context.get("body_world_epoch"))
+            control_epoch = self._parse_epoch(runtime_context.get("body_control_epoch"))
+        elif message.get("event") == "control_state":
+            world_epoch = self._parse_epoch(data.get("body_world_epoch"))
+            control_epoch = self._parse_epoch(data.get("body_control_epoch"))
+        else:
+            return
+        if world_epoch is None or control_epoch is None:
+            return
+        with self._epoch_lock:
+            current_world = self._body_world_epoch
+            current_control = self._body_control_epoch
+            if current_world is None or world_epoch > current_world \
+                    or world_epoch == current_world and (current_control is None or control_epoch >= current_control):
+                self._body_world_epoch = world_epoch
+                self._body_control_epoch = control_epoch
+
+    @staticmethod
+    def _parse_epoch(value) -> int | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value if value >= 0 else None
+        if isinstance(value, str) and value.isdecimal():
+            return int(value)
+        return None

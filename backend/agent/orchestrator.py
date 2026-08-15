@@ -50,6 +50,7 @@ class Orchestrator:
             },
         }
         self._body_epoch = 0
+        self._body_lifecycle: tuple[int, int] | None = None
 
     def start(self):
         """Start the orchestrator."""
@@ -130,6 +131,8 @@ class Orchestrator:
                 event_type = msg.data.get("event", "unknown")
                 event_data = msg.data.get("data", {})
                 self.session.handle_event(event_type, event_data)
+                if self._observe_body_lifecycle(event_type, event_data):
+                    self._handle_body_lifecycle_transition()
                 if event_type != "player_chat":
                     self._publish_event(event_type, event_data, msg.data.get("ts"))
                 # Broadcast chat events to WebSocket clients
@@ -147,6 +150,45 @@ class Orchestrator:
                 self.session.handle_event("command_outcome", msg.data)
             if self.task_coordinator:
                 self.task_coordinator.handle_body_message(msg)
+
+    def _observe_body_lifecycle(self, event_type: str, data: object) -> bool:
+        if not isinstance(data, dict):
+            return False
+        if event_type == "control_state":
+            source = data
+        elif event_type == "state_update":
+            source = data.get("runtime_context")
+            if not isinstance(source, dict):
+                return False
+        else:
+            return False
+        world_epoch = self._parse_body_epoch(source.get("body_world_epoch"))
+        control_epoch = self._parse_body_epoch(source.get("body_control_epoch"))
+        if world_epoch is None or control_epoch is None:
+            return False
+        lifecycle = (world_epoch, control_epoch)
+        previous = self._body_lifecycle
+        if previous is None:
+            self._body_lifecycle = lifecycle
+            return False
+        if lifecycle == previous:
+            return False
+        if lifecycle[0] < previous[0] or lifecycle[0] == previous[0] and lifecycle[1] < previous[1]:
+            return False
+        self._body_lifecycle = lifecycle
+        return True
+
+    @staticmethod
+    def _parse_body_epoch(value: object) -> int | None:
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+    def _handle_body_lifecycle_transition(self) -> None:
+        self._body_epoch += 1
+        invalidated = self.decision_scheduler.invalidate("companion body lifecycle changed")
+        if invalidated:
+            self._persist_decision_event("decision.invalidated", invalidated["request_id"], invalidated)
+        if self.task_coordinator:
+            self.task_coordinator.on_control_transition()
 
     def set_task_coordinator(self, coordinator) -> None:
         self.task_coordinator = coordinator
@@ -259,6 +301,8 @@ class Orchestrator:
 
     def on_body_disconnect(self) -> None:
         with self._session_lock:
+            self._body_epoch += 1
+            self._body_lifecycle = None
             invalidated = self.decision_scheduler.invalidate("companion body disconnected")
             if invalidated:
                 self._persist_decision_event(

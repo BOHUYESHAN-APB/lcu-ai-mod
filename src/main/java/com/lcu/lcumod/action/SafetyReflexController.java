@@ -2,6 +2,7 @@ package com.lcu.lcumod.action;
 
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.monster.Enemy;
@@ -11,6 +12,8 @@ import net.minecraft.world.phys.Vec3;
 
 /** Always-local survival reflexes that preempt planner and autonomous work. */
 public final class SafetyReflexController {
+    private static final String KERNEL_OWNER = "safety";
+
     public enum Reflex {
         NONE, LEDGE_BRAKE, DROWNING_ESCAPE, FIRE_ESCAPE, LAVA_ESCAPE, HOSTILE_ESCAPE, AUTO_EAT
     }
@@ -18,18 +21,21 @@ public final class SafetyReflexController {
     private static Reflex active = Reflex.NONE;
     private static String detail = "";
     private static int eatCooldown;
+    private static String activeFoodId;
 
     private SafetyReflexController() {}
 
-    public static boolean tick(Minecraft mc, Runnable preemptLowerPriority) {
+    public static boolean tick(Minecraft mc, Runnable preemptLowerPriority, boolean allowAutoEat) {
         if (mc.player == null || mc.level == null || !InputIsolation.isAiControlled()) {
             reset();
             return false;
         }
 
-        Reflex next = choose(mc);
+        Reflex next = choose(mc, allowAutoEat);
+        if (next != Reflex.NONE && !claimChannels(next)) return false;
         if (next != active) {
             clearReflexInputs(mc);
+            if (active == Reflex.AUTO_EAT) activeFoodId = null;
             if (next != Reflex.NONE) preemptLowerPriority.run();
             active = next;
         }
@@ -46,7 +52,7 @@ public final class SafetyReflexController {
         return true;
     }
 
-    private static Reflex choose(Minecraft mc) {
+    private static Reflex choose(Minecraft mc, boolean allowAutoEat) {
         if (mc.player.isInLava()) {
             detail = "player is in lava";
             return Reflex.LAVA_ESCAPE;
@@ -64,20 +70,38 @@ public final class SafetyReflexController {
             detail = "low health near hostile " + hostile.getName().getString();
             return Reflex.HOSTILE_ESCAPE;
         }
+        boolean ownedFood = activeFoodId != null && !mc.player.getUseItem().isEmpty()
+            && activeFoodId.equals(BuiltInRegistries.ITEM.getKey(mc.player.getUseItem().getItem()).toString());
+        if (allowAutoEat && SafetyReflexPolicy.shouldMaintainAutoEat(
+                active == Reflex.AUTO_EAT, mc.player.isUsingItem(), ownedFood)) {
+            return Reflex.AUTO_EAT;
+        }
         if (isUnsafeStepAhead(mc)) {
             detail = "unsafe drop ahead";
             return Reflex.LEDGE_BRAKE;
         }
-        if (eatCooldown <= 0 && shouldUseHealingFood(mc) && findHealingFoodSlot(mc) >= 0) {
+        if (allowAutoEat && eatCooldown <= 0 && shouldUseHealingFood(mc) && findHealingFoodSlot(mc) >= 0) {
             detail = "health is low and a golden apple is available";
             return Reflex.AUTO_EAT;
         }
-        if (eatCooldown <= 0 && mc.player.getFoodData().getFoodLevel() < 14 && findFoodSlot(mc) >= 0) {
+        if (allowAutoEat && eatCooldown <= 0 && mc.player.getFoodData().getFoodLevel() < 14 && findFoodSlot(mc) >= 0) {
             detail = "hunger below 14";
             return Reflex.AUTO_EAT;
         }
         detail = "";
         return Reflex.NONE;
+    }
+
+    private static boolean claimChannels(Reflex reflex) {
+        return switch (reflex) {
+            case AUTO_EAT -> BodyKernel.claim(KERNEL_OWNER, BodyPriority.SAFETY,
+                BodyChannel.INVENTORY, BodyChannel.MAIN_HAND);
+            case HOSTILE_ESCAPE -> BodyKernel.claim(KERNEL_OWNER, BodyPriority.SAFETY,
+                BodyChannel.LOCOMOTION, BodyChannel.GAZE);
+            case LEDGE_BRAKE, DROWNING_ESCAPE, FIRE_ESCAPE, LAVA_ESCAPE ->
+                BodyKernel.claim(KERNEL_OWNER, BodyPriority.SAFETY, BodyChannel.LOCOMOTION);
+            case NONE -> true;
+        };
     }
 
     private static boolean isUnsafeStepAhead(Minecraft mc) {
@@ -142,6 +166,7 @@ public final class SafetyReflexController {
             return;
         }
         EquipmentManager.selectHotbarSlot(mc, slot);
+        activeFoodId = BuiltInRegistries.ITEM.getKey(mc.player.getMainHandItem().getItem()).toString();
         mc.gameMode.useItem(mc.player, net.minecraft.world.InteractionHand.MAIN_HAND);
         eatCooldown = 10;
     }
@@ -187,6 +212,8 @@ public final class SafetyReflexController {
         if (mc != null) clearReflexInputs(mc);
         active = Reflex.NONE;
         detail = "";
+        activeFoodId = null;
+        BodyKernel.release(KERNEL_OWNER);
     }
 
     public static boolean isActive() { return active != Reflex.NONE; }

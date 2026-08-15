@@ -42,6 +42,11 @@ from .world_model import WorldModel
 
 logger = logging.getLogger("session")
 
+OBSERVATION_COMMANDS = {
+    "send_chat", "get_state", "get_inventory", "get_container", "get_recipes",
+    "inspect_block", "scan_crops", "observe_gui", "get_keybindings",
+}
+
 
 class Session:
     """
@@ -439,16 +444,22 @@ class Session:
         autonomy_enabled = self.control_mode != "external" \
             and control_state.get("ai_controlled") is True \
             and behavior_state.get("behaviors_enabled") is True
+        backend_strategy_enabled = behavior_state.get("strategy_owner") == "backend"
+        state_fresh = self._body_connected and self._last_state_at is not None \
+            and time.time() - self._last_state_at <= 3.0
         manual_override_active = time.time() < self._manual_command_until or self._manual_behavior_active()
         mode_action = None
-        if autonomy_enabled and not manual_override_active:
+        if autonomy_enabled and backend_strategy_enabled and state_fresh and not manual_override_active:
             with self.skills.command_context("mode"):
                 mode_action = self.modes_engine.tick(self.runtime, action_busy=self.action_manager.is_busy or task_active)
+        elif self.modes_engine._active_mode is not None or self.modes_engine._active_request_id is not None:
+            self.modes_engine.reset()
         if mode_action:
             self.self_prompter.mark_action()
 
         # Self-prompter check (mindcraft-style: trigger LLM when idle too long)
-        if autonomy_enabled and not manual_override_active and self.self_prompter.should_prompt(is_idle, self.action_manager.is_busy or task_active):
+        if autonomy_enabled and backend_strategy_enabled and state_fresh and not manual_override_active \
+                and self.self_prompter.should_prompt(is_idle, self.action_manager.is_busy or task_active):
             prompt = self.self_prompter.build_prompt()
             logger.info("[Session] Self-prompt triggered: %s", prompt[:60])
             # Route through LLM service to generate commands
@@ -650,7 +661,7 @@ class Session:
             for pending_id in list(self._pending_commands):
                 self._finish_pending_command(pending_id, "cancelled", "stopped by command")
         requester, requester_id = self._current_requester or ("", "")
-        if cmd not in {"send_chat", "get_state", "get_inventory"}:
+        if cmd not in OBSERVATION_COMMANDS:
             self._pending_commands[req_id] = {
                 "command": cmd,
                 "args": dict(args),
@@ -684,7 +695,7 @@ class Session:
 
     def register_external_command(self, command: str, req_id: str, args: dict,
                                   requester: str = "sdk") -> None:
-        if command in {"send_chat", "get_state", "get_inventory"}:
+        if command in OBSERVATION_COMMANDS:
             return
         self._pending_commands[req_id] = {
             "command": command,

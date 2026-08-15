@@ -14,21 +14,46 @@ import com.lcu.lcumod.config.ServerPolicy;
 /** Local, server-synchronised equipment selection for the headed body. */
 public final class EquipmentManager {
     private static int cooldown;
+    private static PendingArmorSwap pendingArmorSwap;
 
     private EquipmentManager() {}
+
+    public static void reset() {
+        pendingArmorSwap = null;
+        cooldown = 0;
+        BodyKernel.release("equipment");
+    }
+
+    public static boolean hasPendingTransaction() {
+        return pendingArmorSwap != null;
+    }
 
     public static void tick(Minecraft mc) {
         if (mc.player == null || mc.level == null || mc.gameMode == null
                 || !InputIsolation.isAiControlled() || mc.player.isDeadOrDying()
                 || !ServerPolicy.inventoryAutomationAllowed()) return;
+        if (pendingArmorSwap != null) {
+            if (!BodyKernel.claim("equipment", BodyPriority.FOREGROUND,
+                    BodyChannel.INVENTORY, BodyChannel.MAIN_HAND)) return;
+            if (pendingArmorSwap.confirmed(mc)) {
+                pendingArmorSwap = null;
+                cooldown = 20;
+            } else if (++pendingArmorSwap.ticks >= 20) {
+                pendingArmorSwap = null;
+                cooldown = 100;
+            }
+            return;
+        }
         if (mc.player.containerMenu != mc.player.inventoryMenu || mc.player.isUsingItem()) return;
         if (cooldown > 0) {
             cooldown--;
             return;
         }
+        if (!BodyKernel.claim("equipment", BodyPriority.AUTONOMY,
+                BodyChannel.INVENTORY, BodyChannel.MAIN_HAND)) return;
         cooldown = 20;
 
-        equipBestArmor(mc);
+        if (equipBestArmor(mc)) return;
         if (hasNearbyHostile(mc) || !isUsefulWeapon(mc.player.getMainHandItem())) {
             selectBestWeapon(mc);
         }
@@ -149,7 +174,7 @@ public final class EquipmentManager {
         return best;
     }
 
-    private static void equipBestArmor(Minecraft mc) {
+    private static boolean equipBestArmor(Minecraft mc) {
         for (EquipmentSlot equipmentSlot : new EquipmentSlot[] {
                 EquipmentSlot.HEAD, EquipmentSlot.CHEST, EquipmentSlot.LEGS, EquipmentSlot.FEET
         }) {
@@ -159,7 +184,9 @@ public final class EquipmentManager {
             ItemStack candidate = mc.player.getInventory().getItem(source);
             if (armorScore(candidate) <= armorScore(current) + 0.25) continue;
             swapArmor(mc, source, equipmentSlot);
+            return true;
         }
+        return false;
     }
 
     private static int findBestArmorSlot(Minecraft mc, EquipmentSlot target) {
@@ -194,6 +221,9 @@ public final class EquipmentManager {
             default -> -1;
         };
         if (armorMenuSlot < 0) return;
+        ItemStack expected = mc.player.getInventory().getItem(inventorySlot).copy();
+        ItemStack displaced = mc.player.getItemBySlot(target).copy();
+        int expectedAfterStateId = mc.player.inventoryMenu.getStateId();
         int sourceMenuSlot = inventorySlot < 9 ? 36 + inventorySlot : inventorySlot;
         int menuId = mc.player.inventoryMenu.containerId;
         mc.gameMode.handleInventoryMouseClick(menuId, sourceMenuSlot, 0, ClickType.PICKUP, mc.player);
@@ -201,6 +231,7 @@ public final class EquipmentManager {
         if (!mc.player.inventoryMenu.getCarried().isEmpty()) {
             mc.gameMode.handleInventoryMouseClick(menuId, sourceMenuSlot, 0, ClickType.PICKUP, mc.player);
         }
+        pendingArmorSwap = new PendingArmorSwap(target, inventorySlot, expected, displaced, expectedAfterStateId);
     }
 
     private static void selectBestWeapon(Minecraft mc) {
@@ -264,5 +295,32 @@ public final class EquipmentManager {
                 "minecraft:pufferfish", "minecraft:chicken"
         ).contains(id)) return -100;
         return food.nutrition() * 4.0f + food.saturation() * 2.0f;
+    }
+
+    private static final class PendingArmorSwap {
+        private final EquipmentSlot target;
+        private final int sourceSlot;
+        private final ItemStack expected;
+        private final ItemStack expectedSource;
+        private final int stateIdBeforeClick;
+        private int ticks;
+        private int stableConfirmationTicks;
+
+        private PendingArmorSwap(EquipmentSlot target, int sourceSlot, ItemStack expected,
+                                 ItemStack expectedSource, int stateIdBeforeClick) {
+            this.target = target;
+            this.sourceSlot = sourceSlot;
+            this.expected = expected;
+            this.expectedSource = expectedSource;
+            this.stateIdBeforeClick = stateIdBeforeClick;
+        }
+
+        private boolean confirmed(Minecraft mc) {
+            boolean matches = mc.player.inventoryMenu.getStateId() != stateIdBeforeClick
+                && ItemStack.isSameItemSameComponents(mc.player.getItemBySlot(target), expected)
+                && ItemStack.isSameItemSameComponents(mc.player.getInventory().getItem(sourceSlot), expectedSource);
+            stableConfirmationTicks = matches ? stableConfirmationTicks + 1 : 0;
+            return stableConfirmationTicks >= 3;
+        }
     }
 }

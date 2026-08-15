@@ -25,7 +25,7 @@ public class InputIsolation {
     private static boolean aiSprint = false;
 
     // Control mode
-    private static boolean aiControlled = true;
+    private static boolean aiControlled = false;
     private static long lastUserActivity = 0;
     private static final long USER_TIMEOUT_MS = 10000;  // 10 seconds
     private static boolean autoReturnEnabled = false;
@@ -86,6 +86,19 @@ public class InputIsolation {
             appliedMouseState = Boolean.TRUE;
         } else {
             lastUserActivity = System.currentTimeMillis();
+            appliedMouseState = Boolean.FALSE;
+        }
+    }
+
+    /** Restore local-player input immediately for lifecycle revocation and manual takeover. */
+    public static void enterManualControl() {
+        aiControlled = false;
+        lastUserActivity = System.currentTimeMillis();
+        clearAiControls();
+        Minecraft mc = Minecraft.getInstance();
+        if (mc != null && mc.level != null && mc.player != null
+                && mc.screen == null && mc.mouseHandler != null) {
+            mc.mouseHandler.grabMouse();
             appliedMouseState = Boolean.FALSE;
         }
     }

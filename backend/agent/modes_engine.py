@@ -37,6 +37,7 @@ class Mode(ABC):
         self.active = False
         self._paused = False
         self._last_trigger: float = 0.0
+        self._request_id: str | None = None
 
     @abstractmethod
     def should_activate(self, state: dict) -> bool:
@@ -96,6 +97,8 @@ class SelfHealMode(Mode):
         super().__init__("self_heal", priority=1, interrupts=True, cooldown=10.0)
 
     def should_activate(self, state: dict) -> bool:
+        if state.get("automation_policy", {}).get("allowInventoryAutomation") is not True:
+            return False
         player = state.get("player", {})
         health = player.get("health", 20)
         max_health = player.get("max_health", 20)
@@ -103,9 +106,9 @@ class SelfHealMode(Mode):
         return health < max_health * 0.3 if max_health > 0 else health < 6
 
     def tick(self, skills, state: dict) -> str | None:
-        # Try eating food for healing
-        skills.use_item()
-        return "self_heal: using healing item"
+        result = skills.eat(healing_only=True)
+        self._request_id = result.get("req_id") if result.get("success") else None
+        return "self_heal: requested verified consumption" if result.get("success") else None
 
 
 class CowardiceMode(Mode):
@@ -136,6 +139,8 @@ class SelfDefenseMode(Mode):
         super().__init__("self_defense", priority=3, interrupts=True, cooldown=2.0)
 
     def should_activate(self, state: dict) -> bool:
+        if state.get("automation_policy", {}).get("allowAutomatedCombat") is not True:
+            return False
         entities = state.get("entities", [])
         return any(e.get("type") == "hostile" and e.get("distance", 999) < 8
                    for e in entities)
@@ -160,33 +165,16 @@ class AutoEatMode(Mode):
         super().__init__("auto_eat", priority=4, interrupts=True, cooldown=5.0)
 
     def should_activate(self, state: dict) -> bool:
+        if state.get("automation_policy", {}).get("allowInventoryAutomation") is not True:
+            return False
         player = state.get("player", {})
         hunger = player.get("hunger", 20)
         return hunger < 14
 
     def tick(self, skills, state: dict) -> str | None:
-        # Scan inventory for food items in hotbar
-        inventory = state.get("inventory", [])
-        food_slot = None
-        food_names = {"minecraft:bread", "minecraft:beef", "minecraft:porkchop", "minecraft:chicken",
-                      "minecraft:potato", "minecraft:baked_potato", "minecraft:apple", "minecraft:golden_apple",
-                      "minecraft:carrot", "minecraft:cooked_beef", "minecraft:cooked_porkchop",
-                      "minecraft:cooked_chicken", "minecraft:cooked_cod", "minecraft:cooked_salmon",
-                      "minecraft:bread", "minecraft:cookie", "minecraft:melon_slice", "minecraft:pumpkin_pie",
-                      "minecraft:mushroom_stew", "minecraft:beetroot_soup", "minecraft:suspicious_stew",
-                      "minecraft:rabbit_stew", "minecraft:steak"}
-        for item in inventory:
-            slot = item.get("slot", -1)
-            name = item.get("name", "")
-            if 0 <= slot < 9 and name in food_names:
-                food_slot = slot
-                break
-
-        if food_slot is not None:
-            skills.select_hotbar(food_slot)
-            skills.use_item()
-            return f"auto_eat: ate {food_slot}"
-        return "auto_eat: no food in hotbar"
+        result = skills.eat()
+        self._request_id = result.get("req_id") if result.get("success") else None
+        return "auto_eat: requested verified consumption" if result.get("success") else None
 
 
 class ItemCollectMode(Mode):
@@ -395,6 +383,7 @@ class ModesEngine:
         self.modes: list[Mode] = []
         self._sorted: list[Mode] = []
         self._active_mode: Optional[Mode] = None
+        self._active_request_id: str | None = None
         self._last_action: str = ""
 
     def add_mode(self, mode: Mode):
@@ -402,17 +391,13 @@ class ModesEngine:
         self._sorted = sorted(self.modes, key=lambda m: m.priority)
 
     def add_defaults(self):
-        """Add all built-in modes (matches TouhouLittleMaid activity groups).
-        Note: StuckRecoveryMode is NOT auto-triggered — only via user command."""
-        self.add_mode(SelfPreservationMode())    # CORE: survival
-        self.add_mode(SelfHealMode())            # CORE: health management
-        self.add_mode(CowardiceMode())           # PANIC: flee
-        self.add_mode(SelfDefenseMode())         # WORK: combat
-        self.add_mode(AutoEatMode())             # IDLE: eat
-        self.add_mode(ItemCollectMode())         # IDLE: collect
-        self.add_mode(TorchPlaceMode())          # WORK: utility
-        self.add_mode(HuntingMode())             # WORK: food
-        self.add_mode(FollowMasterMode())       # IDLE: follow/patrol
+        """Register only modes backed by one bounded body operation.
+
+        Immediate safety stays in Java. Combat, hunting, collection, and patrol
+        remain disabled until they have coarse-grained verified operations.
+        """
+        self.add_mode(SelfHealMode())
+        self.add_mode(AutoEatMode())
 
     def tick(self, state: dict, action_busy: bool = False) -> str | None:
         """
@@ -422,8 +407,10 @@ class ModesEngine:
         if self._active_mode:
             if self._active_mode.should_activate(state) and not self._active_mode.is_on_cooldown:
                 action = self._active_mode.tick(self.skills, state)
+                self._active_mode._mark_triggered()
                 if action:
                     self._last_action = action
+                    self._active_request_id = self._active_mode._request_id
                     logger.info("[Mode] %s: %s", self._active_mode.name, action)
                 return action
             else:
@@ -444,9 +431,10 @@ class ModesEngine:
                 mode.on_activate()
                 logger.info("[Mode] Activated: %s (priority=%d)", mode.name, mode.priority)
                 action = mode.tick(self.skills, state)
+                mode._mark_triggered()
                 if action:
                     self._last_action = action
-                    mode._mark_triggered()
+                    self._active_request_id = mode._request_id
                     logger.info("[Mode] %s: %s", mode.name, action)
                 if self.memory:
                     self.memory.record_action(f"mode:{mode.name}", True)
@@ -455,6 +443,9 @@ class ModesEngine:
         return None
 
     def reset(self):
+        if self._active_request_id:
+            self.skills.cancel_operation(self._active_request_id)
+            self._active_request_id = None
         if self._active_mode:
             self._active_mode.on_deactivate()
         self._active_mode = None

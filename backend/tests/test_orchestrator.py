@@ -83,6 +83,34 @@ class OrchestratorBodyTests(unittest.TestCase):
             self.assertEqual(outcome["requester"], "sdk")
             orchestrator.session.stop()
 
+    def test_body_lifecycle_epoch_change_invalidates_inflight_work(self):
+        body = FakeBody()
+        body.pending.append(BodyEvent("event", {
+            "event": "control_state",
+            "data": {"ai_controlled": True, "body_world_epoch": 1, "body_control_epoch": 1},
+        }))
+        with tempfile.TemporaryDirectory() as tmp:
+            state = AgentStateDB(Path(tmp) / "agent_state.db")
+            orchestrator = Orchestrator(body, storage_root=Path(tmp) / "session", legacy_root=None)
+            coordinator = TaskCoordinator(state, SkillRegistry(), body, initial_scope="default\0default")
+            orchestrator.set_task_coordinator(coordinator)
+            orchestrator.start()
+            orchestrator.tick()
+
+            run = coordinator.create_run("core.jump", {})
+            self.assertEqual(run["status"], "dispatched")
+            body.pending.append(BodyEvent("event", {
+                "event": "control_state",
+                "data": {"ai_controlled": False, "body_world_epoch": 1, "body_control_epoch": 2},
+            }))
+            orchestrator.tick()
+
+            self.assertEqual(state.get_run(run["id"])["status"], "unknown")
+            self.assertFalse(coordinator.get_status()["body_armed"])
+            orchestrator.close()
+            orchestrator.session.stop()
+            state.close()
+
     def test_malformed_state_event_does_not_block_following_valid_event(self):
         body = FakeBody()
         body.pending.extend([

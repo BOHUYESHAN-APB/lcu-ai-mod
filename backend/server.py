@@ -390,6 +390,7 @@ CONTROL_DOMAINS = {"persona", "memory", "planner", "autonomy", "actions"}
 RESERVED_BODY_COMMANDS = {"control_external", "control_builtin", "toggle_ai", "shutdown"}
 EMERGENCY_BODY_COMMANDS = {"stop_all", "disarm"}
 FENCING_FIELD = "__lcu_fencing_token"
+BODY_EPOCH_FIELDS = {"__lcu_world_epoch", "__lcu_control_epoch"}
 
 
 def _capture_control_response(event) -> None:
@@ -481,7 +482,7 @@ def _fenced_args(args: dict[str, Any], lease: dict[str, Any] | None) -> dict[str
 
 
 def _validate_public_command(command: str, args: dict[str, Any]) -> None:
-    if command in RESERVED_BODY_COMMANDS or FENCING_FIELD in args:
+    if command in RESERVED_BODY_COMMANDS or FENCING_FIELD in args or BODY_EPOCH_FIELDS.intersection(args):
         raise HTTPException(status_code=403, detail="Reserved control command or argument")
 
 

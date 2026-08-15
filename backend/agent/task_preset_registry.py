@@ -92,7 +92,8 @@ BUILTIN_TASK_PRESETS = [
     ),
     TaskPreset(
         "survival.eat", "1.0.0", "进食", "选择热键栏中的可用食物并完成一次进食。", "survival",
-        "general.eat", _schema({}), {}, examples=({"name": "进食", "parameters": {}},),
+        "general.eat", _schema({"healing_only": {"type": "boolean"}}), {},
+        examples=({"name": "进食", "parameters": {}},),
         tags=("vanilla", "survival"),
     ),
     TaskPreset(

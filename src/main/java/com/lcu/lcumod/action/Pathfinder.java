@@ -38,9 +38,11 @@ public class Pathfinder {
     private static final double STEP_UP_HEIGHT = 0.6;
     private static final double MAX_JUMP_HEIGHT = 1.2;
     private static final double MAX_DROP_HEIGHT = 3.2;
-    private static final double WAYPOINT_REACH_XZ = 0.62;
+    private static final double WAYPOINT_REACH_XZ = 0.28;
+    private static final double DESTINATION_REACH_XZ = 0.75;
     private static final double WAYPOINT_REACH_Y = 0.9;
     private static final int STUCK_TIMEOUT_TICKS = 40;
+    private static final int COLLISION_REPATH_TICKS = 8;
     private static final int MAX_SEARCH_EXPANSIONS = 2048;
 
     private static final int[][] DIRECTIONS = new int[][] {
@@ -52,8 +54,10 @@ public class Pathfinder {
     private static List<Vec3> currentPath = new ArrayList<>();
     private static int currentPathIndex = 0;
     private static boolean isNavigating = false;
-    private static Vec3 lastPosition = null;
     private static int stuckTicks = 0;
+    private static int collisionTicks = 0;
+    private static int progressPathIndex = -1;
+    private static double bestWaypointDistance = Double.POSITIVE_INFINITY;
     private static String lastFailureReason = "";
     private static Vec3 resolvedGoalPos = null;
     private static final NavigationSession navigationSession = new NavigationSession();
@@ -80,6 +84,9 @@ public class Pathfinder {
             return false;
         }
         boolean retargeted = decision == NavigationSession.StartDecision.RETARGETED;
+        if (retargeted && targetPos != null && targetPos.distanceToSqr(requestedTarget) < 0.25) {
+            return true;
+        }
         if (decision == NavigationSession.StartDecision.STARTED && isNavigating) {
             clearNavigationState();
         }
@@ -88,9 +95,10 @@ public class Pathfinder {
         currentPathIndex = 0;
         isNavigating = true;
         if (!retargeted) {
-            lastPosition = null;
             stuckTicks = 0;
         }
+        resetProgressTracking();
+        HumanLikeBehavior.reset();
         lastFailureReason = "";
         boolean found = calculatePath();
         if (!found) stop();
@@ -135,6 +143,7 @@ public class Pathfinder {
     }
 
     public static void stop() {
+        BodyKernel.release(kernelOwner());
         navigationSession.clear();
         clearNavigationState();
     }
@@ -145,8 +154,11 @@ public class Pathfinder {
         currentPath.clear();
         currentPathIndex = 0;
         isNavigating = false;
-        lastPosition = null;
         stuckTicks = 0;
+        resetProgressTracking();
+        InputIsolation.setAiControlState("back", false);
+        InputIsolation.setAiControlState("left", false);
+        InputIsolation.setAiControlState("right", false);
         InputIsolation.setAiControlState("forward", false);
         InputIsolation.setAiControlState("sprint", false);
         InputIsolation.setAiControlState("jump", false);
@@ -173,14 +185,20 @@ public class Pathfinder {
         }
 
         Vec3 completionTarget = resolvedGoalPos == null ? targetPos : resolvedGoalPos;
-        if (isReached(playerPos, completionTarget)) {
+        if (isDestinationReached(playerPos, completionTarget)) {
             reportProgress(1.0, "arrived");
             reportOutcome("succeeded", "ARRIVED", "arrived");
             stop();
             return;
         }
 
-        if (isStuck(playerPos)) {
+        Vec3 progressTarget = currentPath.isEmpty() || currentPathIndex >= currentPath.size()
+            ? completionTarget
+            : currentPath.get(currentPathIndex);
+        if (isStuck(mc, playerPos, progressTarget)) {
+            InputIsolation.setAiControlState("forward", false);
+            InputIsolation.setAiControlState("sprint", false);
+            InputIsolation.setAiControlState("jump", false);
             if (!navigationSession.consumeRepathAttempt()) {
                 reportProgress(0.0, "navigation stuck after bounded retries");
                 reportOutcome("failed", "STUCK", "navigation stuck after bounded retries");
@@ -195,7 +213,7 @@ public class Pathfinder {
                 stop();
                 return;
             }
-            stuckTicks = 0;
+            resetProgressTracking();
         }
 
         if (currentPath.isEmpty() || currentPathIndex >= currentPath.size()) {
@@ -211,15 +229,22 @@ public class Pathfinder {
         }
 
         Vec3 nextPoint = currentPath.get(currentPathIndex);
-        if (isReached(playerPos, nextPoint)) {
+        if (isWaypointReached(playerPos, nextPoint)) {
             currentPathIndex++;
+            resetProgressTracking();
             if (currentPathIndex >= currentPath.size()) {
                 return;
             }
             nextPoint = currentPath.get(currentPathIndex);
         }
 
-        moveToward(mc, playerPos, nextPoint);
+        String owner = kernelOwner();
+        BodyPriority priority = navigationSession.hasOwnedOperation()
+            ? BodyPriority.FOREGROUND
+            : BodyPriority.AUTONOMY;
+        if (BodyKernel.claim(owner, priority, BodyChannel.LOCOMOTION, BodyChannel.GAZE)) {
+            moveToward(mc, playerPos, nextPoint);
+        }
     }
 
     private static boolean calculatePath() {
@@ -510,15 +535,14 @@ public class Pathfinder {
 
         boolean alignedEnoughToWalk = Math.abs(yawDiff) < 65.0f;
         boolean alignedEnoughToSprint = Math.abs(yawDiff) < 18.0f;
+        InputIsolation.setAiControlState("back", false);
+        InputIsolation.setAiControlState("left", false);
+        InputIsolation.setAiControlState("right", false);
         InputIsolation.setAiControlState("forward", alignedEnoughToWalk);
         InputIsolation.setAiControlState("sprint", MovementSystem.getLastSpeed() >= 1.0f
             && alignedEnoughToSprint && horizontalDistance > 4.0 && Math.abs(dy) < 0.2);
 
-        boolean shouldJump = dy > STEP_UP_HEIGHT || (dy > 0.18 && horizontalDistance < 1.2);
-        if (!shouldJump && mc.player != null && mc.player.onGround()) {
-            Vec3 probe = current.add(dx / horizontalDistance * 0.35, 0, dz / horizontalDistance * 0.35);
-            shouldJump = !hasHeadroom(mc.level, mc.player, new Vec3(probe.x, Math.max(current.y, target.y), probe.z));
-        }
+        boolean shouldJump = dy > STEP_UP_HEIGHT;
         InputIsolation.setAiControlState("jump", alignedEnoughToWalk && shouldJump);
     }
 
@@ -540,26 +564,45 @@ public class Pathfinder {
         return yawDiff;
     }
 
-    private static boolean isStuck(Vec3 currentPos) {
-        if (lastPosition == null) {
-            lastPosition = currentPos;
-            stuckTicks = 0;
-            return false;
+    private static boolean isStuck(Minecraft mc, Vec3 currentPos, Vec3 waypoint) {
+        if (progressPathIndex != currentPathIndex) {
+            resetProgressTracking();
+            progressPathIndex = currentPathIndex;
         }
 
-        if (lastPosition.distanceTo(currentPos) < 0.05) {
-            stuckTicks++;
-        } else {
+        double distance = horizontalDistance(currentPos, waypoint);
+        if (distance + 0.05 < bestWaypointDistance) {
+            bestWaypointDistance = distance;
             stuckTicks = 0;
-            lastPosition = currentPos;
+        } else {
+            stuckTicks++;
         }
-        return stuckTicks >= STUCK_TIMEOUT_TICKS;
+
+        collisionTicks = mc.player != null && mc.player.horizontalCollision ? collisionTicks + 1 : 0;
+        return stuckTicks >= STUCK_TIMEOUT_TICKS || collisionTicks >= COLLISION_REPATH_TICKS;
     }
 
-    private static boolean isReached(Vec3 current, Vec3 target) {
-        return Math.abs(current.x - target.x) <= WAYPOINT_REACH_XZ
-            && Math.abs(current.z - target.z) <= WAYPOINT_REACH_XZ
+    private static void resetProgressTracking() {
+        stuckTicks = 0;
+        collisionTicks = 0;
+        progressPathIndex = -1;
+        bestWaypointDistance = Double.POSITIVE_INFINITY;
+    }
+
+    private static boolean isWaypointReached(Vec3 current, Vec3 target) {
+        return horizontalDistance(current, target) <= WAYPOINT_REACH_XZ
             && Math.abs(current.y - target.y) <= WAYPOINT_REACH_Y;
+    }
+
+    private static boolean isDestinationReached(Vec3 current, Vec3 target) {
+        return horizontalDistance(current, target) <= DESTINATION_REACH_XZ
+            && Math.abs(current.y - target.y) <= WAYPOINT_REACH_Y;
+    }
+
+    private static double horizontalDistance(Vec3 from, Vec3 to) {
+        double dx = from.x - to.x;
+        double dz = from.z - to.z;
+        return Math.sqrt(dx * dx + dz * dz);
     }
 
     public static boolean isNavigating() {
@@ -582,6 +625,11 @@ public class Pathfinder {
 
     public static String getLastFailureReason() {
         return lastFailureReason;
+    }
+
+    private static String kernelOwner() {
+        String requestId = navigationSession.requestId();
+        return requestId == null ? "navigation:internal" : "navigation:" + requestId;
     }
 
     public static boolean cancelOperation(String operationId, String reason) {

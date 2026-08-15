@@ -23,13 +23,15 @@ public class MovementSystem {
     }
 
     public static boolean moveTo(double x, double y, double z, float speed) {
-        lastSpeed = speed;
-        return Pathfinder.navigateTo(null, x, y, z);
+        boolean accepted = Pathfinder.navigateTo(null, x, y, z);
+        if (accepted) lastSpeed = speed;
+        return accepted;
     }
 
     public static boolean moveToOwned(String ownerId, double x, double y, double z, float speed) {
-        lastSpeed = speed;
-        return Pathfinder.navigateChild(ownerId, x, y, z);
+        boolean accepted = Pathfinder.navigateChild(ownerId, x, y, z);
+        if (accepted) lastSpeed = speed;
+        return accepted;
     }
 
     public static void stop() {

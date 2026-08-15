@@ -15,8 +15,11 @@ public class ActionExecutorBridge {
 
     @SubscribeEvent
     public static void onClientTick(ClientTickEvent.Post event) {
-        if (ClientBodyRuntime.ACTION != null) {
+        ClientBodyRuntime.onClientTick();
+        if (ClientBodyRuntime.isActuatorReady() && ClientBodyRuntime.ACTION != null) {
             ClientBodyRuntime.ACTION.onTick();
+        } else if (ClientBodyRuntime.isSidebandReady() && ClientBodyRuntime.ACTION != null) {
+            ClientBodyRuntime.ACTION.onSidebandTick();
         }
     }
 }

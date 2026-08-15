@@ -32,7 +32,7 @@ public class AIControlOverlay {
         if (mc.player == null || mc.level == null) return;
 
         var graphics = event.getGuiGraphics();
-        boolean aiOn = InputIsolation.isAiControlled();
+        boolean aiOn = ClientBodyRuntime.isArmed();
 
         // Button position: top-left corner
         int x = MARGIN;
@@ -50,7 +50,12 @@ public class AIControlOverlay {
         graphics.fill(x + BUTTON_WIDTH - 1, y, x + BUTTON_WIDTH, y + BUTTON_HEIGHT, borderColor);
 
         // Text
-        String text = aiOn ? "AI 控制中" : "你控制中";
+        String text = switch (ClientBodyRuntime.phase()) {
+            case WARMING_UP, STARTING -> "初始化中";
+            case ARMED -> "AI 控制中";
+            case FAILED -> "AI 启动失败";
+            default -> "你控制中";
+        };
         int textColor = 0xFFFFFFFF;
         int textWidth = mc.font.width(text);
         int textX = x + (BUTTON_WIDTH - textWidth) / 2;
@@ -72,7 +77,7 @@ public class AIControlOverlay {
             InputIsolation.recordUserActivity();
         }
 
-        if (InputIsolation.isAiControlled()) event.setCanceled(true);
+        if (ClientBodyRuntime.isArmed()) event.setCanceled(true);
     }
 
     /**
@@ -95,7 +100,7 @@ public class AIControlOverlay {
     @SubscribeEvent
     public static void onMouseScroll(InputEvent.MouseScrollingEvent event) {
         if (!ClientBodyRuntime.isBodyClient()) return;
-        if (InputIsolation.isAiControlled()) {
+        if (ClientBodyRuntime.isArmed()) {
             event.setCanceled(true);
         } else {
             InputIsolation.recordUserActivity();

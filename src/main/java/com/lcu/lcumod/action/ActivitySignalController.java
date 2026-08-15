@@ -38,7 +38,11 @@ public final class ActivitySignalController {
         }
 
         idleTicks++;
-        applyTransientSignals();
+        if (strafePulseTicks > 0 || sneakPulseTicks > 0) {
+            if (!BodyKernel.claim("activity-signal", BodyPriority.IDLE,
+                    BodyChannel.LOCOMOTION, BodyChannel.GAZE)) return;
+            applyTransientSignals();
+        }
 
         if (idleTicks < MIN_IDLE_BEFORE_PULSE || idleTicks < nextPulseTicks) {
             return;
@@ -50,6 +54,8 @@ public final class ActivitySignalController {
 
     private static void emitPulse(Minecraft mc) {
         if (mc.player == null) return;
+        if (!BodyKernel.claim("activity-signal", BodyPriority.IDLE,
+                BodyChannel.LOCOMOTION, BodyChannel.GAZE)) return;
 
         float yawDelta = (float) (RANDOM.nextDouble() * 12.0 - 6.0);
         float pitchDelta = (float) (RANDOM.nextDouble() * 4.0 - 2.0);

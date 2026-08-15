@@ -16,6 +16,7 @@ import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.inventory.ClickType;
+import net.minecraft.world.inventory.AbstractContainerMenu;
 import net.minecraft.world.inventory.CraftingMenu;
 import net.minecraft.world.item.crafting.RecipeHolder;
 import net.minecraft.world.item.crafting.RecipeType;
@@ -68,7 +69,8 @@ public class ActionExecutor {
     private static final Set<String> INVENTORY_COMMANDS = Set.of(
         "use_item", "select_hotbar", "equip_item", "auto_equip", "inventory_click", "container_button",
         "place_recipe", "take_item", "put_item", "drop_item", "sort_inventory",
-        "craft_item", "eat", "trade", "build", "harvest_crop_at", "place_block_at"
+        "craft_item", "eat", "trade", "build", "harvest_crop_at", "place_block_at",
+        "ui_click", "key_press", "close_container"
     );
     private static final Set<String> PERCEPTION_COMMANDS = Set.of("inspect_block", "scan_crops");
     // Jump cooldown
@@ -100,6 +102,12 @@ public class ActionExecutor {
     private static int pendingCraftOutputBaseline = 0;
     private static String pendingCraftExpectedOutput = null;
     private static int pendingCraftProcessingStallTicks = 0;
+    private static int pendingCraftOwnedMenuId = -1;
+    private static AbstractContainerMenu pendingCraftOwnedMenu;
+    private static AbstractContainerMenu pendingCraftOutputMenu;
+    private static long pendingCraftMenuOperationEpoch;
+    private static long pendingCraftMenuWorldEpoch;
+    private static long pendingCraftMenuControlEpoch;
     private static BlockPos pendingCraftStationPos = null;
     private static Vec3 pendingCraftStationStandPos = null;
     private static int pendingCraftStationUseAttempts = 0;
@@ -110,6 +118,7 @@ public class ActionExecutor {
     private static float pendingEatStartHealth = -1;
     private static float pendingEatStartAbsorption = -1;
     private static String pendingEatItemId = null;
+    private static boolean pendingEatHealingOnly = false;
     private static int pendingEatStartItemCount = -1;
     private static String pendingCollectItem = null;
     private static String pendingCollectReqId = null;
@@ -131,10 +140,15 @@ public class ActionExecutor {
     private static int pendingStorageOpenSentTick = -1;
     private static int pendingStorageOpenAttempts = 0;
     private static int pendingStorageOwnedMenuId = -1;
+    private static AbstractContainerMenu pendingStorageOwnedMenu;
+    private static long pendingStorageMenuOperationEpoch;
+    private static long pendingStorageMenuWorldEpoch;
+    private static long pendingStorageMenuControlEpoch;
     private static int pendingStorageMenuOpenTick = -1;
     private static int pendingStorageClickTick = -1;
     private static int pendingStorageClickBaseline = 0;
     private static int pendingStorageClickAttempts = 0;
+    private static long nextMenuOperationEpoch = 1;
     private static final java.util.Set<BlockPos> triedStoragePositions = new java.util.HashSet<>();
     private static String activeTaskKind = "idle";
     private static String activeTaskStatus = "idle";
@@ -150,11 +164,13 @@ public class ActionExecutor {
     private boolean movementWasAllowed = true;
     private boolean inventoryWasAllowed;
     private boolean backgroundSuspended;
+    private String strategyOwnerWas = "java";
 
     /** Called every client tick via ActionExecutorBridge (ClientTickEvent.Post). */
     public void onTick() {
         var mc = Minecraft.getInstance();
         if (mc == null || mc.level == null || mc.player == null) return;
+        BodyKernel.beginTick();
 
         // Window focus is presentation state, not body ownership. The client body
         // must continue safely when minimized or behind another window.
@@ -176,14 +192,11 @@ public class ActionExecutor {
         }
 
         enforceActivePolicies(mc);
+        enforceStrategyOwner();
+        boolean commandPending = !WireServer.commandQueue.isEmpty();
 
         // ── Input isolation (core control system) ──
         InputIsolation.tick(mc);
-
-        // Equipment automation may not steal inventory or hotbar ownership from foreground work.
-        if (ServerPolicy.inventoryAutomationAllowed() && !hasManualTask()) {
-            EquipmentManager.tick(mc);
-        }
 
         // Local survival always outranks planner, external leases, and autonomy.
         boolean safetyWasActive = SafetyReflexController.isActive();
@@ -191,9 +204,17 @@ public class ActionExecutor {
             Pathfinder.suspend(mc.player.tickCount);
             preemptForSafety();
             setTaskState("safety_reflex", "active", SafetyReflexController.stateName(), SafetyReflexController.detail(), 0.0);
-        })) {
+        }, pendingEatReqId == null && ServerPolicy.inventoryAutomationAllowed()
+                && ServerPolicy.localAutonomyAllowed())) {
             if (tickCount++ % 10 == 0) sendBehaviorSnapshot();
             return;
+        }
+
+        // Equipment automation may not steal inventory or hotbar ownership from foreground work.
+        if (ServerPolicy.inventoryAutomationAllowed()
+                && (EquipmentManager.hasPendingTransaction()
+                    || ServerPolicy.localAutonomyAllowed() && !hasManualTask() && !commandPending)) {
+            EquipmentManager.tick(mc);
         }
         if (safetyWasActive) {
             Pathfinder.resume(mc.player.tickCount);
@@ -239,14 +260,14 @@ public class ActionExecutor {
         // ── Movement system (packet-based) ──
         MovementSystem.tick(mc);
 
-        boolean optionalAutonomy = ServerPolicy.autonomousBehaviorsAllowed()
+        boolean optionalAutonomy = ServerPolicy.localAutonomyAllowed()
                 && (ClientBodyRuntime.BEHAVIORS == null || ClientBodyRuntime.BEHAVIORS.isEnabled());
 
         boolean manualTaskActive = hasManualTask();
         boolean behaviorActive = false;
 
         // ── Java-side autonomous behavior (works without backend) ──
-        if (InputIsolation.isAiControlled() && optionalAutonomy && !manualTaskActive) {
+        if (InputIsolation.isAiControlled() && optionalAutonomy && !manualTaskActive && !commandPending) {
             behaviorActive = JavaAutonomousBehavior.tick(mc);
         }
 
@@ -271,12 +292,13 @@ public class ActionExecutor {
                 && !manualTaskActive
                 && JavaAutonomousBehavior.getState() == JavaAutonomousBehavior.BehaviorState.IDLE
                 && !MovementSystem.isMoving()
-                && !Pathfinder.isNavigating()) {
+                && !Pathfinder.isNavigating()
+                && !commandPending) {
             HumanLikeBehavior.tick(mc);
         }
 
         // ── Anti-AFK subtle activity pulses ──
-        if (ServerPolicy.activitySignalsAllowed()) {
+        if (ServerPolicy.activitySignalsAllowed() && ServerPolicy.localAutonomyAllowed()) {
             ActivitySignalController.tick(mc, runtimeBusy);
         }
 
@@ -304,43 +326,61 @@ public class ActionExecutor {
         }
     }
 
+    /** Drains only manual-safe commands while F12 ownership remains with the player. */
+    public void onSidebandTick() {
+        var mc = Minecraft.getInstance();
+        if (mc == null || mc.level == null || mc.player == null) return;
+        WireServer.WireCommand cmd = WireServer.commandQueue.poll();
+        if (cmd == null) return;
+        if (!WireServer.isSidebandCommand(cmd.cmd())) {
+            sendResponse(cmd.id(), false, "BODY_DISARMED: press F12 before executing actions");
+            return;
+        }
+        executeCommand(cmd);
+    }
+
     // ── AI/User Control Toggle ──
 
     public static boolean isAiControlled() { return InputIsolation.isAiControlled(); }
+
+    /** Enter an armed world only after ClientBodyRuntime has completed warm-up. */
     public void armForWorld() {
         InputIsolation.setAiControlled(true);
-        JavaAutonomousBehavior.setEnabled(true);
+        JavaAutonomousBehavior.setEnabled(ServerPolicy.localAutonomyAllowed());
         if (ClientBodyRuntime.BEHAVIORS != null) ClientBodyRuntime.BEHAVIORS.setEnabled(true);
         sendControlStateToBackend();
     }
-    public static void setAiControlled(boolean v) { 
-        if (v != InputIsolation.isAiControlled()) {
-            toggleAiControl();
-        }
-    }
-    public static void toggleAiControl() { 
-        InputIsolation.toggleControl();
-        boolean aiNow = InputIsolation.isAiControlled();
-        if (!aiNow) {
-            InputIsolation.clearAiControls();
-            Pathfinder.cancelActiveOperation("USER_OVERRIDE", "navigation canceled: user override");
-            MovementSystem.stop();
-            followTargetName = null;
-            followTargetUuid = null;
-            followLastGoal = null;
-            backendDisconnectStopRequested = true;
-        } else {
-            InputIsolation.clearUserControls();
-        }
+
+    /** Revoke body ownership without relying on a future client tick. */
+    public void disarmForWorld() {
+        stopAllRuntime();
+        clearExternalControlLease();
+        JavaAutonomousBehavior.setEnabled(false);
+        if (ClientBodyRuntime.BEHAVIORS != null) ClientBodyRuntime.BEHAVIORS.setEnabled(false);
+        InputIsolation.enterManualControl();
+        backendDisconnectStopRequested = false;
         sendControlStateToBackend();
+    }
+
+    /** Prepare an already-created executor for a new world without arming it. */
+    public void prepareForWorldManual() {
+        clearExternalControlLease();
+        JavaAutonomousBehavior.setEnabled(false);
+        if (ClientBodyRuntime.BEHAVIORS != null) ClientBodyRuntime.BEHAVIORS.setEnabled(false);
+        InputIsolation.enterManualControl();
+        backendDisconnectStopRequested = false;
+        sendControlStateToBackend();
+    }
+
+    public static void setAiControlled(boolean v) {
+        InputIsolation.setAiControlled(v);
+    }
+    public static boolean toggleAiControl() {
+        return ClientBodyRuntime.toggleControl();
     }
     
     private static void sendControlStateToBackend() {
-        if (LCUMod.WIRE != null) {
-            JsonObject data = new JsonObject();
-            data.addProperty("ai_controlled", isAiControlled());
-            LCUMod.WIRE.sendEvent("control_state", data);
-        }
+        ClientBodyRuntime.publishControlState();
     }
 
     // ── Input State (read by Mixin) ──
@@ -443,6 +483,17 @@ public class ActionExecutor {
         activitySignalsWereAllowed = activitySignalsAllowed;
     }
 
+    private void enforceStrategyOwner() {
+        String currentOwner = ServerPolicy.autonomyStrategyOwner();
+        if (currentOwner.equals(strategyOwnerWas)) return;
+        JavaAutonomousBehavior.resetCurrentState();
+        HumanLikeBehavior.reset();
+        ActivitySignalController.reset();
+        if (Pathfinder.isNavigating() && !Pathfinder.hasActiveOperation()) MovementSystem.stop();
+        strategyOwnerWas = currentOwner;
+        sendBehaviorSnapshot();
+    }
+
     private boolean isSafetyControl(String command) {
         return switch (command) {
              case "stop_all", "disarm", "stop_digging", "cancel_operation", "control_external",
@@ -461,7 +512,14 @@ public class ActionExecutor {
         }
 
         try {
-            if (!"control_external".equals(cmd.cmd()) && !"control_builtin".equals(cmd.cmd())
+            if (!WireServer.isEpochFenceExemptCommand(cmd.cmd())) {
+                String epochError = ClientBodyRuntime.commandEpochError(cmd.args());
+                if (epochError != null) {
+                    sendResponse(cmd.id(), false, epochError);
+                    return;
+                }
+            }
+            if (!"control_external".equals(cmd.cmd()) && !WireServer.isSidebandCommand(cmd.cmd())
                     && externalControlActive && commandFencingToken(cmd) != activeFencingToken) {
                 sendResponse(cmd.id(), false, "Stale or missing control fencing token");
                 return;
@@ -486,8 +544,20 @@ public class ActionExecutor {
                 sendResponse(cmd.id(), false, "POLICY_DISABLED: surroundings collection is disabled");
                 return;
             }
-            if ("send_chat".equals(cmd.cmd()) && !ServerPolicy.chatAutomationAllowed()) {
+            if (("send_chat".equals(cmd.cmd()) || "server_command".equals(cmd.cmd()))
+                    && !ServerPolicy.chatAutomationAllowed()) {
                 sendResponse(cmd.id(), false, "POLICY_DISABLED: chat automation is disabled");
+                return;
+            }
+            String commandOwner = "command:" + cmd.id();
+            if (HAND_ACTION_COMMANDS.contains(cmd.cmd()) && !BodyKernel.claim(
+                    commandOwner, BodyPriority.BACKEND_DIRECT, BodyChannel.GAZE, BodyChannel.MAIN_HAND)) {
+                sendResponse(cmd.id(), false, "HANDS_BUSY: another operation owns gaze or main-hand control");
+                return;
+            }
+            if (INVENTORY_COMMANDS.contains(cmd.cmd()) && !BodyKernel.claim(
+                    commandOwner, BodyPriority.BACKEND_DIRECT, BodyChannel.INVENTORY)) {
+                sendResponse(cmd.id(), false, "INVENTORY_BUSY: another operation owns inventory control");
                 return;
             }
             if (diggingPos != null && HAND_ACTION_COMMANDS.contains(cmd.cmd())) {
@@ -500,6 +570,11 @@ public class ActionExecutor {
                 case "move_to" -> handleMoveTo(cmd);
                 case "look_at" -> handleLookAt(cmd);
                 case "jump" -> {
+                    if (!BodyKernel.claim("command:" + cmd.id(), BodyPriority.BACKEND_DIRECT,
+                            BodyChannel.LOCOMOTION)) {
+                        sendResponse(cmd.id(), false, "LOCOMOTION_BUSY: another operation owns movement");
+                        return;
+                    }
                     if (jumpCooldown <= 0 && mc.player.onGround()) {
                         mc.player.jumpFromGround();
                         jumpCooldown = JUMP_COOLDOWN_TICKS;
@@ -509,11 +584,11 @@ public class ActionExecutor {
                             ? "Jump on cooldown (" + jumpCooldown + " ticks)" : "Jump requires ground contact");
                     }
                 }
-                case "sneak" -> { mc.player.setShiftKeyDown(cmd.args() != null && cmd.args().has("sneak") ? cmd.args().get("sneak").getAsBoolean() : true); sendResponse(cmd.id(), true, "Sneak"); }
-                case "sprint" -> { mc.player.setSprinting(cmd.args() == null || !cmd.args().has("sprint") || cmd.args().get("sprint").getAsBoolean()); sendResponse(cmd.id(), true, "Sprint"); }
+                case "sneak" -> handleControlToggle(cmd, "sneak");
+                case "sprint" -> handleControlToggle(cmd, "sprint");
                  case "send_chat" -> handleSendChat(cmd);
                  case "server_command" -> handleServerCommand(cmd);
-                case "use_item" -> { mc.gameMode.useItem(mc.player, InteractionHand.MAIN_HAND); sendResponse(cmd.id(), true, "Item used"); }
+                case "use_item" -> handleUseItem(cmd);
                 case "select_hotbar" -> handleSelectHotbar(cmd);
                 case "attack" -> handleAttack(cmd);
                 case "stop_digging" -> handleStopDigging(cmd);
@@ -568,7 +643,7 @@ public class ActionExecutor {
                     }
                 }
                 case "behavior_disable" -> { 
-                    stopAllRuntime();
+                    stopAllRuntime(ClientBodyRuntime.isArmed());
                     if (ClientBodyRuntime.BEHAVIORS != null) {
                         ClientBodyRuntime.BEHAVIORS.setEnabled(false);
                     }
@@ -603,6 +678,10 @@ public class ActionExecutor {
     // ── Handlers ──
 
     private void handleMoveTo(WireServer.WireCommand cmd) {
+        if (hasManualTask()) {
+            sendResponse(cmd.id(), false, "CONFLICT: another foreground operation is active");
+            return;
+        }
         var args = cmd.args();
         if (args == null || !args.has("x") || !args.has("z")) {
             sendResponse(cmd.id(), false, "Missing x,z");
@@ -628,6 +707,10 @@ public class ActionExecutor {
         var args = cmd.args();
         if (args == null || !args.has("x") || !args.has("z")) {
             sendResponse(cmd.id(), false, "Missing x,z");
+            return;
+        }
+        if (!BodyKernel.claim("command:" + cmd.id(), BodyPriority.BACKEND_DIRECT, BodyChannel.GAZE)) {
+            sendResponse(cmd.id(), false, "GAZE_BUSY: another operation owns camera control");
             return;
         }
         var mc = Minecraft.getInstance();
@@ -690,6 +773,11 @@ public class ActionExecutor {
             sendResponse(cmd.id(), false, "No index");
             return;
         }
+        if (!BodyKernel.claim("command:" + cmd.id(), BodyPriority.BACKEND_DIRECT,
+                BodyChannel.INVENTORY, BodyChannel.MAIN_HAND)) {
+            sendResponse(cmd.id(), false, "INVENTORY_BUSY: another operation owns the selected item");
+            return;
+        }
         int idx = cmd.args().get("index").getAsInt();
         if (idx >= 0 && idx < 9) {
             EquipmentManager.selectHotbarSlot(Minecraft.getInstance(), idx);
@@ -708,6 +796,11 @@ public class ActionExecutor {
 
         if (!ServerPolicy.automatedCombatAllowed()) {
             sendResponse(cmd.id(), false, "POLICY_DISABLED: automated combat is disabled");
+            return;
+        }
+        if (!BodyKernel.claim("command:" + cmd.id(), BodyPriority.BACKEND_DIRECT,
+                BodyChannel.GAZE, BodyChannel.MAIN_HAND)) {
+            sendResponse(cmd.id(), false, "HANDS_BUSY: another operation owns combat controls");
             return;
         }
         if (mc.player.getAttackStrengthScale(0.5f) < 0.9f) {
@@ -808,6 +901,11 @@ public class ActionExecutor {
         }
         if (diggingReqId != null) {
             sendResponse(cmd.id(), false, "CONFLICT: another mining operation is active");
+            return;
+        }
+        if (!BodyKernel.claim("digging:" + cmd.id(), BodyPriority.FOREGROUND,
+                BodyChannel.GAZE, BodyChannel.MAIN_HAND)) {
+            sendResponse(cmd.id(), false, "HANDS_BUSY: another operation owns mining controls");
             return;
         }
         var hit = mc.hitResult;
@@ -980,8 +1078,9 @@ public class ActionExecutor {
 
     private void stopDigging(String status, String code, String message) {
         if (diggingPos != null) {
+            String kernelOwner = diggingKernelOwner();
             var mc = Minecraft.getInstance();
-            if (mc.gameMode != null) {
+            if (mc != null && mc.gameMode != null) {
                 mc.gameMode.stopDestroyBlock();
             }
             LCUMod.LOGGER.info("[Action] Stopped digging {}", diggingPos);
@@ -989,12 +1088,15 @@ public class ActionExecutor {
             diggingDir = null;
             diggingTicks = 0;
             if (status != null) sendOperationOutcome(diggingReqId, status, code, message);
+            BodyKernel.release(kernelOwner);
             diggingReqId = null;
         }
     }
 
     private void handleContinuousDigging(Minecraft mc) {
         if (diggingPos == null) return;
+        if (!BodyKernel.claim(diggingKernelOwner(), BodyPriority.FOREGROUND,
+                BodyChannel.GAZE, BodyChannel.MAIN_HAND)) return;
 
         diggingTicks++;
         if (diggingTicks > DIGGING_TIMEOUT_TICKS) {
@@ -1053,12 +1155,20 @@ public class ActionExecutor {
         }
         var mc = Minecraft.getInstance();
         if (mc.player == null) { sendResponse(cmd.id(), false, "No player"); return; }
+        if (!BodyKernel.claim("command:" + cmd.id(), BodyPriority.BACKEND_DIRECT, BodyChannel.LOCOMOTION)) {
+            sendResponse(cmd.id(), false, "LOCOMOTION_BUSY: cancel the active movement operation first");
+            return;
+        }
+        if (!externalControlActive) {
+            sendResponse(cmd.id(), false,
+                "EXTERNAL_CONTROL_REQUIRED: persistent raw controls require a fenced external lease");
+            return;
+        }
         String control = args.get("control").getAsString();
         boolean state = args.get("state").getAsBoolean();
 
         switch (control) {
             case "forward" -> {
-                if (state) { MovementSystem.stop(); } // cancel auto-nav
                 setInput("forward", state);
             }
             case "back" -> setInput("back", state);
@@ -1070,10 +1180,27 @@ public class ActionExecutor {
                     jumpCooldown = JUMP_COOLDOWN_TICKS;
                 }
             }
-            case "sneak" -> mc.player.setShiftKeyDown(state);
-            case "sprint" -> mc.player.setSprinting(state);
+            case "sneak" -> InputIsolation.setAiControlState("sneak", state);
+            case "sprint" -> InputIsolation.setAiControlState("sprint", state);
             default -> { sendResponse(cmd.id(), false, "Unknown control: " + control); return; }
         }
+        sendResponse(cmd.id(), true, control + "=" + state);
+    }
+
+    private void handleControlToggle(WireServer.WireCommand cmd, String control) {
+        if (!externalControlActive) {
+            sendResponse(cmd.id(), false,
+                "EXTERNAL_CONTROL_REQUIRED: persistent raw controls require a fenced external lease");
+            return;
+        }
+        if (!BodyKernel.claim("command:" + cmd.id(), BodyPriority.BACKEND_DIRECT,
+                BodyChannel.LOCOMOTION)) {
+            sendResponse(cmd.id(), false, "LOCOMOTION_BUSY: another operation owns movement");
+            return;
+        }
+        JsonObject args = cmd.args();
+        boolean state = args == null || !args.has(control) || args.get(control).getAsBoolean();
+        InputIsolation.setAiControlState(control, state);
         sendResponse(cmd.id(), true, control + "=" + state);
     }
 
@@ -1143,7 +1270,7 @@ public class ActionExecutor {
     }
 
     private void handleStopAll(WireServer.WireCommand cmd) {
-        stopAllRuntime();
+        stopAllRuntime(ClientBodyRuntime.isArmed());
         sendResponse(cmd.id(), true, "All stopped");
     }
 
@@ -1155,6 +1282,35 @@ public class ActionExecutor {
         } catch (Exception exception) {
             sendResponse(cmd.id(), false, "GUI observation failed: " + exception.getMessage());
         }
+    }
+
+    private String diggingKernelOwner() {
+        if (diggingReqId != null) return "digging:" + diggingReqId;
+        if (pendingCollectReqId != null && pendingCollectTargetPos != null
+                && pendingCollectTargetPos.equals(diggingPos)) {
+            return "task:" + pendingCollectReqId;
+        }
+        return "digging:internal";
+    }
+
+    private void handleUseItem(WireServer.WireCommand cmd) {
+        var mc = Minecraft.getInstance();
+        if (mc.player == null || mc.gameMode == null) {
+            sendResponse(cmd.id(), false, "No player/gameMode");
+            return;
+        }
+        if (!BodyKernel.claim("command:" + cmd.id(), BodyPriority.BACKEND_DIRECT, BodyChannel.MAIN_HAND)) {
+            sendResponse(cmd.id(), false, "HANDS_BUSY: another operation owns item use");
+            return;
+        }
+        mc.gameMode.useItem(mc.player, InteractionHand.MAIN_HAND);
+        if (mc.player.isUsingItem()) {
+            mc.gameMode.releaseUsingItem(mc.player);
+            sendResponse(cmd.id(), false,
+                "HOLD_REQUIRED: use a typed consume, shield, or charge-and-release operation");
+            return;
+        }
+        sendResponse(cmd.id(), true, "Instant item use dispatched");
     }
 
     private void handleGetKeybindings(WireServer.WireCommand cmd) {
@@ -1218,6 +1374,11 @@ public class ActionExecutor {
             sendResponse(cmd.id(), false, "Need screen_revision, x, and y");
             return;
         }
+        if (!BodyKernel.claim("command:" + cmd.id(), BodyPriority.BACKEND_DIRECT,
+                BodyChannel.GUI, BodyChannel.INVENTORY)) {
+            sendResponse(cmd.id(), false, "GUI_BUSY: another operation owns the active screen");
+            return;
+        }
         boolean clicked = GuiAutomation.click(
             Minecraft.getInstance(), args.get("screen_revision").getAsLong(),
             args.get("x").getAsDouble(), args.get("y").getAsDouble(),
@@ -1232,6 +1393,11 @@ public class ActionExecutor {
             sendResponse(cmd.id(), false, "Need screen_revision and mapping_id");
             return;
         }
+        if (!BodyKernel.claim("command:" + cmd.id(), BodyPriority.BACKEND_DIRECT,
+                BodyChannel.GUI, BodyChannel.INVENTORY)) {
+            sendResponse(cmd.id(), false, "GUI_BUSY: another operation owns the active screen");
+            return;
+        }
         boolean pressed = GuiAutomation.pressKey(
             Minecraft.getInstance(), args.get("screen_revision").getAsLong(), args.get("mapping_id").getAsString()
         );
@@ -1239,11 +1405,9 @@ public class ActionExecutor {
     }
 
     private void handleDisarm(WireServer.WireCommand cmd) {
-        stopAllRuntime();
-        if (ClientBodyRuntime.BEHAVIORS != null) ClientBodyRuntime.BEHAVIORS.setEnabled(false);
-        JavaAutonomousBehavior.setEnabled(false);
-        sendResponse(cmd.id(), true, "AI actions stopped; local ownership unchanged");
-        sendControlStateToBackend();
+        boolean disarmed = ClientBodyRuntime.disarmFromBackend();
+        sendResponse(cmd.id(), disarmed,
+            disarmed ? "AI actions stopped; manual ownership restored" : "BODY_UNAVAILABLE");
     }
 
     private void handleCancelOperation(WireServer.WireCommand cmd) {
@@ -1271,10 +1435,12 @@ public class ActionExecutor {
         }
         if (operationId.equals(pendingEatReqId)) {
             sendOperationOutcome(operationId, "cancelled", "CANCELLED", "eat cancelled by controller");
+            BodyKernel.release("eat:" + operationId);
             pendingEatReqId = null;
             pendingEatTicks = 0;
             pendingEatAttempts = 0;
             pendingEatItemId = null;
+            pendingEatHealingOnly = false;
             pendingEatStartItemCount = -1;
             var client = Minecraft.getInstance();
             if (client.player != null && client.player.isUsingItem() && client.gameMode != null) {
@@ -1309,8 +1475,13 @@ public class ActionExecutor {
     }
 
     public void stopAllRuntime() {
+        stopAllRuntime(true);
+    }
+
+    private void stopAllRuntime(boolean closeAnyOpenMenu) {
         var mc = Minecraft.getInstance();
         cancelActiveOperations("STOP_ALL", "all operations stopped");
+        BodyKernel.release("eat:" + pendingEatReqId);
         followTargetName = null;
         followTargetUuid = null;
         followReqId = null;
@@ -1326,12 +1497,18 @@ public class ActionExecutor {
         pendingCraftNoProgressAttempts = 0;
         clearPendingCraftOutput();
         pendingCraftProcessingStallTicks = 0;
+        pendingCraftOwnedMenuId = -1;
+        pendingCraftOwnedMenu = null;
+        pendingCraftMenuOperationEpoch = 0;
+        pendingCraftMenuWorldEpoch = 0;
+        pendingCraftMenuControlEpoch = 0;
         clearPendingCraftStation();
         pendingCraftGoalCount = 1;
         pendingEatReqId = null;
         pendingEatTicks = 0;
         pendingEatAttempts = 0;
         pendingEatItemId = null;
+        pendingEatHealingOnly = false;
         pendingEatStartItemCount = -1;
         clearPendingCollectTask();
         harvestCrop.cancel("STOP_ALL", "all operations stopped");
@@ -1340,13 +1517,14 @@ public class ActionExecutor {
         MovementSystem.stop();
         JavaAutonomousBehavior.resetCurrentState();
         SafetyReflexController.reset();
+        EquipmentManager.reset();
         releaseAllInputs();
-        if (mc.player != null) {
-            if (mc.gameMode != null) stopDigging();
+        stopDigging();
+        if (mc != null && mc.player != null) {
             if (mc.gameMode != null && mc.player.isUsingItem()) {
                 mc.gameMode.releaseUsingItem(mc.player);
             }
-            if (mc.player.containerMenu != null && mc.player.containerMenu != mc.player.inventoryMenu) {
+            if (closeAnyOpenMenu && mc.player.containerMenu != null && mc.player.containerMenu != mc.player.inventoryMenu) {
                 mc.player.closeContainer();
             }
         }
@@ -1361,9 +1539,11 @@ public class ActionExecutor {
 
     public void invalidateRuntime() {
         stopAllRuntime();
-        setAiControlled(false);
+        clearExternalControlLease();
+        InputIsolation.enterManualControl();
         if (ClientBodyRuntime.BEHAVIORS != null) ClientBodyRuntime.BEHAVIORS.setEnabled(false);
         JavaAutonomousBehavior.setEnabled(false);
+        backendDisconnectStopRequested = false;
     }
 
     private void cancelActiveOperations(String code, String message) {
@@ -1418,7 +1598,7 @@ public class ActionExecutor {
 
     private boolean requiresArmedBody(String command) {
         return switch (command) {
-            case "control_external", "control_builtin", "get_state", "get_inventory", "get_container",
+            case "control_builtin", "get_state", "get_inventory", "get_container", "get_recipes",
                  "inspect_block", "scan_crops", "observe_gui", "get_keybindings", "stop_all", "disarm", "cancel_operation",
                  "behavior_disable", "send_chat" -> false;
             default -> true;
@@ -1471,6 +1651,12 @@ public class ActionExecutor {
         HumanLikeBehavior.reset();
         ActivitySignalController.reset();
         sendBehaviorSnapshot();
+    }
+
+    private static void clearExternalControlLease() {
+        externalControlActive = false;
+        activeFencingToken = 0;
+        behaviorEnabledBeforeExternal = false;
     }
 
     // ── Container Interaction (mineflayer-style) ───────────────
@@ -1783,6 +1969,11 @@ public class ActionExecutor {
 
     private void handleCloseContainer(WireServer.WireCommand cmd) {
         var mc = Minecraft.getInstance();
+        if (!BodyKernel.claim("command:" + cmd.id(), BodyPriority.BACKEND_DIRECT,
+                BodyChannel.GUI, BodyChannel.INVENTORY)) {
+            sendResponse(cmd.id(), false, "GUI_BUSY: another operation owns the active screen");
+            return;
+        }
         if (mc.player != null) {
             mc.player.closeContainer();
             sendResponse(cmd.id(), true, "Container closed");
@@ -1796,6 +1987,10 @@ public class ActionExecutor {
         var args = cmd.args();
         if (args == null || !args.has("id")) {
             sendResponse(cmd.id(), false, "Need entity id");
+            return;
+        }
+        if (!BodyKernel.claim("command:" + cmd.id(), BodyPriority.BACKEND_DIRECT, BodyChannel.GAZE)) {
+            sendResponse(cmd.id(), false, "GAZE_BUSY: another operation owns camera control");
             return;
         }
         var mc = Minecraft.getInstance();
@@ -1947,6 +2142,12 @@ public class ActionExecutor {
 
         pendingCraftItem = itemName;
         pendingCraftReqId = cmd.id();
+        pendingCraftMenuOperationEpoch = nextMenuOperationEpoch++;
+        pendingCraftMenuWorldEpoch = ClientBodyRuntime.worldEpoch();
+        pendingCraftMenuControlEpoch = ClientBodyRuntime.controlEpoch();
+        pendingCraftOwnedMenu = null;
+        pendingCraftOwnedMenuId = -1;
+        pendingCraftOutputMenu = null;
         pendingCraftTicks = 0;
         pendingCraftAttempts = 0;
         pendingCraftNoProgressAttempts = 0;
@@ -2016,10 +2217,19 @@ public class ActionExecutor {
             sendResponse(cmd.id(), false, "CONFLICT: another foreground operation is active");
             return;
         }
+        if (!BodyKernel.claim("eat:" + cmd.id(), BodyPriority.FOREGROUND,
+                BodyChannel.INVENTORY, BodyChannel.MAIN_HAND)) {
+            sendResponse(cmd.id(), false, "HANDS_BUSY: another operation owns item consumption");
+            return;
+        }
 
-        EquipmentManager.ensureFoodInHotbar(mc);
-        if (!hasFoodInHotbar(mc)) {
-            sendResponse(cmd.id(), false, "No food in inventory");
+        boolean healingOnly = cmd.args() != null && cmd.args().has("healing_only")
+            && cmd.args().get("healing_only").getAsBoolean();
+        if (healingOnly) EquipmentManager.ensureHealingFoodInHotbar(mc);
+        else EquipmentManager.ensureFoodInHotbar(mc);
+        if (healingOnly ? EquipmentManager.healingFoodHotbarSlot(mc) < 0 : !hasFoodInHotbar(mc)) {
+            BodyKernel.release("eat:" + cmd.id());
+            sendResponse(cmd.id(), false, healingOnly ? "No healing food in inventory" : "No food in inventory");
             return;
         }
 
@@ -2029,11 +2239,14 @@ public class ActionExecutor {
         pendingEatStartHunger = mc.player.getFoodData().getFoodLevel();
         pendingEatStartHealth = mc.player.getHealth();
         pendingEatStartAbsorption = mc.player.getAbsorptionAmount();
+        pendingEatHealingOnly = healingOnly;
         setTaskState("eat", "running", "food", "consuming food", 0.05);
         startEating(mc);
         if (pendingEatItemId == null) {
+            BodyKernel.release("eat:" + cmd.id());
             sendResponse(cmd.id(), false, "Food could not be selected");
             pendingEatReqId = null;
+            pendingEatHealingOnly = false;
             clearTaskState();
             return;
         }
@@ -2075,6 +2288,7 @@ public class ActionExecutor {
         JsonObject data = new JsonObject();
         data.addProperty("behaviors_enabled", JavaAutonomousBehavior.isEnabled()
                 && (ClientBodyRuntime.BEHAVIORS == null || ClientBodyRuntime.BEHAVIORS.isEnabled()));
+        data.addProperty("strategy_owner", ServerPolicy.autonomyStrategyOwner());
         data.addProperty("follow_target", followTargetName == null ? "" : followTargetName);
         data.addProperty("suspended_follow_target", suspendedFollowTargetName == null ? "" : suspendedFollowTargetName);
         data.addProperty("pending_craft_item", pendingCraftItem == null ? "" : pendingCraftItem);
@@ -2091,6 +2305,12 @@ public class ActionExecutor {
         data.addProperty("navigation_failure", Pathfinder.getLastFailureReason());
         data.addProperty("active_behavior", JavaAutonomousBehavior.getState().name().toLowerCase());
         data.addProperty("movement_owner", currentMovementOwner());
+        JsonObject channelOwners = new JsonObject();
+        for (BodyChannel channel : BodyChannel.values()) {
+            String owner = BodyKernel.ownerOf(channel);
+            if (owner != null) channelOwners.addProperty(channel.name().toLowerCase(), owner);
+        }
+        data.add("channel_owners", channelOwners);
         LCUMod.WIRE.sendEvent("behavior_state", data);
     }
 
@@ -2101,6 +2321,7 @@ public class ActionExecutor {
 
     private boolean hasManualTask() {
         return Pathfinder.hasActiveOperation()
+                || diggingReqId != null
                 || followTargetName != null
                 || pendingCraftItem != null
                 || pendingEatReqId != null
@@ -2151,11 +2372,7 @@ public class ActionExecutor {
     }
 
     private void sendControlState() {
-        if (LCUMod.WIRE != null) {
-            JsonObject data = new JsonObject();
-            data.addProperty("ai_controlled", isAiControlled());
-            LCUMod.WIRE.sendEvent("control_state", data);
-        }
+        ClientBodyRuntime.publishControlState();
     }
 
     // ── Response helpers ──
@@ -2236,6 +2453,14 @@ public class ActionExecutor {
         if (pendingCraftItem == null || pendingCraftReqId == null || mc.player == null || mc.level == null || mc.gameMode == null) {
             return;
         }
+        if (!craftMenuLifecycleCurrent()) {
+            sendOperationOutcome(pendingCraftReqId, "cancelled", "MENU_EPOCH_STALE",
+                "craft menu operation became stale");
+            finishCraftTask();
+            return;
+        }
+        if (!BodyKernel.claim("task:" + pendingCraftReqId, BodyPriority.FOREGROUND,
+                BodyChannel.INVENTORY, BodyChannel.GUI, BodyChannel.MAIN_HAND)) return;
 
         if (countInventoryItem(mc, pendingCraftItem) >= pendingCraftGoalCount) {
             if (LCUMod.WIRE != null) {
@@ -2264,6 +2489,11 @@ public class ActionExecutor {
         }
 
         pendingCraftTicks++;
+        if (pendingCraftTicks > 2400) {
+            sendOperationOutcome(pendingCraftReqId, "failed", "TIMEOUT", "craft operation timed out");
+            finishCraftTask();
+            return;
+        }
         if (pendingCraftTicks % 10 != 0) {
             return;
         }
@@ -2306,6 +2536,14 @@ public class ActionExecutor {
                 }
                 return;
             }
+            if (needsTable && pendingCraftStationUseAttempts > 0) {
+                if (!claimCraftMenu(mc)) {
+                    sendOperationOutcome(pendingCraftReqId, "cancelled", "MENU_OWNERSHIP_LOST",
+                        "crafting menu is no longer owned by this operation");
+                    finishCraftTask();
+                    return;
+                }
+            }
 
             if (!needsTable
                 && mc.player.containerMenu != mc.player.inventoryMenu
@@ -2314,12 +2552,19 @@ public class ActionExecutor {
                 return;
             }
 
+            if (!claimCraftMenu(mc)) {
+                sendOperationOutcome(pendingCraftReqId, "cancelled", "MENU_OWNERSHIP_LOST",
+                    "crafting menu is no longer owned by this operation");
+                finishCraftTask();
+                return;
+            }
             pendingCraftAttempts++;
             mc.gameMode.handlePlaceRecipe(mc.player.containerMenu.containerId, step.recipe, false);
             pendingCraftAwaitingOutput = true;
             pendingCraftOutputClicked = false;
             pendingCraftOutputWaitTicks = 0;
-            pendingCraftOutputMenuId = mc.player.containerMenu.containerId;
+            pendingCraftOutputMenu = mc.player.containerMenu;
+            pendingCraftOutputMenuId = pendingCraftOutputMenu.containerId;
             pendingCraftExpectedOutput = step.itemId;
             String detail = "craft step " + pendingCraftAttempts + ": " + step.itemId + " x" + step.craftOperations;
             setTaskState("craft", "crafting", pendingCraftItem, detail, Math.min(0.9, 0.35 + pendingCraftAttempts * 0.12));
@@ -2339,6 +2584,21 @@ public class ActionExecutor {
                     sendOperationOutcome(pendingCraftReqId, "failed", "STATION_UNAVAILABLE", "need nearby " + step.stationBlockId + " for " + pendingCraftItem);
                     finishCraftTask();
                 }
+                return;
+            }
+            if (pendingCraftStationUseAttempts > 0) {
+                if (!claimCraftMenu(mc)) {
+                    sendOperationOutcome(pendingCraftReqId, "cancelled", "MENU_OWNERSHIP_LOST",
+                        "processing menu is no longer owned by this operation");
+                    finishCraftTask();
+                    return;
+                }
+            }
+
+            if (!claimCraftMenu(mc)) {
+                sendOperationOutcome(pendingCraftReqId, "cancelled", "MENU_OWNERSHIP_LOST",
+                    "processing menu is no longer owned by this operation");
+                finishCraftTask();
                 return;
             }
 
@@ -2398,9 +2658,21 @@ public class ActionExecutor {
     }
 
     private void tickPendingCraftOutput(Minecraft mc) {
+        if (!craftMenuLifecycleCurrent() || pendingCraftOutputMenu == null
+                || mc.player.containerMenu != pendingCraftOutputMenu
+                || mc.player.containerMenu.containerId != pendingCraftOutputMenuId) {
+            String operationId = pendingCraftReqId;
+            clearPendingCraftOutput();
+            if (operationId != null) {
+                sendOperationOutcome(operationId, "cancelled", "MENU_OWNERSHIP_LOST",
+                    "craft output menu changed before confirmation");
+            }
+            finishCraftTask();
+            return;
+        }
         pendingCraftOutputWaitTicks++;
         var menu = mc.player.containerMenu;
-        if (menu == null || menu.containerId != pendingCraftOutputMenuId || menu.slots.isEmpty()) {
+        if (menu.slots.isEmpty()) {
             pendingCraftNoProgressAttempts++;
             clearPendingCraftOutput();
             return;
@@ -2436,11 +2708,45 @@ public class ActionExecutor {
         pendingCraftOutputClicked = false;
         pendingCraftOutputWaitTicks = 0;
         pendingCraftOutputMenuId = -1;
+        pendingCraftOutputMenu = null;
         pendingCraftOutputBaseline = 0;
         pendingCraftExpectedOutput = null;
     }
 
+    private static boolean craftMenuLifecycleCurrent() {
+        return pendingCraftMenuOperationEpoch > 0
+            && pendingCraftMenuWorldEpoch == ClientBodyRuntime.worldEpoch()
+            && pendingCraftMenuControlEpoch == ClientBodyRuntime.controlEpoch();
+    }
+
+    private static boolean claimCraftMenu(Minecraft mc) {
+        if (!craftMenuLifecycleCurrent() || mc == null || mc.player == null || mc.player.containerMenu == null) {
+            return false;
+        }
+        AbstractContainerMenu menu = mc.player.containerMenu;
+        if (pendingCraftOwnedMenu == null) {
+            pendingCraftOwnedMenu = menu;
+            pendingCraftOwnedMenuId = menu.containerId;
+            return true;
+        }
+        return pendingCraftOwnedMenu == menu && pendingCraftOwnedMenuId == menu.containerId;
+    }
+
     private void finishCraftTask() {
+        String operationId = pendingCraftReqId;
+        if (operationId != null && Pathfinder.isOwnedBy(operationId)) Pathfinder.stop();
+        var mc = Minecraft.getInstance();
+        if (mc.player != null && pendingCraftOwnedMenu != null && mc.player.containerMenu == pendingCraftOwnedMenu
+                && mc.player.containerMenu != null
+                && mc.player.containerMenu != mc.player.inventoryMenu
+                && mc.player.containerMenu.containerId == pendingCraftOwnedMenuId) {
+            mc.player.closeContainer();
+        }
+        pendingCraftOwnedMenuId = -1;
+        pendingCraftOwnedMenu = null;
+        pendingCraftMenuOperationEpoch = 0;
+        pendingCraftMenuWorldEpoch = 0;
+        pendingCraftMenuControlEpoch = 0;
         pendingCraftItem = null;
         pendingCraftReqId = null;
         pendingCraftTicks = 0;
@@ -2508,7 +2814,8 @@ public class ActionExecutor {
         ItemEntity nearbyDrop = findNearbyCollectibleItem(mc, pendingCollectItem, 12.0);
         if (nearbyDrop != null) {
             pendingCollectTargetPos = null;
-            MovementSystem.moveTo(nearbyDrop.getX(), nearbyDrop.getY(), nearbyDrop.getZ(), 1.1f);
+            MovementSystem.moveToOwned(pendingCollectReqId,
+                nearbyDrop.getX(), nearbyDrop.getY(), nearbyDrop.getZ(), 1.1f);
             setTaskState(resolveRootTaskKind(), "collecting", pendingCollectItem, "picking up nearby drop", collectProgress(mc));
             return;
         }
@@ -2545,12 +2852,16 @@ public class ActionExecutor {
 
         double distance = mc.player.distanceToSqr(Vec3.atCenterOf(pendingCollectTargetPos));
         if (distance > 16.0) {
-            MovementSystem.moveTo(pendingCollectTargetPos.getX() + 0.5, pendingCollectTargetPos.getY(), pendingCollectTargetPos.getZ() + 0.5, 1.0f);
+            MovementSystem.moveToOwned(pendingCollectReqId,
+                pendingCollectTargetPos.getX() + 0.5, pendingCollectTargetPos.getY(),
+                pendingCollectTargetPos.getZ() + 0.5, 1.0f);
             setTaskState(resolveRootTaskKind(), "moving", pendingCollectItem, "moving to resource node", collectProgress(mc));
             return;
         }
 
         if (diggingPos == null || !pendingCollectTargetPos.equals(diggingPos)) {
+            if (!BodyKernel.claim("task:" + pendingCollectReqId, BodyPriority.FOREGROUND,
+                    BodyChannel.GAZE, BodyChannel.MAIN_HAND, BodyChannel.INVENTORY)) return;
             if (ServerPolicy.inventoryAutomationAllowed()) {
                 autoEquipForBlock(mc, pendingCollectTargetPos);
             }
@@ -2634,6 +2945,11 @@ public class ActionExecutor {
         pendingStorageTargetItem = pendingCollectItem;
         pendingStorageGoalCount = stillNeeded;
         pendingStorageStartCount = currentCount;
+        pendingStorageMenuOperationEpoch = nextMenuOperationEpoch++;
+        pendingStorageMenuWorldEpoch = ClientBodyRuntime.worldEpoch();
+        pendingStorageMenuControlEpoch = ClientBodyRuntime.controlEpoch();
+        pendingStorageOwnedMenu = null;
+        pendingStorageOwnedMenuId = -1;
         pendingStorageTicks = 0;
         triedStoragePositions.add(storagePos.immutable());
         return true;
@@ -2660,7 +2976,12 @@ public class ActionExecutor {
      * Called every tick from onTick() before tickPendingCollect.
      */
     private void tickPendingStorageRetrieve(Minecraft mc) {
-        if (pendingStoragePos == null || mc.player == null || mc.level == null || mc.gameMode == null) {
+        if (pendingStoragePos == null || pendingCollectReqId == null
+                || mc.player == null || mc.level == null || mc.gameMode == null) {
+            return;
+        }
+        if (!storageMenuLifecycleCurrent()) {
+            cleanupAndClearStorage(mc);
             return;
         }
 
@@ -2673,6 +2994,8 @@ public class ActionExecutor {
             cleanupAndClearStorage(mc);
             return;
         }
+        if (!BodyKernel.claim("task:" + pendingCollectReqId, BodyPriority.FOREGROUND,
+                BodyChannel.INVENTORY, BodyChannel.GUI, BodyChannel.MAIN_HAND)) return;
 
         pendingStorageTicks++;
         if (pendingStorageTicks > 400) {
@@ -2691,7 +3014,7 @@ public class ActionExecutor {
             if (!MovementSystem.isMoving()
                 || movementTarget == null
                 || movementTarget.distanceToSqr(pendingStorageStandPos) > 0.25) {
-                boolean started = MovementSystem.moveTo(
+                boolean started = MovementSystem.moveToOwned(pendingCollectReqId,
                     pendingStorageStandPos.x, pendingStorageStandPos.y,
                     pendingStorageStandPos.z, 1.0f);
                 if (!started) {
@@ -2719,6 +3042,7 @@ public class ActionExecutor {
                     clearPendingStorageTask();
                     return;
                 }
+                pendingStorageOwnedMenu = menu;
                 pendingStorageOwnedMenuId = menu.containerId;
                 pendingStorageMenuOpenTick = pendingStorageTicks;
                 setTaskState(resolveRootTaskKind(), "storage", pendingStorageTargetItem,
@@ -2727,6 +3051,8 @@ public class ActionExecutor {
             }
 
             if (pendingStorageOpenSentTick < 0) {
+                if (!BodyKernel.claim("task:" + pendingCollectReqId, BodyPriority.FOREGROUND,
+                        BodyChannel.GAZE, BodyChannel.MAIN_HAND)) return;
                 mc.player.lookAt(net.minecraft.commands.arguments.EntityAnchorArgument.Anchor.EYES,
                     Vec3.atCenterOf(pendingStorageInteractionPos));
                 BlockHitResult hitResult = targetedBlockHit(mc, pendingStorageInteractionPos);
@@ -2746,7 +3072,8 @@ public class ActionExecutor {
             return;
         }
 
-        if (inventoryMenu || menu.containerId != pendingStorageOwnedMenuId) {
+        if (inventoryMenu || pendingStorageOwnedMenu == null || menu != pendingStorageOwnedMenu
+                || menu.containerId != pendingStorageOwnedMenuId) {
             clearPendingStorageTask();
             return;
         }
@@ -2831,7 +3158,8 @@ public class ActionExecutor {
     }
 
     private void closeOwnedStorageMenu(Minecraft mc) {
-        if (mc.player.containerMenu != null
+        if (mc != null && mc.player != null && pendingStorageOwnedMenu != null
+            && mc.player.containerMenu == pendingStorageOwnedMenu && mc.player.containerMenu != null
             && mc.player.containerMenu != mc.player.inventoryMenu
             && mc.player.containerMenu.containerId == pendingStorageOwnedMenuId) {
             mc.player.closeContainer();
@@ -2854,10 +3182,20 @@ public class ActionExecutor {
         pendingStorageOpenSentTick = -1;
         pendingStorageOpenAttempts = 0;
         pendingStorageOwnedMenuId = -1;
+        pendingStorageOwnedMenu = null;
+        pendingStorageMenuOperationEpoch = 0;
+        pendingStorageMenuWorldEpoch = 0;
+        pendingStorageMenuControlEpoch = 0;
         pendingStorageMenuOpenTick = -1;
         pendingStorageClickTick = -1;
         pendingStorageClickBaseline = 0;
         pendingStorageClickAttempts = 0;
+    }
+
+    private static boolean storageMenuLifecycleCurrent() {
+        return pendingStorageMenuOperationEpoch > 0
+            && pendingStorageMenuWorldEpoch == ClientBodyRuntime.worldEpoch()
+            && pendingStorageMenuControlEpoch == ClientBodyRuntime.controlEpoch();
     }
 
     private record StorageApproach(BlockPos interactionPos, Vec3 standPos) {
@@ -2915,6 +3253,8 @@ public class ActionExecutor {
     }
 
     private boolean placeStationFromInventory(Minecraft mc, String stationBlockId) {
+        if (!BodyKernel.claim("task:" + pendingCraftReqId, BodyPriority.FOREGROUND,
+                BodyChannel.GAZE, BodyChannel.MAIN_HAND, BodyChannel.INVENTORY)) return true;
         int slot = findHotbarOrInventoryItem(mc, stationBlockId);
         if (slot < 0) {
             return false;
@@ -2988,7 +3328,7 @@ public class ActionExecutor {
             if (!MovementSystem.isMoving()
                 || movementTarget == null
                 || movementTarget.distanceToSqr(pendingCraftStationStandPos) > 0.25) {
-                return MovementSystem.moveTo(
+                return MovementSystem.moveToOwned(pendingCraftReqId,
                     pendingCraftStationStandPos.x,
                     pendingCraftStationStandPos.y,
                     pendingCraftStationStandPos.z,
@@ -3000,6 +3340,8 @@ public class ActionExecutor {
 
         MovementSystem.stop();
         if (pendingCraftStationUseAttempts >= 3) return false;
+        if (!BodyKernel.claim("task:" + pendingCraftReqId, BodyPriority.FOREGROUND,
+                BodyChannel.GAZE, BodyChannel.MAIN_HAND)) return true;
         mc.player.lookAt(net.minecraft.commands.arguments.EntityAnchorArgument.Anchor.EYES, Vec3.atCenterOf(stationPos));
         BlockHitResult hitResult = targetedBlockHit(mc, stationPos);
         if (hitResult == null) return true;
@@ -3192,6 +3534,8 @@ public class ActionExecutor {
         if (pendingEatReqId == null || mc.player == null || mc.gameMode == null) {
             return;
         }
+        if (!BodyKernel.claim("eat:" + pendingEatReqId, BodyPriority.FOREGROUND,
+                BodyChannel.INVENTORY, BodyChannel.MAIN_HAND)) return;
 
         pendingEatTicks++;
         if (mc.player.isUsingItem()) {
@@ -3212,10 +3556,12 @@ public class ActionExecutor {
                 LCUMod.WIRE.sendProgress(pendingEatReqId, 1.0, "eat complete");
             }
             sendOperationOutcome(pendingEatReqId, "succeeded", "CONSUMED", "eat complete");
+            BodyKernel.release("eat:" + pendingEatReqId);
             pendingEatReqId = null;
             pendingEatTicks = 0;
             pendingEatAttempts = 0;
             pendingEatItemId = null;
+            pendingEatHealingOnly = false;
             pendingEatStartItemCount = -1;
             clearTaskState();
             sendBehaviorSnapshot();
@@ -3233,10 +3579,12 @@ public class ActionExecutor {
                 LCUMod.WIRE.sendProgress(pendingEatReqId, 0.0, "eat failed or cannot start use animation");
             }
             sendOperationOutcome(pendingEatReqId, "failed", "USE_FAILED", "eat failed or cannot start use animation");
+            BodyKernel.release("eat:" + pendingEatReqId);
             pendingEatReqId = null;
             pendingEatTicks = 0;
             pendingEatAttempts = 0;
             pendingEatItemId = null;
+            pendingEatHealingOnly = false;
             pendingEatStartItemCount = -1;
             clearTaskState();
             sendBehaviorSnapshot();
@@ -3254,6 +3602,14 @@ public class ActionExecutor {
     }
 
     private void clearPendingCollectTask() {
+        String operationId = pendingCollectReqId;
+        BlockPos target = pendingCollectTargetPos;
+        if (target != null && target.equals(diggingPos)) stopDigging();
+        if (operationId != null && Pathfinder.isOwnedBy(operationId)) {
+            Pathfinder.stop();
+        } else if (Pathfinder.isNavigating() && !Pathfinder.hasActiveOperation()) {
+            MovementSystem.stop();
+        }
         pendingCollectItem = null;
         pendingCollectReqId = null;
         pendingCollectGoalCount = 0;
@@ -3262,7 +3618,7 @@ public class ActionExecutor {
         pendingCollectTicks = 0;
         pendingCollectSearchMisses = 0;
         triedStoragePositions.clear();
-        clearPendingStorageTask();
+        cleanupAndClearStorage(Minecraft.getInstance());
     }
 
     private int countInventoryItem(Minecraft mc, String itemId) {
@@ -3399,8 +3755,11 @@ public class ActionExecutor {
     }
 
     private void startEating(Minecraft mc) {
-        EquipmentManager.ensureFoodInHotbar(mc);
-        int slot = EquipmentManager.bestFoodHotbarSlot(mc);
+        if (pendingEatHealingOnly) EquipmentManager.ensureHealingFoodInHotbar(mc);
+        else EquipmentManager.ensureFoodInHotbar(mc);
+        int slot = pendingEatHealingOnly
+            ? EquipmentManager.healingFoodHotbarSlot(mc)
+            : EquipmentManager.bestFoodHotbarSlot(mc);
         if (slot < 0) return;
         EquipmentManager.selectHotbarSlot(mc, slot);
         var stack = mc.player.getInventory().getItem(slot);

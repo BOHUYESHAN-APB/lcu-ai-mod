@@ -56,9 +56,22 @@ public class StateCollector {
     private static final float HEALTH_THRESHOLD = 0.5f;     // 0.5 hearts
     private static final int FORCE_UPDATE_INTERVAL = 100;   // Force update every 5 seconds
 
+    public static void resetForWorld() {
+        tickCounter = 0;
+        lastX = Double.NaN;
+        lastY = Double.NaN;
+        lastZ = Double.NaN;
+        lastYaw = Float.NaN;
+        lastPitch = Float.NaN;
+        lastHealth = Float.NaN;
+        lastHunger = -1;
+        updateCounter = 0;
+        lastGameTime = Long.MIN_VALUE;
+    }
+
     @SubscribeEvent
     public static void onClientTick(ClientTickEvent.Post event) {
-        if (!ClientBodyRuntime.isBodyClient()) return;
+        if (!ClientBodyRuntime.isBodyClient() || !ClientBodyRuntime.isObservationReady()) return;
         tickCounter++;
         
         // Check if config is loaded before accessing it
@@ -120,6 +133,7 @@ public class StateCollector {
         
         // Skip if no significant change
         if (!hasChanged) return;
+        long collectionStarted = System.nanoTime();
         
         // Update last sent state
         lastX = p.getX();
@@ -181,7 +195,14 @@ public class StateCollector {
         runtimeContext.addProperty("server_id", mc.getCurrentServer() == null ? "singleplayer" : mc.getCurrentServer().ip);
         runtimeContext.addProperty("world_id", mc.level.dimension().location().toString());
         runtimeContext.addProperty("identity_observed", true);
+        runtimeContext.addProperty("body_world_epoch", ClientBodyRuntime.worldEpoch());
+        runtimeContext.addProperty("body_control_epoch", ClientBodyRuntime.controlEpoch());
+        runtimeContext.addProperty("body_runtime_phase", ClientBodyRuntime.phase().name().toLowerCase(java.util.Locale.ROOT));
         state.add("runtime_context", runtimeContext);
+
+        JsonObject automationPolicy = new JsonObject();
+        ServerPolicy.snapshot().forEach((key, value) -> automationPolicy.addProperty(key, value));
+        state.add("automation_policy", automationPolicy);
 
         // Inventory
         JsonArray inv = new JsonArray();
@@ -380,6 +401,11 @@ public class StateCollector {
         state.add("nearby_storage", nearbyStorage);
 
         LCUMod.WIRE.sendEvent("state_update", state);
+        long collectionNanos = System.nanoTime() - collectionStarted;
+        if (collectionNanos >= 10_000_000L) {
+            LCUMod.LOGGER.warn("[StateCollector] Snapshot took {} ms (entities={}, blocks={}, surroundings={})",
+                collectionNanos / 1_000_000L, entities.size(), nearbyBlocks.size(), collectSurroundings);
+        }
     }
 
     private static String packFingerprint() {

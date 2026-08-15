@@ -47,7 +47,7 @@ public class HumanLikeBehavior {
 
         // If we have a target, smoothly rotate toward it
         if (hasTarget) {
-            smoothRotate(mc);
+            if (BodyKernel.claim("idle-gaze", BodyPriority.IDLE, BodyChannel.GAZE)) smoothRotate(mc);
             return;
         }
 
@@ -70,6 +70,7 @@ public class HumanLikeBehavior {
         // Pick a random target (weighted)
         LookTarget chosen = weightedPick(targets);
         if (chosen != null) {
+            if (!BodyKernel.claim("idle-gaze", BodyPriority.IDLE, BodyChannel.GAZE)) return;
             // Calculate target yaw/pitch
             var p = mc.player;
             double dx = chosen.x - p.getX();

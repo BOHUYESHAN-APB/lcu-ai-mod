@@ -27,6 +27,10 @@ public class ModConfig {
             .comment("Shared wire authentication token; set MOD_WIRE_TOKEN to the same value in the backend")
             .define("wireToken", "");
 
+    public static final ModConfigSpec.IntValue WORLD_WARMUP_TICKS = BUILDER
+            .comment("Client ticks to wait after a world becomes player-ready before starting body services. 600 ticks is 30 seconds.")
+            .defineInRange("worldWarmupTicks", 600, 0, 7200);
+
     // State push interval in ticks (20 ticks = 1 second)
     public static final ModConfigSpec.IntValue STATE_INTERVAL = BUILDER
             .comment("How often (in ticks) to push full state snapshot to backend")
@@ -45,6 +49,12 @@ public class ModConfig {
     public static final ModConfigSpec.BooleanValue ENABLE_AUTONOMOUS_BEHAVIORS = BUILDER
             .comment("Enable unattended Java behaviors. Keep false on public servers unless their rules explicitly permit bots.")
             .define("enableAutonomousBehaviors", false);
+
+    public static final ModConfigSpec.ConfigValue<String> AUTONOMY_STRATEGY_OWNER = BUILDER
+            .comment("Autonomous strategy owner: java or backend. Only one side may produce autonomous goals.")
+            .define("autonomyStrategyOwner", "java",
+                    value -> value instanceof String text
+                            && (text.equalsIgnoreCase("java") || text.equalsIgnoreCase("backend")));
 
     public static final ModConfigSpec.BooleanValue ENABLE_ACTIVITY_SIGNALS = BUILDER
             .comment("Enable anti-AFK movement/look pulses. This is prohibited on many servers and defaults off.")

@@ -52,7 +52,8 @@ public final class ToolCatalog {
             stringAndCount("block_type"), List.of("block_type", "count")));
         tools.add(tool("craft_item", "operation", true, "outcome", List.of("body.move", "inventory.ui", "inventory.consume", "inventory.produce", "world.interact"),
             stringAndCount("item"), List.of("item", "count")));
-        tools.add(tool("eat", "operation", true, "outcome", List.of("inventory.consume"), emptyProperties(), List.of()));
+        tools.add(tool("eat", "operation", true, "outcome", List.of("inventory.consume"),
+            booleanProperties("healing_only"), List.of()));
         tools.add(tool("get_inventory", "immediate", false, "response", List.of("inventory.read"), emptyProperties(), List.of()));
         tools.add(tool("inspect_block", "immediate", false, "response", List.of("world.read"),
             integerProperties("x", "y", "z"), List.of("x", "y", "z")));

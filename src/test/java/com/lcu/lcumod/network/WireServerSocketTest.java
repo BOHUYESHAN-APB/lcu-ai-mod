@@ -37,6 +37,8 @@ class WireServerSocketTest {
             assertEquals(WireServer.PROTOCOL_VERSION, auth.get("protocol_version").getAsInt());
             assertEquals("body_client", auth.get("role").getAsString());
             assertTrue(auth.getAsJsonArray("tools").size() >= 10);
+            assertTrue(auth.getAsJsonArray("capabilities").asList().stream()
+                .anyMatch(capability -> capability.getAsString().equals("epoch_fencing")));
             assertTrue(auth.getAsJsonArray("tools").asList().stream()
                 .anyMatch(tool -> tool.getAsJsonObject().get("command").getAsString().equals("craft_item")));
             assertTrue(auth.getAsJsonArray("tools").asList().stream()
@@ -123,6 +125,91 @@ class WireServerSocketTest {
             assertFalse(response.get("success").getAsBoolean());
             assertEquals("BODY_UNAVAILABLE", response.get("error").getAsString());
             assertNull(WireServer.commandQueue.poll());
+        }
+    }
+
+    @Test
+    void admitsManualSafeCommandsWhileActuatorIsDisarmed() throws Exception {
+        server = new WireServer(0, "token", "body_client", () -> {});
+        server.setCommandAdmissionEnabled(false);
+        server.setSidebandAdmissionEnabled(true);
+        server.start();
+
+        try (Peer peer = new Peer(server.getBoundPort())) {
+            assertTrue(peer.authenticate("token").get("success").getAsBoolean());
+            peer.send("{\"type\":\"command\",\"id\":\"state-1\",\"cmd\":\"get_state\",\"args\":{}}");
+            WireServer.WireCommand state = awaitCommand();
+            assertEquals("get_state", state.cmd());
+
+            peer.send("{\"type\":\"command\",\"id\":\"jump-1\",\"cmd\":\"jump\",\"args\":{}}");
+            JsonObject response = peer.read();
+            assertFalse(response.get("success").getAsBoolean());
+            assertEquals("BODY_UNAVAILABLE", response.get("error").getAsString());
+        }
+    }
+
+    @Test
+    void suppressesDuplicateRequestsAndReplaysTheCachedTerminalFrame() throws Exception {
+        server = new WireServer(0, "token", "body_client", () -> {});
+        server.start();
+
+        try (Peer peer = new Peer(server.getBoundPort())) {
+            assertTrue(peer.authenticate("token").get("success").getAsBoolean());
+            String command = "{\"type\":\"command\",\"id\":\"dedupe-1\",\"cmd\":\"jump\",\"args\":{}}";
+            peer.send(command);
+            assertEquals("dedupe-1", awaitCommand().id());
+
+            peer.send(command);
+            JsonObject inFlight = peer.read();
+            assertFalse(inFlight.get("success").getAsBoolean());
+            assertEquals("REQUEST_IN_FLIGHT", inFlight.get("error").getAsString());
+            assertNull(WireServer.commandQueue.poll());
+
+            JsonObject data = new JsonObject();
+            data.addProperty("message", "jump accepted");
+            server.sendResponse("dedupe-1", true, data);
+            assertTrue(peer.read().get("success").getAsBoolean());
+
+            peer.send(command);
+            JsonObject replay = peer.read();
+            assertTrue(replay.get("success").getAsBoolean());
+            assertEquals("jump accepted", replay.getAsJsonObject("data").get("message").getAsString());
+            assertNull(WireServer.commandQueue.poll());
+
+            peer.send("{\"type\":\"command\",\"id\":\"dedupe-1\",\"cmd\":\"look_at\",\"args\":{}}");
+            JsonObject conflict = peer.read();
+            assertFalse(conflict.get("success").getAsBoolean());
+            assertEquals("REQUEST_ID_CONFLICT", conflict.get("error").getAsString());
+        }
+    }
+
+    @Test
+    void keepsOutcomeBoundCommandsInFlightUntilTheirOutcomeArrives() throws Exception {
+        server = new WireServer(0, "token", "body_client", () -> {});
+        server.start();
+
+        try (Peer peer = new Peer(server.getBoundPort())) {
+            assertTrue(peer.authenticate("token").get("success").getAsBoolean());
+            String command = "{\"type\":\"command\",\"id\":\"move-1\",\"cmd\":\"move_to\",\"args\":{}}";
+            peer.send(command);
+            assertEquals("move-1", awaitCommand().id());
+
+            JsonObject accepted = new JsonObject();
+            accepted.addProperty("message", "path accepted");
+            server.sendResponse("move-1", true, accepted);
+            assertTrue(peer.read().get("success").getAsBoolean());
+
+            peer.send(command);
+            JsonObject inFlight = peer.read();
+            assertEquals("REQUEST_IN_FLIGHT", inFlight.get("error").getAsString());
+
+            server.sendOutcome("move-1", "succeeded", "ARRIVED", "arrived");
+            assertEquals("outcome", peer.read().get("type").getAsString());
+
+            peer.send(command);
+            JsonObject replay = peer.read();
+            assertEquals("outcome", replay.get("type").getAsString());
+            assertEquals("succeeded", replay.get("status").getAsString());
         }
     }
 

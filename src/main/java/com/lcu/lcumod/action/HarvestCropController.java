@@ -72,6 +72,7 @@ final class HarvestCropController {
 
     void tick(Minecraft mc) {
         if (!isActive() || mc.player == null || mc.level == null || mc.gameMode == null) return;
+        if (phase != Phase.NAVIGATING && !claimActionChannels()) return;
         ticks++;
         phaseTicks++;
         if (ticks > 400) { fail("TIMEOUT", "crop transaction timed out"); return; }
@@ -192,6 +193,7 @@ final class HarvestCropController {
 
     private void finish(String status, String code, String message) {
         String id = operationId;
+        BodyKernel.release(kernelOwner());
         operationId = null;
         cropPos = null;
         interactionPos = null;
@@ -200,6 +202,19 @@ final class HarvestCropController {
         targetToken = null;
         phase = null;
         if (id != null && LCUMod.WIRE != null) LCUMod.WIRE.sendOutcome(id, status, code, message);
+    }
+
+    private boolean claimActionChannels() {
+        if (phase == Phase.AIM_PLANT || phase == Phase.WAIT_PLANT) {
+            return BodyKernel.claim(kernelOwner(), BodyPriority.FOREGROUND,
+                BodyChannel.GAZE, BodyChannel.MAIN_HAND, BodyChannel.INVENTORY);
+        }
+        return BodyKernel.claim(kernelOwner(), BodyPriority.FOREGROUND,
+            BodyChannel.GAZE, BodyChannel.MAIN_HAND);
+    }
+
+    private String kernelOwner() {
+        return "harvest:" + operationId;
     }
 
     private String id() { return operationId; }

@@ -2,6 +2,7 @@ package com.lcu.lcumod.action;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
+import com.lcu.lcumod.LCUMod;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -37,6 +38,8 @@ public final class PoiMemory {
     public static final int SCAN_RADIUS_Y = 6;
     public static final int INTERACTION_RADIUS = 32;
     private static final int RESCAN_INTERVAL_TICKS = 40;
+    private static final int SCAN_BLOCK_BUDGET = 512;
+    private static final long SLOW_SCAN_BATCH_NANOS = 10_000_000L;
     private static final int STALE_TICKS = 20 * 300;
     private static final int CONTENTS_STALE_TICKS = 20 * 300;
 
@@ -66,6 +69,12 @@ public final class PoiMemory {
     private static final Map<BlockPos, Integer> CONTENTS_LAST_SEEN = new HashMap<>();
     private static Object activeLevel = null;
     private static int latestTick = 0;
+    private static BlockPos scanOrigin;
+    private static int scanX;
+    private static int scanY;
+    private static int scanZ;
+    private static int scanStartedTick;
+    private static int scanVisitedBlocks;
 
     private PoiMemory() {
     }
@@ -87,39 +96,23 @@ public final class PoiMemory {
             return;
         }
         if (activeLevel != mc.level) {
-            MEMORY.clear();
-            STORAGE_CONTENTS.clear();
-            CONTENTS_LAST_SEEN.clear();
+            resetForWorld();
             activeLevel = mc.level;
         }
         latestTick = tickCount;
-        if (tickCount % RESCAN_INTERVAL_TICKS != 0) {
+        if (scanOrigin == null && tickCount % RESCAN_INTERVAL_TICKS != 0) {
             return;
         }
 
-        BlockPos origin = mc.player.blockPosition();
-        for (int dx = -SCAN_RADIUS_XZ; dx <= SCAN_RADIUS_XZ; dx++) {
-            for (int dy = -SCAN_RADIUS_Y; dy <= SCAN_RADIUS_Y; dy++) {
-                for (int dz = -SCAN_RADIUS_XZ; dz <= SCAN_RADIUS_XZ; dz++) {
-                    BlockPos pos = origin.offset(dx, dy, dz);
-                    var state = mc.level.getBlockState(pos);
-                    if (state.isAir()) continue;
-
-                    String blockId = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
-                    if (WORKSTATIONS.contains(blockId)) {
-                        MEMORY.put(pos.immutable(), new PoiEntry(blockId, "workstation", tickCount));
-                    } else if (isStorageBlock(blockId)) {
-                        BlockPos storagePos = canonicalStoragePos(pos, state);
-                        MEMORY.put(storagePos, new PoiEntry(blockId, "storage", tickCount));
-                        if (!storagePos.equals(pos)) {
-                            MEMORY.remove(pos);
-                            STORAGE_CONTENTS.remove(pos);
-                            CONTENTS_LAST_SEEN.remove(pos);
-                        }
-                    }
-                }
-            }
+        if (scanOrigin == null) beginScan(mc.player.blockPosition(), tickCount);
+        long batchStarted = System.nanoTime();
+        int visited = scanBatch(mc, tickCount);
+        long batchNanos = System.nanoTime() - batchStarted;
+        if (batchNanos >= SLOW_SCAN_BATCH_NANOS) {
+            LCUMod.LOGGER.warn("[PoiMemory] Scan batch visited {} blocks in {} ms", visited,
+                batchNanos / 1_000_000L);
         }
+        if (scanOrigin != null) return;
 
         MEMORY.entrySet().removeIf(entry -> {
             PoiEntry poi = entry.getValue();
@@ -143,6 +136,65 @@ public final class PoiMemory {
             STORAGE_CONTENTS.remove(entry.getKey());
             return true;
         });
+    }
+
+    public static void resetForWorld() {
+        MEMORY.clear();
+        STORAGE_CONTENTS.clear();
+        CONTENTS_LAST_SEEN.clear();
+        activeLevel = null;
+        scanOrigin = null;
+        scanX = -SCAN_RADIUS_XZ;
+        scanY = -SCAN_RADIUS_Y;
+        scanZ = -SCAN_RADIUS_XZ;
+        scanStartedTick = 0;
+        scanVisitedBlocks = 0;
+        latestTick = 0;
+    }
+
+    private static void beginScan(BlockPos origin, int tickCount) {
+        scanOrigin = origin.immutable();
+        scanX = -SCAN_RADIUS_XZ;
+        scanY = -SCAN_RADIUS_Y;
+        scanZ = -SCAN_RADIUS_XZ;
+        scanStartedTick = tickCount;
+        scanVisitedBlocks = 0;
+    }
+
+    private static int scanBatch(Minecraft mc, int tickCount) {
+        int visited = 0;
+        for (; visited < SCAN_BLOCK_BUDGET && scanOrigin != null; visited++) {
+            BlockPos pos = scanOrigin.offset(scanX, scanY, scanZ);
+            scanVisitedBlocks++;
+            var state = mc.level.getBlockState(pos);
+            if (!state.isAir()) {
+                String blockId = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
+                if (WORKSTATIONS.contains(blockId)) {
+                    MEMORY.put(pos.immutable(), new PoiEntry(blockId, "workstation", tickCount));
+                } else if (isStorageBlock(blockId)) {
+                    BlockPos storagePos = canonicalStoragePos(pos, state);
+                    MEMORY.put(storagePos, new PoiEntry(blockId, "storage", tickCount));
+                    if (!storagePos.equals(pos)) {
+                        MEMORY.remove(pos);
+                        STORAGE_CONTENTS.remove(pos);
+                        CONTENTS_LAST_SEEN.remove(pos);
+                    }
+                }
+            }
+            advanceScanCursor(tickCount);
+        }
+        return visited;
+    }
+
+    private static void advanceScanCursor(int tickCount) {
+        if (++scanZ <= SCAN_RADIUS_XZ) return;
+        scanZ = -SCAN_RADIUS_XZ;
+        if (++scanX <= SCAN_RADIUS_XZ) return;
+        scanX = -SCAN_RADIUS_XZ;
+        if (++scanY <= SCAN_RADIUS_Y) return;
+        LCUMod.LOGGER.info("[PoiMemory] Completed {}-block scan across {} ticks", scanVisitedBlocks,
+            Math.max(1, tickCount - scanStartedTick + 1));
+        scanOrigin = null;
     }
 
     public static BlockPos findNearest(Minecraft mc, Set<String> blockIds, int maxDistance) {

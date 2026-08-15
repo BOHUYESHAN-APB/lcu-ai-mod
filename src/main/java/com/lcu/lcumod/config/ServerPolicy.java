@@ -11,6 +11,19 @@ public final class ServerPolicy {
         return enabled(ModConfig.ENABLE_AUTONOMOUS_BEHAVIORS);
     }
 
+    public static String autonomyStrategyOwner() {
+        try {
+            String owner = ModConfig.AUTONOMY_STRATEGY_OWNER.get().trim().toLowerCase(java.util.Locale.ROOT);
+            return "backend".equals(owner) ? "backend" : "java";
+        } catch (IllegalStateException ignored) {
+            return "java";
+        }
+    }
+
+    public static boolean localAutonomyAllowed() {
+        return autonomousBehaviorsAllowed() && "java".equals(autonomyStrategyOwner());
+    }
+
     public static boolean activitySignalsAllowed() {
         return enabled(ModConfig.ENABLE_ACTIVITY_SIGNALS);
     }

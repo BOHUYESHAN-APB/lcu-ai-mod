@@ -96,6 +96,28 @@ class WireClientTests(unittest.TestCase):
         self.assertFalse(wire.is_connected)
         self.assertIsNone(wire.sock)
 
+    def test_command_attaches_learned_epoch_pair_without_mutating_args(self):
+        wire = WireClient()
+        socket = RecordingSocket()
+        wire.sock = socket
+        wire._running = True
+        args = {"x": 12}
+        wire._learn_body_epochs({
+            "type": "event",
+            "event": "control_state",
+            "data": {"body_world_epoch": 4, "body_control_epoch": 9},
+        })
+
+        wire.send_command("move_to", args, request_id="epoch-1")
+
+        payload = json.loads(socket.payloads[0].decode())
+        self.assertEqual(payload["args"], {
+            "x": 12,
+            "__lcu_world_epoch": 4,
+            "__lcu_control_epoch": 9,
+        })
+        self.assertEqual(args, {"x": 12})
+
 
 if __name__ == "__main__":
     unittest.main()

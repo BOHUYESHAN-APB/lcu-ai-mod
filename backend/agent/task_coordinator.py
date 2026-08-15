@@ -30,7 +30,8 @@ FARM_RESTORATION_CODES = {
 }
 SIDEBAND_COMMANDS = {
     "send_chat", "get_state", "get_inventory", "get_container", "get_recipes",
-    "inspect_block", "scan_crops",
+    "inspect_block", "scan_crops", "observe_gui", "get_keybindings", "stop_all",
+    "disarm", "cancel_operation", "behavior_disable", "control_builtin",
 }
 
 
@@ -523,7 +524,7 @@ class TaskCoordinator:
             self._raw_requests.clear()
             self._cancel_requests.clear()
         detail = "control ownership changed before terminal event"
-        return self.state.mark_inflight_unknown(detail) + self.state.cancel_queued_runs(detail)
+        return self.state.mark_inflight_unknown(detail)
 
     def is_busy(self) -> bool:
         with self._dispatch_lock:
@@ -610,7 +611,7 @@ class TaskCoordinator:
                 raise ValueError("a durable task run owns the companion body")
             if not sideband and self.state.get_active_lease() is not None:
                 raise LeaseConflictError("an external control lease owns the companion body")
-            if not sideband and self._raw_requests and context != "mode":
+            if not sideband and self._raw_requests:
                 raise ValueError("the companion is already executing an internal command")
             return self.dispatch_raw_command(command, dict(args))
 

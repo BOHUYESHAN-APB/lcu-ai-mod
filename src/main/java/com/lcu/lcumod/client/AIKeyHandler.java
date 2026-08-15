@@ -1,9 +1,7 @@
 package com.lcu.lcumod.client;
 
 import com.lcu.lcumod.LCUMod;
-import com.lcu.lcumod.action.ActionExecutor;
 import com.lcu.lcumod.action.InputIsolation;
-import com.lcu.lcumod.action.MovementSystem;
 import com.mojang.blaze3d.platform.InputConstants;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
@@ -33,12 +31,11 @@ public class AIKeyHandler {
     @SubscribeEvent
     public static void onKeyPress(InputEvent.Key event) {
         if (!ClientBodyRuntime.isBodyClient()) return;
+        if (event.getAction() != GLFW.GLFW_PRESS) return;
         if (TOGGLE_AI.consumeClick()) {
-            // Toggle control mode
-            ActionExecutor.toggleAiControl();
-            
-            boolean newState = ActionExecutor.isAiControlled();
-            LCUMod.LOGGER.info("[Key] AI control toggled: {}", newState);
+            boolean changed = ClientBodyRuntime.toggleControl();
+            LCUMod.LOGGER.info("[Key] F12 toggle changed={} phase={} armed={}",
+                changed, ClientBodyRuntime.phase(), ClientBodyRuntime.isArmed());
         }
     }
 

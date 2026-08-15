@@ -28,11 +28,7 @@ public class LCUModClient {
         NeoForge.EVENT_BUS.addListener(LCUModClient::onLevelUnload);
     }
 
-    /**
-     * Disable pause-on-lost-focus + raw mouse input.
-     * AI keeps running when window is unfocused.
-     * Mouse isn't captured when dragging the window.
-     */
+    /** Bootstrap only; world services wait for the player-ready warm-up gate. */
     @SubscribeEvent
     public static void onClientSetup(FMLClientSetupEvent event) {
         event.enqueueWork(() -> {
@@ -43,9 +39,10 @@ public class LCUModClient {
                 return;
             }
             ClientBodyRuntime.start();
-            var options = Minecraft.getInstance().options;
-            options.pauseOnLostFocus = false;
-            LCUMod.LOGGER.info("[LCUMod] Body client continues while unfocused; focus never changes control ownership");
+            if (ServerPolicy.backgroundExecutionAllowed()) {
+                Minecraft.getInstance().options.pauseOnLostFocus = false;
+            }
+            LCUMod.LOGGER.info("[LCUMod] Body client bootstrap loaded; world activation remains manual after warm-up");
         });
     }
 
@@ -58,15 +55,14 @@ public class LCUModClient {
     }
 
     private static void onClientPlayerClone(ClientPlayerNetworkEvent.Clone event) {
-        ClientBodyRuntime.invalidateWorld();
-        ClientBodyRuntime.activateWorld();
+        ClientBodyRuntime.onPlayerClone();
     }
 
     private static void onLevelLoad(LevelEvent.Load event) {
-        if (event.getLevel() instanceof ClientLevel) ClientBodyRuntime.activateWorld();
+        if (event.getLevel() instanceof ClientLevel) ClientBodyRuntime.beginWorldWarmup();
     }
 
     private static void onLevelUnload(LevelEvent.Unload event) {
-        if (event.getLevel() instanceof ClientLevel) ClientBodyRuntime.invalidateWorld();
+        if (event.getLevel() instanceof ClientLevel level) ClientBodyRuntime.invalidateWorld(level);
     }
 }

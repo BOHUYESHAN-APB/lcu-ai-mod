@@ -87,6 +87,10 @@ class Skills:
         """Stop all work and return control to the local player."""
         return self._send_cmd("disarm", {})
 
+    def cancel_operation(self, operation_id: str) -> dict:
+        """Cancel one operation previously accepted by the body."""
+        return self._send_cmd("cancel_operation", {"operation_id": operation_id})
+
     # ── Combat (mineflayer entities.js, mindcraft commands) ────
 
     def attack(self) -> dict:
@@ -320,9 +324,9 @@ class Skills:
         """Sleep in a bed."""
         return self._send_cmd("sleep", {})
 
-    def eat(self) -> dict:
-        """Eat food from inventory."""
-        return self._send_cmd("eat", {})
+    def eat(self, healing_only: bool = False) -> dict:
+        """Consume ordinary food or require healing food such as a golden apple."""
+        return self._send_cmd("eat", {"healing_only": healing_only})
 
     def drop_item(self, item: str, count: int = 1) -> dict:
         """Drop specified item."""
