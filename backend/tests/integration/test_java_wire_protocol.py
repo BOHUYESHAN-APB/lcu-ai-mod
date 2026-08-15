@@ -73,6 +73,7 @@ class JavaWireProtocolIntegrationTests(unittest.TestCase):
                 self._tick_until(
                     orchestrator,
                     lambda: orchestrator.session.runtime.get("fixture") == "java-production-wire",
+                    timeout=15.0,
                 )
             except AssertionError:
                 # Diagnostics for platform-specific flakiness: the fixture's
@@ -101,6 +102,7 @@ class JavaWireProtocolIntegrationTests(unittest.TestCase):
             self._tick_until(
                 orchestrator,
                 lambda: state.get_run(run["id"])["status"] == "succeeded",
+                timeout=15.0,
             )
             completed = state.get_run(run["id"])
             self.assertEqual(completed["request_id"], run["id"])

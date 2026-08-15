@@ -13,10 +13,10 @@ public final class WireServerFixtureMain {
         System.out.println("READY " + server.getBoundPort());
         System.out.flush();
         long deadline = System.nanoTime() + 60_000_000_000L;
-        boolean snapshotSent = false;
+        long lastSnapshotAt = 0L;
         try {
             while (System.nanoTime() < deadline) {
-                if (server.isConnected() && !snapshotSent) {
+                if (server.isConnected() && System.nanoTime() - lastSnapshotAt >= 1_000_000_000L) {
                     JsonObject player = new JsonObject();
                     player.addProperty("health", 20.0);
                     player.addProperty("max_health", 20.0);
@@ -29,7 +29,7 @@ public final class WireServerFixtureMain {
                     state.addProperty("day_time", 100L);
                     state.addProperty("fixture", "java-production-wire");
                     server.sendEvent("state_update", state);
-                    snapshotSent = true;
+                    lastSnapshotAt = System.nanoTime();
                 }
                 WireServer.WireCommand command = WireServer.commandQueue.poll();
                 if (command != null) {
