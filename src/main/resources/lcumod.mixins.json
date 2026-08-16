@@ -4,7 +4,7 @@
   "package": "com.lcu.lcumod.mixin",
   "compatibilityLevel": "JAVA_21",
   "mixins": [],
-  "client": ["MouseHandlerMixin"],
+  "client": ["MouseHandlerMixin", "HeadlessRenderSkipMixin"],
   "injectors": {
     "defaultRequire": 1
   }

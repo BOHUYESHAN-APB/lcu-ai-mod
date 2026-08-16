@@ -1,6 +1,7 @@
 package com.lcu.lcumod;
 
 import com.lcu.lcumod.client.ClientBodyRuntime;
+import com.lcu.lcumod.client.HeadlessModeController;
 import com.lcu.lcumod.config.RuntimeRole;
 import com.lcu.lcumod.config.ServerPolicy;
 import net.minecraft.client.Minecraft;
@@ -32,6 +33,7 @@ public class LCUModClient {
     @SubscribeEvent
     public static void onClientSetup(FMLClientSetupEvent event) {
         event.enqueueWork(() -> {
+            HeadlessModeController.applyIfEnabled(Minecraft.getInstance());
             RuntimeRole role = RuntimeRole.current();
             if (!role.activatesClientBody()) {
                 LCUMod.LOGGER.info("[LCUMod] Client role {} active; actuator runtime is disabled",

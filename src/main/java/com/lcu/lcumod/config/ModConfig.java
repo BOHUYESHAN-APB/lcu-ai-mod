@@ -68,6 +68,10 @@ public class ModConfig {
             .comment("Keep the body running while Minecraft is unfocused. AI body clients require this.")
             .define("runInBackground", true);
 
+    public static final ModConfigSpec.BooleanValue HEADLESS_MODE = BUILDER
+            .comment("Reduce rendering to near-zero for unattended/headless operation: skips world rendering, caps FPS, applies a low-power preset, and iconifies the window. The game client still requires a display/GL context; this only removes the rendering cost.")
+            .define("headlessMode", false);
+
     public static final ModConfigSpec.BooleanValue AUTO_RESPAWN = BUILDER
             .comment("Automatically send respawn requests after death. Defaults off for public-server safety.")
             .define("autoRespawn", false);
