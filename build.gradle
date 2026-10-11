@@ -123,6 +123,13 @@ neoForge {
 // "optional", meaning it will not be pulled by dependents of this mod.
 configurations {
     runtimeClasspath.extendsFrom localRuntime
+
+    // 夹具（src/test 里的 WireServerFixtureMain）要**跑真实的生产 WireServer**，
+    // 因此 test 这一侧必须看到和 main 完全一样的游戏类与依赖（Gson、com.mojang:logging、
+    // NeoForge…）。moddev 插件把这些接在 main 的 compileClasspath/runtimeClasspath 上，
+    // 而 Gradle 默认只让 testImplementation 继承 implementation —— 这里显式补上。
+    testCompileClasspath.extendsFrom compileClasspath
+    testRuntimeClasspath.extendsFrom runtimeClasspath
 }
 
 dependencies {
@@ -331,6 +338,22 @@ tasks.register('verifyTitle', JavaExec) {
     dependsOn tasks.named('testClasses')
     classpath = sourceSets.test.output + sourceSets.main.output
     mainClass = 'com.lcu.lcumod.client.TitleFormatCheck'
+}
+
+// 跨语言线协议夹具：把**生产**的 WireServer（真实 accept/reader/writer/commandQueue/
+// sendEvent/sendResponse/ControlStream 分支）在无游戏客户端的情况下跑起来，供
+// backend/tests/integration 的 Python 测试连上去做真实往返。
+// 这是长驻服务，**不进 check/build**；只有显式跑 integration 时才启动：
+//   cmd /c "gradlew.bat runWireFixture -PwireFixturePort=<port>"
+// 夹具类在 src/test，永远不会进 build/libs/lcumod-*.jar。
+tasks.register('runWireFixture', JavaExec) {
+    group = 'verification'
+    description = '无游戏客户端的线协议夹具（真实 WireServer，等着后端连上来做往返）'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.lcu.lcumod.network.WireServerFixtureMain'
+    args providers.gradleProperty('wireFixturePort').getOrElse('0'),
+            providers.gradleProperty('wireFixtureBind').getOrElse('127.0.0.1')
 }
 
 tasks.named('test').configure {

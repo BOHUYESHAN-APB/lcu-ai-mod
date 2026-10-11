@@ -22,7 +22,7 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
       # `sh gradlew` works on both OS and does not depend on the exec bit
       # (gradlew is committed as 100644). `build` runs `check`, which on this
-      # branch is wired to the 13 zero-dependency `verifyXxx` JavaExec
+      # branch is wired to the 15 zero-dependency `verifyXxx` JavaExec
       # self-checks instead of JUnit (26.3 dropped JUnit — maven.neoforged.net
       # is unreachable from the build machine). Compiles against the real
       # MC 26.3 classes from the neoform dev runtime — no game client needed.
@@ -53,10 +53,43 @@ jobs:
         shell: bash
         run: python -m unittest discover -s tests
 
-  # No `integration` job: it ran `gradlew runWireFixture`, a task 26.3 does not
-  # have (the headless Java fixture `WireServerFixtureMain` went away with the
-  # JUnit-era test sources), so it could only ever fail and hide real
-  # regressions. Python-side wire checks stay in test_wire_encoding.py and
-  # test_wire_contract_block_tools.py; standing the real end-to-end fixture
-  # back up means rewriting it against 26.3's WireServer (see
-  # docs/dev/PORT_LIST.md).
+  integration:
+    name: Java wire fixture ⇄ Python backend (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: gradle/actions/setup-gradle@v4
+      # The only test that proves the two sides actually talk to each other.
+      # It launches `gradlew runWireFixture` itself — the headless fixture
+      # (`src/test/java/.../WireServerFixtureMain`, test source set, never in
+      # the mod jar) runs the **production** WireServer with no game client —
+      # and drives it through the real `protocol.wire_client.WireClient`.
+      # No `tests/integration/__init__.py` on purpose: `discover -s tests`
+      # skips non-package directories, so the 1103-test unit suite keeps its
+      # "zero skips" baseline and this heavier test is run here, explicitly.
+      # Needs no pip install: the test imports only stdlib + protocol.wire_client.
+      #
+      # The unit suite runs *first, in this same job* on purpose: if the wire
+      # fixture fails, the transcript above it still shows whether the 1103
+      # unit tests were green, so "unit green / integration red" is readable
+      # instead of being hidden by a broken fixture.
+      - name: Backend unit suite (baseline, 1103 tests, zero skips)
+        shell: bash
+        run: python -m unittest discover -s tests
+      - name: Boot the real WireServer and drive it from the backend
+        shell: bash
+        run: python -m unittest discover -s tests/integration -t tests/integration -v
