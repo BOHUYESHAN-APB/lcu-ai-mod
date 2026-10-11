@@ -22,15 +22,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agent.composites import (  # noqa: E402
-    CHECK_KINDS, CODE_CANCELLED, CODE_MISSING_ARG, CODE_PERMISSION, CODE_SKIPPED,
-    CODE_UNREGISTERED, COMPOSITE_BY_NAME, COMPOSITES, DEPOSIT_ALL, MAKE_BED,
-    STATUS_CANCELLED, STATUS_DONE, STATUS_FAILED, WHEN_FAIL, Check, Composite,
-    CompositeRejected,
-    CompositeRun, bed_craftable, composite_note, evaluate, has_item, hotbar_slot,
-    item_matches, missing_item, run_composite, slot, step, validate_composite)
+    CHECK_BED_IN_INVENTORY, CHECK_KINDS, CODE_AWAIT_TIMEOUT, CODE_CANCELLED, CODE_MISSING_ARG,
+    CODE_PERMISSION, CODE_SKIPPED, CODE_UNREGISTERED, COMPOSITE_BY_NAME, COMPOSITES,
+    DEFAULT_AWAIT_SECONDS, DEPOSIT_ALL, MAKE_BED, STATUS_CANCELLED, STATUS_DONE, STATUS_FAILED,
+    WHEN_FAIL, Check, Composite, CompositeRejected, CompositeRun, bed_craftable,
+    bed_in_inventory, composite_note, evaluate, expire_run, has_item, hotbar_slot, item_matches,
+    missing_item, run_composite, slot, step, validate_composite)
 from agent.config_store import ConfigStore, _default_config  # noqa: E402
 from agent.job_registry import (JOB_CANCELLED, JOB_DONE, JOB_FAILED,  # noqa: E402
-                               JobRegistry)
+                               JOB_RUNNING, JobRegistry)
 from agent.permissions import PermissionsStore  # noqa: E402
 from agent.planner import PHASE_GROUPS, Planner, _actions_for_phase, build_tool_schemas  # noqa: E402
 from agent.territory import TerritoryStore  # noqa: E402
@@ -75,10 +75,36 @@ class FakeActionManager:
         self.stops += 1
 
 
+class FakeClock:
+    """假钟：把"等超时"测出来（**不是定时器** —— 时间只由测试喂，代码里没有后台触发）。"""
+
+    def __init__(self, now: float = 1000.0):
+        self.now = float(now)
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += float(seconds)
+
+
+class RecordingLlm:
+    """只记"有没有被叫"（挂起/续跑**不许**引发任何模型调用）。"""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+        self.api_key = "test"
+
+    def chat(self, *args, **kwargs):
+        self.calls.append({"args": args, "kwargs": kwargs})
+        return {"content": ""}
+
+
 _UNSET = object()
 
 
-def _planner(*, craft=True, job_registry=_UNSET, skills=None, action_manager=None, **kwargs):
+def _planner(*, craft=True, job_registry=_UNSET, skills=None, action_manager=None,
+             llm_service=None, **kwargs):
     tmp = tempfile.mkdtemp()
     permissions = PermissionsStore(Path(tmp) / "permissions.json")
     permissions.set({"craft": {"guest": craft}, "containers": {"guest": craft}})
@@ -92,7 +118,7 @@ def _planner(*, craft=True, job_registry=_UNSET, skills=None, action_manager=Non
         kwargs.setdefault("job_registry", JobRegistry())
     else:
         kwargs["job_registry"] = job_registry      # 显式 None ＝"就不注入台账"
-    return Planner(llm_service=None, permissions=permissions, territory=territory,
+    return Planner(llm_service=llm_service, permissions=permissions, territory=territory,
                    action_manager=action_manager, **kwargs)
 
 
@@ -502,6 +528,340 @@ class CompositeConfigTests(unittest.TestCase):
             self.assertIs(stored["composites"]["enabled"], False)
             store.set_app_config({"composites": {"enabled": "是"}})
             self.assertTrue(store.get_composites_enabled())
+
+
+# ── 跨轮推进（挂起 → 续跑 → 走完 / 超时 / 取消 / 无僵尸）────────
+
+def _craft_context(**extra) -> dict:
+    """手里有羊毛 + 木板（够造床）、但**还没有床**：正是"合成后要等下一轮"的场景。"""
+    ctx = _ctx(inventory=[{"name": "wool", "count": 3, "slot": 9},
+                          {"name": "oak_planks", "count": 3, "slot": 10}])
+    ctx.update(extra)
+    return ctx
+
+
+def _bed_context(**extra) -> dict:
+    """下一轮的快照：床已经到手（合成结果可见）。"""
+    ctx = _ctx(inventory=[{"name": "white_bed", "count": 1, "slot": 2}])
+    ctx.update(extra)
+    return ctx
+
+
+class AwaitDeclarationTests(unittest.TestCase):
+    def test_make_bed_waits_for_the_bed_before_holding_it(self):
+        hold = MAKE_BED.steps[2]
+
+        self.assertEqual(hold.label, "hold_bed")
+        self.assertEqual(hold.await_check, CHECK_BED_IN_INVENTORY)
+        self.assertEqual(hold.await_seconds, 10.0)
+
+    def test_unknown_await_check_is_rejected_at_declaration_time(self):
+        bad = Composite("bad", "x", (step("select_hotbar", name="s",
+                                          await_check="not_a_check"),))
+
+        with self.assertRaises(CompositeRejected) as caught:
+            validate_composite(bad, is_registered=lambda name: name in TOOL_BY_NAME)
+        self.assertIn("await_check", str(caught.exception))
+
+    def test_await_seconds_must_be_positive(self):
+        bad = Composite("bad", "x", (step("select_hotbar", name="s",
+                                          await_check=CHECK_BED_IN_INVENTORY,
+                                          await_seconds=0),))
+
+        with self.assertRaises(CompositeRejected):
+            validate_composite(bad, is_registered=lambda name: name in TOOL_BY_NAME)
+        self.assertGreater(DEFAULT_AWAIT_SECONDS, 0, "默认上限必须是正数（不许无限等）")
+
+    def test_bed_in_inventory_is_a_declarative_check(self):
+        self.assertEqual(bed_in_inventory().kind, CHECK_BED_IN_INVENTORY)
+        self.assertIn(CHECK_BED_IN_INVENTORY, CHECK_KINDS)
+        met, _code, detail, _how = evaluate(bed_in_inventory(), {"inventory": []})
+        self.assertFalse(met)
+        self.assertIn("还没有床", detail)
+        self.assertTrue(evaluate(bed_in_inventory(),
+                                 {"inventory": [{"name": "red_bed", "count": 1}]})[0])
+
+    def test_no_background_trigger_machinery_in_the_module(self):
+        """挂起靠**既有轮次**推进：这个模块里不许出现线程/定时器/asyncio 定时 ✗。"""
+        source = (Path(__file__).resolve().parent.parent / "agent" / "composites.py").read_text(
+            encoding="utf-8")
+
+        for forbidden in ("threading", "Timer", "asyncio", "schedule(", "sleep("):
+            self.assertNotIn(forbidden, source, f"复合体不许有后台触发：{forbidden}")
+
+
+class CrossTurnEngineTests(unittest.TestCase):
+    def _waiting_composite(self) -> Composite:
+        return Composite("probe_wait", "x", (
+            step("get_inventory", name="look"),
+            step("select_hotbar", {"index": 0}, name="hold",
+                 await_check=CHECK_BED_IN_INVENTORY, await_seconds=5.0),
+            step("place_block", name="place"),
+        ))
+
+    def test_unsatisfied_await_parks_and_sends_nothing(self):
+        dispatch, calls = _dispatch_recorder()
+        run = CompositeRun(self._waiting_composite(), {}, clock=FakeClock())
+        run_composite(run, dispatch=dispatch, context=_ctx())
+
+        self.assertTrue(run.parked)
+        self.assertEqual([tool for tool, _ in calls], ["get_inventory"], "等不到就一步都不发")
+        self.assertEqual((run.waiting_index, run.waiting_step, run.waiting_check), (1, "hold",
+                                                                                    CHECK_BED_IN_INVENTORY))
+        self.assertEqual(run.status, "", "挂起＝还在跑（不是失败、不是完成）")
+        self.assertIn("等「bed_in_inventory」", run.note)
+        self.assertIn("上限 5 秒", run.note)
+        self.assertEqual(run.result()["waiting"]["check"], CHECK_BED_IN_INVENTORY)
+
+    def test_resume_with_a_new_context_continues_from_the_waiting_step(self):
+        dispatch, calls = _dispatch_recorder()
+        run = CompositeRun(self._waiting_composite(), {}, clock=FakeClock())
+        run_composite(run, dispatch=dispatch, context=_ctx())
+
+        run_composite(run, dispatch=dispatch, context=_ctx(
+            inventory=[{"name": "white_bed", "count": 1, "slot": 4}]))
+
+        self.assertEqual([tool for tool, _ in calls], ["get_inventory", "select_hotbar",
+                                                       "place_block"])
+        self.assertEqual(run.status, STATUS_DONE)
+        self.assertFalse(run.parked)
+        self.assertEqual(run.progress(), 1.0)
+
+    def test_await_satisfied_at_once_never_parks(self):
+        dispatch, calls = _dispatch_recorder()
+        run = CompositeRun(self._waiting_composite(), {}, clock=FakeClock())
+        run_composite(run, dispatch=dispatch, context=_ctx(
+            inventory=[{"name": "white_bed", "count": 1, "slot": 4}]))
+
+        self.assertEqual([tool for tool, _ in calls], ["get_inventory", "select_hotbar",
+                                                       "place_block"])
+        self.assertEqual(run.status, STATUS_DONE)
+        self.assertNotIn("等「", run.note)
+
+    def test_expire_reports_step_check_and_how_long_it_waited(self):
+        clock = FakeClock()
+        run = CompositeRun(self._waiting_composite(), {}, clock=clock)
+        dispatch, _calls = _dispatch_recorder()
+        run_composite(run, dispatch=dispatch, context=_ctx())
+
+        clock.advance(5.0)
+        self.assertTrue(expire_run(run))
+        self.assertEqual(run.status, STATUS_FAILED)
+        self.assertEqual((run.failed_index, run.failed_step, run.failure_code),
+                         (2, "hold", CODE_AWAIT_TIMEOUT))
+        self.assertIn("等「bed_in_inventory」等了 5 秒", run.failure_detail)
+        self.assertIn("超过上限 5 秒", run.failure_detail)
+        self.assertIn("已经做完 look", run.note)
+        self.assertFalse(run.parked)
+
+    def test_expire_is_not_yet_due_before_the_limit(self):
+        clock = FakeClock()
+        run = CompositeRun(self._waiting_composite(), {}, clock=clock)
+        dispatch, _calls = _dispatch_recorder()
+        run_composite(run, dispatch=dispatch, context=_ctx())
+
+        clock.advance(4.9)
+        self.assertFalse(expire_run(run))
+        self.assertIsNone(run.terminal(), "没到期 ⇒ job 还是 running")
+        clock.advance(0.2)
+        verdict = run.terminal()
+
+        self.assertEqual(verdict["status"], STATUS_FAILED)
+        self.assertEqual(verdict["code"], CODE_AWAIT_TIMEOUT, "有界：不靠下一轮也认到期")
+
+
+class CrossTurnPlannerTests(unittest.TestCase):
+    def test_make_bed_parks_then_finishes_on_the_next_turn(self):
+        clock = FakeClock()
+        registry = JobRegistry()
+        planner = _planner(job_registry=registry, composite_clock=clock)
+
+        # 第一轮：合成下发 ⇒ 床还没到手 ⇒ 挂在第 3 步（一步都不再发）
+        self.assertTrue(planner._dispatch_tool_call("make_bed", {}, _craft_context()))
+        self.assertEqual(planner.skills.calls, ["get_inventory", "craft_via_recipe"])
+        parked = planner.parked_composites()
+        self.assertEqual(len(parked), 1)
+        self.assertEqual(parked[0]["waiting"]["step_index"], 3)
+        self.assertEqual(registry.jobs()[0].status, JOB_RUNNING)
+        registry.refresh()
+        self.assertEqual(registry.jobs()[0].progress, 0.4, "进度停在第 3 步（2/5）")
+
+        # 下一轮：喂新 context（床到了）⇒ 从等那一步接着往下，一路走完
+        clock.advance(1.0)
+        self.assertEqual(planner.resume_composites(_bed_context()), ["make_bed"])
+
+        self.assertEqual(planner.skills.calls,
+                         ["get_inventory", "craft_via_recipe", "select_hotbar", "place_block",
+                          "sleep_in_bed"])
+        self.assertEqual(planner._composite_last["status"], STATUS_DONE)
+        self.assertEqual(planner._composite_last["done"],
+                         ["check_backpack", "craft_bed", "hold_bed", "place_bed", "sleep"])
+        self.assertEqual(planner.parked_composites(), [], "走完就不该再挂账")
+        job = registry.jobs()[0]
+        self.assertEqual((job.status, job.progress), (JOB_DONE, 1.0))
+
+    def test_resume_with_a_stale_context_stays_parked_and_quiet(self):
+        clock = FakeClock()
+        llm = RecordingLlm()
+        planner = _planner(llm_service=llm, composite_clock=clock)
+        planner._dispatch_tool_call("make_bed", {}, _craft_context())
+        before = list(planner.skills.calls)
+
+        for _ in range(3):                      # 三个"安静轮次"：没有任何新东西
+            clock.advance(0.5)
+            self.assertEqual(planner.resume_composites(_craft_context()), [])
+
+        self.assertEqual(planner.skills.calls, before, "条件没满足就一步都不发")
+        self.assertEqual(len(planner.parked_composites()), 1, "仍然挂着等（有界 ✓）")
+        self.assertEqual(llm.calls, [], "挂起/续跑本身**不引发任何模型调用**")
+
+    def test_await_timeout_fails_the_job_with_the_step_code(self):
+        clock = FakeClock()
+        registry = JobRegistry()
+        planner = _planner(job_registry=registry, composite_clock=clock)
+        planner._dispatch_tool_call("make_bed", {}, _craft_context())
+
+        clock.advance(11.0)
+        self.assertEqual(planner.resume_composites(_craft_context()), ["make_bed"])
+
+        last = planner._composite_last
+        self.assertEqual((last["step_index"], last["step"], last["code"]),
+                         (3, "hold_bed", CODE_AWAIT_TIMEOUT))
+        self.assertEqual(last["done"], ["check_backpack", "craft_bed"], "前几步照实保留")
+        self.assertIn("等了 11 秒", planner._composite_note)
+        self.assertIn("上限 10 秒", planner._composite_note)
+        job = registry.jobs()[0]
+        self.assertEqual((job.status, job.failure_code), (JOB_FAILED, CODE_AWAIT_TIMEOUT))
+        self.assertEqual(job.result["step"], "hold_bed")
+        self.assertEqual(planner.parked_composites(), [], "超时就收摊，不留僵尸")
+
+    def test_parked_job_is_bounded_even_without_a_turn(self):
+        """没有"下一轮"也不会无限挂着：`jobs.refresh()` 判到期同样如实失败。"""
+        clock = FakeClock()
+        registry = JobRegistry()
+        planner = _planner(job_registry=registry, composite_clock=clock)
+        planner._dispatch_tool_call("make_bed", {}, _craft_context())
+
+        clock.advance(10.5)
+        changed = registry.refresh()
+
+        self.assertEqual([row["kind"] for row in changed], ["progress", "terminal"])
+        self.assertEqual(registry.jobs()[0].status, JOB_FAILED)
+        self.assertEqual(registry.jobs()[0].failure_code, CODE_AWAIT_TIMEOUT)
+        self.assertEqual(planner.resume_composites(_craft_context()), ["make_bed"],
+                         "已经结算过的挂起账会被收掉（无僵尸）")
+        self.assertEqual(planner.parked_composites(), [])
+
+    def test_cancel_while_parked_stops_everything(self):
+        clock = FakeClock()
+        registry = JobRegistry()
+        planner = _planner(job_registry=registry, composite_clock=clock)
+        planner._dispatch_tool_call("make_bed", {}, _craft_context())
+        craft_calls = list(planner.skills.calls)
+
+        self.assertEqual(registry.cancel_all("玩家让我停"), 1)
+        # 取消路径自己就"停当前步"（这一步之后就一步都不发了）。
+        self.assertEqual(planner.skills.calls, craft_calls + ["stop_all"])
+        stopped = list(planner.skills.calls)
+
+        clock.advance(1.0)
+        planner.resume_composites(_bed_context())
+
+        self.assertEqual(planner.skills.calls, stopped, "即使条件满足也不许再往下")
+        self.assertEqual(planner._composite_last["status"], STATUS_CANCELLED)
+        self.assertEqual(registry.jobs()[0].status, JOB_CANCELLED)
+        self.assertEqual(planner.parked_composites(), [])
+
+    def test_new_instruction_aborts_the_parked_run(self):
+        """一条别的指令（模型说停）⇒ 挂起的复合体被中止，不留僵尸。"""
+        clock = FakeClock()
+        registry = JobRegistry()
+        action_manager = FakeActionManager()
+        planner = _planner(job_registry=registry, action_manager=action_manager,
+                           composite_clock=clock)
+        planner._dispatch_tool_call("make_bed", {}, _craft_context())
+        before = list(planner.skills.calls)
+
+        self.assertTrue(planner._dispatch_tool_call("stop", {}, _craft_context()))
+
+        self.assertEqual(planner.parked_composites(), [])
+        self.assertEqual(registry.jobs()[0].status, JOB_CANCELLED)
+        self.assertEqual(action_manager.stops, 1, "走已有的停路：停当前步")
+        self.assertIn("被取消", planner._composite_note)
+        clock.advance(1.0)
+        planner.resume_composites(_bed_context())
+        self.assertEqual(planner.skills.calls, before + ["stop_all"], "取消后不再往下发")
+
+    def test_interrupt_aborts_the_parked_runs(self):
+        planner = _planner(composite_clock=FakeClock())
+        planner._dispatch_tool_call("make_bed", {}, _craft_context())
+
+        planner.interrupt()
+
+        self.assertEqual(planner.parked_composites(), [])
+        self.assertEqual(planner._composite_last["status"], STATUS_CANCELLED)
+
+    def test_multiple_parked_runs_are_all_resumed(self):
+        clock = FakeClock()
+        registry = JobRegistry()
+        planner = _planner(job_registry=registry, composite_clock=clock)
+
+        planner._dispatch_tool_call("make_bed", {}, _craft_context())
+        planner._dispatch_tool_call("make_bed", {}, _craft_context())
+
+        self.assertEqual(len(planner.parked_composites()), 2, "允许多个挂起并行 ✓")
+        clock.advance(1.0)
+        self.assertEqual(sorted(planner.resume_composites(_bed_context())),
+                         ["make_bed", "make_bed"])
+        self.assertEqual(planner.parked_composites(), [])
+        self.assertEqual([job.status for job in registry.jobs()], [JOB_DONE, JOB_DONE])
+
+    def test_switch_off_never_parks(self):
+        planner = _planner(composites_enabled=lambda: False, composite_clock=FakeClock())
+
+        self.assertFalse(planner._dispatch_tool_call("make_bed", {}, _craft_context()))
+        self.assertEqual(planner.parked_composites(), [])
+        self.assertEqual(planner.skills.calls, [])
+        self.assertEqual(planner.resume_composites(_bed_context()), [])
+
+    def test_a_normal_turn_drives_the_parked_run_forward(self):
+        """挂起的续跑就长在**既有轮次**里（`plan_and_execute`）：这一轮本来就要发生 ✓。"""
+        clock = FakeClock()
+        registry = JobRegistry()
+        llm = RecordingLlm()
+        planner = _planner(job_registry=registry, composite_clock=clock, llm_service=llm)
+        planner._dispatch_tool_call("make_bed", {}, _craft_context())
+
+        clock.advance(1.0)
+        planner.plan_and_execute("Steve", "hi", _bed_context(), "AI")
+
+        self.assertEqual(planner.skills.calls,
+                         ["get_inventory", "craft_via_recipe", "select_hotbar", "place_block",
+                          "sleep_in_bed"])
+        self.assertEqual(registry.jobs()[0].status, JOB_DONE)
+        self.assertEqual(planner.parked_composites(), [])
+        self.assertEqual(len(llm.calls), 1, "这一轮自己的模型调用；续跑自己不请模型 ✓")
+
+    def test_progress_stays_monotonic_across_park_and_resume(self):
+        clock = FakeClock()
+        registry = JobRegistry()
+        planner = _planner(job_registry=registry, composite_clock=clock)
+        samples: list[float] = []
+
+        planner._dispatch_tool_call("make_bed", {}, _craft_context())
+        registry.refresh()
+        samples.append(registry.jobs()[0].progress)
+        for step in range(3):
+            clock.advance(0.5)
+            planner.resume_composites(_craft_context())
+            registry.refresh()
+            samples.append(registry.jobs()[0].progress)
+        clock.advance(0.5)
+        planner.resume_composites(_bed_context())
+
+        self.assertEqual(samples, sorted(samples))
+        self.assertEqual(registry.jobs()[0].progress, 1.0)
+        self.assertEqual(len(planner.parked_composites()), 0)
 
 
 if __name__ == "__main__":

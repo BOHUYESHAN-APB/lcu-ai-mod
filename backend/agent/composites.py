@@ -20,15 +20,19 @@
 `COMPOSITES` 里加一条声明（UI 是将来件；注册表仍是唯一事实来源 ✓）。
 
 **如实记下的边界**（不假装）：
-- 复合体是**一次调用里把声明的几步依次下发**（与模型自己连发几个 tool call 同义）；
-  每一步的「完成」就是**该步被成功下发**（各工具自己的长任务语义不变）；
-- 跨轮推进的步（如 `haul`）**保留它自己的逐步账/回执**，复合体不重复记账、也不假装它已搬完；
-- 复合体**不重试**、**不换路绕过**：某一步被门拦下就停在那里如实回报（§10.4 验收③）。
+- 复合体按声明**依次下发**（与模型自己连发几个 tool call 同义）；某步声明了 `await_check` 而条件
+  没满足 ⇒ **挂起**（一步都不发 ✗），在**下一轮本来就要发生**的轮次里用当轮新 context 重判 ⇒
+  满足就接着往下 —— **没有后台线程/定时器/看门狗** ✗；等超时 ⇒ 如实失败（`await_timeout`）；
+- 挂起账在**内存里**（planner 按 job id 记 ⇒ 允许多个并行 ✓）：**跨进程重启不保留** ✓（重启即丢，不假装记得）；
+- 每一步的「完成」= **该步被成功下发**（各工具自己的长任务语义不变）；跨轮推进的步（如 `haul`）
+  **保留它自己的逐步账/回执**，复合体不重复记账、也不假装它已搬完；
+- 复合体**不重试**、**不换路绕过**：某一步被门拦下/等超时 ⇒ 停在那里如实回报（§10.4 验收③）。
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional
 
@@ -37,6 +41,11 @@ from .farm import cycle_step, hold_index  # 逐步账 / 热栏槽位解析：沿
 from .territory import bed_attempt, bed_note  # 造床判定：既有纯函数，不重写一份
 
 logger = logging.getLogger("composites")
+
+
+def _now() -> float:
+    """单调时钟（挂起计时用；注入只是为了测试，**没有线程/定时器** ✗）。"""
+    return time.monotonic()
 
 # 一次运行的终态：与 `job_registry.JOB_*` **同值**（那份台账认的就是这三个词）。
 # **刻意不 import job_registry** ✗：`tool_registry` 在 import 期必须保持零依赖，否则
@@ -67,6 +76,10 @@ CODE_RESOURCE = "resource_busy"              # 资源被占，本次排队（没
 CODE_BACKOFF = "backoff"                     # 刚判定卡死，处于退避窗口
 CODE_TOOL = "tool_failed"                    # 该工具自己失败（它的说法在 detail）
 CODE_CANCELLED = "step_cancelled"            # 取消：当前步已停，后面的步骤不走
+CODE_AWAIT_TIMEOUT = "await_timeout"         # 挂起等条件等超时了（等不到就如实失败）
+
+# 挂起（跨轮推进）的默认等待上限（秒）：**不许无限等** ✗ —— 步声明可以覆盖。
+DEFAULT_AWAIT_SECONDS = 10.0
 
 # 派发口回来的"门"名 → 步级 code（planner 只报门名，不在这里判权限）。
 GATE_CODES: dict[str, str] = {
@@ -85,8 +98,10 @@ CHECK_MISSING_ITEM = "missing_item"
 # "背包里没有床时，按既有判定（`territory.bed_attempt`）看能不能造"：三种结论
 # —— 已有床（跳过合成）/ 材料够（去合成）/ 缺料或周围不安全（**如实报**，停在这一步）。
 CHECK_BED_CRAFTABLE = "bed_craftable"
+# "背包里有床"（跨轮推进用：合成结果要等下一轮快照才看得见 ⇒ 挂起等它）。
+CHECK_BED_IN_INVENTORY = "bed_in_inventory"
 CHECK_KINDS: frozenset[str] = frozenset({CHECK_ALWAYS, CHECK_HAS_ITEM, CHECK_MISSING_ITEM,
-                                         CHECK_BED_CRAFTABLE})
+                                         CHECK_BED_CRAFTABLE, CHECK_BED_IN_INVENTORY})
 
 
 @dataclass(frozen=True)
@@ -112,6 +127,11 @@ def missing_item(item: str, count: int = 1) -> Check:
 def bed_craftable() -> Check:
     """「没有床就按配方合成（羊毛+木板），缺料/不安全如实报」——判定复用领地模块的纯函数。"""
     return Check(CHECK_BED_CRAFTABLE)
+
+
+def bed_in_inventory() -> Check:
+    """「背包里有床」——跨轮挂起等它（合成结果下一轮快照可见），也可当下发前的前置条件。"""
+    return Check(CHECK_BED_IN_INVENTORY)
 
 
 # ── 参数绑定（**只说"参数从哪来"**）─────────────────────────────
@@ -147,6 +167,10 @@ class CompositeStep:
     when_missing: str = WHEN_FAIL                    # 条件不成立时：停（fail）还是跳过（skip）
     optional: bool = False                           # 失败了也不终止（只如实入账，继续）
     note: str = ""                                   # 人读说明
+    # 跨轮挂起（§10.2 #4 续件）：下发这一步**之前**要先等到的**具名 check**（走已有 check 表 ✓）。
+    # 空 ＝ 不等；等不到 ⇒ **停在这一步**（一步都不发），等**下一轮**本来就要发生的轮次再判。
+    await_check: str = ""
+    await_seconds: float = DEFAULT_AWAIT_SECONDS     # 等多久（秒）；等不到 ⇒ 如实失败（有界 ✓）
 
     @property
     def label(self) -> str:
@@ -155,11 +179,13 @@ class CompositeStep:
 
 def step(tool: str, args: Optional[Mapping[str, Any]] = None, *, name: str = "",
          when: Optional[Check] = None, when_missing: str = WHEN_FAIL, optional: bool = False,
-         note: str = "") -> CompositeStep:
+         note: str = "", await_check: str = "",
+         await_seconds: float = DEFAULT_AWAIT_SECONDS) -> CompositeStep:
     """声明一步（复合体里**只**能用这个 —— 不许内联逻辑、不许直接发帧 ✗）。"""
     return CompositeStep(tool=str(tool), args=dict(args or {}), name=str(name or ""),
                          when=when, when_missing=str(when_missing), optional=bool(optional),
-                         note=str(note or ""))
+                         note=str(note or ""), await_check=str(await_check or ""),
+                         await_seconds=float(await_seconds))
 
 
 @dataclass(frozen=True)
@@ -203,6 +229,14 @@ def validate_composite(comp: Composite, *, is_registered: Callable[[str], bool])
         if item.when_missing not in WHEN_KINDS:
             raise CompositeRejected(f"复合体「{comp.name}」第 {index} 步的 when_missing 不认得："
                                     f"{item.when_missing}")
+        # 跨轮挂起：只认**已有 check 表**里的名字（不新造机制 ✗），上限必须是正数（有界 ✓）。
+        if item.await_check and item.await_check not in CHECK_KINDS:
+            raise CompositeRejected(f"复合体「{comp.name}」第 {index} 步的 await_check 不认得："
+                                    f"{item.await_check}（只认 {sorted(CHECK_KINDS)}）")
+        if not isinstance(item.await_seconds, (int, float)) \
+                or not float(item.await_seconds) > 0:
+            raise CompositeRejected(f"复合体「{comp.name}」第 {index} 步的 await_seconds "
+                                    f"必须是正数（不许无限等）：{item.await_seconds!r}")
         for key, spec in item.args.items():
             if isinstance(spec, dict) and "from" in spec and str(spec["from"]) not in SOURCES:
                 raise CompositeRejected(f"复合体「{comp.name}」第 {index} 步的参数「{key}」"
@@ -221,8 +255,9 @@ MAKE_BED = Composite(
     name="make_bed",
     description="造一张床并睡下（复合体，逐步走各自的权限门）：先看背包 → **没有床才**按配方"
                 "合成（羊毛 3 + 木板 3；缺料/周围不安全就如实报、绝不自作聪明）→ 把床切到"
-                "手上 → 就地放下（place_block，受区域保护）→ sleep_in_bed。哪一步被拦/失败"
-                "就说清是第几步、哪个 code，前面做完的步骤不抹掉",
+                "手上（**先等背包里真有床**：刚合成的床要下一轮快照才看得见，会挂着等，"
+                "等超时就如实报）→ 就地放下（place_block，受区域保护）→ sleep_in_bed。"
+                "哪一步被拦/失败就说清是第几步、哪个 code，前面做完的步骤不抹掉",
     args=(),
     steps=(
         step("get_inventory", name="check_backpack", note="看背包有没有床"),
@@ -230,7 +265,9 @@ MAKE_BED = Composite(
              when=bed_craftable(), when_missing=WHEN_FAIL,
              note="没有床才合成（缺料/未授权由这一步自己报）"),
         step("select_hotbar", {"index": slot("bed")}, name="hold_bed",
-             note="把床切到热栏里（不在热栏就如实报，不假装拿在手上）"),
+             await_check=CHECK_BED_IN_INVENTORY, await_seconds=10.0,
+             note="把床切到热栏里：先等**背包里真有床**（刚合成的床要下一轮快照才看得见 ✓）"
+                  "（不在热栏就如实报，不假装拿在手上）"),
         step("place_block", name="place_bed", note="就地放下（受区域硬保护约束）"),
         step("sleep_in_bed", name="sleep", note="躺下睡到天亮"),
     ),
@@ -306,6 +343,9 @@ def evaluate(check: Optional[Check], context: Mapping[str, Any]) -> tuple[bool, 
                     "" if have >= want else f"（背包里没有 {check.item}（要 {want} 个））", "")
         absent = have < want
         return (absent, "", "" if absent else f"（背包里已经有 {check.item} 了，不用再合成）", "")
+    if check.kind == CHECK_BED_IN_INVENTORY:
+        have = family_count(inventory_counts((context or {}).get("inventory")), "bed")
+        return (have > 0, "", "" if have > 0 else "（背包里还没有床）", "")
     if check.kind == CHECK_BED_CRAFTABLE:
         ctx = context or {}
         counts = inventory_counts(ctx.get("inventory"))
@@ -386,6 +426,41 @@ class CompositeRun:
     cancel_reason: str = ""                          # 取消原因（人读）
     _cancel_pending: bool = False                    # 还没把"停当前步"落到当前步上
     note: str = ""
+    # ── 跨轮挂起（等某个具名 check；谁挂的、从什么时候起、上限多少）──
+    job_id: str = ""                                 # 挂在哪个 job 上（planner 记册用）
+    waiting_index: int = 0                           # 等在**第几步**（0-based）
+    waiting_step: str = ""
+    waiting_check: str = ""                          # 空 ＝ 没在等（正常跑/已结束）
+    waiting_since: float = 0.0
+    wait_limit: float = 0.0
+    clock: Optional[Callable[[], float]] = None       # 计时来源（None = 真实单调钟；测试注入）
+
+    @property
+    def parked(self) -> bool:
+        """是不是正**挂着等**（等条件、还没结束）——一步都不会往下发。"""
+        return bool(self.waiting_check) and not self.status
+
+    def now(self) -> float:
+        """当前时刻（注入的钟优先；不注入就是单调钟）。"""
+        return float(self.clock()) if callable(self.clock) else _now()
+
+    def waited(self) -> float:
+        """已经等了多久（秒）。"""
+        if not self.waiting_check:
+            return 0.0
+        return max(0.0, self.now() - self.waiting_since)
+
+    def park(self, index: int, label: str, check: str, limit: float) -> None:
+        """挂起在第 `index` 步（等 `check`）：**一步都不发**，等下一轮再判（有界 ✓）。"""
+        self.waiting_index = int(index)
+        self.waiting_step = str(label)
+        self.waiting_check = str(check)
+        self.waiting_since = self.now()
+        self.wait_limit = float(limit)
+
+    def release(self) -> None:
+        """不再等（续跑到了 / 到期了 / 被取消了）。"""
+        self.waiting_check = ""
 
     # ── job 的四样门槛 ──
 
@@ -395,7 +470,12 @@ class CompositeRun:
         return min(1.0, self.index / total)
 
     def terminal(self) -> Optional[dict]:
-        """② 终止条件：步走完 ⇒ done；某步失败 ⇒ failed（带**那一步自己的 code**）；取消 ⇒ cancelled。"""
+        """② 终止条件：步走完 ⇒ done；某步失败 ⇒ failed（带**那一步自己的 code**）；取消 ⇒ cancelled。
+
+        挂起中 ⇒ None（还在跑）；**挂起到期**也在这里判（有界 ✓ —— 不靠"下一轮"才认到期）。
+        """
+        if not self.status and self.parked and self.waited() >= self.wait_limit:
+            expire_run(self)                     # 等超时 ⇒ 如实失败（`await_timeout`）
         if not self.status:
             return None
         if self.status == STATUS_FAILED:
@@ -442,6 +522,13 @@ class CompositeRun:
             "skipped": skipped,
             "steps": [dict(row) for row in self.steps],
             "note": self.note,
+            "waiting": ({
+                "step_index": self.waiting_index + 1,
+                "step": self.waiting_step,
+                "check": self.waiting_check,
+                "waited": round(self.waited(), 3),
+                "limit": self.wait_limit,
+            } if self.waiting_check else None),
         }
 
 
@@ -454,19 +541,24 @@ def _stop(run: CompositeRun, index: int, label: str, code: str, detail: str,
     run.failure_code = code
     run.failure_detail = detail
     run.status = status
+    run.release()                  # 结束了就不再"挂着等"（`parked` 与 `status` 保持一致）
 
 
 def run_composite(run: CompositeRun, *, dispatch: Callable[[str, dict, dict], Any],
                   context: Optional[dict] = None,
                   is_registered: Optional[Callable[[str], bool]] = None,
                   cancel_current: Optional[Callable[[], None]] = None) -> CompositeRun:
-    """按声明**依次**跑完几步（每一步都从**同一个派发口**出去 ⇒ 自己的门一个都不跳）。
+    """从**当前位置**按声明**依次**往下跑（每一步都从**同一个派发口**出去 ⇒ 自己的门一个都不跳）。
 
+    - 首次调用跑完（或挂起/失败）；**再次调用＝续跑**：从 `run.index` 接着往下（跨轮推进 ✓）。
+      每次都要喂**当轮的新 context**（挂起的条件就是拿它重判的）；
     - `dispatch(tool, payload, context)`：**唯一**的执行口（planner 传的是注册表驱动的
       `_dispatch_tool_call`：查注册表 → `_authorize_tool` → 资源租约 → handler）；
       返回 `bool` 或 `{ok, code, detail}`（后者能把"被哪道门拦下 + 原话"如实带回来）；
     - `cancel_current()`：取消时"停当前步"的落点（planner 传的是 `action_manager.stop`）；
-    - 失败/被拦**不重试、不换路**：停在那一步，把已完成的前几步如实留在账上。
+    - 步声明了 `await_check` 而条件**没满足** ⇒ **挂起**（一步都不发 ✗），等下一轮再判；
+      等超时 ⇒ 由 `expire_run` 如实失败（`await_timeout`，有界 ✓）；
+    - 失败/被拦/挂起**都不重试、不换路**：把已完成的前几步如实留在账上。
     """
     ctx = context if isinstance(context, dict) else {}
     registered = is_registered or is_registered_tool
@@ -488,7 +580,10 @@ def run_composite(run: CompositeRun, *, dispatch: Callable[[str, dict, dict], An
                                   detail="（复合体被取消：当前步已停，后面的步骤不再走）"))
         _stop(run, index, label, CODE_CANCELLED, "当前步已停，不再往下走", STATUS_CANCELLED)
 
-    for index, item in enumerate(run.composite.steps):
+    total = len(run.composite.steps)
+    start = max(0, min(run.index, total))
+    for index in range(start, total):
+        item = run.composite.steps[index]
         label = item.label
         if run.cancelled:
             _cancelled_here(index, label)
@@ -503,6 +598,16 @@ def run_composite(run: CompositeRun, *, dispatch: Callable[[str, dict, dict], An
                 break
             run.index = max(run.index, index + 1)
             continue
+        # ①.5 跨轮挂起：这一步声明了要先等到的条件 ⇒ 没满足就**停在这儿等**（一步都不发）
+        if item.await_check:
+            met, _code, _detail, _how = evaluate(Check(item.await_check), ctx)
+            if not met:
+                run.park(index, label, item.await_check, item.await_seconds)
+                run.note = composite_note(run)
+                logger.info("[Composites] %s 挂起在第 %d 步 %s（等 %s，上限 %.0fs）",
+                            run.composite.name, index + 1, label, item.await_check,
+                            item.await_seconds)
+                return run
         # ② 前置条件（具名谓词；只读快照，不动手）
         met, code, detail, how = evaluate(item.when, ctx)
         if not met:
@@ -547,6 +652,30 @@ def run_composite(run: CompositeRun, *, dispatch: Callable[[str, dict, dict], An
     return run
 
 
+def expire_run(run: CompositeRun) -> bool:
+    """挂起**到期**就如实失败（`await_timeout`：第几步 / 哪个 check / 等了多久）。
+
+    「不许无限等」✗ —— 到期是**如实失败**，不是假装成功、也不是继续挂着。
+    """
+    if not run.parked or run.waited() < run.wait_limit:
+        return False
+    waited = run.waited()
+    label = run.waiting_step or (
+        run.composite.steps[run.waiting_index].label
+        if 0 <= run.waiting_index < len(run.composite.steps) else "")
+    run.failed_index = run.waiting_index + 1
+    run.failed_step = label
+    run.failure_code = CODE_AWAIT_TIMEOUT
+    run.failure_detail = (f"（等「{run.waiting_check}」等了 {waited:.0f} 秒，超过上限 "
+                          f"{run.wait_limit:.0f} 秒：这一步没法往下走）")
+    run.release()
+    run.status = STATUS_FAILED
+    run.note = composite_note(run)
+    logger.info("[Composites] %s 挂起超时（%s，第 %d 步 %s）", run.composite.name,
+                run.failure_code, run.failed_index, run.failed_step)
+    return True
+
+
 def abort_run(run: CompositeRun, code: str, detail: str) -> CompositeRun:
     """复合体**自己**出岔子时的如实收尾：记成"卡在下一条要跑的步"上（绝不假装成功）。"""
     total = len(run.composite.steps)
@@ -556,6 +685,7 @@ def abort_run(run: CompositeRun, code: str, detail: str) -> CompositeRun:
     run.failure_code = str(code)
     run.failure_detail = str(detail)
     run.status = STATUS_FAILED
+    run.release()                      # 结束了就不再"挂着等"
     run.note = composite_note(run)
     return run
 
@@ -577,6 +707,10 @@ def composite_note(run: CompositeRun) -> str:
         did += f"（跳过 {'、'.join(skipped)}）"
     for row in gaps:
         did += f"；{row['step']} 没成（{row['reason']}：{row['detail']}）"
+    if run.parked:
+        return (f"（复合体 {name} 停在第 {run.waiting_index + 1} 步 {run.waiting_step}："
+                f"等「{run.waiting_check}」（已等 {run.waited():.0f} 秒 / "
+                f"上限 {run.wait_limit:.0f} 秒）；{did}）")
     if run.status == STATUS_CANCELLED:
         where = f"第 {run.failed_index} 步 {run.failed_step}" if run.failed_index else "开跑前"
         return f"（复合体 {name} 被取消（{where}起不再往下）；{did}）"

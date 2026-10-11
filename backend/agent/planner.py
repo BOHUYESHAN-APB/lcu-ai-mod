@@ -27,8 +27,8 @@ from .container_view import (CODE_BUSY as CONTAINER_VIEW_BUSY, CODE_NO_TOUCH,
 from .container_view import is_open as container_is_open
 from .container_view import matches as container_matches
 from .composites import (CODE_TOOL, COMPOSITE_BY_NAME, DEFAULT_FAILURE_CODE, GATE_CODES,
-                         CompositeRun, abort_run as abort_composite_run,
-                         composite_note, run_composite)
+                         STATUS_DONE, CompositeRun, abort_run as abort_composite_run,
+                         composite_note, expire_run, run_composite)
 from .container_view import other_container_note as container_view_other_note
 from .container_view import title_of as container_title
 from .container_view import view as container_view_snapshot
@@ -423,7 +423,8 @@ class Planner:
                  whisper_sender=None, tpa_responder=None, tpa_requester=None,
                  player_resolver=None, territory=None, action_manager=None,
                  poi=None, places=None, resource_lease=None, state_governor=None,
-                 job_registry=None, task_list=None, composites_enabled=None):
+                 job_registry=None, task_list=None, composites_enabled=None,
+                 composite_clock=None):
         self.llm = llm_service
         self.memory = memory
         self.skills = skills
@@ -486,6 +487,12 @@ class Planner:
         self._composite_note: Optional[str] = None
         self._composite_last: Optional[dict] = None
         self._composite_stack: list[str] = []
+        # **挂起**的复合体（等某个 await_check）：按 job id 记账（允许多个并行 ✓），
+        # 在**下一轮本来就要发生**的轮次里续跑（不新开线程/定时器 ✗）。
+        self._composite_runs: dict[str, CompositeRun] = {}
+        self._composite_seq: int = 0
+        # 挂起计时来源（不注入＝真实单调钟；注入只是为了把"等超时"测出来，不是定时器 ✗）。
+        self._composite_clock = composite_clock
         # 复合体的总开关（`config.json → composites.enabled`，默认**开**）：没注入就按默认开，
         # 注入后关掉 ⇒ 复合体调用被**如实拒绝**（一步都不发，行为回到"没有复合体"之前）。
         self._composites_enabled_provider = composites_enabled
@@ -564,6 +571,13 @@ class Planner:
                 self.haul_step(context)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[Planner] 搬运续跑失败: %s", exc)
+        # 挂起的复合体（等某个 check）也在这**同一个槽位**续跑：这一轮本来就要发生，
+        # 顺手把已被模型调用过、正等条件的挂起任务往前推一步 —— **不加线程/定时器** ✗。
+        if self._composite_runs:
+            try:
+                self.resume_composites(context)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[Planner] 复合体续跑失败: %s", exc)
 
         try:
             # 第一阶段：planner 结合状态产出候选动作（JSON）。
@@ -1577,6 +1591,8 @@ class Planner:
         - 关掉开关 ⇒ **一步都不发**，如实说不干（行为回到"没有复合体"之前）；
         - job 句柄：进度=按步（单调）/ 终止条件=步走完或某步失败 / 失败 code=**那一步自己的
           code** / 取消路径=停当前步 + 不再往下（取消复用 `action_manager.stop`，不另造）；
+        - 某步声明了 `await_check` 而条件没满足 ⇒ **挂起**（一步都不发，job 保持 running，
+          等**下一轮**本来就要发生的轮次续跑；上限 `await_seconds` 到点就如实失败）；
         - 结果：`run.result()` 逐步账 + 卡在第几步，说明里写全（`self._composite_note`）。
         """
         comp = COMPOSITE_BY_NAME.get(str(name or "").strip())
@@ -1597,8 +1613,10 @@ class Planner:
         ctx = context if isinstance(context, dict) else {}
         args = {str(key): value for key, value in payload.items()} \
             if isinstance(payload, dict) else {}
-        run = CompositeRun(comp, args)
+        run = CompositeRun(comp, args, clock=self._composite_clock)
         job = self._register_composite_job(comp, run, args, ctx)
+        if job is not None:
+            run.job_id = job.id
         self._composite_stack.append(comp.name)
         try:
             run_composite(run, dispatch=self._composite_dispatch, context=ctx,
@@ -1610,8 +1628,96 @@ class Planner:
             self._composite_stack.pop()
         self._composite_last = run.result()
         self._composite_note = run.note or composite_note(run)
-        self._settle_composite_job(job, run)
-        return run.status == JOB_DONE
+        if run.parked:
+            # 挂起：**一步都不发了**，job 保持 running，记在册上等下一轮续跑（有界 ✓）。
+            self._composite_runs[self._composite_run_key(run)] = run
+            logger.info("[Planner] 复合体 %s 挂起在第 %d 步（等 %s）", comp.name,
+                        run.waiting_index + 1, run.waiting_check)
+        else:
+            self._settle_composite_job(job, run)
+        # 挂起也算"受理了"（与 haul 起一趟跨轮搬运同一个口径）；失败/取消才是 False。
+        return run.status in (STATUS_DONE, "")
+
+    def _composite_run_key(self, run: CompositeRun) -> str:
+        """挂起账的键：有 job 就用 job id（**允许多个挂起并行** ✓），没有就自己发号。"""
+        if run.job_id:
+            return str(run.job_id)
+        self._composite_seq += 1
+        return f"{run.composite.name}#{self._composite_seq}"
+
+    def resume_composites(self, context: Optional[dict] = None) -> list[str]:
+        """把**挂起**的复合体往前推（跨轮推进；**不加线程/定时器** ✗）。
+
+        复用**既有轮次**语义：这一轮本来就要发生（玩家说话/状态变化触发），顺手把已经被
+        模型调用过、正等条件的复合体推下去 —— 用**当轮的新 context** 重判那个 check：
+        满足 ⇒ 从等那一步接着按声明往下发（每步照旧走 `_composite_dispatch` ⇒ 门一个不跳）；
+        超时 ⇒ 如实失败（`await_timeout`）；被取消 ⇒ 不再往下。
+        返回这一趟**收尾**（跑完/失败/取消/到期）的复合体名；仍在挂起的不算。
+        """
+        ctx = context if isinstance(context, dict) else {}
+        advanced: list[str] = []
+        for key in list(self._composite_runs):
+            run = self._composite_runs[key]
+            try:
+                self._advance_parked_composite(run, ctx)
+            except Exception as exc:  # noqa: BLE001 — 续跑坏了也要留账，不拖垮主链路
+                logger.warning("[Planner] 复合体续跑失败(%s): %s", key, exc)
+            if not run.parked:        # 跑完了/失败了/取消了/到期了 ⇒ 不再挂账（无僵尸 ✓）
+                self._composite_runs.pop(key, None)
+                advanced.append(run.composite.name)
+        return advanced
+
+    def _advance_parked_composite(self, run: CompositeRun, context: dict) -> None:
+        """一个挂起 run 接着往下跑（跑到再挂起/失败/走完为止）或如实收尾。"""
+        if run.status:                # 已被别处结算（例：jobs.refresh 判到到期）⇒ 只收尾
+            self._composite_last = run.result()
+            self._composite_note = run.note or composite_note(run)
+            return
+        if expire_run(run):           # 等超时 ⇒ 如实失败（第几步/哪个 check/等了多久）
+            self._composite_last = run.result()
+            self._composite_note = run.note
+            self._settle_composite_job(self._job_of_composite(run), run)
+            return
+        run_composite(run, dispatch=self._composite_dispatch, context=context,
+                      cancel_current=self._stop_current_action)
+        self._composite_last = run.result()
+        self._composite_note = run.note or composite_note(run)
+        if not run.parked:
+            self._settle_composite_job(self._job_of_composite(run), run)
+
+    def _job_of_composite(self, run: CompositeRun):
+        """这条挂起 run 对应的 job 句柄（没登记/没台账就是 None）。"""
+        registry = self.job_registry
+        if registry is None or not run.job_id:
+            return None
+        return registry.get(run.job_id)
+
+    def parked_composites(self) -> list[dict]:
+        """当前挂起的复合体（只读快照，供查看/测试；没有就空表）。"""
+        return [run.result() for run in self._composite_runs.values()]
+
+    def _abort_parked_composites(self, reason: str = "") -> int:
+        """一条**新的指令**要停（或中断）⇒ 挂着的复合体也不许留僵尸 ✗。
+
+        走**已有**那条停的路（`_stop_current_action`）；取消后**一步都不再发**，
+        job 如实记 cancelled。
+        """
+        count = 0
+        for key in list(self._composite_runs):
+            run = self._composite_runs.pop(key, None)
+            if run is None:
+                continue
+            self._stop_current_action()          # 复用既有停止路径（不新造取消通道）
+            run.cancel(reason or "新的指令")
+            run_composite(run, dispatch=self._composite_dispatch, context={},
+                          cancel_current=None)   # 只把"取消"记进账：一步都不发
+            self._composite_last = run.result()
+            self._composite_note = run.note or composite_note(run)
+            self._settle_composite_job(self._job_of_composite(run), run)
+            count += 1
+        if count:
+            logger.info("[Planner] 中止了 %d 个挂起的复合体（%s）", count, reason)
+        return count
 
     def _register_composite_job(self, comp, run: CompositeRun, args: dict, context: dict):
         """登记复合体的 job（四样门槛齐备；缺一就干脆不登记，绝不半成品）。"""
@@ -1622,12 +1728,24 @@ class Planner:
         try:
             return registry.register(
                 comp.name, progress=run.progress, terminal=run.terminal,
-                failure=DEFAULT_FAILURE_CODE, cancel=run.cancel,
+                failure=DEFAULT_FAILURE_CODE, cancel=self._composite_cancel_path(run),
                 priority=self._lease_priority(context), actor=actor,
                 detail=f"{comp.name} {json.dumps(args, ensure_ascii=False)}"[:200])
         except JobRejected as exc:
             logger.info("[Planner] 复合体 %s 未登记为 job：%s", comp.name, exc.reason)
             return None
+
+    def _composite_cancel_path(self, run: CompositeRun):
+        """job 的**取消路径**：停当前步（复用已有那条停路）+ 标取消 ⇒ 挂起的也不留僵尸。"""
+
+        def _cancel(reason: str = "") -> None:
+            if run.cancelled:            # 已经取消过（例子：新指令那条路先停过了）⇒ 别再停一次
+                return
+            run.cancel(reason)
+            run.take_cancel()            # 这里已经停过了，别让引擎再停一次
+            self._stop_current_action()
+
+        return _cancel
 
     def _settle_composite_job(self, job, run: CompositeRun) -> None:
         """把跑完的复合体落进 job 台账（失败带**那一步的 code**；结果带逐步账）。"""
@@ -1805,6 +1923,8 @@ class Planner:
 
     def _tool_stop(self, payload: dict, context: dict) -> bool:
         self.skills.stop_all()
+        # 新的指令说"停" ⇒ 还**挂着等**的复合体也不许留僵尸（走已有那条停的路）。
+        self._abort_parked_composites("模型让我停")
         return True
 
     def _tool_where_is(self, payload: dict, context: dict) -> bool:
@@ -4331,8 +4451,9 @@ class Planner:
         return target.strip().replace(" ", "").lower()
     
     def interrupt(self):
-        """中断当前规划。"""
+        """中断当前规划（顺带把**挂起**的复合体一并中止，不留僵尸）。"""
         self._is_planning = False
+        self._abort_parked_composites("规划被中断")
         logger.info("[Planner] 规划被中断")
     
     def get_status(self) -> dict:
