@@ -140,14 +140,14 @@ textarea{width:100%;min-height:68px;resize:vertical;background:#0d1117;border:1p
 
 <div class="tabs">
   <button class="tab active" onclick="showPage('dashboard',this)">仪表盘</button>
-  <button class="tab" onclick="showPage('bodies',this)">Bodies</button>
-  <button class="tab" onclick="showPage('operations',this)">操作</button>
+  <button class="tab" onclick="showPage('bodies',this)">Bodies（待移植）</button>
+  <button class="tab" onclick="showPage('operations',this)">操作（待移植）</button>
   <button class="tab" onclick="showPage('chat',this)">聊天</button>
-  <button class="tab" onclick="showPage('memory',this)">记忆</button>
-  <button class="tab" onclick="showPage('providers',this)">模型服务商</button>
-  <button class="tab" onclick="showPage('access',this)">访问权限</button>
+  <button class="tab" onclick="showPage('memory',this)">记忆（待移植）</button>
+  <button class="tab" onclick="showPage('providers',this)">模型服务商（待移植）</button>
+  <button class="tab" onclick="showPage('access',this)">访问权限（待移植）</button>
   <button class="tab" onclick="showPage('settings',this)">基础设置</button>
-  <button class="tab" onclick="showPage('diagnostics',this)">Diagnostics</button>
+  <button class="tab" onclick="showPage('diagnostics',this)">Diagnostics（待移植）</button>
   <button class="tab" onclick="showPage('debug',this)">调试</button>
 </div>
 
@@ -237,74 +237,23 @@ textarea{width:100%;min-height:68px;resize:vertical;background:#0d1117;border:1p
 <!-- Bodies Page -->
 <div id="page-bodies" class="page">
   <div class="card">
-    <h3>AI Bodies</h3>
-    <div class="hint" style="margin-bottom:12px">一个后端可以托管多个身体。当前 body_client 已使用同一注册表，server_fake_player 后续按 body_id 接入。</div>
-    <div id="bodyRegistryList" class="data-list"><div class="empty">正在加载...</div></div>
-  </div>
-  <div class="card">
-    <h3>Body Detail</h3>
-    <div id="bodyRegistryDetail" class="memory-detail-grid"><div class="empty">选择一个身体查看详情</div></div>
+    <h3>身体注册表（待移植）</h3>
+    <div class="hint">此面板依赖 master 分支的 <code>/api/v2/bodies</code> 能力，当前后端未提供该端点，调用会 404。已暂时移除面板内容，待 /api/v2 能力回捞后恢复。</div>
   </div>
 </div>
 
 <!-- Operations Page -->
 <div id="page-operations" class="page">
-  <div class="ops-grid">
-    <div>
-      <div class="card">
-        <h3>控制权</h3>
-        <div class="stats">
-          <div class="stat"><div class="label">模式</div><div class="value" id="opsControlMode">builtin</div></div>
-          <div class="stat"><div class="label">租约所有者</div><div class="value" id="opsLeaseOwner">-</div></div>
-          <div class="stat"><div class="label">身体准入</div><div class="value" id="opsBodyAdmission">-</div></div>
-          <div class="stat"><div class="label">Intent / Run</div><div class="value" id="opsIntentState">-</div></div>
-        </div>
-        <div class="form-row" style="margin-top:10px"><label for="leaseOwner">控制器</label><input id="leaseOwner" value="dashboard" maxlength="128"></div>
-        <div class="form-row"><label for="leaseTtl">TTL 秒</label><input id="leaseTtl" type="number" min="5" max="300" value="30"></div>
-        <div class="form-actions"><button class="btn primary" onclick="acquireLease()">接管</button><button class="btn danger" onclick="releaseLease()">释放</button></div>
-        <div id="leaseStatus" class="hint" aria-live="polite">未持有控制租约</div>
-      </div>
-      <div class="card">
-        <h3>执行任务</h3>
-        <div class="form-row"><label for="executionMode">模式</label><select id="executionMode" onchange="renderExecutionForm()"><option value="preset">任务预设</option><option value="skill">原始 Skill</option></select></div>
-        <div class="form-row" id="presetPicker"><label for="presetSelect">任务预设</label><select id="presetSelect" onchange="renderExecutionForm()"></select></div>
-        <div class="form-row" id="skillPicker" hidden><label for="skillSelect">Skill</label><select id="skillSelect" onchange="renderExecutionForm()"></select></div>
-        <div id="executionFields" class="field-grid"></div>
-        <div class="form-actions"><button class="btn primary" onclick="runSelectedOperation()">执行</button></div>
-        <div id="skillStatus" class="hint" aria-live="polite">等待预设与能力清单</div>
-      </div>
-      <div class="card">
-        <h3>创建日程</h3>
-        <div class="form-row"><label for="scheduleName">名称</label><input id="scheduleName" placeholder="晨间补给"></div>
-        <div class="form-row"><label for="scheduleClock">时钟</label><select id="scheduleClock" onchange="updateScheduleForm()"><option value="wall">真实时间</option><option value="game">游戏时间</option></select></div>
-        <div class="form-row"><label for="scheduleTrigger">触发</label><select id="scheduleTrigger" onchange="updateScheduleValue()"><option value="interval">间隔</option><option value="once">一次</option></select></div>
-        <div class="form-row"><label id="scheduleValueLabel" for="scheduleValue">间隔秒</label><input id="scheduleValue" type="number" value="60" min="1"></div>
-        <div class="form-row"><label for="scheduleMisfire">错过策略</label><select id="scheduleMisfire"><option value="fire_once">补执行一次</option><option value="skip">跳过</option></select></div>
-        <div class="form-actions"><button class="btn primary" onclick="createSchedule()">保存日程</button></div>
-        <div class="hint">使用上方当前 Skill 和参数。游戏一天为 24000 tick。</div>
-        <div id="scheduleStatus" class="hint" aria-live="polite"></div>
-      </div>
-    </div>
-    <div>
-      <div class="card"><h3>Task Runs</h3><div id="runList" class="data-list"><div class="empty">暂无运行记录</div></div></div>
-      <div class="card"><h3>Run 详情</h3><div id="runDetail" class="memory-detail"><div class="empty">选择一条运行记录</div></div></div>
-      <div class="card"><h3>日程</h3><div id="scheduleList" class="data-list"><div class="empty">暂无日程</div></div></div>
-      <div class="card"><h3>事件</h3><div id="eventList" class="data-list"><div class="empty">暂无事件</div></div></div>
-    </div>
+  <div class="card">
+    <h3>操作面板（待移植）</h3>
+    <div class="hint">此面板依赖 master 分支的 <code>/api/v2/control</code>、<code>/api/v2/skills</code>、<code>/api/v2/task-presets</code>、<code>/api/v2/runs</code>、<code>/api/v2/schedules</code>、<code>/api/v2/events</code> 能力，当前后端未提供这些端点，调用会 404。已暂时移除面板内容，待 /api/v2 能力回捞后恢复。</div>
   </div>
 </div>
-
 <!-- Chat Page -->
 <div id="page-chat" class="page">
-  <div id="inboxLayout" class="inbox-layout">
-    <section class="memory-pane contact-pane">
-      <div class="memory-pane-header"><h3>通讯录</h3><button class="btn" onclick="loadInbox()">刷新</button></div>
-      <div id="inboxContacts" class="inbox-contacts"><div class="empty" style="padding:12px">暂无会话</div></div>
-    </section>
-    <section class="memory-pane">
-      <div class="memory-pane-header"><h3 id="inboxTitle">选择联系人</h3><div><span class="hint" id="inboxPresence">-</span> <button id="inboxContactToggle" class="btn" onclick="toggleInboxContacts()">隐藏通讯录</button></div></div>
-      <div id="inboxMessages" class="inbox-messages"><div class="empty" style="padding:12px">玩家客户端消息会显示在这里</div></div>
-    </section>
+  <div class="card">
+    <h3>玩家会话收件箱（待移植）</h3>
+    <div class="hint">通讯录与会话历史依赖 master 分支的 <code>/api/v2/inbox/*</code> 能力，当前后端未提供这些端点，调用会 404。已暂时移除该区块；下方的「后台直接对话」走 <code>/ws</code> 实时链路，可正常使用。</div>
   </div>
   <section class="memory-pane" style="margin-top:16px">
     <div class="memory-pane-header"><h3>后台直接对话</h3></div>
@@ -322,161 +271,24 @@ textarea{width:100%;min-height:68px;resize:vertical;background:#0d1117;border:1p
 
 <!-- Memory Page -->
 <div id="page-memory" class="page">
-  <div class="memory-status-strip" id="memoryStatusStrip">
-    <span>作用域 <strong id="memoryScope">-</strong></span>
-    <span>记录 <strong id="memoryRecordCount">0</strong></span>
-    <span>修订 <strong id="memoryRevision">-</strong></span>
-    <span class="status warning" id="memoryStorageStatus">本地开发存储</span>
+  <div class="card">
+    <h3>记忆面板（待移植）</h3>
+    <div class="hint">此面板依赖 master 分支的 <code>/api/v2/memory/*</code> 能力，当前后端未提供这些端点，调用会 404。已暂时移除面板内容，待 /api/v2 能力回捞后恢复。</div>
   </div>
-  <div class="memory-toolbar">
-    <div class="compact-field"><label for="memorySearch">搜索</label><input id="memorySearch" type="search" placeholder="消息、玩家、任务或位置" onkeydown="if(event.key==='Enter')loadMemoryRecords(true)"></div>
-    <div class="compact-field"><label for="memoryCategory">类别</label><select id="memoryCategory" onchange="loadMemoryRecords(true)"><option value="">全部类别</option><option value="message">消息</option><option value="event">事件</option><option value="task_outcome">任务结果</option><option value="profile">玩家画像</option><option value="relationship">关系</option><option value="location">位置</option><option value="experience">经历</option><option value="summary">摘要</option></select></div>
-    <div class="compact-field"><label for="memoryStateFilter">状态</label><select id="memoryStateFilter" onchange="loadMemoryRecords(true)"><option value="active">活动</option><option value="archived">已归档</option><option value="deleted">已删除</option></select></div>
-    <div class="compact-field"><label for="memoryPlayer">玩家</label><input id="memoryPlayer" placeholder="名称或 UUID" onkeydown="if(event.key==='Enter')loadMemoryRecords(true)"></div>
-    <div class="form-actions"><button class="btn" onclick="loadMemoryRecords(true)">查询</button><button class="btn" onclick="previewMemoryCompression()">摘要</button><button class="btn primary" onclick="exportMemory()">导出</button></div>
-  </div>
-  <div id="memoryNotice" class="hint" style="margin-bottom:10px">当前视图读取本地测试/开发数据；生产部署必须使用 PostgreSQL。</div>
-  <div class="memory-layout">
-    <section class="memory-pane" aria-label="记忆记录">
-      <div class="memory-pane-header"><h3>记录</h3><span class="hint" id="memoryResultCount">0 条</span></div>
-      <div class="memory-list" id="memoryList"><div class="empty" style="padding:12px">尚未加载</div></div>
-      <div class="memory-pagination"><button class="btn" id="memoryPrevious" onclick="memoryPreviousPage()" disabled>上一页</button><span id="memoryPageInfo">第 1 页</span><button class="btn" id="memoryNext" onclick="memoryNextPage()" disabled>下一页</button></div>
-    </section>
-    <section class="memory-pane" aria-label="记忆详情">
-      <div class="memory-pane-header"><h3>详情与来源</h3></div>
-      <div class="memory-detail" id="memoryDetail"><div class="empty">选择一条记录查看完整内容</div></div>
-    </section>
-  </div>
-  <dialog id="memoryCompressionDialog">
-    <div class="dialog-header"><h3>持久摘要预览</h3><button class="btn" onclick="document.getElementById('memoryCompressionDialog').close()">关闭</button></div>
-    <div class="dialog-body">
-      <div class="memory-detail-grid">
-        <div class="memory-detail-key">来源记录</div><div class="memory-detail-value" id="memoryCompressionCount">-</div>
-        <div class="memory-detail-key">摘要模型</div><div class="memory-detail-value" id="memoryCompressionModel">-</div>
-        <div class="memory-detail-key">来源处理</div><div class="memory-detail-value">保留全部原始记录</div>
-        <div class="memory-detail-key">有效期</div><div class="memory-detail-value" id="memoryCompressionExpiry">-</div>
-      </div>
-      <div class="summary-preview" id="memoryCompressionSummary"></div>
-      <div class="hint">提交时会重新验证记忆修订和来源哈希；发生变化时拒绝写入，不会使用陈旧预览。</div>
-    </div>
-    <div class="dialog-actions"><button class="btn" onclick="document.getElementById('memoryCompressionDialog').close()">取消</button><button class="btn primary" id="memoryCompressionCommit" onclick="executeMemoryCompression()">保存摘要</button></div>
-  </dialog>
-  <dialog id="memoryActionDialog">
-    <div class="dialog-header"><h3 id="memoryActionTitle">记忆操作确认</h3><button class="btn" onclick="document.getElementById('memoryActionDialog').close()">关闭</button></div>
-    <div class="dialog-body">
-      <div class="memory-detail-grid">
-        <div class="memory-detail-key">影响记录</div><div class="memory-detail-value" id="memoryActionCount">-</div>
-        <div class="memory-detail-key">状态变化</div><div class="memory-detail-value" id="memoryActionChanges">-</div>
-        <div class="memory-detail-key">来源处理</div><div class="memory-detail-value">保留原始数据，可恢复</div>
-      </div>
-      <div class="compact-field" style="margin-top:12px"><label for="memoryActionConfirmation">输入确认文本</label><input id="memoryActionConfirmation" oninput="validateMemoryActionConfirmation()"></div>
-      <div class="hint" id="memoryActionExpected"></div>
-    </div>
-    <div class="dialog-actions"><button class="btn" onclick="document.getElementById('memoryActionDialog').close()">取消</button><button class="btn primary" id="memoryActionCommit" onclick="executeMemoryAction()" disabled>确认执行</button></div>
-  </dialog>
-  <section class="memory-pane" style="margin-top:16px" aria-label="记忆保留策略">
-    <div class="memory-pane-header"><h3>保留策略</h3><span class="hint" id="memoryRetentionVersion">版本 0</span></div>
-    <div class="dialog-body">
-      <div class="field-grid">
-        <div class="compact-field"><label for="memoryRetentionCategory">类别</label><select id="memoryRetentionCategory" onchange="loadMemoryRetentionRule()"><option value="message">消息</option><option value="event">事件</option><option value="task_outcome">任务结果</option><option value="profile">玩家画像</option><option value="relationship">关系</option><option value="location">位置</option><option value="experience">经历</option><option value="summary">摘要</option></select></div>
-        <div class="compact-field"><label for="memoryArchiveDays">归档天数</label><input id="memoryArchiveDays" type="number" min="0" value="30"></div>
-        <div class="compact-field"><label for="memoryDeleteDays">软删除天数</label><input id="memoryDeleteDays" type="number" min="0" value="90"></div>
-        <div class="compact-field"><label for="memoryMinKeep">最少保留</label><input id="memoryMinKeep" type="number" min="0" value="50"></div>
-      </div>
-      <div class="form-actions"><button class="btn" onclick="saveMemoryRetention()">保存规则</button><button class="btn primary" onclick="previewMemoryRetention()">预览并执行</button></div>
-      <div class="hint" id="memoryRetentionStatus">尚未配置当前类别</div>
-    </div>
-  </section>
 </div>
 
 <!-- Providers Page -->
 <div id="page-providers" class="page">
-  <div class="provider-page-head">
-    <div><h2>模型服务商</h2><p>配置连接，自动发现模型，然后保存为可复用的 Profile。</p></div>
-    <button class="btn" onclick="loadProviderProfiles()">刷新</button>
-  </div>
-  <div class="provider-workspace">
-    <section class="card provider-sidebar">
-      <div class="provider-sidebar-head"><h3>连接配置</h3><button class="btn" onclick="clearProviderProfileForm()">新增</button></div>
-      <div id="providerProfileList"><div class="empty-state">正在加载...</div></div>
-    </section>
-    <section class="card">
-      <div class="provider-editor-head">
-        <div><h3 id="providerEditorTitle">新建 Profile</h3><div class="muted-block" style="margin:4px 0 0">密钥只保存在后端，页面不会回显。</div></div>
-        <span class="badge" id="providerEnabledBadge">ENABLED</span>
-      </div>
-      <div class="provider-form-grid">
-        <div class="provider-field"><label for="profileName">显示名称</label><input id="profileName" placeholder="Primary OpenAI"></div>
-        <div class="provider-field"><label for="profileProvider">Provider</label><select id="profileProvider"></select></div>
-        <div class="provider-field full"><label for="profileBaseUrl">Base URL</label><input id="profileBaseUrl" placeholder="https://api.openai.com/v1"></div>
-        <div class="provider-field full"><label for="profileApiKey">API Key</label><input id="profileApiKey" type="password" autocomplete="new-password" placeholder="已有密钥不会回显；留空则继续使用"></div>
-      </div>
-      <details class="provider-advanced">
-        <summary>高级信息</summary>
-        <div class="provider-form-grid">
-          <div class="provider-field"><label for="profileId">Profile ID</label><input id="profileId" placeholder="自动根据名称生成"></div>
-          <label class="toggle-field" for="profileEnabled"><span>启用此服务商</span><input id="profileEnabled" type="checkbox" checked></label>
-        </div>
-      </details>
-      <div class="model-discovery">
-        <div class="model-discovery-head">
-          <div><strong>选择模型</strong><div><span id="modelDiscoveryHint">填写连接信息后获取模型列表</span></div></div>
-          <span class="model-count" id="profileModelCount">未获取</span>
-        </div>
-        <div class="model-picker-row">
-          <select id="profileModelSelect" aria-label="模型"><option value="">请先获取模型</option></select>
-          <button class="btn" id="refreshProfileModels" onclick="refreshProfileModels()">获取模型</button>
-        </div>
-        <div class="provider-field model-custom" id="profileModelCustomWrap" style="display:none"><label for="profileModelCustom">手动模型 ID</label><input id="profileModelCustom" placeholder="例如 gpt-4o-mini"></div>
-      </div>
-      <div class="provider-editor-actions">
-        <span class="connection-state" id="providerProfileStatus">尚未测试连接</span>
-        <div class="form-actions"><button class="btn primary" onclick="saveProviderProfile()">保存 Profile</button></div>
-      </div>
-    </section>
-  </div>
-  <div class="ops-grid" style="margin-top:16px">
-    <section class="card">
-      <h3>Agent 路由</h3>
-      <div class="form-row"><label for="routeAgent">Agent</label><select id="routeAgent" onchange="loadAgentRoute()"></select></div>
-      <div class="form-row"><label for="routePrimary">主 Profile</label><select id="routePrimary"></select></div>
-      <div class="form-row"><label for="routeMode">路由模式</label><select id="routeMode"><option value="manual">手动固定</option><option value="priority">失败后按优先级切换</option></select></div>
-      <div class="form-row"><label for="routeFallbacks">备用顺序</label><input id="routeFallbacks" placeholder="profile-a,profile-b"></div>
-      <div class="form-actions"><button class="btn primary" onclick="saveAgentRoute()">保存路由</button></div>
-      <div id="agentRouteStatus" class="hint">priority 模式只在当前请求失败时尝试备用服务商。</div>
-    </section>
-    <section class="card">
-      <h3>Provider Health</h3>
-      <div id="providerHealthList" class="data-list"><div class="empty">尚无请求健康数据</div></div>
-    </section>
+  <div class="card">
+    <h3>模型服务商 Profile（待移植）</h3>
+    <div class="hint">多 Profile 管理与 Agent 路由依赖 master 分支的 <code>/api/v2/llm/profiles</code> 能力，当前后端未提供该端点，调用会 404。已暂时移除面板内容。<br>当前后端支持的模型配置请到「基础设置」页配置（<code>/api/llm/config</code>、<code>/api/llm/models</code>、<code>/api/llm/providers</code>、<code>/api/llm/roles</code>）。</div>
   </div>
 </div>
-
 <!-- Access Page -->
 <div id="page-access" class="page">
-  <div class="ops-grid">
-    <section class="card">
-      <h3>授权主体</h3>
-      <div class="form-row"><label for="accessPublicChat">公共聊天</label><select id="accessPublicChat" onchange="saveAccessPolicyHeader()"><option value="true">允许</option><option value="false">拒绝</option></select></div>
-      <div class="form-row"><label for="accessPrivateChat">对话客户端</label><select id="accessPrivateChat" onchange="saveAccessPolicyHeader()"><option value="true">允许</option><option value="false">拒绝</option></select></div>
-      <div class="hint" style="margin-bottom:12px">公共聊天只授予 chat.reply，不授予移动、资源、背包、战斗或管理能力。</div>
-      <div id="accessPrincipalList" class="data-list"><div class="empty">正在加载...</div></div>
-    </section>
-    <section class="card">
-      <h3>编辑 Master / Friend / Operator</h3>
-      <div class="field-grid">
-        <div class="compact-field"><label for="principalId">Principal ID</label><input id="principalId" placeholder="alice"></div>
-        <div class="compact-field"><label for="principalRole">角色</label><select id="principalRole"><option value="player">player</option><option value="friend">friend</option><option value="master">master</option><option value="owner">owner</option><option value="server_moderator">server_moderator</option><option value="operator">operator</option><option value="server_admin">server_admin</option></select></div>
-        <div class="compact-field"><label for="principalName">显示名</label><input id="principalName" placeholder="Alice"></div>
-        <div class="compact-field"><label for="principalUuid">Minecraft UUID</label><input id="principalUuid" placeholder="UUID 优先"></div>
-        <div class="compact-field"><label for="principalServers">Server Scope</label><input id="principalServers" placeholder="survival-1,creative-1"></div>
-        <div class="compact-field"><label for="principalBodies">Body Scope</label><input id="principalBodies" placeholder="server-ai-1"></div>
-      </div>
-      <label class="toggle-field" for="principalEnabled"><span>启用授权</span><input id="principalEnabled" type="checkbox" checked></label>
-      <div class="compact-field"><label for="principalSkills">Skill Overrides JSON</label><textarea id="principalSkills" placeholder='{"task.inventory":"allow","task.combat":"deny"}'></textarea></div>
-      <div class="form-actions"><button class="btn" onclick="clearAccessPrincipalForm()">新建</button><button class="btn primary" onclick="saveAccessPrincipal()">保存</button></div>
-      <div id="accessStatus" class="hint">未指定 scope 表示适用于此后端可见的所有服务器或身体。</div>
-    </section>
+  <div class="card">
+    <h3>授权主体与访问策略（待移植）</h3>
+    <div class="hint">此面板依赖 master 分支的 <code>/api/v2/access/policy</code> 与 <code>/api/v2/access/principals</code> 能力，当前后端未提供这些端点，调用会 404。已暂时移除面板内容。<br>当前后端支持的基础权限（server_mode / master / friends 等）请到「基础设置」页配置（<code>/api/permissions</code>）。</div>
   </div>
 </div>
 
@@ -677,11 +489,10 @@ textarea{width:100%;min-height:68px;resize:vertical;background:#0d1117;border:1p
 
 <!-- Diagnostics Page -->
 <div id="page-diagnostics" class="page">
-  <div class="responsive-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
-    <section class="card"><h3>Access Audit</h3><div id="accessAuditList" class="data-list"><div class="empty">正在加载...</div></div></section>
-    <section class="card"><h3>Provider Audit</h3><div id="providerAuditList" class="data-list"><div class="empty">正在加载...</div></div></section>
+  <div class="card">
+    <h3>诊断审计（待移植）</h3>
+    <div class="hint">此面板依赖 master 分支的 <code>/api/v2/audit</code> 能力，当前后端未提供该端点，调用会 404。已暂时移除面板内容，待 /api/v2 能力回捞后恢复。</div>
   </div>
-  <div class="card"><div class="form-actions"><button class="btn" onclick="loadDiagnostics()">刷新审计</button></div><div class="hint">审计日志为本机 append-only JSONL，API key、token、secret 和 password 字段写入前会脱敏。</div></div>
 </div>
 
 <!-- Debug Page -->
@@ -732,24 +543,10 @@ window.fetch = (input, init = {}) => {
 let ws = null;
 let reconnectTimer = null;
 let providerPresets = [];
-let providerProfiles = [];
-let accessPolicy = null;
 let llmConfig = null;
 let sessionPollInFlight = false;
-let skillManifests = [];
-let taskPresets = [];
-let dashboardLease = null;
-let heartbeatTimer = null;
-let lastEventCursor = 0;
-let operationEvents = [];
 let bodyConnected = false;
 let bodyArmed = false;
-let registeredBodies = [];
-let selectedRunId = null;
-let operationsRefreshTimer = null;
-let executionDraft = {mode:'preset',presetId:'',presetFields:{},skillId:'',skillFields:{}};
-const memoryState = {offset:0,limit:50,count:0,nextOffset:null,selectedId:null,requestSequence:0,loaded:false,compressionPreview:null,actionPreview:null,actionEndpoint:null,retention:{version:0,rules:[]}};
-const inboxState = {contacts:[],selectedConversationId:null};
 
 function connectWS() {
   const protocols = sdkToken ? [`lcu-token.${sdkToken}`] : [];
@@ -780,90 +577,14 @@ function connectWS() {
 connectWS();
 
 // ── Page Navigation ──
+// 当前后端只提供 /api/status、/api/llm/*、/api/config、/api/permissions、/api/persona、
+// /api/tasks/{cancel,activate} 与 /ws；master 线的 /api/v2/* 尚未移植。
+// 因此这里不再为「待移植」页面触发任何加载调用，避免请求不存在的端点（404）。
 function showPage(name, tab) {
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.getElementById('page-' + name).classList.add('active');
   if (tab) tab.classList.add('active');
-  if (name === 'operations') {
-    loadOperations();
-    startOperationsPolling();
-  } else {
-    stopOperationsPolling();
-  }
-  if (name === 'memory' && !memoryState.loaded) loadMemoryPage();
-  if (name === 'chat') loadInbox();
-  if (name === 'bodies') loadBodies();
-  if (name === 'providers') loadProviderProfiles();
-  if (name === 'access') loadAccessPolicy();
-  if (name === 'diagnostics') loadDiagnostics();
-}
-
-function startOperationsPolling() {
-  stopOperationsPolling();
-  operationsRefreshTimer = setInterval(() => {
-    if (document.getElementById('page-operations').classList.contains('active')) loadOperations();
-  }, 5000);
-}
-
-function stopOperationsPolling() {
-  if (operationsRefreshTimer) clearInterval(operationsRefreshTimer);
-  operationsRefreshTimer = null;
-}
-
-async function loadBodies() {
-  try {
-    const data = await apiFetch('/api/v2/bodies');
-    registeredBodies = data.bodies || [];
-    renderDataRows('bodyRegistryList', registeredBodies, body => ({
-      title: `${body.id} · ${body.runtime_role}`,
-      meta: `${body.server_id}/${body.world_id} · ${body.connected ? '在线' : '离线'} · ${body.armed ? '已武装' : '未武装'} · ${body.stale ? '状态过期' : '状态新鲜'}`,
-      actions: [['查看', () => showBodyDetail(body.id)]]
-    }));
-    if (registeredBodies.length === 1) showBodyDetail(registeredBodies[0].id);
-  } catch (error) {
-    document.getElementById('bodyRegistryList').innerHTML = `<div class="empty">加载失败：${escapeHtml(error.message)}</div>`;
-  }
-}
-
-function showBodyDetail(bodyId) {
-  const body = registeredBodies.find(item => item.id === bodyId);
-  if (!body) return;
-  const target = document.getElementById('bodyRegistryDetail');
-  target.replaceChildren();
-  const fields = [
-    ['Body ID', body.id], ['运行角色', body.runtime_role], ['Owner', `${body.owner_type}:${body.owner_id}`],
-    ['Server', body.server_id], ['World', body.world_id], ['连接', body.connected ? 'online' : 'offline'],
-    ['武装', body.armed ? 'armed' : 'disarmed'], ['控制模式', body.control_mode],
-    ['状态年龄', body.state_age_seconds == null ? '-' : `${Number(body.state_age_seconds).toFixed(2)}s`],
-    ['控制租约', body.lease ? `${body.lease.owner} / ${body.lease.id}` : 'none'],
-    ['能力', (body.capabilities || []).join(', ') || '-'], ['更新时间', body.updated_at ? new Date(body.updated_at * 1000).toLocaleString('zh-CN') : '-']
-  ];
-  fields.forEach(([key, value]) => {
-    const label = document.createElement('div'); label.className = 'memory-detail-key'; label.textContent = key;
-    const content = document.createElement('div'); content.className = 'memory-detail-value'; content.textContent = String(value);
-    target.append(label, content);
-  });
-}
-
-async function loadDiagnostics() {
-  try {
-    const [access, provider] = await Promise.all([
-      apiFetch('/api/v2/audit?category=access&limit=100'),
-      apiFetch('/api/v2/audit?category=provider&limit=100')
-    ]);
-    renderAuditEvents('accessAuditList', access.events || []);
-    renderAuditEvents('providerAuditList', provider.events || []);
-  } catch (error) {
-    ['accessAuditList','providerAuditList'].forEach(id => { document.getElementById(id).innerHTML = `<div class="empty">加载失败：${escapeHtml(error.message)}</div>`; });
-  }
-}
-
-function renderAuditEvents(targetId, events) {
-  renderDataRows(targetId, events, event => ({
-    title: `${event.action} · ${event.outcome}`,
-    meta: `${event.target || '-'} · ${event.actor} · ${event.occurred_at ? new Date(event.occurred_at * 1000).toLocaleString('zh-CN') : '-'}`
-  }));
 }
 
 // ── Local Settings Cache ──
@@ -1037,12 +758,6 @@ function renderInventoryItems(targetId, items) {
     meta.textContent=`${location} · ${item.name || '-'}${durability}`;
     row.append(name,meta); target.append(row);
   });
-}
-
-function toggleInboxContacts() {
-  const layout = document.getElementById('inboxLayout');
-  const hidden = layout.classList.toggle('contacts-hidden');
-  document.getElementById('inboxContactToggle').textContent = hidden ? '显示通讯录' : '隐藏通讯录';
 }
 
 function setBodyConnection(connected) {
@@ -1240,56 +955,6 @@ function sendChat() {
   addChatMessage('我', text);
 }
 
-async function loadInbox() {
-  const target = document.getElementById('inboxContacts');
-  try {
-    const data = await apiFetch('/api/v2/inbox/contacts');
-    inboxState.contacts = data.contacts || [];
-    target.replaceChildren();
-    if (!inboxState.contacts.length) {
-      const empty = document.createElement('div'); empty.className = 'empty'; empty.style.padding = '12px'; empty.textContent = '暂无玩家会话'; target.append(empty); return;
-    }
-    const selected = inboxState.contacts.find(contact => contact.conversation_id === inboxState.selectedConversationId) || inboxState.contacts[0];
-    inboxState.selectedConversationId = selected.conversation_id;
-    inboxState.contacts.forEach(contact => {
-      const row = document.createElement('button'); row.type = 'button'; row.className = `contact-row${contact.conversation_id === inboxState.selectedConversationId ? ' active' : ''}`;
-      row.dataset.conversationId = contact.conversation_id;
-      const name = document.createElement('div'); name.className = 'contact-name'; name.textContent = contact.display_name || contact.id;
-      const meta = document.createElement('div'); meta.className = 'contact-meta'; meta.textContent = `${contact.presence || 'unknown'} · ${contact.message_count || 0} 条消息`;
-      row.append(name, meta); row.onclick = () => selectInboxConversation(contact); target.append(row);
-    });
-    await selectInboxConversation(selected);
-  } catch (error) {
-    target.replaceChildren(); const failed = document.createElement('div'); failed.className = 'empty'; failed.style.padding = '12px'; failed.textContent = `通讯录加载失败：${error.message}`; target.append(failed);
-  }
-}
-
-async function selectInboxConversation(contact) {
-  inboxState.selectedConversationId = contact.conversation_id;
-  document.querySelectorAll('.contact-row').forEach(row => row.classList.toggle('active', row.dataset.conversationId === contact.conversation_id));
-  document.getElementById('inboxTitle').textContent = contact.display_name || contact.id;
-  document.getElementById('inboxPresence').textContent = contact.presence || 'unknown';
-  const target = document.getElementById('inboxMessages'); target.replaceChildren();
-  const loading = document.createElement('div'); loading.className = 'empty'; loading.style.padding = '12px'; loading.textContent = '正在加载会话...'; target.append(loading);
-  try {
-    const data = await apiFetch(`/api/v2/inbox/conversations/${encodeURIComponent(contact.conversation_id)}/messages`);
-    if (inboxState.selectedConversationId !== contact.conversation_id) return;
-    target.replaceChildren();
-    (data.messages || []).forEach(message => {
-      const item = document.createElement('div'); item.className = `inbox-message ${message.is_ai ? 'ai' : 'player'}`;
-      const header = document.createElement('div'); header.className = 'inbox-message-header'; header.textContent = `${message.sender} · ${formatMemoryTime(message.timestamp)}`;
-      const content = document.createElement('div'); content.className = 'inbox-message-content'; content.textContent = message.message;
-      item.append(header, content); target.append(item);
-    });
-    if (!(data.messages || []).length) {
-      const empty = document.createElement('div'); empty.className = 'empty'; empty.style.padding = '12px'; empty.textContent = '会话中还没有消息'; target.append(empty);
-    }
-    target.scrollTop = target.scrollHeight;
-  } catch (error) {
-    target.replaceChildren(); const failed = document.createElement('div'); failed.className = 'empty'; failed.style.padding = '12px'; failed.textContent = `会话加载失败：${error.message}`; target.append(failed);
-  }
-}
-
 // ── Controls ──
 function toggleAutonomy() {
   if (!wsOpen()) return;
@@ -1303,7 +968,7 @@ function sendSafetyCommand(command) {
   dbgLog(command === 'disarm' ? '已请求解除武装' : '已请求停止全部操作');
 }
 
-// ── V2 Operations ──
+// ── API / WS helpers ──
 async function apiFetch(path, options = {}) {
   const response = await fetch(path, options);
   let data = {};
@@ -1319,899 +984,6 @@ async function apiFetch(path, options = {}) {
 function wsOpen() {
   return ws && ws.readyState === WebSocket.OPEN;
 }
-
-function leasePayload() {
-  return dashboardLease ? {lease_id:dashboardLease.id, fencing_token:dashboardLease.fencing_token} : {};
-}
-
-async function loadOperations() {
-  try {
-    executionDraft = {
-      mode: document.getElementById('executionMode')?.value || executionDraft.mode,
-      presetId: document.getElementById('presetSelect')?.value || executionDraft.presetId,
-      presetFields: collectFields('preset'),
-      skillId: document.getElementById('skillSelect')?.value || executionDraft.skillId,
-      skillFields: collectFields('skill'),
-    };
-    const [control, skillData, presetData, runData, scheduleData, eventData] = await Promise.all([
-      apiFetch('/api/v2/control'), apiFetch('/api/v2/skills'), apiFetch('/api/v2/task-presets'), apiFetch('/api/v2/runs?limit=30'),
-      apiFetch('/api/v2/schedules'), apiFetch(lastEventCursor ? `/api/v2/events?after=${lastEventCursor}&limit=50` : '/api/v2/events?after=0&limit=50&latest=true')
-    ]);
-    document.getElementById('opsControlMode').textContent = control.mode || 'builtin';
-    document.getElementById('opsLeaseOwner').textContent = control.lease?.owner || '-';
-    document.getElementById('opsBodyAdmission').textContent = control.coordinator?.body_armed ? 'armed' : 'disarmed';
-    document.getElementById('opsIntentState').textContent = control.coordinator
-      ? `${control.coordinator.raw_request_count || 0} raw / ${control.coordinator.durable_run_active ? 1 : 0} run`
-      : 'unavailable';
-    document.getElementById('executionMode').value = executionDraft.mode;
-    skillManifests = skillData.skills || [];
-    taskPresets = presetData.presets || [];
-    const skillSelect = document.getElementById('skillSelect');
-    const previousSkill = executionDraft.skillId || skillSelect.value;
-    skillSelect.replaceChildren(...skillManifests.map(skill => {
-      const option = document.createElement('option'); option.value = skill.id;
-      option.disabled = !skill.durable || skill.available === false;
-      option.textContent = `${skill.category} · ${skill.id}${skill.available === false ? ' · 身体未提供' : skill.durable ? '' : ' · 低层命令限定'}`; return option;
-    }));
-    if (skillManifests.some(skill => skill.id === previousSkill)) skillSelect.value = previousSkill;
-    const presetSelect = document.getElementById('presetSelect');
-    const previousPreset = executionDraft.presetId || presetSelect.value;
-    presetSelect.replaceChildren(...taskPresets.map(preset => {
-      const option = document.createElement('option'); option.value = preset.id;
-      option.disabled = preset.available === false;
-      option.textContent = `${preset.category} · ${preset.title}${preset.available === false ? ' · 身体未提供' : ''}`; return option;
-    }));
-    if (taskPresets.some(preset => preset.id === previousPreset)) presetSelect.value = previousPreset;
-    renderExecutionForm();
-    const runs = runData.runs || [];
-    renderRuns(runs);
-    if (selectedRunId && runs.some(run => run.id === selectedRunId)) {
-      await loadRunDetail(selectedRunId);
-    } else if (!selectedRunId && runs.length) {
-      await selectRun(runs[0].id);
-    } else if (!runs.length) {
-      document.getElementById('runDetail').innerHTML = '<div class="empty">选择一条运行记录</div>';
-      selectedRunId = null;
-    }
-    renderSchedules(scheduleData.schedules || []);
-    const events = eventData.events || [];
-    if (events.length) lastEventCursor = eventData.next_cursor || events.at(-1).cursor;
-    operationEvents = [...operationEvents, ...events].filter((item, index, all) => all.findIndex(other => other.cursor === item.cursor) === index).slice(-50);
-    renderEvents(operationEvents);
-    updateLeaseStatus(control);
-  } catch (error) { dbgLog('操作面板加载失败: ' + error.message); }
-}
-
-function renderExecutionForm() {
-  const mode = document.getElementById('executionMode').value;
-  document.getElementById('presetPicker').hidden = mode !== 'preset';
-  document.getElementById('skillPicker').hidden = mode !== 'skill';
-  const container = document.getElementById('executionFields');
-  container.replaceChildren();
-  if (mode === 'preset') {
-    const preset = taskPresets.find(item => item.id === document.getElementById('presetSelect').value);
-    if (!preset) return;
-    const initialValues = preset.id === executionDraft.presetId && Object.keys(executionDraft.presetFields || {}).length
-      ? executionDraft.presetFields
-      : (preset.examples?.[0]?.parameters || {});
-    renderSchemaFields(preset.parameter_schema, container, 'preset', initialValues);
-    const execution = preset.kind === 'workflow'
-      ? `${preset.step_count} 步 workflow`
-      : (preset.skill?.command || preset.skill_id);
-    document.getElementById('skillStatus').textContent = `${preset.description} · ${execution}${preset.available === false ? ' · 身体未提供' : ''}`;
-    return;
-  }
-  const skill = skillManifests.find(item => item.id === document.getElementById('skillSelect').value);
-  if (!skill) return;
-  const initialValues = skill.id === executionDraft.skillId ? executionDraft.skillFields : {};
-  renderSchemaFields(skill.input_schema, container, 'skill', initialValues);
-  document.getElementById('skillStatus').textContent = `${skill.description} · ${skill.duration} · ${skill.safety_class}${skill.available === false ? ' · 身体未提供' : ''}`;
-}
-
-function renderSchemaFields(schema, container, prefix, initialValues = {}) {
-  const required = new Set(schema?.required || []);
-  Object.entries(schema?.properties || {}).forEach(([name, definition]) => {
-    const wrapper = document.createElement('div');
-    const fieldId = `${prefix}-field-${name}`;
-    const label = document.createElement('label');
-    label.textContent = required.has(name) ? `${name} *` : name;
-    label.htmlFor = fieldId;
-    label.style.fontSize = '11px';
-    label.style.color = '#8b949e';
-    let input;
-    if (Array.isArray(definition.enum)) {
-      input = document.createElement('select');
-      if (!required.has(name)) {
-        const empty = document.createElement('option'); empty.value = ''; empty.textContent = '默认'; input.append(empty);
-      }
-      definition.enum.forEach(value => { const option = document.createElement('option'); option.value = value; option.textContent = value; input.append(option); });
-    } else if (definition.type === 'boolean') {
-      input = document.createElement('input');
-      input.type = 'checkbox';
-      input.checked = Boolean(initialValues[name] ?? definition.default);
-    } else {
-      input = document.createElement('input');
-      input.placeholder = definition.type || 'value';
-      if (definition.type === 'integer' || definition.type === 'number') {
-        input.type = 'number'; input.step = definition.type === 'integer' ? '1' : 'any';
-        if (definition.minimum !== undefined) input.min = definition.minimum;
-        if (definition.maximum !== undefined) input.max = definition.maximum;
-      }
-      const value = initialValues[name] ?? definition.default;
-      if (value !== undefined) input.value = value;
-    }
-    input.id = fieldId;
-    input.dataset.fieldPrefix = prefix;
-    input.dataset.fieldName = name;
-    input.dataset.valueType = definition.type || 'string';
-    wrapper.append(label, input); container.append(wrapper);
-  });
-}
-
-function collectFields(prefix) {
-  const result = {};
-  document.querySelectorAll(`[data-field-prefix="${prefix}"]`).forEach(input => {
-    if (input.dataset.valueType === 'boolean') {
-      if (input.checked) result[input.dataset.fieldName] = true;
-      return;
-    }
-    if (input.value === '') return;
-    result[input.dataset.fieldName] = input.dataset.valueType === 'integer' ? parseInt(input.value, 10)
-      : input.dataset.valueType === 'number' ? Number(input.value) : input.value;
-  });
-  return result;
-}
-
-function resolvePresetTemplate(value, parameters) {
-  if (Array.isArray(value)) return value.map(item => resolvePresetTemplate(item, parameters));
-  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, resolvePresetTemplate(item, parameters)]));
-  if (typeof value !== 'string') return value;
-  const exact = value.match(/^\$\{parameters\.([A-Za-z_][A-Za-z0-9_]*)\}$/);
-  if (exact) return parameters[exact[1]];
-  return value.replace(/\$\{parameters\.([A-Za-z_][A-Za-z0-9_]*)\}/g, (_, name) => String(parameters[name] ?? ''));
-}
-
-function currentOperationSpec() {
-  const mode = document.getElementById('executionMode').value;
-  if (mode === 'preset') {
-    const preset = taskPresets.find(item => item.id === document.getElementById('presetSelect').value);
-    if (!preset) return null;
-    const parameters = collectFields('preset');
-    return {
-      kind: 'preset',
-      available: preset.available !== false,
-      title: preset.title,
-      skillId: preset.skill_id,
-      schedulable: preset.schedulable === true,
-      parameters,
-      input: resolvePresetTemplate(preset.input_template, parameters),
-      endpoint: `/api/v2/task-presets/${encodeURIComponent(preset.id)}/runs`,
-    };
-  }
-  const skill = skillManifests.find(item => item.id === document.getElementById('skillSelect').value);
-  if (!skill) return null;
-  return {
-    kind: 'skill',
-    available: skill.available !== false,
-    title: skill.id,
-    skillId: skill.id,
-    schedulable: skill.schedulable === true,
-    input: collectFields('skill'),
-    endpoint: `/api/v2/skills/${encodeURIComponent(skill.id)}/runs`,
-  };
-}
-
-async function acquireLease() {
-  try {
-    const data = await apiFetch('/api/v2/control/leases', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
-      owner:document.getElementById('leaseOwner').value || 'dashboard', mode:'external',
-      ttl_seconds:Number(document.getElementById('leaseTtl').value) || 30
-    })});
-    dashboardLease = data.lease; sessionStorage.setItem('lcu.controlLease', JSON.stringify(dashboardLease));
-    startHeartbeat(); await loadOperations();
-  } catch (error) { document.getElementById('leaseStatus').textContent = error.message; }
-}
-
-async function releaseLease() {
-  if (!dashboardLease) return;
-  try {
-    await apiFetch(`/api/v2/control/leases/${dashboardLease.id}/release`, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fencing_token:dashboardLease.fencing_token})});
-  } catch (error) { dbgLog('释放租约失败: ' + error.message); return; }
-  dashboardLease = null; sessionStorage.removeItem('lcu.controlLease'); clearTimeout(heartbeatTimer); heartbeatTimer = null;
-  await loadOperations();
-}
-
-function startHeartbeat() {
-  clearTimeout(heartbeatTimer);
-  if (!dashboardLease) return;
-  const ttl = Math.max(5, Math.round((dashboardLease.expires_at || 0) - (dashboardLease.renewed_at || 0)) || Number(document.getElementById('leaseTtl')?.value) || 30);
-  const remaining = Math.max(0, (dashboardLease.expires_at || 0) - Date.now() / 1000);
-  if (remaining <= 0) { dashboardLease = null; sessionStorage.removeItem('lcu.controlLease'); return; }
-  heartbeatTimer = setTimeout(async () => {
-    try {
-      const data = await apiFetch(`/api/v2/control/leases/${dashboardLease.id}/heartbeat`, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fencing_token:dashboardLease.fencing_token,ttl_seconds:ttl})});
-      dashboardLease = {...dashboardLease,...data.lease}; sessionStorage.setItem('lcu.controlLease', JSON.stringify(dashboardLease)); startHeartbeat();
-    } catch (error) { heartbeatTimer = null; dashboardLease = null; sessionStorage.removeItem('lcu.controlLease'); dbgLog('租约续期停止: ' + error.message); }
-  }, Math.max(500, Math.floor(Math.min(ttl, remaining) * 1000 / 3)));
-}
-
-function updateLeaseStatus(control) {
-  if (dashboardLease && control.lease?.id !== dashboardLease.id) {
-    dashboardLease = null; sessionStorage.removeItem('lcu.controlLease'); clearTimeout(heartbeatTimer); heartbeatTimer = null;
-  }
-  const text = dashboardLease ? `本页面持有租约，${new Date(dashboardLease.expires_at * 1000).toLocaleTimeString('zh-CN')} 到期`
-    : control.lease ? `由 ${control.lease.owner} 控制` : '未持有控制租约';
-  document.getElementById('leaseStatus').textContent = text;
-}
-
-async function runSelectedOperation() {
-  try {
-    const spec = currentOperationSpec();
-    if (!spec) throw new Error('当前没有可执行的任务');
-    if (!spec.available) throw new Error('当前身体未提供该任务所需能力');
-    const payload = spec.kind === 'preset' ? {parameters: spec.parameters, ...leasePayload()} : {input: spec.input, ...leasePayload()};
-    const run = await apiFetch(spec.endpoint, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-    document.getElementById('skillStatus').textContent = `Run ${run.id} · ${run.status}`;
-    selectedRunId = run.id;
-    await loadOperations();
-  } catch (error) { document.getElementById('skillStatus').textContent = error.message; }
-}
-
-function updateScheduleForm() {
-  const clock = document.getElementById('scheduleClock').value;
-  const trigger = document.getElementById('scheduleTrigger');
-  trigger.replaceChildren();
-  (clock === 'wall' ? [['interval','间隔'],['once','一次']] : [['interval','Tick 间隔'],['time_of_day','每天时段']]).forEach(([value,text]) => {
-    const option = document.createElement('option'); option.value = value; option.textContent = text; trigger.append(option);
-  });
-  updateScheduleValue();
-}
-
-function updateScheduleValue() {
-  const clock = document.getElementById('scheduleClock').value;
-  const trigger = document.getElementById('scheduleTrigger').value;
-  const input = document.getElementById('scheduleValue');
-  if (clock === 'wall' && trigger === 'once') {
-    input.type = 'datetime-local'; input.removeAttribute('min');
-    const local = new Date(Date.now() + 300000);
-    input.value = new Date(local.getTime() - local.getTimezoneOffset() * 60000).toISOString().slice(0,16);
-    document.getElementById('scheduleValueLabel').textContent = '执行时间';
-  } else {
-    input.type = 'number'; input.value = clock === 'game' ? '1200' : '60';
-    input.min = clock === 'game' && trigger === 'time_of_day' ? '0' : clock === 'game' ? '20' : '1';
-    if (clock === 'game' && trigger === 'time_of_day') input.max = '23999'; else input.removeAttribute('max');
-    document.getElementById('scheduleValueLabel').textContent = clock === 'game' ? 'Tick / 时刻' : '间隔秒';
-  }
-}
-
-async function createSchedule() {
-  try {
-    const clock = document.getElementById('scheduleClock').value;
-    const trigger = document.getElementById('scheduleTrigger').value;
-    const rawValue = document.getElementById('scheduleValue').value;
-    const value = clock === 'wall' && trigger === 'once' ? Date.parse(rawValue) / 1000 : Number(rawValue);
-    const spec = currentOperationSpec();
-    if (!spec) throw new Error('当前没有可调度的任务');
-    if (!spec.available) throw new Error('当前身体未提供该任务所需能力');
-    if (!spec.schedulable) throw new Error('当前任务没有有限终态，不能加入日程');
-    const payload = {name:document.getElementById('scheduleName').value || spec.title || 'schedule',skill_id:spec.skillId,input:spec.input,clock,trigger_type:trigger,misfire_policy:document.getElementById('scheduleMisfire').value,...leasePayload()};
-    if (clock === 'wall' && trigger === 'interval') payload.wall_interval_seconds = value;
-    if (clock === 'wall' && trigger === 'once') payload.wall_run_at = value;
-    if (clock === 'game' && trigger === 'interval') payload.game_interval_ticks = value;
-    if (clock === 'game' && trigger === 'time_of_day') payload.time_of_day_tick = value;
-    await apiFetch('/api/v2/schedules', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-    document.getElementById('scheduleStatus').textContent = dashboardLease ? '日程已保存，释放控制租约后开始调度' : '日程已保存'; await loadOperations();
-  } catch (error) { document.getElementById('scheduleStatus').textContent = error.message; dbgLog('创建日程失败: ' + error.message); }
-}
-
-function renderRuns(runs) {
-  const target = document.getElementById('runList'); target.replaceChildren();
-  if (!runs.length) { const empty=document.createElement('div'); empty.className='empty'; empty.textContent='暂无运行记录'; target.append(empty); return; }
-  runs.forEach(run => {
-    const skill=skillManifests.find(item=>item.id===run.skill_id);
-    const terminal=['succeeded','failed','cancelled','unknown'].includes(run.status);
-    const canCancel=run.run_kind==='workflow' ? !terminal : run.status==='queued'||(skill?.cancellable&&!terminal);
-    const row=document.createElement('div'); row.className=`data-row${run.id===selectedRunId?' active':''}`; row.dataset.runId = run.id;
-    const content=document.createElement('button'); content.type='button'; content.style.all='unset'; content.style.cursor='pointer'; content.style.flex='1';
-    const title=document.createElement('div'); title.className='data-title'; title.textContent=`${run.run_kind==='workflow'?'Workflow':'Skill'} · ${run.skill_id} · ${run.status}`;
-    const meta=document.createElement('div'); meta.className='data-meta'; meta.textContent=`${run.id} · ${Math.round((run.progress || 0) * 100)}% ${run.detail || run.error || ''}`;
-    content.append(title,meta); content.onclick=()=>selectRun(run.id); row.append(content);
-    const actions=[]; if(run.status==='queued')actions.push(['恢复',()=>resumeRun(run.id)]); if(canCancel)actions.push(['取消',()=>cancelRun(run.id)]);
-    if(actions.length){const controls=document.createElement('div');controls.style.display='flex';controls.style.gap='6px';actions.forEach(action=>{const button=document.createElement('button');button.className='btn';button.textContent=action[0];button.onclick=event=>{event.stopPropagation();action[1]();};controls.append(button);});row.append(controls);} target.append(row);
-  });
-}
-
-async function selectRun(id) {
-  selectedRunId = id;
-  document.querySelectorAll('#runList .data-row').forEach(row => row.classList.toggle('active', row.dataset.runId === id));
-  await loadRunDetail(id);
-}
-
-async function loadRunDetail(id) {
-  try {
-    const run = await apiFetch(`/api/v2/runs/${encodeURIComponent(id)}`);
-    const detail = document.getElementById('runDetail');
-    detail.replaceChildren();
-    const rows = [
-      ['运行 ID', run.id], ['类型', run.run_kind || 'skill'], [run.run_kind === 'workflow' ? 'Preset' : 'Skill', run.skill_id], ['状态', run.status], ['进度', `${Math.round((run.progress || 0) * 100)}%`],
-      ['请求 ID', run.request_id || '-'], ['创建', run.created_at || '-'], ['派发', run.dispatched_at || '-'], ['完成', run.finished_at || '-'],
-      ['说明', run.detail || '-'], ['代码', run.error || '-'], ['输入', JSON.stringify(run.input || {}, null, 2)],
-    ];
-    rows.forEach(([key, value]) => { const k=document.createElement('div'); k.className='memory-detail-key'; k.textContent=key; const v=document.createElement('div'); v.className='memory-detail-value'; v.textContent=String(value); detail.append(k,v); });
-    (run.steps || []).forEach(step => {
-      const key=document.createElement('div'); key.className='memory-detail-key'; key.textContent=`步骤 ${step.index + 1}`;
-      const value=document.createElement('div'); value.className='memory-detail-value';
-      value.textContent=`${step.title || step.key} · ${step.skill_id} · ${step.status} · ${Math.round((step.progress || 0) * 100)}%${step.detail || step.error ? ` · ${step.detail || step.error}` : ''}`;
-      detail.append(key,value);
-    });
-  } catch (error) {
-    document.getElementById('runDetail').innerHTML = `<div class="empty">详情加载失败：${escapeHtml(error.message)}</div>`;
-  }
-}
-
-async function cancelRun(id) { try { await apiFetch(`/api/v2/runs/${id}/cancel`, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(leasePayload())}); await loadOperations(); } catch(error){dbgLog(error.message);} }
-async function resumeRun(id) { try { await apiFetch(`/api/v2/runs/${id}/resume`, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(leasePayload())}); await loadOperations(); } catch(error){dbgLog(error.message);} }
-function renderSchedules(items) { renderDataRows('scheduleList', items, item => ({title:`${item.name} · ${item.enabled?'启用':'停用'}`,meta:`${item.clock}/${item.trigger_type} · ${item.skill_id}`,actions:[[item.enabled?'停用':'启用',()=>setScheduleEnabled(item.id,!item.enabled)],['删除',()=>deleteSchedule(item.id)]]})); }
-async function setScheduleEnabled(id, enabled) { try { await apiFetch(`/api/v2/schedules/${id}`, {method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled,...leasePayload()})}); await loadOperations(); } catch(error){dbgLog(error.message);} }
-async function deleteSchedule(id) { try { await apiFetch(`/api/v2/schedules/${id}`, {method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify(leasePayload())}); await loadOperations(); } catch(error){dbgLog(error.message);} }
-function renderEvents(items) { renderDataRows('eventList', items.slice().reverse(), item => ({title:item.type,meta:`#${item.cursor} · ${item.aggregate_type}:${item.aggregate_id}`})); }
-
-function renderDataRows(targetId, items, describe) {
-  const target = document.getElementById(targetId); target.replaceChildren();
-  if (!items.length) { const empty=document.createElement('div');empty.className='empty';empty.textContent='暂无记录';target.append(empty);return; }
-  items.forEach(item => { const data=describe(item); const row=document.createElement('div');row.className='data-row';const content=document.createElement('div');const title=document.createElement('div');title.className='data-title';title.textContent=data.title;const meta=document.createElement('div');meta.className='data-meta';meta.textContent=data.meta;content.append(title,meta);row.append(content);const actions=data.actions||(data.action?[data.action]:[]);if(actions.length){const controls=document.createElement('div');controls.style.display='flex';controls.style.gap='6px';actions.forEach(action=>{const button=document.createElement('button');button.className='btn';button.textContent=action[0];button.onclick=action[1];controls.append(button);});row.append(controls);}target.append(row); });
-}
-
-// ── Memory ──
-async function loadMemoryPage() {
-  memoryState.loaded = true;
-  try {
-    await Promise.all([loadMemoryStatus(), loadMemoryRecords(true), loadMemoryRetention()]);
-  } catch (error) {
-    memoryState.loaded = false;
-    document.getElementById('memoryNotice').textContent = `记忆加载失败：${error.message}`;
-  }
-}
-
-async function loadMemoryStatus() {
-  const status = await apiFetch('/api/v2/memory/status');
-  document.getElementById('memoryScope').textContent = `${status.scope?.scope || '-'} · ${status.scope?.id || '-'}`;
-  document.getElementById('memoryRecordCount').textContent = status.record_count ?? 0;
-  document.getElementById('memoryRevision').textContent = String(status.revision || '-').slice(0, 10);
-  const storage = document.getElementById('memoryStorageStatus');
-  storage.className = `status ${status.repository?.production_ready ? 'online' : 'warning'}`;
-  storage.textContent = status.repository?.production_ready ? '生产存储就绪' : '本地开发存储';
-  if (status.save_blocked_reason) {
-    document.getElementById('memoryNotice').textContent = `记忆写入已阻止：${status.save_blocked_reason}`;
-  }
-}
-
-function memoryQueryString() {
-  const params = new URLSearchParams({
-    q: document.getElementById('memorySearch').value.trim(),
-    player: document.getElementById('memoryPlayer').value.trim(),
-    offset: String(memoryState.offset),
-    limit: String(memoryState.limit)
-  });
-  const category = document.getElementById('memoryCategory').value;
-  if (category) params.append('category', category);
-  params.append('state', document.getElementById('memoryStateFilter').value || 'active');
-  return params.toString();
-}
-
-async function loadMemoryRecords(reset = false) {
-  if (reset) memoryState.offset = 0;
-  const sequence = ++memoryState.requestSequence;
-  const list = document.getElementById('memoryList');
-  list.replaceChildren();
-  const loading = document.createElement('div'); loading.className = 'empty'; loading.style.padding = '12px'; loading.textContent = '正在加载...'; list.append(loading);
-  try {
-    const data = await apiFetch(`/api/v2/memory/records?${memoryQueryString()}`);
-    if (sequence !== memoryState.requestSequence) return;
-    memoryState.count = data.count || 0;
-    memoryState.nextOffset = data.next_offset;
-    renderMemoryRecords(data.records || []);
-    document.getElementById('memoryResultCount').textContent = `${memoryState.count} 条`;
-    document.getElementById('memoryPrevious').disabled = memoryState.offset <= 0;
-    document.getElementById('memoryNext').disabled = memoryState.nextOffset == null;
-    document.getElementById('memoryPageInfo').textContent = `第 ${Math.floor(memoryState.offset / memoryState.limit) + 1} 页`;
-  } catch (error) {
-    if (sequence !== memoryState.requestSequence) return;
-    list.replaceChildren();
-    const failed = document.createElement('div'); failed.className = 'empty'; failed.style.padding = '12px'; failed.textContent = `加载失败：${error.message}`; list.append(failed);
-  }
-}
-
-function renderMemoryRecords(records) {
-  const list = document.getElementById('memoryList');
-  list.replaceChildren();
-  if (!records.length) {
-    const empty = document.createElement('div'); empty.className = 'empty'; empty.style.padding = '12px'; empty.textContent = '没有符合条件的记录'; list.append(empty); return;
-  }
-  records.forEach(record => {
-    const row = document.createElement('button'); row.type = 'button'; row.className = `memory-row${record.id === memoryState.selectedId ? ' active' : ''}`;
-    const title = document.createElement('div'); title.className = 'memory-row-title'; title.textContent = record.title || record.category;
-    const meta = document.createElement('div'); meta.className = 'memory-row-meta'; meta.textContent = `${record.category} · ${formatMemoryTime(record.occurred_at)}`;
-    const excerpt = document.createElement('div'); excerpt.className = 'memory-row-excerpt'; excerpt.textContent = record.excerpt || '';
-    row.append(title, meta, excerpt); row.onclick = () => selectMemoryRecord(record.id); list.append(row);
-  });
-}
-
-async function selectMemoryRecord(recordId) {
-  memoryState.selectedId = recordId;
-  document.querySelectorAll('.memory-row').forEach(row => row.classList.remove('active'));
-  const detail = document.getElementById('memoryDetail'); detail.replaceChildren();
-  const loading = document.createElement('div'); loading.className = 'empty'; loading.textContent = '正在加载详情...'; detail.append(loading);
-  try {
-    const record = await apiFetch(`/api/v2/memory/records/${encodeURIComponent(recordId)}`);
-    if (memoryState.selectedId !== recordId) return;
-    renderMemoryDetail(record);
-    loadMemoryRecords(false);
-  } catch (error) {
-    detail.replaceChildren(); const failed = document.createElement('div'); failed.className = 'empty'; failed.textContent = `详情加载失败：${error.message}`; detail.append(failed);
-  }
-}
-
-function renderMemoryDetail(record) {
-  const detail = document.getElementById('memoryDetail'); detail.replaceChildren();
-  const grid = document.createElement('div'); grid.className = 'memory-detail-grid';
-  const fields = [
-    ['ID', record.id], ['类别', record.category], ['状态', record.state],
-    ['时间', formatMemoryTime(record.occurred_at)], ['作用域', record.scope?.id],
-    ['来源', record.provenance?.source], ['来源哈希', record.provenance?.source_hash]
-  ];
-  fields.forEach(([key, value]) => {
-    const label = document.createElement('div'); label.className = 'memory-detail-key'; label.textContent = key;
-    const content = document.createElement('div'); content.className = 'memory-detail-value'; content.textContent = value ?? '-';
-    grid.append(label, content);
-  });
-  const jsonView = document.createElement('pre'); jsonView.className = 'memory-json'; jsonView.textContent = JSON.stringify(record.content, null, 2);
-  const actions = document.createElement('div'); actions.className = 'form-actions';
-  if (record.state === 'active') actions.append(memoryActionButton('归档', () => previewMemoryAction('archive', record.id)));
-  if (record.state === 'archived') {
-    actions.append(memoryActionButton('恢复', () => previewMemoryAction('restore', record.id)));
-    actions.append(memoryActionButton('软删除', () => previewMemoryAction('delete', record.id), true));
-  }
-  if (record.state === 'deleted') actions.append(memoryActionButton('恢复', () => previewMemoryAction('restore', record.id)));
-  detail.append(grid, jsonView, actions);
-}
-
-function memoryActionButton(label, handler, danger = false) {
-  const button = document.createElement('button'); button.className = `btn${danger ? ' danger' : ''}`; button.textContent = label; button.onclick = handler; return button;
-}
-
-function memoryPreviousPage() {
-  memoryState.offset = Math.max(0, memoryState.offset - memoryState.limit);
-  loadMemoryRecords(false);
-}
-
-function memoryNextPage() {
-  if (memoryState.nextOffset == null) return;
-  memoryState.offset = memoryState.nextOffset;
-  loadMemoryRecords(false);
-}
-
-async function exportMemory() {
-  const category = document.getElementById('memoryCategory').value;
-  const payload = {
-    q: document.getElementById('memorySearch').value.trim(),
-    player: document.getElementById('memoryPlayer').value.trim(),
-    categories: category ? [category] : [],
-    states: [document.getElementById('memoryStateFilter').value || 'active'],
-    format: 'jsonl',
-    include_provenance: true
-  };
-  try {
-    const response = await fetch('/api/v2/memory/exports', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-    if (!response.ok) { const error = await response.json().catch(()=>({})); throw new Error(error.detail || `HTTP ${response.status}`); }
-    const blob = await response.blob(); const url = URL.createObjectURL(blob); const link = document.createElement('a');
-    link.href = url; link.download = 'lcu-memory-export.jsonl'; document.body.append(link); link.click(); link.remove(); URL.revokeObjectURL(url);
-    document.getElementById('memoryNotice').textContent = '记忆导出已生成；内容已按管理接口规则脱敏。';
-  } catch (error) {
-    document.getElementById('memoryNotice').textContent = `导出失败：${error.message}`;
-  }
-}
-
-async function previewMemoryCompression() {
-  const category = document.getElementById('memoryCategory').value;
-  const defaultConfig = llmConfig?.agents?.default || {};
-  const agent = defaultConfig.summary_model_agent || 'default';
-  const targetTokens = Math.max(64, Math.min(4096, Number(defaultConfig.summary_max_output_tokens) || 1024));
-  const payload = {
-    q: document.getElementById('memorySearch').value.trim(),
-    player: document.getElementById('memoryPlayer').value.trim(),
-    categories: category ? [category] : [],
-    states: [document.getElementById('memoryStateFilter').value || 'active'],
-    summary_model_agent: agent,
-    target_tokens: targetTokens
-  };
-  document.getElementById('memoryNotice').textContent = '正在生成持久摘要预览...';
-  try {
-    const preview = await apiFetch('/api/v2/memory/compression/previews', {
-      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)
-    });
-    memoryState.compressionPreview = preview;
-    document.getElementById('memoryCompressionCount').textContent = `${preview.source_count} 条`;
-    document.getElementById('memoryCompressionModel').textContent = `${preview.agent} · ${preview.model || '-'}`;
-    document.getElementById('memoryCompressionExpiry').textContent = formatMemoryTime(preview.expires_at);
-    document.getElementById('memoryCompressionSummary').textContent = preview.summary;
-    document.getElementById('memoryCompressionCommit').disabled = false;
-    document.getElementById('memoryCompressionDialog').showModal();
-    document.getElementById('memoryNotice').textContent = '摘要预览已生成，原始记录尚未改变。';
-  } catch (error) {
-    document.getElementById('memoryNotice').textContent = `摘要预览失败：${error.message}`;
-  }
-}
-
-async function executeMemoryCompression() {
-  const preview = memoryState.compressionPreview;
-  if (!preview) return;
-  const button = document.getElementById('memoryCompressionCommit');
-  button.disabled = true;
-  try {
-    await apiFetch('/api/v2/memory/compression/runs', {
-      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({preview_id:preview.id})
-    });
-    document.getElementById('memoryCompressionDialog').close();
-    memoryState.compressionPreview = null;
-    document.getElementById('memoryNotice').textContent = '持久摘要已保存，全部来源记录仍然保留。';
-    await Promise.all([loadMemoryStatus(), loadMemoryRecords(true)]);
-  } catch (error) {
-    button.disabled = false;
-    document.getElementById('memoryNotice').textContent = `摘要保存失败：${error.message}`;
-  }
-}
-
-async function previewMemoryAction(action, recordId) {
-  try {
-    const preview = await apiFetch('/api/v2/memory/actions/previews', {
-      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({
-        action, record_ids:[recordId], states:[], reason:'dashboard manual action'
-      })
-    });
-    openMemoryActionPreview(preview, '/api/v2/memory/actions');
-  } catch (error) {
-    document.getElementById('memoryNotice').textContent = `操作预览失败：${error.message}`;
-  }
-}
-
-function openMemoryActionPreview(preview, endpoint) {
-  memoryState.actionPreview = preview;
-  memoryState.actionEndpoint = endpoint;
-  document.getElementById('memoryActionTitle').textContent = preview.action === 'retention' ? '保留策略执行确认' : '记忆操作确认';
-  document.getElementById('memoryActionCount').textContent = `${preview.affected_count} 条`;
-  document.getElementById('memoryActionChanges').textContent = Object.entries(preview.changes || {}).map(([state, ids]) => `${state}: ${ids.length}`).join(' · ');
-  document.getElementById('memoryActionExpected').textContent = `请输入：${preview.confirmation_text}`;
-  document.getElementById('memoryActionConfirmation').value = '';
-  document.getElementById('memoryActionCommit').disabled = true;
-  document.getElementById('memoryActionDialog').showModal();
-}
-
-function validateMemoryActionConfirmation() {
-  const preview = memoryState.actionPreview;
-  document.getElementById('memoryActionCommit').disabled = !preview || document.getElementById('memoryActionConfirmation').value !== preview.confirmation_text;
-}
-
-async function executeMemoryAction() {
-  const preview = memoryState.actionPreview;
-  if (!preview || !memoryState.actionEndpoint) return;
-  const button = document.getElementById('memoryActionCommit'); button.disabled = true;
-  try {
-    await apiFetch(memoryState.actionEndpoint, {
-      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({
-        preview_id:preview.id,
-        confirmation_token:preview.confirmation_token,
-        confirmation_text:document.getElementById('memoryActionConfirmation').value
-      })
-    });
-    document.getElementById('memoryActionDialog').close();
-    memoryState.actionPreview = null; memoryState.actionEndpoint = null; memoryState.selectedId = null;
-    const detail = document.getElementById('memoryDetail'); detail.replaceChildren();
-    const empty = document.createElement('div'); empty.className = 'empty'; empty.textContent = '选择一条记录查看完整内容'; detail.append(empty);
-    document.getElementById('memoryNotice').textContent = '记忆状态已更新，原始数据仍然保留。';
-    await Promise.all([loadMemoryStatus(), loadMemoryRecords(true), loadMemoryRetention()]);
-  } catch (error) {
-    button.disabled = false;
-    document.getElementById('memoryNotice').textContent = `操作失败：${error.message}`;
-  }
-}
-
-async function loadMemoryRetention() {
-  const retention = await apiFetch('/api/v2/memory/retention');
-  memoryState.retention = retention;
-  document.getElementById('memoryRetentionVersion').textContent = `版本 ${retention.version}`;
-  loadMemoryRetentionRule();
-}
-
-function loadMemoryRetentionRule() {
-  const category = document.getElementById('memoryRetentionCategory').value;
-  const rule = memoryState.retention.rules.find(item => item.category === category);
-  document.getElementById('memoryArchiveDays').value = rule?.archive_after_days ?? 30;
-  document.getElementById('memoryDeleteDays').value = rule?.delete_after_days ?? 90;
-  document.getElementById('memoryMinKeep').value = rule?.min_keep ?? 50;
-  document.getElementById('memoryRetentionStatus').textContent = rule ? '当前类别规则已启用' : '尚未配置当前类别';
-}
-
-async function saveMemoryRetention() {
-  const category = document.getElementById('memoryRetentionCategory').value;
-  const archiveDays = Number(document.getElementById('memoryArchiveDays').value);
-  const deleteDays = Number(document.getElementById('memoryDeleteDays').value);
-  const minKeep = Number(document.getElementById('memoryMinKeep').value);
-  if (!Number.isFinite(archiveDays) || !Number.isFinite(deleteDays) || deleteDays <= archiveDays) {
-    document.getElementById('memoryRetentionStatus').textContent = '软删除天数必须大于归档天数'; return;
-  }
-  const rules = memoryState.retention.rules.filter(item => item.category !== category);
-  rules.push({category,enabled:true,archive_after_days:archiveDays,delete_after_days:deleteDays,min_keep:minKeep});
-  try {
-    memoryState.retention = await apiFetch('/api/v2/memory/retention', {
-      method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({expected_version:memoryState.retention.version,rules})
-    });
-    document.getElementById('memoryRetentionVersion').textContent = `版本 ${memoryState.retention.version}`;
-    document.getElementById('memoryRetentionStatus').textContent = '规则已保存';
-  } catch (error) {
-    document.getElementById('memoryRetentionStatus').textContent = `保存失败：${error.message}`;
-  }
-}
-
-async function previewMemoryRetention() {
-  try {
-    const preview = await apiFetch('/api/v2/memory/retention/previews', {method:'POST'});
-    openMemoryActionPreview(preview, '/api/v2/memory/retention/runs');
-  } catch (error) {
-    document.getElementById('memoryRetentionStatus').textContent = `没有可执行变更：${error.message}`;
-  }
-}
-
-function formatMemoryTime(timestamp) {
-  if (!timestamp) return '-';
-  return new Date(Number(timestamp) * 1000).toLocaleString('zh-CN');
-}
-
-// ── Provider Profiles ──
-async function loadProviderProfiles() {
-  try {
-    const data = await apiFetch('/api/v2/llm/profiles');
-    providerProfiles = data.profiles || [];
-    const providerSelect = document.getElementById('profileProvider');
-    providerSelect.replaceChildren(...providerPresets.map(item => new Option(item.name, item.id)));
-    const profileOptions = providerProfiles.map(item => new Option(`${item.name} (${item.id})`, item.id));
-    document.getElementById('routePrimary').replaceChildren(...profileOptions);
-    const agents = Object.keys(llmConfig?.agents || {default:{}});
-    document.getElementById('routeAgent').replaceChildren(...agents.map(name => new Option(name, name)));
-    renderProviderProfiles();
-    renderProviderHealth(llmConfig?.usage?.provider_health || []);
-    loadAgentRoute();
-  } catch (error) {
-    document.getElementById('providerProfileStatus').textContent = `加载失败：${error.message}`;
-  }
-}
-
-function renderProviderProfiles() {
-  renderDataRows('providerProfileList', providerProfiles, profile => ({
-    title: `${profile.name} · ${profile.enabled === false ? '停用' : '启用'}`,
-    meta: `${profile.id} · ${profile.provider} · ${profile.model || '-'} · ${profile.base_url || '-'}`,
-    actions: [['编辑', () => editProviderProfile(profile.id)], ['删除', () => deleteProviderProfile(profile.id)]]
-  }));
-}
-
-function renderProviderHealth(items) {
-  renderDataRows('providerHealthList', items, item => ({
-    title: `${item.profile_id || item.key} · ${item.status}`,
-    meta: `${item.provider || '-'} · ${item.model || '-'} · failures ${item.consecutive_failures || 0} · cooldown ${Math.ceil(item.cooldown_remaining_seconds || 0)}s${item.last_error ? ` · ${item.last_error}` : ''}`
-  }));
-}
-
-function editProviderProfile(profileId) {
-  const profile = providerProfiles.find(item => item.id === profileId);
-  if (!profile) return;
-  document.getElementById('profileId').value = profile.id;
-  document.getElementById('profileName').value = profile.name || '';
-  document.getElementById('profileProvider').value = profile.provider || 'custom';
-  document.getElementById('profileBaseUrl').value = profile.base_url || '';
-  document.getElementById('providerEditorTitle').textContent = profile.name || profile.id;
-  document.getElementById('providerEnabledBadge').textContent = profile.enabled === false ? 'DISABLED' : 'ENABLED';
-  setProfileModels(profile.model ? [profile.model] : [], profile.model || '');
-  document.getElementById('profileApiKey').value = '';
-  document.getElementById('profileEnabled').checked = profile.enabled !== false;
-}
-
-function clearProviderProfileForm() {
-  ['profileId','profileName','profileBaseUrl','profileApiKey','profileModelCustom'].forEach(id => { document.getElementById(id).value = ''; });
-  document.getElementById('profileProvider').value = providerPresets[0]?.id || 'custom';
-  document.getElementById('profileEnabled').checked = true;
-  document.getElementById('providerEditorTitle').textContent = '新建 Profile';
-  document.getElementById('providerEnabledBadge').textContent = 'ENABLED';
-  setProfileModels([], '');
-  document.getElementById('providerProfileStatus').textContent = '尚未测试连接';
-}
-
-function setProfileModels(models, selected) {
-  const unique = [...new Set((models || []).filter(Boolean))].sort();
-  const select = document.getElementById('profileModelSelect');
-  const options = unique.map(model => new Option(model, model));
-  options.push(new Option('手动输入模型 ID', '__custom__'));
-  select.replaceChildren(...options);
-  if (selected && unique.includes(selected)) {
-    select.value = selected;
-    document.getElementById('profileModelCustomWrap').style.display = 'none';
-  } else if (selected) {
-    select.value = '__custom__';
-    document.getElementById('profileModelCustom').value = selected;
-    document.getElementById('profileModelCustomWrap').style.display = '';
-  } else {
-    select.value = unique[0] || '__custom__';
-    document.getElementById('profileModelCustomWrap').style.display = unique.length ? 'none' : '';
-  }
-  document.getElementById('profileModelCount').textContent = unique.length ? `${unique.length} 个模型` : '手动输入';
-}
-
-document.getElementById('profileModelSelect')?.addEventListener('change', event => {
-  document.getElementById('profileModelCustomWrap').style.display = event.target.value === '__custom__' ? '' : 'none';
-});
-
-async function refreshProfileModels() {
-  const button = document.getElementById('refreshProfileModels');
-  const status = document.getElementById('providerProfileStatus');
-  const payload = {};
-  const profileId = document.getElementById('profileId').value.trim();
-  const baseUrl = document.getElementById('profileBaseUrl').value.trim();
-  const apiKey = document.getElementById('profileApiKey').value.trim();
-  if (profileId && providerProfiles.some(item => item.id === profileId)) payload.profile_id = profileId;
-  if (baseUrl) payload.base_url = baseUrl;
-  if (apiKey) payload.api_key = apiKey;
-  button.disabled = true;
-  status.className = 'connection-state loading';
-  status.textContent = '正在获取模型...';
-  try {
-    const data = await apiFetch('/api/llm/models', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-    const current = document.getElementById('profileModelSelect').value;
-    setProfileModels(data.models || [], current === '__custom__' ? document.getElementById('profileModelCustom').value.trim() : current);
-    status.className = 'connection-state ok';
-    status.textContent = '连接正常，模型列表已更新';
-  } catch (error) {
-    setProfileModels([], document.getElementById('profileModelCustom').value.trim());
-    status.className = 'connection-state error';
-    status.textContent = `获取失败：${error.message}`;
-  } finally {
-    button.disabled = false;
-  }
-}
-
-async function saveProviderProfile() {
-  let id = document.getElementById('profileId').value.trim();
-  const name = document.getElementById('profileName').value.trim();
-  if (!id && name) id = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-  if (!id) { document.getElementById('providerProfileStatus').textContent = 'Profile ID 不能为空'; return; }
-  const selectedModel = document.getElementById('profileModelSelect').value;
-  const model = selectedModel === '__custom__' ? document.getElementById('profileModelCustom').value.trim() : selectedModel;
-  if (!model) { document.getElementById('providerProfileStatus').textContent = '请选择或输入模型 ID'; return; }
-  const payload = {
-    id,
-    name: name || id,
-    provider: document.getElementById('profileProvider').value,
-    base_url: document.getElementById('profileBaseUrl').value.trim(),
-    model,
-    enabled: document.getElementById('profileEnabled').checked
-  };
-  const apiKey = document.getElementById('profileApiKey').value;
-  if (apiKey) payload.api_key = apiKey;
-  try {
-    await apiFetch('/api/v2/llm/profiles', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-    document.getElementById('providerProfileStatus').textContent = `${id} 已保存`;
-    document.getElementById('profileApiKey').value = '';
-    await loadLLMConfig(); await loadProviderProfiles();
-  } catch (error) { document.getElementById('providerProfileStatus').textContent = `保存失败：${error.message}`; }
-}
-
-async function deleteProviderProfile(profileId) {
-  if (!confirm(`删除 Provider Profile ${profileId}？`)) return;
-  try {
-    await apiFetch(`/api/v2/llm/profiles/${encodeURIComponent(profileId)}`, {method:'DELETE'});
-    await loadProviderProfiles();
-  } catch (error) { document.getElementById('providerProfileStatus').textContent = `删除失败：${error.message}`; }
-}
-
-function loadAgentRoute() {
-  const agent = document.getElementById('routeAgent').value || 'default';
-  const config = llmConfig?.agents?.[agent] || llmConfig?.agents?.default || {};
-  document.getElementById('routePrimary').value = config.provider_profile || providerProfiles[0]?.id || '';
-  document.getElementById('routeMode').value = config.routing_mode || 'manual';
-  document.getElementById('routeFallbacks').value = (config.fallback_profiles || []).join(',');
-}
-
-async function saveAgentRoute() {
-  const agent = document.getElementById('routeAgent').value || 'default';
-  const payload = {
-    agent,
-    provider_profile: document.getElementById('routePrimary').value,
-    routing_mode: document.getElementById('routeMode').value,
-    fallback_profiles: document.getElementById('routeFallbacks').value.split(',').map(value => value.trim()).filter(Boolean)
-  };
-  try {
-    await apiFetch('/api/llm/config', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-    document.getElementById('agentRouteStatus').textContent = `${agent} 路由已保存`;
-    await loadLLMConfig(); loadAgentRoute();
-  } catch (error) { document.getElementById('agentRouteStatus').textContent = `保存失败：${error.message}`; }
-}
-
-// ── Access Policy ──
-async function loadAccessPolicy() {
-  try {
-    accessPolicy = await apiFetch('/api/v2/access/policy');
-    document.getElementById('accessPublicChat').value = String(accessPolicy.public_chat !== false);
-    document.getElementById('accessPrivateChat').value = String(accessPolicy.private_chat !== false);
-    renderAccessPrincipals();
-  } catch (error) { document.getElementById('accessStatus').textContent = `加载失败：${error.message}`; }
-}
-
-function renderAccessPrincipals() {
-  renderDataRows('accessPrincipalList', accessPolicy?.principals || [], principal => ({
-    title: `${principal.name || principal.id} · ${principal.role} · ${principal.enabled === false ? '停用' : '启用'}`,
-    meta: `${principal.uuid || '无 UUID'} · servers: ${(principal.server_ids || []).join(',') || '*'} · bodies: ${(principal.body_ids || []).join(',') || '*'}`,
-    actions: [['编辑', () => editAccessPrincipal(principal.id)], ['删除', () => deleteAccessPrincipal(principal.id)]]
-  }));
-}
-
-function editAccessPrincipal(principalId) {
-  const principal = accessPolicy?.principals?.find(item => item.id === principalId);
-  if (!principal) return;
-  document.getElementById('principalId').value = principal.id;
-  document.getElementById('principalRole').value = principal.role;
-  document.getElementById('principalName').value = principal.name || '';
-  document.getElementById('principalUuid').value = principal.uuid || '';
-  document.getElementById('principalServers').value = (principal.server_ids || []).join(',');
-  document.getElementById('principalBodies').value = (principal.body_ids || []).join(',');
-  document.getElementById('principalEnabled').checked = principal.enabled !== false;
-  document.getElementById('principalSkills').value = JSON.stringify(principal.skills || {}, null, 2);
-}
-
-function clearAccessPrincipalForm() {
-  ['principalId','principalName','principalUuid','principalServers','principalBodies','principalSkills'].forEach(id => { document.getElementById(id).value = ''; });
-  document.getElementById('principalRole').value = 'friend';
-  document.getElementById('principalEnabled').checked = true;
-}
-
-async function saveAccessPolicyHeader() {
-  if (!accessPolicy) return;
-  accessPolicy.public_chat = document.getElementById('accessPublicChat').value === 'true';
-  accessPolicy.private_chat = document.getElementById('accessPrivateChat').value === 'true';
-  try {
-    accessPolicy = await apiFetch('/api/v2/access/policy', {method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(accessPolicy)});
-    document.getElementById('accessStatus').textContent = '公共聊天策略已保存';
-  } catch (error) { document.getElementById('accessStatus').textContent = `保存失败：${error.message}`; }
-}
-
-async function saveAccessPrincipal() {
-  const id = document.getElementById('principalId').value.trim();
-  if (!id) { document.getElementById('accessStatus').textContent = 'Principal ID 不能为空'; return; }
-  let skills = {};
-  try { skills = JSON.parse(document.getElementById('principalSkills').value || '{}'); }
-  catch (_) { document.getElementById('accessStatus').textContent = 'Skill Overrides 必须是 JSON 对象'; return; }
-  const payload = {
-    id,
-    role: document.getElementById('principalRole').value,
-    name: document.getElementById('principalName').value.trim(),
-    uuid: document.getElementById('principalUuid').value.trim(),
-    server_ids: document.getElementById('principalServers').value.split(',').map(value => value.trim()).filter(Boolean),
-    body_ids: document.getElementById('principalBodies').value.split(',').map(value => value.trim()).filter(Boolean),
-    enabled: document.getElementById('principalEnabled').checked,
-    skills
-  };
-  try {
-    await apiFetch('/api/v2/access/principals', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-    document.getElementById('accessStatus').textContent = `${id} 已保存`;
-    await loadAccessPolicy();
-  } catch (error) { document.getElementById('accessStatus').textContent = `保存失败：${error.message}`; }
-}
-
-async function deleteAccessPrincipal(principalId) {
-  if (!confirm(`删除授权主体 ${principalId}？`)) return;
-  try {
-    await apiFetch(`/api/v2/access/principals/${encodeURIComponent(principalId)}`, {method:'DELETE'});
-    await loadAccessPolicy();
-  } catch (error) { document.getElementById('accessStatus').textContent = `删除失败：${error.message}`; }
-}
-
 // ── Settings ──
 function numericValue(id) {
   const value = Number(document.getElementById(id).value);
@@ -2295,7 +1067,6 @@ function loadLLMConfig() {
     const agent = recallSetting('agent', d.default_agent || 'default');
     document.getElementById('agentSelect').value = agent;
     loadAgentLLMConfig();
-    if (document.getElementById('providerHealthList')) renderProviderHealth(d.usage?.provider_health || []);
   }).catch(()=>{});
 }
 
@@ -2489,9 +1260,6 @@ function escapeHtml(str) {
 }
 
 // ── Init ──
-try { dashboardLease = JSON.parse(sessionStorage.getItem('lcu.controlLease') || 'null'); } catch (_) { dashboardLease = null; }
-if (dashboardLease) startHeartbeat();
-updateScheduleForm();
 Promise.resolve()
   .then(loadProviders)
   .then(loadRoles)
@@ -2499,7 +1267,6 @@ Promise.resolve()
   .then(loadPermissionConfig)
   .then(loadPersonaConfig)
   .then(() => { renderEffective(); updateConnection({}); })
-  .then(loadOperations)
   .catch(err => dbgLog('初始化配置失败: ' + err));
 
 // ── 连接状态（后端 vs 模组）与"游戏状态是否同步上"提示 ──
