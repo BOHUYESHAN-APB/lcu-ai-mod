@@ -211,6 +211,15 @@ tasks.named('check').configure {
     dependsOn 'verifyPhrase'
     dependsOn 'verifyGate'
     dependsOn 'verifyHold'
+    dependsOn 'verifyContainer'
+}
+
+tasks.register('verifyContainer', JavaExec) {
+    group = 'verification'
+    description = '纯逻辑自检（容器/UI 驱动层：槽位映射 / QUICK_MOVE 参数 / 让路 / 幂等 / 非法槽位与超时恒实失败）'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.output + sourceSets.main.output
+    mainClass = 'com.lcu.lcumod.action.ContainerCheck'
 }
 
 tasks.register('verifyHold', JavaExec) {

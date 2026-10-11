@@ -180,6 +180,9 @@ public class ActionExecutor {
         // ── Craft controller (stateful crafting) ──
         tickPendingCraft(mc);
 
+        // ── craft_via_recipe 的结果校验（诚实 outcome：背包真多出物品才算成功，超时恒实失败）──
+        ContainerController.tickCraftVerification(mc);
+
         // ── Storage retrieval controller (check chests/barrels before world collect) ──
         tickPendingStorageRetrieve(mc);
 
@@ -422,11 +425,16 @@ public class ActionExecutor {
                     sendResponse(cmd.id(), true, "AI=" + isAiControlled());
                 }
                 // Container interaction (mineflayer-style)
-                case "use_on" -> handleUseOn(cmd);       // right-click block/entity
+                case "use_on" -> handleUseOn(cmd);       // 通用右键：看向 + 按住右键（语义交给后端/原版）
                 case "get_container" -> handleGetContainer(cmd);
                 case "take_item" -> handleTakeItem(cmd);
                 case "put_item" -> handlePutItem(cmd);
-                case "close_container" -> handleCloseContainer(cmd);
+                case "close_container", "container_close" -> handleCloseContainer(cmd);
+                // UI 驱动层：一律发窗口点击包，绝不打开客户端界面（见 ContainerController）
+                case "container_move" -> handleContainerMove(cmd);
+                case "container_click" -> handleContainerClick(cmd);
+                case "equip_armor" -> handleEquipArmor(cmd);
+                case "craft_via_recipe" -> handleCraftViaRecipe(cmd);
                 case "look_at_entity" -> handleLookAtEntity(cmd);
                 case "use_on_entity" -> handleUseOnEntity(cmd);
                 case "behavior_enable", "toggle_behavior" -> { 
@@ -695,23 +703,15 @@ public class ActionExecutor {
         sendResponse(cmd.id(), true, state);
     }
 
+    /** interact / interact_block：和 use_on 是同一件事（通用右键），不再有"命中方块→useItemOn / 否则 useItem"的分支。 */
     private void handleInteract(WireServer.WireCommand cmd) {
         var mc = Minecraft.getInstance();
         if (mc.player == null || mc.gameMode == null) {
             sendResponse(cmd.id(), false, "No player");
             return;
         }
-        // Right-click the block the player is looking at
-        var hit = mc.hitResult;
-        if (hit != null && hit.getType() == net.minecraft.world.phys.HitResult.Type.BLOCK) {
-            var blockHit = (net.minecraft.world.phys.BlockHitResult) hit;
-            mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, blockHit);
-            sendResponse(cmd.id(), true, "Interacted");
-        } else {
-            // Use item in hand instead
-            mc.gameMode.useItem(mc.player, InteractionHand.MAIN_HAND);
-            sendResponse(cmd.id(), true, "Used item");
-        }
+        ContainerController.genericRightClick(mc, 4);
+        sendResponse(cmd.id(), true, "Right-click");
     }
 
     private void handleMine(WireServer.WireCommand cmd) {
@@ -839,6 +839,7 @@ public class ActionExecutor {
             }
         }
         ControlStream.hold("use", ticks);
+        ContainerController.markAiContainerIntent();
         sendResponse(cmd.id(), true, "Using item for " + ticks + " ticks");
     }
 
@@ -1209,24 +1210,24 @@ public class ActionExecutor {
     // ── Container Interaction (mineflayer-style) ───────────────
 
     private void handleUseOn(WireServer.WireCommand cmd) {
-        // Right-click whatever player is looking at (block or entity)
+        // 通用右键：**不判断命中的是方块还是实体，也不判断手上是什么** —— 看向 + 按住 use，
+        // 由原版自己分派。之前这里按 hitResult 分 useItemOn/useItem 就是"特殊交互"的来源。
         var mc = Minecraft.getInstance();
         if (mc.player == null || mc.gameMode == null) {
             sendResponse(cmd.id(), false, "No player");
             return;
         }
-        var hit = mc.hitResult;
-        if (hit instanceof net.minecraft.world.phys.BlockHitResult blockHit) {
-            mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, blockHit);
-            sendResponse(cmd.id(), true, "Right-clicked block");
-        } else if (hit instanceof net.minecraft.world.phys.EntityHitResult entityHit) {
-            mc.gameMode.interact(mc.player, entityHit.getEntity(), new net.minecraft.world.phys.EntityHitResult(entityHit.getEntity()), InteractionHand.MAIN_HAND);
-            sendResponse(cmd.id(), true, "Right-clicked entity");
-        } else {
-            // Use item in hand
-            mc.gameMode.useItem(mc.player, InteractionHand.MAIN_HAND);
-            sendResponse(cmd.id(), true, "Used item (no target)");
+        int ticks = 4;
+        var args = cmd.args();
+        if (args != null && args.has("ticks")) {
+            try {
+                ticks = Math.max(1, Math.min(args.get("ticks").getAsInt(), 200));
+            } catch (Exception ignored) {
+                // 非法值回落到默认 4
+            }
         }
+        ContainerController.genericRightClick(mc, ticks);
+        sendResponse(cmd.id(), true, "Right-click (hold use " + ticks + "t)");
     }
 
     private void handleGetContainer(WireServer.WireCommand cmd) {
@@ -1257,35 +1258,17 @@ public class ActionExecutor {
         sendResponse(cmd.id(), true, result);
     }
 
+    /** take_item {slot}：容器里 shift 点击取出（QUICK_MOVE）—— 统一走 ContainerController。 */
     private void handleTakeItem(WireServer.WireCommand cmd) {
-        // Take item from container slot (shift-click to player inventory)
-        var args = cmd.args();
-        if (args == null || !args.has("slot")) {
-            sendResponse(cmd.id(), false, "Need slot number");
-            return;
-        }
-        var mc = Minecraft.getInstance();
-        if (mc.player == null || mc.gameMode == null) {
-            sendResponse(cmd.id(), false, "No player");
-            return;
-        }
-        var menu = mc.player.containerMenu;
-        if (menu == null) { sendResponse(cmd.id(), false, "No container open"); return; }
-
-        int slot = args.get("slot").getAsInt();
-        if (slot < 0 || slot >= menu.slots.size()) {
-            sendResponse(cmd.id(), false, "Invalid slot " + slot);
-            return;
-        }
-
-        // Shift-click to transfer item quickly (button=1, clickType=QUICK_MOVE)
-        mc.gameMode.handleContainerInput(menu.containerId, slot, 0,
-            net.minecraft.world.inventory.ContainerInput.QUICK_MOVE, mc.player);
-        sendResponse(cmd.id(), true, "Taking from slot " + slot);
+        quickMoveFromCmd(cmd, "Taking from slot ");
     }
 
+    /** put_item {slot}：玩家背包里 shift 点击存入（QUICK_MOVE）—— 同一个原版语义。 */
     private void handlePutItem(WireServer.WireCommand cmd) {
-        // Put item from player inventory into container (shift-click)
+        quickMoveFromCmd(cmd, "Putting into slot ");
+    }
+
+    private void quickMoveFromCmd(WireServer.WireCommand cmd, String prefix) {
         var args = cmd.args();
         if (args == null || !args.has("slot")) {
             sendResponse(cmd.id(), false, "Need slot number");
@@ -1296,28 +1279,87 @@ public class ActionExecutor {
             sendResponse(cmd.id(), false, "No player");
             return;
         }
-        var menu = mc.player.containerMenu;
-        if (menu == null) { sendResponse(cmd.id(), false, "No container open"); return; }
-
         int slot = args.get("slot").getAsInt();
-        if (slot < 0 || slot >= menu.slots.size()) {
-            sendResponse(cmd.id(), false, "Invalid slot " + slot);
-            return;
-        }
-
-        // Shift-click from player inventory section into container
-        mc.gameMode.handleContainerInput(menu.containerId, slot, 0,
-            net.minecraft.world.inventory.ContainerInput.QUICK_MOVE, mc.player);
-        sendResponse(cmd.id(), true, "Putting into slot " + slot);
+        // to_slot = -1 → 原版 QUICK_MOVE（shift 点击）
+        sendControllerResult(cmd.id(), ContainerController.move(mc, slot, -1, 0), prefix + slot);
     }
 
+    /** close_container / container_close：发关闭包（不开界面、幂等）。 */
     private void handleCloseContainer(WireServer.WireCommand cmd) {
         var mc = Minecraft.getInstance();
-        if (mc.player != null) {
-            mc.player.closeContainer();
-            sendResponse(cmd.id(), true, "Container closed");
+        var res = ContainerController.close(mc);
+        sendControllerResult(cmd.id(), res, res.reason());
+    }
+
+    // ── UI 驱动层命令（一律发窗口点击包）──────────────────────────
+
+    /** container_move {from_slot,to_slot,count?}；to_slot < 0 = QUICK_MOVE（背包↔快捷栏）。 */
+    private void handleContainerMove(WireServer.WireCommand cmd) {
+        var args = cmd.args();
+        if (args == null || !args.has("from_slot")) {
+            sendResponse(cmd.id(), false, "Need from_slot");
+            return;
+        }
+        var mc = Minecraft.getInstance();
+        int from = args.get("from_slot").getAsInt();
+        int to = args.has("to_slot") ? args.get("to_slot").getAsInt() : -1;
+        int count = args.has("count") ? args.get("count").getAsInt() : 0;
+        sendControllerResult(cmd.id(), ContainerController.move(mc, from, to, count),
+                "Moved slot " + from + " -> " + to);
+    }
+
+    /** container_click {slot,button?,click_type?}（click_type = ContainerInput 小写名）。 */
+    private void handleContainerClick(WireServer.WireCommand cmd) {
+        var args = cmd.args();
+        if (args == null || !args.has("slot")) {
+            sendResponse(cmd.id(), false, "Need slot");
+            return;
+        }
+        var mc = Minecraft.getInstance();
+        int slot = args.get("slot").getAsInt();
+        int button = args.has("button") ? args.get("button").getAsInt() : 0;
+        String clickType = args.has("click_type") ? args.get("click_type").getAsString() : "pickup";
+        sendControllerResult(cmd.id(), ContainerController.click(mc, slot, button, clickType),
+                "Clicked slot " + slot + " (" + clickType + ")");
+    }
+
+    /** equip_armor {}：背包里找盔甲 → 穿到对应装备槽 → 校验真的穿上了。 */
+    private void handleEquipArmor(WireServer.WireCommand cmd) {
+        var mc = Minecraft.getInstance();
+        sendControllerResult(cmd.id(), ContainerController.equipArmor(mc), "equip_armor");
+    }
+
+    /** craft_via_recipe {item,count?}：原版配方放置 API + 结果槽 shift 点击。 */
+    private void handleCraftViaRecipe(WireServer.WireCommand cmd) {
+        var args = cmd.args();
+        if (args == null || !args.has("item")) {
+            sendResponse(cmd.id(), false, "Need item");
+            return;
+        }
+        var mc = Minecraft.getInstance();
+        String item = args.get("item").getAsString();
+        int count = args.has("count") ? args.get("count").getAsInt() : 1;
+        var res = ContainerController.craftViaRecipe(mc, item, count);
+        if (res.ok()) {
+            // 配方放置包已发出：登记诚实 outcome（背包真的多出物品才算成功，超时恒实失败）
+            ContainerController.trackCraftOutcome(cmd.id());
+        }
+        sendControllerResult(cmd.id(), res, "craft_via_recipe " + item);
+    }
+
+    /** 把 ContainerController 的结果如实转成 wire 回执（成功/失败都带机器可读 reason）。 */
+    private void sendControllerResult(String id, ContainerController.Result res, String okMessage) {
+        if (LCUMod.WIRE == null) {
+            return;
+        }
+        JsonObject data = res.data() != null ? res.data() : new JsonObject();
+        if (okMessage != null) {
+            data.addProperty("message", okMessage);
+        }
+        if (res.ok()) {
+            LCUMod.WIRE.sendResponse(id, true, data);
         } else {
-            sendResponse(cmd.id(), false, "No player");
+            LCUMod.WIRE.sendResponse(id, false, data, res.reason());
         }
     }
 
@@ -1365,8 +1407,10 @@ public class ActionExecutor {
         int entityId = args.get("id").getAsInt();
         var entity = mc.level.getEntity(entityId);
         if (entity != null) {
-            mc.gameMode.interact(mc.player, entity, new net.minecraft.world.phys.EntityHitResult(entity), InteractionHand.MAIN_HAND);
-            sendResponse(cmd.id(), true, "Interacted with entity " + entityId);
+            // 看向实体 + 通用右键（不再直接 interact(entity)：语义交给后端/原版）
+            ContainerController.aimAt(mc, entity.getEyePosition());
+            ContainerController.genericRightClick(mc, 4);
+            sendResponse(cmd.id(), true, "Right-clicking entity " + entityId);
         } else {
             sendResponse(cmd.id(), false, "Entity " + entityId + " not found");
         }
@@ -1748,20 +1792,14 @@ public class ActionExecutor {
         return pos.getX() + "," + pos.getY() + "," + pos.getZ();
     }
 
-    /** 盯着床并右键；是否允许睡由服务器裁决。 */
+    /** 盯着床并**通用右键**；是否允许睡由服务器裁决（本地不判断"床=睡觉"的语义）。 */
     private void useBed(Minecraft mc, BlockPos bedPos) {
         var player = mc.player;
         if (player == null || mc.gameMode == null) {
             return;
         }
-        double dx = bedPos.getX() + 0.5 - player.getX();
-        double dy = bedPos.getY() + 0.5 - player.getEyeY();
-        double dz = bedPos.getZ() + 0.5 - player.getZ();
-        double horizontal = Math.sqrt(dx * dx + dz * dz);
-        player.setYRot((float) Math.toDegrees(Math.atan2(-dx, dz)));
-        player.setXRot((float) Math.toDegrees(-Math.atan2(dy, horizontal)));
-        var hit = new BlockHitResult(Vec3.atCenterOf(bedPos), Direction.UP, bedPos, false);
-        mc.gameMode.useItemOn(player, InteractionHand.MAIN_HAND, hit);
+        ContainerController.aimAt(mc, Vec3.atCenterOf(bedPos));
+        ContainerController.genericRightClick(mc, 4);
         StateCollector.requestRefresh();
     }
 
@@ -2491,7 +2529,7 @@ public class ActionExecutor {
         if (step.mode.equals("craft")) {
             boolean needsTable = step.needsCraftingTable;
             if (needsTable && !isCraftingTableOpen(mc)) {
-                if (!openNearbyCraftingTable(mc)) {
+                if (!ContainerController.openNearestContainer(mc, "minecraft:crafting_table")) {
                     if (LCUMod.WIRE != null) {
                         LCUMod.WIRE.sendProgress(pendingCraftReqId, 0.0, "need nearby crafting table for " + pendingCraftItem);
                     }
@@ -2505,7 +2543,7 @@ public class ActionExecutor {
             }
 
             pendingCraftAttempts++;
-            RecipeDisplayId displayId = resolveRecipeDisplayId(step.recipe);
+            RecipeDisplayId displayId = ContainerController.resolveRecipeDisplayId(step.recipe);
             if (displayId != null) {
                 mc.gameMode.handlePlaceRecipe(mc.player.containerMenu.containerId, displayId, false);
                 mc.gameMode.handleContainerInput(mc.player.containerMenu.containerId, 0, 0, ContainerInput.QUICK_MOVE, mc.player);
@@ -2523,7 +2561,7 @@ public class ActionExecutor {
             }
         } else {
             if (!isProcessingStationOpen(mc, step.mode)) {
-                if (!openNearbyProcessingStation(mc, step.stationBlockId)) {
+                if (!ContainerController.openNearestContainer(mc, step.stationBlockId)) {
                     if (LCUMod.WIRE != null) {
                         LCUMod.WIRE.sendProgress(pendingCraftReqId, 0.0, "need nearby " + step.stationBlockId + " for " + pendingCraftItem);
                     }
@@ -2566,7 +2604,7 @@ public class ActionExecutor {
             }
 
             pendingCraftAttempts++;
-            RecipeDisplayId displayId = resolveRecipeDisplayId(step.recipe);
+            RecipeDisplayId displayId = ContainerController.resolveRecipeDisplayId(step.recipe);
             if (displayId != null) {
                 mc.gameMode.handlePlaceRecipe(mc.player.containerMenu.containerId, displayId, false);
             } else {
@@ -2765,9 +2803,7 @@ public class ActionExecutor {
                     "arrived at storage", 0.2);
                 return;
             }
-            Vec3 hitVec = Vec3.atCenterOf(pendingStoragePos);
-            BlockHitResult hitResult = new BlockHitResult(hitVec, Direction.UP, pendingStoragePos, false);
-            mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, hitResult);
+            ContainerController.openContainerAt(mc, pendingStoragePos, 6);
             setTaskState(resolveRootTaskKind(), "storage", pendingStorageTargetItem,
                 "opening storage", 0.3);
             return;
@@ -2862,93 +2898,15 @@ public class ActionExecutor {
         return false;
     }
 
-    private RecipeHolder<?> findRecipeByResult(Minecraft mc, String itemName) {
-        var server = mc.getSingleplayerServer();
-        if (server == null) return null;
-        net.minecraft.util.context.ContextMap context = SlotDisplayContext.fromLevel(mc.level);
-        for (RecipeHolder<?> recipe : server.getRecipeManager().getRecipes()) {
-            if (recipe.value().getType() != RecipeType.CRAFTING) continue;
-            for (var display : recipe.value().display()) {
-                var result = display.result().resolveForFirstStack(context);
-                if (result == null || result.isEmpty()) continue;
-                String id = BuiltInRegistries.ITEM.getKey(result.getItem()).toString();
-                if (id.equals(itemName) || id.endsWith(":" + itemName)) {
-                    return recipe;
-                }
-            }
-        }
-        return null;
-    }
-
     /**
      * 26.3: server-side recipe placement (ServerboundPlaceRecipePacket) needs a RecipeDisplayId
      * (the index the server's RecipeManager assigned to the recipe's display) instead of a RecipeHolder.
-     * Only resolvable against the integrated server's recipe manager.
+     * 解析统一放在 {@link ContainerController#resolveRecipeDisplayId}（容器驱动层单点）。
      */
-    private RecipeDisplayId resolveRecipeDisplayId(RecipeHolder<?> recipe) {
-        var server = Minecraft.getInstance().getSingleplayerServer();
-        if (server == null || recipe == null) return null;
-        List<RecipeDisplayId> ids = new ArrayList<>();
-        server.getRecipeManager().listDisplaysForRecipe(recipe.id(), entry -> ids.add(entry.id()));
-        return ids.isEmpty() ? null : ids.get(0);
-    }
-
     private boolean isCraftingTableOpen(Minecraft mc) {
         return mc.player.containerMenu != null
             && mc.player.containerMenu != mc.player.inventoryMenu
             && mc.player.containerMenu.slots.size() >= 10;
-    }
-
-    private boolean openNearbyCraftingTable(Minecraft mc) {
-        BlockPos remembered = PoiMemory.findNearest(mc, Set.of("minecraft:crafting_table"), PoiMemory.INTERACTION_RADIUS);
-        if (remembered != null && mc.level.getBlockState(remembered).is(Blocks.CRAFTING_TABLE)) {
-            Vec3 hitVec = Vec3.atCenterOf(remembered);
-            BlockHitResult hitResult = new BlockHitResult(hitVec, Direction.UP, remembered, false);
-            mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, hitResult);
-            return true;
-        }
-
-        BlockPos playerPos = mc.player.blockPosition();
-        for (int dx = -4; dx <= 4; dx++) {
-            for (int dy = -2; dy <= 2; dy++) {
-                for (int dz = -4; dz <= 4; dz++) {
-                    BlockPos pos = playerPos.offset(dx, dy, dz);
-                    if (!mc.level.getBlockState(pos).is(Blocks.CRAFTING_TABLE)) continue;
-                    Vec3 hitVec = Vec3.atCenterOf(pos);
-                    BlockHitResult hitResult = new BlockHitResult(hitVec, Direction.UP, pos, false);
-                    mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, hitResult);
-                    return true;
-                }
-            }
-        }
-        return placeStationFromInventory(mc, "minecraft:crafting_table");
-    }
-
-    private boolean placeStationFromInventory(Minecraft mc, String stationBlockId) {
-        int slot = findHotbarOrInventoryItem(mc, stationBlockId);
-        if (slot < 0) {
-            return false;
-        }
-
-        if (slot >= 9) {
-            int swapHotbar = 0;
-            var current = mc.player.getInventory().getItem(swapHotbar).copy();
-            var target = mc.player.getInventory().getItem(slot).copy();
-            mc.player.getInventory().setItem(slot, current);
-            mc.player.getInventory().setItem(swapHotbar, target);
-            slot = swapHotbar;
-        }
-        mc.player.getInventory().setSelectedSlot(slot);
-
-        BlockPos placePos = findNearbyStationPlacement(mc);
-        if (placePos == null) {
-            return false;
-        }
-        BlockPos supportPos = placePos.below();
-        Vec3 hitVec = Vec3.atCenterOf(supportPos);
-        BlockHitResult hitResult = new BlockHitResult(hitVec, Direction.UP, supportPos, false);
-        mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, hitResult);
-        return true;
     }
 
     private boolean isProcessingStationOpen(Minecraft mc, String mode) {
@@ -2962,68 +2920,6 @@ public class ActionExecutor {
             case "smoke" -> menuName.contains("smoker");
             default -> false;
         };
-    }
-
-    private boolean openNearbyProcessingStation(Minecraft mc, String stationBlockId) {
-        BlockPos remembered = PoiMemory.findNearest(mc, Set.of(stationBlockId), PoiMemory.INTERACTION_RADIUS);
-        if (remembered != null) {
-            String rememberedId = BuiltInRegistries.BLOCK.getKey(mc.level.getBlockState(remembered).getBlock()).toString();
-            if (rememberedId.equals(stationBlockId)) {
-                Vec3 hitVec = Vec3.atCenterOf(remembered);
-                BlockHitResult hitResult = new BlockHitResult(hitVec, Direction.UP, remembered, false);
-                mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, hitResult);
-                return true;
-            }
-        }
-
-        BlockPos playerPos = mc.player.blockPosition();
-        for (int dx = -4; dx <= 4; dx++) {
-            for (int dy = -2; dy <= 2; dy++) {
-                for (int dz = -4; dz <= 4; dz++) {
-                    BlockPos pos = playerPos.offset(dx, dy, dz);
-                    String blockId = BuiltInRegistries.BLOCK.getKey(mc.level.getBlockState(pos).getBlock()).toString();
-                    if (!blockId.equals(stationBlockId)) continue;
-                    Vec3 hitVec = Vec3.atCenterOf(pos);
-                    BlockHitResult hitResult = new BlockHitResult(hitVec, Direction.UP, pos, false);
-                    mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, hitResult);
-                    return true;
-                }
-            }
-        }
-        return placeStationFromInventory(mc, stationBlockId);
-    }
-
-    private int findHotbarOrInventoryItem(Minecraft mc, String itemId) {
-        int found = -1;
-        for (int i = 0; i < mc.player.getInventory().getContainerSize(); i++) {
-            var stack = mc.player.getInventory().getItem(i);
-            if (stack.isEmpty()) continue;
-            String stackId = BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
-            if (!CraftingPlanner.matchesRegistryId(stackId, itemId)) continue;
-            if (i < 9) {
-                return i;
-            }
-            if (found < 0) {
-                found = i;
-            }
-        }
-        return found;
-    }
-
-    private BlockPos findNearbyStationPlacement(Minecraft mc) {
-        BlockPos origin = mc.player.blockPosition();
-        for (int radius = 1; radius <= 4; radius++) {
-            for (int dx = -radius; dx <= radius; dx++) {
-                for (int dz = -radius; dz <= radius; dz++) {
-                    BlockPos pos = origin.offset(dx, 0, dz);
-                    if (!mc.level.getBlockState(pos).isAir()) continue;
-                    BlockPos supportPos = pos.below();
-                    if (mc.level.getBlockState(supportPos).isAir()) continue;
-                    return pos;
-                }
-            }
-        }
-        return null;
     }
 
     private boolean pickupProcessedOutputIfReady(Minecraft mc, String expectedItemId) {
@@ -3242,7 +3138,7 @@ public class ActionExecutor {
         clearPendingStorageTask();
     }
 
-    private int countInventoryItem(Minecraft mc, String itemId) {
+    public static int countInventoryItem(Minecraft mc, String itemId) {
         int total = 0;
         for (int i = 0; i < mc.player.getInventory().getContainerSize(); i++) {
             var stack = mc.player.getInventory().getItem(i);
@@ -3384,7 +3280,7 @@ public class ActionExecutor {
         boolean first = true;
 
         // 检查配方是否存在
-        RecipeHolder<?> recipe = findRecipeByResult(mc, itemId);
+        RecipeHolder<?> recipe = ContainerController.findRecipeByResult(mc, itemId);
         if (recipe == null) {
             sb.append("无配方");
             return sb.toString();

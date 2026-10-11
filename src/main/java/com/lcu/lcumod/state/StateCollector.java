@@ -67,6 +67,8 @@ public class StateCollector {
 
     private static String lastScreenName = "";
     private static int presenceTicks = 0;
+    /** 当前容器内容指纹（-1 = 没开外部容器）；容器开关或内容变化要立刻上报。 */
+    private static int lastContainerFingerprint = -1;
 
     /**
      * 不在世界里时发的最小状态：`in_world=false` + 当前界面名。
@@ -199,6 +201,15 @@ public class StateCollector {
             }
         }
         
+        // 容器开/关/内容变化必须立刻上报：后端靠 open_container.items 才知道每格是什么、能不能点
+        {
+            int fingerprintNow = com.lcu.lcumod.action.ContainerController.containerFingerprint(mc);
+            if (fingerprintNow != lastContainerFingerprint) {
+                hasChanged = true;
+                lastContainerFingerprint = fingerprintNow;
+            }
+        }
+
         // Force update periodically
         if (updateCounter >= FORCE_UPDATE_INTERVAL) {
             hasChanged = true;
@@ -284,6 +295,9 @@ public class StateCollector {
             }
         }
         state.add("inventory", inv);
+
+        // 当前操作中的容器（无则空对象 {}）—— 后端据此知道槽位布局与让路情况
+        state.add("open_container", com.lcu.lcumod.action.ContainerController.describeState(mc));
 
         // 在线玩家：仪表盘"在线玩家"面板 + "它在听谁"。以前这里只有 entities（前端没接上），
         // 所以面板永远"暂无玩家"。speaking = 最近发过话的人。
