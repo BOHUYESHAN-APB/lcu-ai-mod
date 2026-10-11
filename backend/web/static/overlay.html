@@ -11,20 +11,20 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:transparent;overf
   box-sizing:border-box;padding:0.4em;
   font-family:'Segoe UI','PingFang SC','Microsoft YaHei',system-ui,sans-serif;
   /* 字号跟随源的短边并给下限：OBS 里拉多大就多大（源很小也读得清），不写死像素尺寸。 */
-  font-size:calc(var(--scale,1) * max(11px, 6vmin));
+  font-size:calc(var(--scale,1) * var(--ov-font-scale,1) * max(11px, 6vmin));
   line-height:1.3;
 }
 .unknown{color:#f85149;font-size:3vmin}
 .overlay{
-  --fg:#c9d1d9;--dim:#8b949e;--accent:#58a6ff;--ok:#3fb950;--warn:#d29922;--bad:#f85149;
-  --panel:transparent;--line:transparent;--shadow:0 1px 2px rgba(0,0,0,.85);
+  --fg:var(--ov-fg,#c9d1d9);--dim:#8b949e;--accent:var(--ov-accent,#58a6ff);--ok:#3fb950;--warn:#d29922;--bad:#f85149;
+  --panel:var(--ov-bg,transparent);--line:transparent;--shadow:0 1px 2px rgba(0,0,0,.85);
   width:100%;max-height:100%;box-sizing:border-box;color:var(--fg);
   background:var(--panel);border:1px solid var(--line);border-radius:.4em;
   padding:.5em .7em;overflow:hidden;text-shadow:var(--shadow);
 }
 .overlay.light{
-  --fg:#1f2328;--dim:#3d444d;--accent:#0550ae;--ok:#116329;--warn:#7d4e00;--bad:#a40e26;
-  --panel:transparent;--line:transparent;--shadow:0 1px 2px rgba(255,255,255,.9);
+  --fg:var(--ov-fg,#1f2328);--dim:#3d444d;--accent:var(--ov-accent,#0550ae);--ok:#116329;--warn:#7d4e00;--bad:#a40e26;
+  --panel:var(--ov-bg,transparent);--line:transparent;--shadow:0 1px 2px rgba(255,255,255,.9);
 }
 .row{display:flex;align-items:baseline;gap:.5em;flex-wrap:wrap}
 .label{color:var(--dim);font-size:.85em}
@@ -48,6 +48,46 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:transparent;overf
 .tag.ok{color:var(--ok)}.tag.warn{color:var(--warn)}.tag.bad{color:var(--bad)}
 .muted{color:var(--dim);font-size:.9em}
 </style>
+<script>
+/* ── OBS 外观（bg / fg / accent / font_scale）──────────────────────────────
+   优先级：URL 参数 > 服务端保存的默认值(/api/overlay/theme) > 页面内置默认。
+   非法值一律忽略 → 回退下一层，绝不白屏/报错；值只经 style.setProperty 落到 CSS，
+   从不拼进 HTML 文本（防注入）。不传参数且未保存过 ⇒ 外观与以前完全一致。 */
+(function () {
+  var COLOR = /^(#[0-9a-fA-F]{3}|#[0-9a-fA-F]{6}|rgba?\(\s*[0-9.]+%?\s*,\s*[0-9.]+%?\s*,\s*[0-9.]+%?\s*(?:,\s*[0-9.]+\s*)?\))$/;
+  function color(v) { return typeof v === 'string' && COLOR.test(v.trim()) ? v.trim() : ''; }
+  function bgOf(v) { if (typeof v !== 'string') return ''; var t = v.trim(); return t === 'transparent' ? t : color(t); }
+  function scaleOf(v) { var n = parseFloat(v); return (isFinite(n) && n > 0) ? Math.max(0.25, Math.min(8, n)) : null; }
+  var root = document.documentElement;
+  function apply(theme) {
+    theme = theme || {};
+    var bg = bgOf(theme.bg), fg = color(theme.fg), ac = color(theme.accent), fs = scaleOf(theme.font_scale);
+    root.classList.toggle('ov-transparent', bg === 'transparent');
+    if (bg && bg !== 'transparent') { root.classList.add('ov-bg'); root.style.setProperty('--ov-bg', bg); }
+    else { root.classList.remove('ov-bg'); root.style.removeProperty('--ov-bg'); }
+    if (fg) root.style.setProperty('--ov-fg', fg); else root.style.removeProperty('--ov-fg');
+    if (ac) root.style.setProperty('--ov-accent', ac); else root.style.removeProperty('--ov-accent');
+    if (fs) root.style.setProperty('--ov-font-scale', String(fs)); else root.style.removeProperty('--ov-font-scale');
+  }
+  var params = new URLSearchParams(location.search);
+  var KEYS = ['bg', 'fg', 'accent', 'font_scale'];
+  function merge(stored) {
+    var theme = {};
+    for (var i = 0; i < KEYS.length; i++) {
+      var k = KEYS[i];
+      theme[k] = params.has(k) ? params.get(k) : (stored && stored[k] != null ? stored[k] : '');
+    }
+    apply(theme);
+  }
+  merge(null);
+  try {
+    fetch('/api/overlay/theme', {cache: 'no-store'})
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) { merge(d && d.theme ? d.theme : null); })
+      .catch(function () {});
+  } catch (e) {}
+})();
+</script>
 </head>
 <body>
 <div id="root"></div>

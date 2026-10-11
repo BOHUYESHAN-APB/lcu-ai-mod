@@ -4,7 +4,9 @@ Serves dashboard, WebSocket, and REST API for the Session-based architecture.
 """
 
 import json
+import math
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -105,6 +107,73 @@ def _overlay_manifest() -> list[dict[str, str]]:
     return [{"name": name, "title": meta["title"], "desc": meta["desc"],
              "url": f"/overlay/{name}"}
             for name, meta in OVERLAY_COMPONENTS.items()]
+
+
+# ── OBS 外观主题（overlay_theme）─────────────────────────────────────────────
+# 附加式：只新增读写端点，不改任何现有路由行为。主题存进**同一个** .local/config.json
+# 的 `overlay_theme` 键（实测：ConfigStore.save() 虽然整份写回，但会原样保留未知键；
+# 而且我们改的是同一个共享实例，所以不会和 patrol_radius 之类的现有键互相抹掉）。
+_OV_THEME_KEY = "overlay_theme"
+_OV_COLOR_RE = re.compile(
+    r"^(#[0-9a-fA-F]{3}|#[0-9a-fA-F]{6}"
+    r"|rgba?\(\s*[0-9.]+%?\s*,\s*[0-9.]+%?\s*,\s*[0-9.]+%?\s*(?:,\s*[0-9.]+\s*)?\))$"
+)
+
+
+def _ov_color(value: Any) -> str:
+    """只接受 #rgb / #rrggbb / rgb()/rgba()；其余（含注入尝试）一律回默认空串。"""
+    if not isinstance(value, str):
+        return ""
+    probe = value.strip()
+    return probe if _OV_COLOR_RE.match(probe) else ""
+
+
+def _ov_bg(value: Any) -> str:
+    """背景：`transparent` 或合法颜色；非法 → 空串（不覆盖页面内置默认）。"""
+    if not isinstance(value, str):
+        return ""
+    probe = value.strip()
+    if probe == "transparent":
+        return "transparent"
+    return _ov_color(probe)
+
+
+def _ov_font_scale(value: Any) -> Optional[float]:
+    """字号倍率：有限正数，夹在 [0.25, 8]；非法 → None。"""
+    if value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number <= 0:
+        return None
+    return round(max(0.25, min(8.0, number)), 3)
+
+
+def _normalize_overlay_theme(payload: Any) -> dict[str, Any]:
+    """把任意输入规整成 {bg, fg, accent, font_scale}；非法字段回默认，绝不原样回传。"""
+    source = payload if isinstance(payload, dict) else {}
+    return {
+        "bg": _ov_bg(source.get("bg")),
+        "fg": _ov_color(source.get("fg")),
+        "accent": _ov_color(source.get("accent")),
+        "font_scale": _ov_font_scale(source.get("font_scale")),
+    }
+
+
+def _read_overlay_theme() -> dict[str, Any]:
+    with config_store._lock:  # noqa: SLF001 —— 共享实例的既有存储，避免两套配置源
+        stored = config_store._data.get(_OV_THEME_KEY)
+    return _normalize_overlay_theme(stored)
+
+
+def _save_overlay_theme(payload: Any) -> dict[str, Any]:
+    theme = _normalize_overlay_theme(payload)
+    with config_store._lock:  # noqa: SLF001
+        config_store._data[_OV_THEME_KEY] = dict(theme)
+        config_store.save()
+    return theme
 
 
 def _static_html(filename: str, fallback: str) -> HTMLResponse:
@@ -236,6 +305,21 @@ async def get_overlay_page(component: str):
 async def get_overlay_components():
     """组件注册表（OBS 里要写的 URL + 标题/说明）。加属性 = 加一条注册。"""
     return {"components": _overlay_manifest()}
+
+
+@app.get("/api/overlay/theme")
+async def get_overlay_theme():
+    """OBS 页外观默认值（背景/文字色/强调色/字号）。
+
+    空串或 null = 不覆盖页面内置默认；因此**从未保存过**时页面外观与以前完全一致。
+    """
+    return {"theme": _read_overlay_theme(), "defaults": _normalize_overlay_theme({})}
+
+
+@app.post("/api/overlay/theme")
+async def set_overlay_theme(data: dict):
+    """保存 OBS 页外观默认值。非法字段回默认（先校验格式再落盘，绝不原样写进页面）。"""
+    return {"status": "ok", "theme": _save_overlay_theme(data)}
 
 
 @app.websocket("/ws")

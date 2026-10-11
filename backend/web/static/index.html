@@ -6,16 +6,21 @@
 <title>LCU Command Center</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;background:#0d1117;color:#c9d1d9;height:100vh;height:100dvh;overflow:hidden;display:flex;flex-direction:column}
+/* OBS 外观变量：缺省值 = 现有深色底（默认外观完全不变）；html.ov-transparent 时
+   所有画底的地方（body/顶栏/页签/卡片/面板/输入框）转真透明（bg 参数触发）。 */
+:root{--ov-bg:#0d1117;--ov-surface:#161b22}
+html.ov-transparent{--ov-bg:transparent;--ov-surface:transparent;background:transparent}
+html.ov-transparent,html.ov-transparent *{box-shadow:none}
+body{font-family:'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;background:var(--ov-bg,#0d1117);color:var(--ov-fg,#c9d1d9);height:100vh;height:100dvh;overflow:hidden;display:flex;flex-direction:column}
 
 /* Top Bar */
-.topbar{display:flex;align-items:center;justify-content:space-between;padding:8px 20px;background:#161b22;border-bottom:1px solid #30363d;flex-shrink:0}
+.topbar{display:flex;align-items:center;justify-content:space-between;padding:8px 20px;background:var(--ov-surface,#161b22);border-bottom:1px solid #30363d;flex-shrink:0}
 .topbar .title{font-size:16px;font-weight:700;color:#58a6ff}
 .topbar .title span{color:#8b949e;font-weight:400;font-size:13px}
 .topbar .online{display:flex;gap:6px;align-items:center;font-size:13px;color:#8b949e}
 
 /* Tabs */
-.tabs{display:flex;background:#161b22;border-bottom:1px solid #30363d;flex-shrink:0;overflow-x:auto}
+.tabs{display:flex;background:var(--ov-surface,#161b22);border-bottom:1px solid #30363d;flex-shrink:0;overflow-x:auto}
 .tab{padding:10px 20px;cursor:pointer;font-size:13px;color:#8b949e;border:0;border-bottom:2px solid transparent;background:transparent;transition:all .2s;white-space:nowrap}
 .tab:hover{color:#c9d1d9;background:#21262d}
 .tab.active{color:#58a6ff;border-bottom-color:#58a6ff}
@@ -26,13 +31,13 @@ body{font-family:'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;backgroun
 .page.active{display:block}
 
 /* Cards */
-.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin-bottom:16px}
+.card{background:var(--ov-surface,#161b22);border:1px solid #30363d;border-radius:8px;padding:16px;margin-bottom:16px}
 .card h3{font-size:14px;font-weight:600;margin-bottom:12px;color:#58a6ff}
 
 /* Form Elements */
 .form-row{display:flex;gap:8px;align-items:center;margin-bottom:8px}
 .form-row label{font-size:12px;color:#8b949e;min-width:80px}
-.form-row input,.form-row select{flex:1;background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:6px 10px;color:#c9d1d9;font-size:12px}
+.form-row input,.form-row select{flex:1;background:var(--ov-bg,#0d1117);border:1px solid #30363d;border-radius:4px;padding:6px 10px;color:#c9d1d9;font-size:12px}
 .form-row input:focus,.form-row select:focus{border-color:#58a6ff;outline:none}
 .form-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
 .hint{font-size:11px;color:#8b949e;margin-top:6px;line-height:1.5}
@@ -40,17 +45,17 @@ body{font-family:'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;backgroun
 .settings-section h4{font-size:12px;color:#c9d1d9;margin-bottom:9px}
 .compact-field{display:flex;flex-direction:column;gap:5px;min-width:0}
 .compact-field label{font-size:11px;color:#8b949e}
-.compact-field input,.compact-field select{width:100%;min-width:0;background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:6px 8px;color:#c9d1d9;font-size:12px}
+.compact-field input,.compact-field select{width:100%;min-width:0;background:var(--ov-bg,#0d1117);border:1px solid #30363d;border-radius:4px;padding:6px 8px;color:#c9d1d9;font-size:12px}
 .toggle-field{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:10px 0;font-size:12px;color:#8b949e}
 .toggle-field input{width:16px;height:16px;accent-color:#1f6feb}
 .usage-strip{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;padding:10px 0;border-top:1px solid #21262d;border-bottom:1px solid #21262d}
 .usage-item{min-width:0}.usage-item .label{font-size:10px;color:#8b949e}.usage-item .value{font-size:14px;font-weight:600;margin-top:3px;overflow-wrap:anywhere}
 .memory-toolbar{display:grid;grid-template-columns:minmax(180px,2fr) repeat(3,minmax(120px,1fr)) auto;gap:8px;align-items:end;margin-bottom:12px}
 .memory-toolbar .compact-field{margin:0}.memory-layout{display:grid;grid-template-columns:minmax(300px,1.1fr) minmax(320px,.9fr);gap:16px;min-height:420px}
-.memory-pane{min-width:0;background:#161b22;border:1px solid #30363d;border-radius:8px;overflow:hidden}.memory-pane-header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px 12px;border-bottom:1px solid #30363d}.memory-pane-header h3{font-size:13px;color:#c9d1d9;margin:0}.memory-list{max-height:calc(100dvh - 310px);overflow:auto}.memory-row{width:100%;display:block;text-align:left;background:transparent;color:#c9d1d9;border:0;border-bottom:1px solid #21262d;padding:10px 12px;cursor:pointer}.memory-row:hover,.memory-row.active{background:#21262d}.memory-row-title{font-size:12px;font-weight:600;overflow-wrap:anywhere}.memory-row-meta{font-size:10px;color:#8b949e;margin-top:4px}.memory-row-excerpt{font-size:11px;color:#b1bac4;margin-top:5px;line-height:1.4;overflow-wrap:anywhere}.memory-detail{padding:12px;overflow:auto;max-height:calc(100dvh - 310px)}.memory-detail-grid{display:grid;grid-template-columns:110px minmax(0,1fr);gap:7px 10px;font-size:11px}.memory-detail-key{color:#8b949e}.memory-detail-value{overflow-wrap:anywhere}.memory-json{margin-top:12px;background:#0d1117;border:1px solid #21262d;border-radius:4px;padding:10px;white-space:pre-wrap;overflow-wrap:anywhere;font:11px/1.5 monospace}.memory-status-strip{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px;font-size:11px;color:#8b949e}.memory-status-strip strong{color:#c9d1d9}.memory-pagination{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 12px;border-top:1px solid #30363d;font-size:11px;color:#8b949e}
-dialog{width:min(680px,calc(100vw - 24px));max-height:calc(100dvh - 24px);margin:auto;background:#161b22;color:#c9d1d9;border:1px solid #30363d;border-radius:8px;padding:0;box-shadow:0 20px 60px rgba(0,0,0,.5)}dialog::backdrop{background:rgba(1,4,9,.72)}.dialog-header{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border-bottom:1px solid #30363d}.dialog-header h3{font-size:14px;margin:0}.dialog-body{padding:14px;overflow:auto}.dialog-actions{display:flex;justify-content:flex-end;gap:8px;padding:12px 14px;border-top:1px solid #30363d}.summary-preview{white-space:pre-wrap;line-height:1.55;font-size:12px;background:#0d1117;border:1px solid #21262d;border-radius:4px;padding:11px;margin-top:10px;max-height:45dvh;overflow:auto}
-.inbox-layout{display:grid;grid-template-columns:minmax(240px,.7fr) minmax(360px,1.3fr);gap:16px;min-height:480px}.inbox-contacts,.inbox-messages{overflow:auto;max-height:calc(100dvh - 230px)}.contact-row{width:100%;display:block;text-align:left;background:transparent;color:#c9d1d9;border:0;border-bottom:1px solid #21262d;padding:11px 12px;cursor:pointer}.contact-row:hover,.contact-row.active{background:#21262d}.contact-name{font-size:12px;font-weight:600}.contact-meta{font-size:10px;color:#8b949e;margin-top:4px}.inbox-message{margin:10px 12px;padding:9px 10px;border-left:2px solid #30363d;background:#0d1117}.inbox-message.ai{border-left-color:#3fb950}.inbox-message.player{border-left-color:#58a6ff}.inbox-message-header{font-size:10px;color:#8b949e;margin-bottom:5px}.inbox-message-content{font-size:12px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere}
-.inbox-layout.contacts-hidden{grid-template-columns:1fr}.inbox-layout.contacts-hidden .contact-pane{display:none}.inventory-layout{display:grid;grid-template-columns:minmax(260px,.8fr) minmax(340px,1.2fr);gap:16px;margin-top:16px}.inventory-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:6px}.inventory-item{min-width:0;background:#0d1117;border:1px solid #21262d;border-radius:4px;padding:8px}.inventory-item-name{font-size:11px;font-weight:600;overflow-wrap:anywhere}.inventory-item-meta{font-size:10px;color:#8b949e;margin-top:3px;overflow-wrap:anywhere}
+.memory-pane{min-width:0;background:var(--ov-surface,#161b22);border:1px solid #30363d;border-radius:8px;overflow:hidden}.memory-pane-header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px 12px;border-bottom:1px solid #30363d}.memory-pane-header h3{font-size:13px;color:#c9d1d9;margin:0}.memory-list{max-height:calc(100dvh - 310px);overflow:auto}.memory-row{width:100%;display:block;text-align:left;background:transparent;color:#c9d1d9;border:0;border-bottom:1px solid #21262d;padding:10px 12px;cursor:pointer}.memory-row:hover,.memory-row.active{background:#21262d}.memory-row-title{font-size:12px;font-weight:600;overflow-wrap:anywhere}.memory-row-meta{font-size:10px;color:#8b949e;margin-top:4px}.memory-row-excerpt{font-size:11px;color:#b1bac4;margin-top:5px;line-height:1.4;overflow-wrap:anywhere}.memory-detail{padding:12px;overflow:auto;max-height:calc(100dvh - 310px)}.memory-detail-grid{display:grid;grid-template-columns:110px minmax(0,1fr);gap:7px 10px;font-size:11px}.memory-detail-key{color:#8b949e}.memory-detail-value{overflow-wrap:anywhere}.memory-json{margin-top:12px;background:var(--ov-bg,#0d1117);border:1px solid #21262d;border-radius:4px;padding:10px;white-space:pre-wrap;overflow-wrap:anywhere;font:11px/1.5 monospace}.memory-status-strip{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px;font-size:11px;color:#8b949e}.memory-status-strip strong{color:#c9d1d9}.memory-pagination{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 12px;border-top:1px solid #30363d;font-size:11px;color:#8b949e}
+dialog{width:min(680px,calc(100vw - 24px));max-height:calc(100dvh - 24px);margin:auto;background:var(--ov-surface,#161b22);color:#c9d1d9;border:1px solid #30363d;border-radius:8px;padding:0;box-shadow:0 20px 60px rgba(0,0,0,.5)}dialog::backdrop{background:rgba(1,4,9,.72)}.dialog-header{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border-bottom:1px solid #30363d}.dialog-header h3{font-size:14px;margin:0}.dialog-body{padding:14px;overflow:auto}.dialog-actions{display:flex;justify-content:flex-end;gap:8px;padding:12px 14px;border-top:1px solid #30363d}.summary-preview{white-space:pre-wrap;line-height:1.55;font-size:12px;background:var(--ov-bg,#0d1117);border:1px solid #21262d;border-radius:4px;padding:11px;margin-top:10px;max-height:45dvh;overflow:auto}
+.inbox-layout{display:grid;grid-template-columns:minmax(240px,.7fr) minmax(360px,1.3fr);gap:16px;min-height:480px}.inbox-contacts,.inbox-messages{overflow:auto;max-height:calc(100dvh - 230px)}.contact-row{width:100%;display:block;text-align:left;background:transparent;color:#c9d1d9;border:0;border-bottom:1px solid #21262d;padding:11px 12px;cursor:pointer}.contact-row:hover,.contact-row.active{background:#21262d}.contact-name{font-size:12px;font-weight:600}.contact-meta{font-size:10px;color:#8b949e;margin-top:4px}.inbox-message{margin:10px 12px;padding:9px 10px;border-left:2px solid #30363d;background:var(--ov-bg,#0d1117)}.inbox-message.ai{border-left-color:#3fb950}.inbox-message.player{border-left-color:#58a6ff}.inbox-message-header{font-size:10px;color:#8b949e;margin-bottom:5px}.inbox-message-content{font-size:12px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere}
+.inbox-layout.contacts-hidden{grid-template-columns:1fr}.inbox-layout.contacts-hidden .contact-pane{display:none}.inventory-layout{display:grid;grid-template-columns:minmax(260px,.8fr) minmax(340px,1.2fr);gap:16px;margin-top:16px}.inventory-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:6px}.inventory-item{min-width:0;background:var(--ov-bg,#0d1117);border:1px solid #21262d;border-radius:4px;padding:8px}.inventory-item-name{font-size:11px;font-weight:600;overflow-wrap:anywhere}.inventory-item-meta{font-size:10px;color:#8b949e;margin-top:3px;overflow-wrap:anywhere}
 
 /* Commands whitelist + OBS overlay list */
 .cmd-table{width:100%;border-collapse:collapse;font-size:12px}
@@ -64,10 +69,10 @@ dialog{width:min(680px,calc(100vw - 24px));max-height:calc(100dvh - 24px);margin
 .tag-pill.hard{color:#f85149;border-color:#f85149}
 .tag-pill.risk{color:#d29922;border-color:#d29922}
 .tag-pill.scope{color:#58a6ff;border-color:#58a6ff}
-.ov-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:9px 10px;border:1px solid #30363d;border-radius:6px;margin-bottom:8px;background:#0d1117}
+.ov-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:9px 10px;border:1px solid #30363d;border-radius:6px;margin-bottom:8px;background:var(--ov-bg,#0d1117)}
 .ov-row .nm{font-family:ui-monospace,Consolas,monospace;font-weight:600;color:#58a6ff;min-width:90px}
 .ov-row .desc{font-size:11px;color:#8b949e;flex:1;min-width:180px}
-.ov-row code{font-size:11px;background:#161b22;border:1px solid #30363d;border-radius:4px;padding:3px 7px}
+.ov-row code{font-size:11px;background:var(--ov-surface,#161b22);border:1px solid #30363d;border-radius:4px;padding:3px 7px}
 .ov-row a{color:#58a6ff}
 
 /* Buttons */
@@ -86,21 +91,21 @@ dialog{width:min(680px,calc(100vw - 24px));max-height:calc(100dvh - 24px);margin
 
 /* Stats */
 .stats{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px}
-.stat{background:#0d1117;border-radius:6px;padding:10px}
+.stat{background:var(--ov-bg,#0d1117);border-radius:6px;padding:10px}
 .stat .label{font-size:11px;color:#8b949e;margin-bottom:4px}
 .stat .value{font-size:16px;font-weight:600}
 
 /* Chat */
 .chat-container{display:flex;flex-direction:column;height:100%}
-.chat-messages{flex:1;overflow-y:auto;padding:10px;background:#0d1117;border-radius:6px;margin-bottom:10px}
+.chat-messages{flex:1;overflow-y:auto;padding:10px;background:var(--ov-bg,#0d1117);border-radius:6px;margin-bottom:10px}
 .chat-input{display:flex;gap:8px}
 .chat-input input{flex:1}
-.msg{margin-bottom:8px;padding:8px;background:#161b22;border-radius:6px}
+.msg{margin-bottom:8px;padding:8px;background:var(--ov-surface,#161b22);border-radius:6px}
 .msg .sender{font-size:11px;color:#58a6ff;margin-bottom:4px}
 .msg .text{font-size:13px}
 
 /* Player List */
-.player-card{display:flex;align-items:center;gap:10px;padding:10px;background:#0d1117;border-radius:6px;margin-bottom:8px;border:1px solid transparent}
+.player-card{display:flex;align-items:center;gap:10px;padding:10px;background:var(--ov-bg,#0d1117);border-radius:6px;margin-bottom:8px;border:1px solid transparent}
 .player-card.speaking{border-color:#58a6ff;background:rgba(88,166,255,.10)}
 .player-card .avatar{width:32px;height:32px;border-radius:4px;background:#30363d}
 .player-card .info{flex:1}
@@ -109,7 +114,7 @@ dialog{width:min(680px,calc(100vw - 24px));max-height:calc(100dvh - 24px);margin
 .speaker-tag{font-size:10px;color:#58a6ff;margin-left:6px;font-weight:400}
 
 /* Task Queue */
-.task-card{background:#0d1117;border-radius:6px;padding:10px}
+.task-card{background:var(--ov-bg,#0d1117);border-radius:6px;padding:10px}
 .task-card .task-head{font-size:13px;margin-bottom:6px}
 .task-card .task-kind{font-weight:600;color:#58a6ff}
 .task-card .task-status{margin-left:8px;color:#8b949e;font-size:11px}
@@ -128,18 +133,58 @@ dialog{width:min(680px,calc(100vw - 24px));max-height:calc(100dvh - 24px);margin
 .hud-note::before{content:"· "}
 
 /* Debug Log */
-.debug-log{background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:8px;font-family:monospace;font-size:11px;color:#8b949e;max-height:200px;overflow-y:auto;white-space:pre-wrap}
+.debug-log{background:var(--ov-bg,#0d1117);border:1px solid #30363d;border-radius:4px;padding:8px;font-family:monospace;font-size:11px;color:#8b949e;max-height:200px;overflow-y:auto;white-space:pre-wrap}
 .ops-grid{display:grid;grid-template-columns:minmax(280px,1fr) minmax(320px,1.4fr);gap:16px}
 .data-list{display:flex;flex-direction:column;gap:6px}
-.data-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:9px 10px}
+.data-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;background:var(--ov-bg,#0d1117);border:1px solid #21262d;border-radius:6px;padding:9px 10px}
 .data-title{font-size:12px;font-weight:600;overflow-wrap:anywhere}.data-meta{font-size:11px;color:#8b949e;margin-top:3px;overflow-wrap:anywhere}
 .empty{font-size:12px;color:#8b949e;padding:12px 0}.field-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px}.field-grid input{width:100%}
 .debug-actions{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-bottom:12px}.debug-command{display:flex;gap:8px;margin-bottom:12px}.debug-command input{min-width:0}.safety-actions{display:flex;gap:6px;margin-left:8px}.safety-actions .btn{border-color:#f85149;color:#ffb4ae;font-weight:700}
-.provider-page-head{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:16px}.provider-page-head h2{font-size:20px;color:#f0f6fc}.provider-page-head p{font-size:12px;color:#8b949e;margin-top:5px}.provider-workspace{display:grid;grid-template-columns:minmax(280px,.72fr) minmax(480px,1.28fr);gap:16px;align-items:start}.provider-sidebar{position:sticky;top:0}.provider-sidebar-head,.provider-editor-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}.provider-sidebar-head h3,.provider-editor-head h3{margin:0}.profile-tile{width:100%;display:flex;align-items:center;gap:11px;text-align:left;background:#0d1117;color:#c9d1d9;border:1px solid #21262d;border-radius:9px;padding:11px;cursor:pointer;margin-bottom:8px}.profile-tile:hover{border-color:#388bfd;background:#111820}.profile-tile.active{border-color:#58a6ff;box-shadow:0 0 0 1px rgba(88,166,255,.18)}.profile-mark{width:34px;height:34px;display:grid;place-items:center;border-radius:9px;background:linear-gradient(135deg,#1f6feb,#8957e5);color:#fff;font-size:12px;font-weight:700;flex:none}.profile-copy{min-width:0;flex:1}.profile-title{font-size:12px;font-weight:650;color:#f0f6fc}.profile-subtitle{font-size:10px;color:#8b949e;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.profile-health-dot{width:8px;height:8px;border-radius:50%;background:#3fb950;box-shadow:0 0 0 3px rgba(63,185,80,.12)}.profile-health-dot.off{background:#8b949e;box-shadow:none}.provider-form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.provider-field{display:flex;flex-direction:column;gap:6px;min-width:0}.provider-field.full{grid-column:1/-1}.provider-field label{font-size:11px;color:#8b949e}.provider-field input,.provider-field select{width:100%;background:#0d1117;border:1px solid #30363d;border-radius:7px;padding:9px 11px;color:#f0f6fc;font-size:12px}.provider-field input:focus,.provider-field select:focus{outline:none;border-color:#58a6ff;box-shadow:0 0 0 2px rgba(88,166,255,.12)}.provider-advanced{margin-top:12px;border-top:1px solid #21262d;padding-top:10px}.provider-advanced summary{font-size:11px;color:#8b949e;cursor:pointer;user-select:none}.provider-advanced .provider-form-grid{margin-top:10px}.model-discovery{margin-top:16px;padding:14px;border:1px solid #30363d;border-radius:10px;background:linear-gradient(145deg,rgba(31,111,235,.08),rgba(137,87,229,.04))}.model-discovery-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:11px}.model-discovery-head strong{font-size:13px;color:#f0f6fc}.model-discovery-head span{font-size:10px;color:#8b949e}.model-picker-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px}.model-picker-row select{min-width:0;background:#0d1117;border:1px solid #388bfd;border-radius:7px;padding:9px 11px;color:#f0f6fc}.model-custom{margin-top:8px}.provider-editor-actions{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:16px}.provider-editor-actions .form-actions{margin:0}.connection-state{font-size:11px;color:#8b949e}.connection-state.ok{color:#3fb950}.connection-state.error{color:#f85149}.connection-state.loading{color:#d29922}.model-count{display:inline-flex;align-items:center;padding:2px 7px;border-radius:999px;background:rgba(88,166,255,.12);color:#79c0ff;font-size:10px}
-textarea{width:100%;min-height:68px;resize:vertical;background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:7px 10px;color:#c9d1d9;font:12px monospace}
+.provider-page-head{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:16px}.provider-page-head h2{font-size:20px;color:#f0f6fc}.provider-page-head p{font-size:12px;color:#8b949e;margin-top:5px}.provider-workspace{display:grid;grid-template-columns:minmax(280px,.72fr) minmax(480px,1.28fr);gap:16px;align-items:start}.provider-sidebar{position:sticky;top:0}.provider-sidebar-head,.provider-editor-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}.provider-sidebar-head h3,.provider-editor-head h3{margin:0}.profile-tile{width:100%;display:flex;align-items:center;gap:11px;text-align:left;background:var(--ov-bg,#0d1117);color:#c9d1d9;border:1px solid #21262d;border-radius:9px;padding:11px;cursor:pointer;margin-bottom:8px}.profile-tile:hover{border-color:#388bfd;background:#111820}.profile-tile.active{border-color:#58a6ff;box-shadow:0 0 0 1px rgba(88,166,255,.18)}.profile-mark{width:34px;height:34px;display:grid;place-items:center;border-radius:9px;background:linear-gradient(135deg,#1f6feb,#8957e5);color:#fff;font-size:12px;font-weight:700;flex:none}.profile-copy{min-width:0;flex:1}.profile-title{font-size:12px;font-weight:650;color:#f0f6fc}.profile-subtitle{font-size:10px;color:#8b949e;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.profile-health-dot{width:8px;height:8px;border-radius:50%;background:#3fb950;box-shadow:0 0 0 3px rgba(63,185,80,.12)}.profile-health-dot.off{background:#8b949e;box-shadow:none}.provider-form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.provider-field{display:flex;flex-direction:column;gap:6px;min-width:0}.provider-field.full{grid-column:1/-1}.provider-field label{font-size:11px;color:#8b949e}.provider-field input,.provider-field select{width:100%;background:var(--ov-bg,#0d1117);border:1px solid #30363d;border-radius:7px;padding:9px 11px;color:#f0f6fc;font-size:12px}.provider-field input:focus,.provider-field select:focus{outline:none;border-color:#58a6ff;box-shadow:0 0 0 2px rgba(88,166,255,.12)}.provider-advanced{margin-top:12px;border-top:1px solid #21262d;padding-top:10px}.provider-advanced summary{font-size:11px;color:#8b949e;cursor:pointer;user-select:none}.provider-advanced .provider-form-grid{margin-top:10px}.model-discovery{margin-top:16px;padding:14px;border:1px solid #30363d;border-radius:10px;background:linear-gradient(145deg,rgba(31,111,235,.08),rgba(137,87,229,.04))}.model-discovery-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:11px}.model-discovery-head strong{font-size:13px;color:#f0f6fc}.model-discovery-head span{font-size:10px;color:#8b949e}.model-picker-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px}.model-picker-row select{min-width:0;background:var(--ov-bg,#0d1117);border:1px solid #388bfd;border-radius:7px;padding:9px 11px;color:#f0f6fc}.model-custom{margin-top:8px}.provider-editor-actions{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:16px}.provider-editor-actions .form-actions{margin:0}.connection-state{font-size:11px;color:#8b949e}.connection-state.ok{color:#3fb950}.connection-state.error{color:#f85149}.connection-state.loading{color:#d29922}.model-count{display:inline-flex;align-items:center;padding:2px 7px;border-radius:999px;background:rgba(88,166,255,.12);color:#79c0ff;font-size:10px}
+textarea{width:100%;min-height:68px;resize:vertical;background:var(--ov-bg,#0d1117);border:1px solid #30363d;border-radius:4px;padding:7px 10px;color:#c9d1d9;font:12px monospace}
 @media(max-width:900px){.provider-workspace{grid-template-columns:1fr}.provider-sidebar{position:static}.provider-form-grid{grid-template-columns:1fr}.provider-field.full{grid-column:auto}}
 @media(max-width:760px){.topbar{padding:8px 12px}.page{padding:12px}.ops-grid,.responsive-grid,.memory-layout,.inbox-layout,.inventory-layout{grid-template-columns:1fr!important}.inbox-contacts,.inbox-messages{max-height:none}.memory-toolbar{grid-template-columns:1fr 1fr}.memory-toolbar .compact-field:first-child{grid-column:1/-1}.memory-list,.memory-detail{max-height:none}.form-row{align-items:flex-start;flex-direction:column}.form-row label{min-width:0}.form-row input,.form-row select{width:100%}.field-grid{grid-template-columns:1fr}.usage-strip{grid-template-columns:repeat(2,minmax(0,1fr))}.tabs{scrollbar-width:thin}.tab{padding:10px 14px}.chat-input,.debug-command{flex-wrap:wrap}.debug-actions{grid-template-columns:repeat(2,minmax(0,1fr))}.debug-command input{width:100%!important}.provider-page-head{align-items:flex-start;flex-direction:column}.model-picker-row{grid-template-columns:1fr}.provider-editor-actions{align-items:flex-start;flex-direction:column}}
 </style>
+<script>
+/* ── OBS 外观（bg / fg / accent / font_scale）──────────────────────────────
+   优先级：URL 参数 > 服务端保存的默认值(/api/overlay/theme) > 页面内置默认。
+   非法值一律忽略 → 回退下一层，绝不白屏/报错；值只经 style.setProperty 落到 CSS，
+   从不拼进 HTML 文本（防注入）。不传参数且未保存过 ⇒ 外观与以前完全一致。 */
+(function () {
+  var COLOR = /^(#[0-9a-fA-F]{3}|#[0-9a-fA-F]{6}|rgba?\(\s*[0-9.]+%?\s*,\s*[0-9.]+%?\s*,\s*[0-9.]+%?\s*(?:,\s*[0-9.]+\s*)?\))$/;
+  function color(v) { return typeof v === 'string' && COLOR.test(v.trim()) ? v.trim() : ''; }
+  function bgOf(v) { if (typeof v !== 'string') return ''; var t = v.trim(); return t === 'transparent' ? t : color(t); }
+  function scaleOf(v) { var n = parseFloat(v); return (isFinite(n) && n > 0) ? Math.max(0.25, Math.min(8, n)) : null; }
+  var root = document.documentElement;
+  function apply(theme) {
+    theme = theme || {};
+    var bg = bgOf(theme.bg), fg = color(theme.fg), ac = color(theme.accent), fs = scaleOf(theme.font_scale);
+    root.classList.toggle('ov-transparent', bg === 'transparent');
+    if (bg && bg !== 'transparent') { root.classList.add('ov-bg'); root.style.setProperty('--ov-bg', bg); }
+    else { root.classList.remove('ov-bg'); root.style.removeProperty('--ov-bg'); }
+    if (fg) root.style.setProperty('--ov-fg', fg); else root.style.removeProperty('--ov-fg');
+    if (ac) root.style.setProperty('--ov-accent', ac); else root.style.removeProperty('--ov-accent');
+    if (fs) root.style.setProperty('--ov-font-scale', String(fs)); else root.style.removeProperty('--ov-font-scale');
+  }
+  var params = new URLSearchParams(location.search);
+  var KEYS = ['bg', 'fg', 'accent', 'font_scale'];
+  function merge(stored) {
+    var theme = {};
+    for (var i = 0; i < KEYS.length; i++) {
+      var k = KEYS[i];
+      theme[k] = params.has(k) ? params.get(k) : (stored && stored[k] != null ? stored[k] : '');
+    }
+    apply(theme);
+  }
+  merge(null);
+  try {
+    fetch('/api/overlay/theme', {cache: 'no-store'})
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) { merge(d && d.theme ? d.theme : null); })
+      .catch(function () {});
+  } catch (e) {}
+})();
+</script>
 </head>
 <body>
 
@@ -467,15 +512,15 @@ textarea{width:100%;min-height:68px;resize:vertical;background:#0d1117;border:1p
     </div>
     <div class="form-row" style="align-items:flex-start">
       <label>身份 identity</label>
-      <textarea id="personaIdentity" rows="4" placeholder="你是……" style="flex:1;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px"></textarea>
+      <textarea id="personaIdentity" rows="4" placeholder="你是……" style="flex:1;background:var(--ov-bg,#0d1117);color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px"></textarea>
     </div>
     <div class="form-row" style="align-items:flex-start">
       <label>表达习惯 reply_style</label>
-      <textarea id="personaReplyStyle" rows="3" placeholder="句子短，多用口语……" style="flex:1;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px"></textarea>
+      <textarea id="personaReplyStyle" rows="3" placeholder="句子短，多用口语……" style="flex:1;background:var(--ov-bg,#0d1117);color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px"></textarea>
     </div>
     <div class="form-row" style="align-items:flex-start">
       <label>备用风格（每行一条，可选）</label>
-      <textarea id="personaMultiple" rows="2" placeholder="偶尔损一点&#10;偶尔很正经" style="flex:1;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px"></textarea>
+      <textarea id="personaMultiple" rows="2" placeholder="偶尔损一点&#10;偶尔很正经" style="flex:1;background:var(--ov-bg,#0d1117);color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px"></textarea>
     </div>
     <div class="form-row">
       <label>备用风格概率</label>
@@ -483,7 +528,7 @@ textarea{width:100%;min-height:68px;resize:vertical;background:#0d1117;border:1p
     </div>
     <div class="form-row" style="align-items:flex-start">
       <label>场景规则 scene_rules</label>
-      <textarea id="personaSceneRules" rows="3" placeholder="- 私聊：……&#10;- 公开服：……&#10;- 被点名：……" style="flex:1;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px"></textarea>
+      <textarea id="personaSceneRules" rows="3" placeholder="- 私聊：……&#10;- 公开服：……&#10;- 被点名：……" style="flex:1;background:var(--ov-bg,#0d1117);color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px"></textarea>
     </div>
     <button class="btn primary" onclick="savePersonaConfig()">保存人设</button>
     <div id="personaStatus" style="margin-top:8px;font-size:11px;color:#8b949e">等待加载</div>
@@ -557,10 +602,35 @@ textarea{width:100%;min-height:68px;resize:vertical;background:#0d1117;border:1p
 <!-- Overlay Page -->
 <div id="page-overlay" class="page">
   <div class="card">
+    <h3>🎨 OBS 外观默认值</h3>
+    <div class="hint">
+      这里保存 OBS 页的<b>默认</b>外观（走后端 <code>/api/overlay/theme</code>，持久化）。<b>URL 参数优先于它</b>；
+      两者都没有时，页面保持原样（默认外观完全不变）。背景填 <code>transparent</code> 就是真透明底。
+    </div>
+    <div class="form-row"><label>背景 bg</label>
+      <input type="text" id="ovThemeBg" placeholder="留空=原样；transparent / #rrggbb / rgba(...)">
+    </div>
+    <div class="form-row"><label>文字色 fg</label>
+      <input type="text" id="ovThemeFg" placeholder="留空=原样；#rrggbb / rgba(...)">
+    </div>
+    <div class="form-row"><label>强调色 accent</label>
+      <input type="text" id="ovThemeAccent" placeholder="留空=原样；#rrggbb / rgba(...)">
+    </div>
+    <div class="form-row"><label>字号倍率</label>
+      <input type="text" id="ovThemeFontScale" placeholder="留空=原样；0.25 ~ 8">
+    </div>
+    <div class="form-actions">
+      <button class="btn primary" onclick="saveOverlayTheme()">保存外观默认值</button>
+      <button class="btn" onclick="loadOverlayTheme()">重新读取</button>
+    </div>
+    <div class="hint" id="ovThemeHint">加载中…</div>
+  </div>
+  <div class="card">
     <h3>🖼️ OBS 组件子页面</h3>
     <div class="hint">
       一个页面只渲染一个属性，透明背景、<code>100%</code> 自适应（OBS 里拉多大就多大，不写死尺寸）。
-      直接把下面的 URL 填进 OBS「浏览器源」。支持 <code>?theme=dark|light</code> 与 <code>?scale=</code> / <code>?max=</code> 微调。
+      直接把下面的 URL 填进 OBS「浏览器源」。支持 <code>?theme=dark|light</code>、<code>?scale=</code> / <code>?max=</code>，
+      以及 <code>?bg=transparent|#rrggbb|rgba(...)</code>、<code>?fg=</code>、<code>?accent=</code>、<code>?font_scale=</code>（非法值自动回默认）。
     </div>
     <div id="overlayList" style="margin-top:12px">等待加载</div>
   </div>
@@ -666,7 +736,7 @@ function showPage(name, tab) {
   if (tab) tab.classList.add('active');
   // 新面板按需拉数据（避免初始化时打一堆 404/空请求）。
   if (name === 'commands') loadCommandsConfig();
-  if (name === 'overlay') loadOverlayComponents();
+  if (name === 'overlay') { loadOverlayComponents(); loadOverlayTheme(); }
 }
 
 // ── Local Settings Cache ──
@@ -1480,6 +1550,38 @@ function loadOverlayComponents() {
     }).join('');
     box.innerHTML = rows || '<div class="hint">没有注册任何组件。</div>';
   }).catch(e => { box.innerHTML = '<div class="hint">读取失败: ' + escapeHtml(String(e)) + '</div>'; });
+}
+
+// ── OBS 外观默认值（持久化到后端，URL 参数优先）──
+function loadOverlayTheme() {
+  fetch('/api/overlay/theme', {cache: 'no-store'}).then(r => r.json()).then(d => {
+    const t = (d && d.theme) || {};
+    document.getElementById('ovThemeBg').value = t.bg || '';
+    document.getElementById('ovThemeFg').value = t.fg || '';
+    document.getElementById('ovThemeAccent').value = t.accent || '';
+    document.getElementById('ovThemeFontScale').value = (t.font_scale == null ? '' : String(t.font_scale));
+    document.getElementById('ovThemeHint').textContent = '已读取保存的默认值（留空=页面保持原样）。';
+  }).catch(e => { document.getElementById('ovThemeHint').textContent = '读取失败: ' + e; });
+}
+
+function saveOverlayTheme() {
+  const payload = {
+    bg: document.getElementById('ovThemeBg').value.trim(),
+    fg: document.getElementById('ovThemeFg').value.trim(),
+    accent: document.getElementById('ovThemeAccent').value.trim(),
+    font_scale: document.getElementById('ovThemeFontScale').value.trim()
+  };
+  fetch('/api/overlay/theme', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
+  }).then(r => r.json()).then(d => {
+    const t = (d && d.theme) || {};
+    // 后端会丢掉非法值 → 回显规整结果，避免"看着存了其实没存"。
+    document.getElementById('ovThemeBg').value = t.bg || '';
+    document.getElementById('ovThemeFg').value = t.fg || '';
+    document.getElementById('ovThemeAccent').value = t.accent || '';
+    document.getElementById('ovThemeFontScale').value = (t.font_scale == null ? '' : String(t.font_scale));
+    document.getElementById('ovThemeHint').textContent = '已保存（非法值已被后端回退为默认）。';
+  }).catch(e => { document.getElementById('ovThemeHint').textContent = '保存失败: ' + e; });
 }
 
 // ── Init ──
