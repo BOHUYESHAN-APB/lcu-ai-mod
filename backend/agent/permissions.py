@@ -75,6 +75,26 @@ MEMORY_VISIBILITY: dict[str, str] = {
     TIER_GUEST: "public",
 }
 
+# 能力位（用户口径：「造东西只有**允许他做**才能做；只有**被授权去辅助制作**才允许
+# 翻箱子」）—— tier → 能否让他造 / 能否授权他动容器。同样是**数据表**：决策链只查表，
+# 不写 `if tier`；要放开谁就改 `.local/permissions.json`。
+# 注意这两项**比"能否下指令"更严**：私人服人人可聊（can_command=True），但让 AI 开工
+# 造东西/翻箱子必须是 master/friend（guest 默认 False）。
+CRAFT_AUTHORITY: dict[str, bool] = {
+    TIER_MASTER: True,
+    TIER_FRIEND: True,
+    TIER_GUEST: False,
+}
+CONTAINER_AUTHORITY: dict[str, bool] = {
+    TIER_MASTER: True,
+    TIER_FRIEND: True,
+    TIER_GUEST: False,
+}
+
+# 无人指挥（自主 self-prompt / 外部事件）时能不能自造：默认 **false**
+# —— 没人授权就不动手，这是用户口径的默认值（要放开请显式打开 autonomy_craft）。
+DEFAULT_AUTONOMY_CRAFT = False
+
 DEFAULT_SESSION_ADJUST = 1.0
 
 
@@ -97,6 +117,10 @@ def _default_permissions() -> dict[str, Any]:
         "debounce_seconds": DEFAULT_DEBOUNCE_SECONDS,
         "window_seconds": DEFAULT_WINDOW_SECONDS,
         "ban_patterns": [],
+        # 能力位：谁能让他造 / 谁能授权他翻箱 / 无人指挥时能否自造
+        "craft": dict(CRAFT_AUTHORITY),
+        "containers": dict(CONTAINER_AUTHORITY),
+        "autonomy_craft": DEFAULT_AUTONOMY_CRAFT,
     }
 
 
@@ -207,6 +231,20 @@ def _as_patterns(value: Any) -> list[str]:
     return [item for item in value if isinstance(item, str) and item.strip()]
 
 
+def _as_capability_map(value: Any, default: dict[str, bool]) -> dict[str, bool]:
+    """能力位表解析：接受 `{tier: bool}` 或名单式 `["master", "friend"]`（名单外的全是 False）。
+
+    默认拒绝：认不出的值一律回退 default 里那一格，名单里没写的一律 False ——
+    把"谁能让他造东西"配错成放行的代价远大于少搭理。
+    """
+    if isinstance(value, dict):
+        return {tier: _as_bool(value.get(tier), default[tier]) for tier in TIERS}
+    if isinstance(value, (list, tuple, set)):
+        granted = {str(item).strip().lower() for item in value if isinstance(item, str)}
+        return {tier: tier in granted for tier in TIERS}
+    return dict(default)
+
+
 def _normalize_base_rates(raw: Any) -> dict[str, dict[str, float]]:
     """base_rates 补全成 {private|public: {master|friend|guest: float}}，缺格取默认。"""
     defaults = _default_permissions()["base_rates"]
@@ -237,6 +275,9 @@ def _normalize(raw: Any) -> dict[str, Any]:
     data["window_seconds"] = _as_seconds(
         source.get("window_seconds"), DEFAULT_WINDOW_SECONDS)
     data["ban_patterns"] = _as_patterns(source.get("ban_patterns"))
+    data["craft"] = _as_capability_map(source.get("craft"), CRAFT_AUTHORITY)
+    data["containers"] = _as_capability_map(source.get("containers"), CONTAINER_AUTHORITY)
+    data["autonomy_craft"] = _as_bool(source.get("autonomy_craft"), DEFAULT_AUTONOMY_CRAFT)
     return data
 
 
@@ -274,6 +315,24 @@ class TierPolicy:
     can_command: bool          # private 服人人可；public 服仅 master + friend
     task_priority: int         # master 80 / friend 50 / guest 20
     memory_visibility: str     # "all"（含私聊）/ "public"（只看公开部分）
+    can_craft: bool            # 能不能让他造东西（craft 能力表）
+    can_use_containers: bool   # 能不能授权他动容器/翻箱（containers 能力表）
+
+
+@dataclass(frozen=True)
+class CraftPolicy:
+    """一次制作/取物请求的授权结论（**全部查表**，决策链不写 `if tier`）。
+
+    - 有人指挥（directed）：能不能造看 `craft` 表；能不能翻箱看 `containers` 表。
+    - 无人指挥（autonomous，self-prompt / 事件注入）：能不能自造看 `autonomy_craft` 开关
+      （默认 false），并且**永远不能翻箱** —— 没人授权他去动别人的箱子。
+    """
+
+    tier: str
+    autonomous: bool
+    may_craft: bool
+    may_open_containers: bool
+    reason: str                # granted / tier_not_allowed / autonomy_craft_off / ...
 
 
 @dataclass
@@ -421,7 +480,56 @@ class PermissionsStore:
             can_command=can_command,
             task_priority=TASK_PRIORITIES[tier],
             memory_visibility=MEMORY_VISIBILITY[tier],
+            can_craft=self.can_craft(tier),
+            can_use_containers=self.can_authorize_containers(tier),
         )
+
+    # ── 能力位（craft / containers / autonomy_craft） ──
+
+    def craft_authority(self) -> dict[str, bool]:
+        """谁能让他造东西（tier → bool 的副本）。"""
+        with self._lock:
+            return dict(self._data["craft"])
+
+    def container_authority(self) -> dict[str, bool]:
+        """谁能授权他翻箱/动容器（tier → bool 的副本）。"""
+        with self._lock:
+            return dict(self._data["containers"])
+
+    def autonomy_craft(self) -> bool:
+        """无人指挥（自主/事件）时能不能自造；默认 false。"""
+        with self._lock:
+            return bool(self._data["autonomy_craft"])
+
+    def can_craft(self, tier: str) -> bool:
+        """该 tier 能否让他造东西（查表，guest 默认 False）。"""
+        tier = _as_tier(tier)
+        with self._lock:
+            return bool(self._data["craft"].get(tier, False))
+
+    def can_authorize_containers(self, tier: str) -> bool:
+        """该 tier 能否授权他翻箱（查表，guest 默认 False）。"""
+        tier = _as_tier(tier)
+        with self._lock:
+            return bool(self._data["containers"].get(tier, False))
+
+    def craft_policy(self, tier: str = "", *, autonomous: bool = False) -> CraftPolicy:
+        """一次制作/取物请求的授权结论（决策链的唯一入口，不看 tier 分支）。
+
+        `autonomous=True` 表示这一轮没有任何人下指令（self-prompt / 事件注入）：
+        能不能自造只看 `autonomy_craft`，且**一律不许翻箱**。
+        """
+        if autonomous:
+            allowed = self.autonomy_craft()
+            return CraftPolicy(tier=_as_tier(tier), autonomous=True, may_craft=allowed,
+                               may_open_containers=False,
+                               reason="autonomy_craft" if allowed else "autonomy_craft_off")
+        resolved = _as_tier(tier)
+        may_craft = self.can_craft(resolved)
+        may_containers = self.can_authorize_containers(resolved)
+        return CraftPolicy(tier=resolved, autonomous=False, may_craft=may_craft,
+                           may_open_containers=may_containers,
+                           reason="granted" if may_craft else "tier_not_allowed")
 
     def base_rate(self, tier: str, *, server_mode: Optional[str] = None) -> float:
         """该 tier 在当前服的基准回复频率。

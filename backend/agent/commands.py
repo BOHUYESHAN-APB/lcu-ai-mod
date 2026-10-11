@@ -14,6 +14,8 @@ import logging
 import re
 from typing import Any, Callable, Optional
 
+from .craft import describe_missing, evaluate_craft
+
 logger = logging.getLogger("commands")
 
 # Regex to find !command patterns, stopping before the next !command.
@@ -39,8 +41,10 @@ class Commands:
         results = cmds.parse_and_execute(llm_output, state)
     """
 
-    def __init__(self, skills):
+    def __init__(self, skills, authorizer=None):
         self.skills = skills
+        # 自主制作的授权来源（self-prompt 这条路上没人下指令）：注入后 `!craft` 先问它。
+        self._authorizer = authorizer if callable(authorizer) else None
         self._queries: dict[str, Callable] = {}
         self._actions: dict[str, Callable] = {}
         self._register_defaults()
@@ -252,9 +256,22 @@ class Commands:
         self.skills.equip(slot)
 
     def _act_craft(self, args: list[str], state: dict):
-        """!craft [recipe_name] [count]"""
+        """!craft [recipe_name] [count]
+
+        自主路的 `!craft`：先过授权（autonomy_craft），再按**自己背包**的材料评估 ——
+        缺料就什么都不做（自主时不许翻箱，用户口径："自己想造时优先只用背包里的材料"）。
+        """
         if args:
             count = int(args[1]) if len(args) > 1 and args[1].isdigit() else 1
+            policy = self._authorizer() if self._authorizer is not None else None
+            if policy is not None:
+                if not policy.may_craft:
+                    logger.info("[Cmd] !craft 被拒：%s", policy.reason)
+                    return
+                plan = evaluate_craft(args[0], count, state.get("inventory"))
+                if plan.known and plan.missing:
+                    logger.info("[Cmd] !craft 材料不足：还缺 %s", describe_missing(plan))
+                    return
             self.skills.craft_item(args[0], count)
 
     def _act_place(self, args: list[str], state: dict):

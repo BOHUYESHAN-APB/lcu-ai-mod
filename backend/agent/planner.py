@@ -17,6 +17,10 @@ import re
 import time
 from typing import Any, Callable, Optional
 
+from .craft import (ContainerPick, armor_in_containers, clamp_take, describe_missing,
+                    evaluate_craft, is_armor, normalize_item, route_containers)
+from .permissions import CraftPolicy, TIER_GUEST
+
 logger = logging.getLogger("planner")
 TOOL_CALL_RE = re.compile(r"tool\(\s*([a-zA-Z_]+)\s*,\s*(\{.*?\})\s*\)", re.DOTALL)
 
@@ -55,16 +59,15 @@ ACTION_GROUPS: dict[str, tuple[tuple[str, str, str], ...]] = {
         ("move_to", "x,y,z", "移动到坐标"),
         ("follow", "player", "跟随玩家"),
         ("explore", "radius", "探索半径"),
-        ("stop", "", "停止当前动作"),
+        ("stop", "", "停止动作"),
     ),
     "locate": (
-        ("find_block", "block,radius,limit", "扫描附近有没有该方块（只查不走）"),
-        ("go_to_block", "block,radius,remember", "扫附近找该方块并自动寻路过去；到达后记住它"),
-        ("locate_structure", "name,kind", "用原版 /locate 查**结构/群系**坐标"
-                                          "（kind=structure|biome，名字用 minecraft:village 这类 id）"),
+        ("find_block", "block,radius,limit", "扫附近有无该方块（只查不走）"),
+        ("go_to_block", "block,radius,remember", "找该方块并寻路过去，到达后记住"),
+        ("locate_structure", "name,kind", "用原版 /locate 查结构/群系坐标（kind=structure|biome）"),
     ),
     "gather": (
-        ("mine_block", "", "挖掘面前或脚下的方块"),
+        ("mine_block", "", "挖面前的方块"),
         ("collect_blocks", "block_type,count", "采集方块"),
         ("drop_item", "item,count", "丢弃物品"),
         ("sort_inventory", "", "整理背包"),
@@ -72,15 +75,22 @@ ACTION_GROUPS: dict[str, tuple[tuple[str, str, str], ...]] = {
     ),
     "craft": (
         ("craft_item", "item,count", "合成物品"),
-        ("place_block", "", "放置手中的方块"),
+        ("craft_via_recipe", "item,count", "用原版配方合成（先看背包材料）"),
+        ("place_block", "", "放置手中方块"),
         ("build", "x,y,z,structure", "建造结构"),
     ),
+    "container": (
+        ("container_move", "from_slot,to_slot,count", "容器里把某格物品移到另一格（省 to_slot＝背包↔快捷栏）"),
+        ("container_click", "slot,click_type", "点容器里的一格（click_type=pickup|quick_move|swap|throw）"),
+        ("container_close", "", "关掉当前容器界面"),
+    ),
     "combat": (
-        ("attack", "", "攻击附近的敌人"),
+        ("attack", "", "攻击附近敌人"),
     ),
     "items": (
-        ("equip_weapon", "", "换上热栏里最好的武器（动手/挨打前先换）"),
-        ("select_hotbar", "index", "切到热栏第 index 格（0-8，放方块/吃东西用）"),
+        ("equip_armor", "", "穿上背包里的盔甲（没有就去容器找）"),
+        ("equip_weapon", "", "换上热栏里最好的武器"),
+        ("select_hotbar", "index", "切到热栏第 index 格（0-8）"),
     ),
     "survive": (
         ("eat", "", "吃东西"),
@@ -88,18 +98,17 @@ ACTION_GROUPS: dict[str, tuple[tuple[str, str, str], ...]] = {
         ("trade", "villager_type", "与村民交易"),
     ),
     "night": (
-        ("sleep_in_bed", "", "走到最近的床并睡到天亮（只有夜里能睡）"),
+        ("sleep_in_bed", "", "走到最近的床睡到天亮（只能夜里）"),
     ),
     "guard": (
-        ("guard", "x,y,z,radius", "在给定坐标的**水平半径**内驻守（默认 32 格，越界自动走回）；"
-                                  "省略坐标＝用最近发话者发言时站的位置"),
+        ("guard", "x,y,z,radius", "在水平半径内驻守（默认 32 格；省略坐标＝最近发话者的位置）"),
         ("guard_off", "", "取消驻守"),
     ),
     "hud": (
-        ("set_hud_note", "text", "把当前在干嘛写进 HUD 状态词后面的描述词（空字符串＝清空）"),
+        ("set_hud_note", "text", "把当前打算写进 HUD 描述词"),
     ),
     "memory": (
-        ("remember_poi", "name,category,x,y,z", "把当前位置/坐标记成记录点（持久记忆）"),
+        ("remember_poi", "name,category,x,y,z", "记住当前位置"),
     ),
 }
 
@@ -115,10 +124,10 @@ _KIND_TO_PHASE = {
 # night / guard / hud / memory 全局注入：睡觉、守点、HUD 描述词与记忆点在任何阶段
 # 都可能有意义（用户说"在这儿守着"时他可能正在看着 AI 挖矿）。
 PHASE_GROUPS: dict[str, tuple[str, ...]] = {
-    "idle": ("move", "locate", "gather", "craft", "guard", "items", "survive", "combat", "hud", "night", "memory"),
-    "travel": ("move", "locate", "combat", "guard", "items", "survive", "hud", "night", "memory"),
-    "gather": ("move", "locate", "gather", "guard", "items", "craft", "hud", "night", "memory"),
-    "craft": ("move", "locate", "craft", "guard", "items", "gather", "hud", "night", "memory"),
+    "idle": ("move", "locate", "gather", "craft", "container", "guard", "items", "survive", "combat", "hud", "night", "memory"),
+    "travel": ("move", "locate", "combat", "guard", "items", "container", "survive", "hud", "night", "memory"),
+    "gather": ("move", "locate", "gather", "guard", "items", "craft", "container", "hud", "night", "memory"),
+    "craft": ("move", "locate", "craft", "container", "guard", "items", "gather", "hud", "night", "memory"),
     "survive": ("survive", "hud", "night", "memory", "guard", "items", "move", "locate"),
 }
 
@@ -183,6 +192,18 @@ def _as_optional_float(value: Any) -> Optional[float]:
         return None
     try:
         return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_optional_int(value: Any) -> Optional[int]:
+    """槽位/数量这类可选整数：缺失/空串/非法 → None（布尔不算数字）。"""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    try:
+        return int(value)
     except (TypeError, ValueError):
         return None
 
@@ -329,7 +350,8 @@ class Planner:
     2. Planner: 回复什么？做什么？
     """
     
-    def __init__(self, llm_service, memory, skills, threshold_provider=None, chat_inbox=None):
+    def __init__(self, llm_service, memory, skills, threshold_provider=None, chat_inbox=None,
+                 permissions=None):
         self.llm = llm_service
         self.memory = memory
         self.skills = skills
@@ -342,6 +364,16 @@ class Planner:
         self.chat_inbox = chat_inbox
         # 本轮的 /locate 结果（`_locate_note()` 会把它如实附到回复后面）。
         self._last_locate_result: Optional[dict] = None
+        # 能力位来源（craft / containers / autonomy_craft）。没注入＝一律不放行（默认拒绝）。
+        self.permissions = permissions
+        # 本轮制作还没补上的材料缺口（bare item → 还差几个）：容器取用以它为上限。
+        self._craft_need: dict[str, int] = {}
+        # 本次制作涉及过的材料（含已补齐的）：用来把"已经够了"和"根本没登记"区分开。
+        self._craft_tracked: set[str] = set()
+        # 取用审计（谁在什么时候从哪一格拿了多少）——"用多少取多少"要能事后查。
+        self._take_audit: list[dict] = []
+        # 本轮如实说明的补充（缺料 / 没授权 / 已经够了），拼在回复后面。
+        self._craft_note: Optional[str] = None
 
     def _threshold(self) -> float:
         """当前 decider 置信度阈值：读注入的 provider，失败回退默认常量。"""
@@ -368,6 +400,8 @@ class Planner:
         self._last_plan_time = time.time()
         # 本轮 /locate 的结果从零开始记（避免上一轮的坐标串到这一轮的回复里）。
         self._last_locate_result = None
+        # 本轮的"如实说明"也从零开始（缺料/没授权这类话不能串轮）。
+        self._craft_note = None
 
         try:
             # 第一阶段：planner 结合状态产出候选动作（JSON）
@@ -385,11 +419,11 @@ class Planner:
             if plan is None:
                 # 模型没按候选 JSON 契约输出 → 回退旧的自由文本解析
                 logger.info("[Planner] 输出非候选 JSON，回退自由文本解析")
-                return self._with_locate_note(
+                return self._with_notes(
                     self._execute_plan(plan_text, sender, message, context))
             
             # 第二阶段：decider 打分并选出一个候选
-            return self._with_locate_note(self._execute_decision(plan, context))
+            return self._with_notes(self._execute_decision(plan, context))
             
         except Exception as e:
             logger.error("[Planner] 规划失败: %s", e)
@@ -422,6 +456,19 @@ class Planner:
         if not reply:
             return note.strip("（）")
         return f"{reply}\n{note}"
+
+    def _with_notes(self, reply: Optional[str]) -> Optional[str]:
+        """把本轮的**真实补充**拼到回复后面：/locate 的真实坐标 + 制作/取物的如实说明。
+
+        `_with_locate_note` 保持原样（有测试直接打它）；这里只是多贴一条缺料/授权说明。
+        """
+        text = self._with_locate_note(reply)
+        note = self._craft_note
+        if not note:
+            return text
+        if not text:
+            return note
+        return f"{text}\n{note}"
     
     def _build_planner_prompt(self, sender: str, message: str, 
                                context: dict, bot_name: str) -> str:
@@ -630,7 +677,7 @@ class Planner:
                 "要不要说点什么完全由你决定：不想说就把 reply 留空、candidates 给空数组——"
                 "硬找话聊比不说话更糟。\n"
             )
-            event_rule = ("12. 上面有外部事件时：先判断值不值得开口（有人死了/掉到好东西/第一次到新地方"
+            event_rule = ("15. 上面有外部事件时：先判断值不值得开口（有人死了/掉到好东西/第一次到新地方"
                           "才值得调侃一句），不值得就不说话；别把事件当指令去干活\n")
 
         # 饥饿/饱和度：自然回血要"饱食度 ≥18 且饱和度 >0"，所以缺血时不能等饿到见底才吃。
@@ -728,17 +775,18 @@ class Planner:
 1. 你是真实玩家，不是 AI；说话自然简短，直接做事
 2. 参数用真实值，禁止"附近""随机位置"这类占位词
 3. 用户要求停止时优先给 stop；当前任务非 idle 且目标未变时不要重复下发同一任务
-4. 到了晚上又没事可做，且附近或记忆里有床 → 给 sleep_in_bed（它会自己走过去并睡下，别干等到天亮）
+4. 晚上没事、且附近或记忆里有床 → 给 sleep_in_bed（它自己走过去睡，别干等到天亮）
 5. 用户说"找床/找箱子/找某某方块"时，用 go_to_block（自己会寻路过去），不要用 explore
 6. 用户说"记住这里/保存一个记录点"时，用 remember_poi
 7. 判断在跟谁说话：看最近聊天上下文 + 在线玩家的 ← 标记；对你说话不一定喊名字，
    谁刚在跟你讲、谁离你最近，就用谁的话当指令
-8. "守住这里/在这儿等着/别走开" → guard（别自己编坐标，用最近发话者发言时站的位置 + 水平半径 32 格）；
-   "不用守了" → guard_off
-9. 要找结构/群系 → locate_structure（走原版 /locate，名字用 minecraft:village 这类 id，别写死成某一个）；
-   坐标要等游戏回话才知道，所以 reply 里**别写坐标**，只说"去查一下"，真实坐标后端会补在你话后面
+8. "守住这里/别走开" → guard（别自己编坐标，用最近发话者的位置）；"不用守了" → guard_off
+9. 找结构/群系 → locate_structure（名字用 minecraft:village 这类 id，别写死成某一个）；坐标等游戏回话，reply 里**别写坐标**，真实的会补在后面
 10. 有人问"在干嘛/要去哪" → 顺手用 set_hud_note 把当前打算写进 HUD 描述词
 11. 回复必须和实际动作一致：写进 reply 的事必须真的作为候选下发；没下发的动作不要写进 reply
+12. 要穿甲 → equip_armor（唯一穿甲方式；背包里没有就去已知容器找，别现场造）
+13. 合成优先用自己背包（含快捷栏）的材料；缺料/没配方就**如实说**；没被授权不要开箱
+14. 容器里只为拿自己要的量：container_move 给明确 count，别整箱搬空；拿完 container_close
 {event_rule}
 给 1-4 个候选动作（按偏好排序，没有合适的就给空数组），只输出合法 JSON（无 markdown、无多余文字）：
 "过来" → {{"reply":"来了","candidates":[{{"tool":"move_to","args":{{"x":100,"y":64,"z":-200}},"why":"靠近"}}]}}
@@ -931,15 +979,15 @@ confidence 表示你对这个选择的确信程度；如果没有一个候选明
             logger.info("[Planner] 放置")
             executed_any_action = True
         
-        # 合成
+        # 合成（自由文本回退路径：同样要过授权 + 库存优先那道门）
         if "craft(" in plan_lower:
             item_name = self._extract_between(plan_text, "craft(", ")")
             if item_name:
                 parts = [part.strip() for part in item_name.split(",") if part.strip()]
                 normalized_item = self._normalize_item_name(parts[0])
                 craft_count = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
-                if not self._is_duplicate_task(context, {"craft"}, normalized_item):
-                    self.skills.craft_item(normalized_item, craft_count)
+                if self._dispatch_craft({"item": normalized_item, "count": craft_count},
+                                        context, command="craft_via_recipe"):
                     logger.info("[Planner] 合成 %s x%d", normalized_item, craft_count)
                     executed_any_action = True
         
@@ -1110,12 +1158,9 @@ confidence 表示你对这个选择的确信程度；如果没有一个候选明
         elif tool_name == "place_block":
             self.skills.place_block()
             return True
-        elif tool_name == "craft_item":
-            item = payload.get("item") or payload.get("item_name")
-            normalized_item = self._normalize_item_name(str(item)) if item else ""
-            if item and not self._is_duplicate_task(context, {"craft"}, normalized_item):
-                self.skills.craft_item(normalized_item, int(payload.get("count", 1)))
-                return True
+        elif tool_name in ("craft_item", "craft_via_recipe"):
+            # 两条合成命令**同一道门**：授权 + 库存优先（用户口径：没被允许不许造）。
+            return self._dispatch_craft(payload, context, command=tool_name)
         elif tool_name == "collect_blocks":
             block_type = payload.get("block_type") or payload.get("block")
             normalized_block = self._normalize_block_name(str(block_type)) if block_type else ""
@@ -1205,6 +1250,15 @@ confidence 表示你对这个选择的确信程度；如果没有一个候选明
         elif tool_name == "equip_weapon":
             self.skills.equip_weapon()
             return True
+        elif tool_name == "equip_armor":
+            return self._dispatch_equip_armor(context)
+        elif tool_name == "container_move":
+            return self._dispatch_container_move(payload, context)
+        elif tool_name == "container_click":
+            return self._dispatch_container_click(payload, context)
+        elif tool_name == "container_close":
+            self.skills.container_close()
+            return True
         elif tool_name == "select_hotbar":
             index = payload.get("index")
             if index is not None:
@@ -1218,6 +1272,252 @@ confidence 表示你对这个选择的确信程度；如果没有一个候选明
             self.skills.stop_all()
             return True
         return False
+
+    # ── 制作 / 容器：授权 + 库存优先（用户口径） ──────────────────
+
+    def _craft_policy(self, context: dict) -> CraftPolicy:
+        """本轮的制作/翻箱授权（**只查能力表**，不看 tier 分支）。
+
+        `context["autonomous"]=True` 表示这一轮没人下指令（self-prompt / 事件注入）：
+        能不能自造只看 `autonomy_craft`，并且**一律不许翻箱**。没有权限表来源时
+        默认**拒绝**（宁可不做，也不越权动别人的箱子）。
+        """
+        ctx = context if isinstance(context, dict) else {}
+        autonomous = bool(ctx.get("autonomous"))
+        tier = str(ctx.get("actor_tier") or "")
+        store = self.permissions
+        if store is None:
+            return CraftPolicy(tier=tier or TIER_GUEST, autonomous=autonomous,
+                               may_craft=False, may_open_containers=False,
+                               reason="no_permissions")
+        return store.craft_policy(tier, autonomous=autonomous)
+
+    def _track_craft_need(self, missing: Any) -> None:
+        """登记本次制作的材料缺口（正数才算）：容器取用以它为上限，绝不搬空。"""
+        need = {}
+        for item, amount in (missing or {}).items() if isinstance(missing, dict) else ():
+            try:
+                value = int(amount)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                need[normalize_item(item)] = value
+        self._craft_need = need
+        self._craft_tracked = set(need)
+
+    def _dispatch_craft(self, payload: dict, context: dict, *, command: str) -> bool:
+        """合成：先过授权，再按**自己背包**评估材料，最后才下发。
+
+        - 没被允许造 → 一句如实说明，**一帧都不发**；
+        - 材料齐（或配方不在我们的表里）→ 就地用 `craft_via_recipe` 造（容器 0）；
+        - 材料不齐：
+            · 获授权翻箱 → 记下缺口（后续 `container_move` 以它为上限）、去已知容器拿；
+            · 没获授权 → **如实说缺什么**，绝不开箱。
+        """
+        item = payload.get("item") or payload.get("item_name")
+        if not item:
+            return False
+        item_id = self._normalize_item_name(str(item))
+        try:
+            count = int(payload.get("count", 1))
+        except (TypeError, ValueError):
+            count = 1
+        count = max(1, count)
+
+        policy = self._craft_policy(context)
+        if not policy.may_craft:
+            self._craft_note = self._auth_note(policy, "造东西")
+            logger.info("[Planner] 合成 %s 被拒：%s", item_id, policy.reason)
+            return False
+        if self._is_duplicate_task(context, {"craft"}, item_id):
+            return False
+
+        inventory = context.get("inventory") if isinstance(context, dict) else None
+        plan = evaluate_craft(item_id, count, inventory)
+        if plan.known and plan.missing:
+            missing = describe_missing(plan)
+            if not policy.may_open_containers:
+                self._track_craft_need({})
+                self._craft_note = (f"（我自己背包里的材料不够：还缺 {missing}；"
+                                    f"没被授权翻箱子，我不去翻）")
+                logger.info("[Planner] 合成 %s 缺料且未授权翻箱：%s", item_id, missing)
+                return False
+            picked = route_containers(plan.missing,
+                                      context.get("known_containers") if isinstance(context, dict) else None)
+            if not picked:
+                self._track_craft_need({})
+                self._craft_note = f"（材料不够：还缺 {missing}；已知的容器里也没有，就没去动）"
+                logger.info("[Planner] 合成 %s 缺料且已知容器补不上：%s", item_id, missing)
+                return False
+            # 缺口登记：后面的 container_move 只能按"还缺的量"取，绝不搬空。
+            self._track_craft_need(plan.missing)
+            pick = picked[0]
+            self._craft_note = (f"（背包里的材料不够：还缺 {missing}；"
+                                f"我记得 {self._pick_label(pick)} 那边有，我去拿）")
+            self._dispatch_container_trip(pick, context)
+            logger.info("[Planner] 合成 %s 缺料 → 去 %s 取", item_id, self._pick_label(pick))
+            return True
+
+        self._track_craft_need({})
+        self._craft_note = None
+        if command == "craft_via_recipe":
+            self.skills.craft_via_recipe(item_id, count)
+        else:
+            self.skills.craft_item(item_id, count)
+        logger.info("[Planner] 合成 %s x%d（库存优先，就地）", item_id, count)
+        return True
+
+    def _auth_note(self, policy: CraftPolicy, what: str) -> str:
+        """如实说明为什么没动手（缺授权时的统一话术）。"""
+        if policy.autonomous:
+            return f"（没人在指挥我，我自己不许{what}（autonomy_craft 关着），所以没动手）"
+        return f"（{policy.tier} 没被允许让我{what}，所以没动手）"
+
+    @staticmethod
+    def _pick_label(pick: ContainerPick) -> str:
+        where = (f"({pick.x:.0f},{pick.y:.0f},{pick.z:.0f})"
+                 if pick.x is not None and pick.z is not None else "记忆里")
+        return f"{pick.block_id}{where}"
+
+    def _dispatch_container_trip(self, pick: ContainerPick, context: dict) -> bool:
+        """去已知容器的路上：走已有的 `go_to_block`（Java 侧负责寻路 + 到达后记 POI）。
+
+        容器只有走到跟前、右键打开后才谈得上取用，所以这里只负责"去哪"这一步。
+        """
+        block = str(pick.block_id or "").strip() or "minecraft:chest"
+        radius = int(max(32, (pick.distance or 0.0) + 8))
+        if self._is_duplicate_task(context, {"go_to_block", "collect"}, block):
+            return False
+        self.skills.go_to_block(block, radius, True)
+        return True
+
+    def _dispatch_container_move(self, payload: dict, context: dict) -> bool:
+        """容器取用：必须获授权，且**用多少取多少**（有缺口登记时绝不超、绝不整组搬空）。"""
+        policy = self._craft_policy(context)
+        if not policy.may_open_containers:
+            self._craft_note = self._auth_note(policy, "翻箱子")
+            logger.info("[Planner] container_move 被拒：%s", policy.reason)
+            return False
+        from_slot = _as_optional_int(payload.get("from_slot"))
+        if from_slot is None:
+            return False
+        to_slot = _as_optional_int(payload.get("to_slot"))
+        count = _as_optional_int(payload.get("count"))
+        item = str(payload.get("item") or payload.get("name") or "").strip()
+        if not item:
+            item = self._item_at_slot(context, from_slot)
+        item_id = normalize_item(item) if item else ""
+        if item_id and item_id in self._craft_tracked:
+            # 这一次制作登记过的材料：只按"还缺的量"取（已经够了就不许再拿）。
+            remaining = self._craft_need.get(item_id, 0)
+            if remaining <= 0:
+                self._craft_note = f"（{item_id} 已经够了，不用再从箱子里拿）"
+                logger.info("[Planner] container_move 被拒：%s 已够", item_id)
+                return False
+            take = clamp_take(item_id, count, self._craft_need)
+            if take <= 0:
+                self._craft_note = f"（{item_id} 已经够了，不用再从箱子里拿）"
+                return False
+            count = take
+            left = remaining - take
+            if left > 0:
+                self._craft_need[item_id] = left
+            else:
+                del self._craft_need[item_id]
+        elif self._craft_tracked:
+            # 有缺口但认不出这一格是什么（Java 的 open_container 只报槽位数）：
+            # 只允许**明确给 count**，且不超过总缺口 —— 整组搬空一律不放行。
+            total = sum(self._craft_need.values())
+            if count is None or count <= 0:
+                self._craft_note = "（不确定这格是什么，不能整组搬；说清要拿哪件材料、拿多少）"
+                logger.info("[Planner] container_move 被拒：缺口中不让整组搬")
+                return False
+            if count > total:
+                self._craft_note = f"（只需要补 {total} 个，不能多拿）"
+                logger.info("[Planner] container_move 被拒：%d > 缺口 %d", count, total)
+                return False
+        self._record_take(item_id or f"slot:{from_slot}", count or 0, from_slot, to_slot)
+        self.skills.container_move(from_slot, to_slot, count)
+        logger.info("[Planner] 容器取用 %s x%s（slot %s → %s）",
+                    item_id or "?", count if count else "整组", from_slot, to_slot if to_slot is not None else "快速移动")
+        return True
+
+    def _dispatch_container_click(self, payload: dict, context: dict) -> bool:
+        """点容器里的一格（"点容器找盔甲"）：同样是容器操作，没授权不动。"""
+        policy = self._craft_policy(context)
+        if not policy.may_open_containers:
+            self._craft_note = self._auth_note(policy, "翻箱子")
+            logger.info("[Planner] container_click 被拒：%s", policy.reason)
+            return False
+        slot = _as_optional_int(payload.get("slot"))
+        if slot is None:
+            return False
+        click_type = str(payload.get("click_type") or "pickup").strip().lower() or "pickup"
+        button = _as_optional_int(payload.get("button"))
+        self.skills.container_click(slot, button if button is not None else 0, click_type)
+        return True
+
+    def _dispatch_equip_armor(self, context: dict) -> bool:
+        """穿甲：自己背包里有盔甲就直接穿；没有就去**已知容器**里找（"点容器找盔甲"）。
+
+        翻箱那一步要 `containers` 授权 —— 没授权就如实说，绝不偷偷开箱。
+        """
+        inventory = context.get("inventory") if isinstance(context, dict) else None
+        has_armor = any(is_armor(entry.get("name") or entry.get("item_id"))
+                        for entry in (inventory or []) if isinstance(entry, dict))
+        if has_armor:
+            self.skills.equip_armor()
+            return True
+        picks = armor_in_containers(context.get("known_containers") if isinstance(context, dict) else None)
+        if not picks:
+            self._craft_note = "（我背包里没有盔甲，已知的容器里也没翻到）"
+            return False
+        policy = self._craft_policy(context)
+        if not policy.may_open_containers:
+            self._craft_note = "（背包里没有盔甲；没被授权翻箱子，我不去翻）"
+            return False
+        pick = picks[0]
+        pieces = ", ".join(f"{name} x{amount}" for name, amount in pick.take.items())
+        self._craft_note = f"（背包里没有盔甲；我记得 {self._pick_label(pick)} 里有 {pieces}，我过去拿）"
+        self._dispatch_container_trip(pick, context)
+        return True
+
+    @staticmethod
+    def _item_at_slot(context: dict, slot: int) -> str:
+        """打开的容器里某格是什么（尽力而为：state 没报内容就返回空串，绝不猜物品）。"""
+        ctx = context if isinstance(context, dict) else {}
+        entries = ctx.get("container_items")
+        if entries is None:
+            container = ctx.get("open_container")
+            container = container if isinstance(container, dict) else {}
+            entries = container.get("items") or container.get("contents")
+        if isinstance(entries, dict):
+            entry = entries.get(str(slot)) or entries.get(slot)
+            return str((entry or {}).get("item") or (entry or {}).get("item_id")
+                       or (entry or {}).get("name") or "") if isinstance(entry, dict) else ""
+        for entry in (entries or []):
+            if not isinstance(entry, dict):
+                continue
+            if _as_optional_int(entry.get("slot")) == slot:
+                return str(entry.get("item") or entry.get("item_id") or entry.get("name") or "")
+        return ""
+
+    def _record_take(self, item: str, count: int, from_slot: int, to_slot: Optional[int]) -> None:
+        """取用审计：记下拿了什么、多少、从哪到哪（"用多少取多少"要能事后查）。"""
+        self._take_audit.append({
+            "ts": time.time(),
+            "item": item,
+            "count": int(count or 0),
+            "from_slot": int(from_slot),
+            "to_slot": int(to_slot) if to_slot is not None else None,
+            "remaining_need": dict(self._craft_need),
+        })
+        del self._take_audit[:-50]
+
+    def take_audit(self, n: int = 10) -> list[dict]:
+        """最近 n 条取用审计（时间从早到晚）。"""
+        rows = self._take_audit[-int(n):] if n and int(n) > 0 else list(self._take_audit)
+        return [dict(row) for row in rows]
 
     def _dispatch_guard(self, payload: dict, context: dict) -> bool:
         """驻守：坐标缺省用**最近发话者发言时站的位置**（用户口径），否则不下发。
@@ -1335,4 +1635,7 @@ confidence 表示你对这个选择的确信程度；如果没有一个候选明
             "last_decision": self._last_decision,
             # 最近一次 /locate 的结果（查不到也如实记下来，便于排查"它怎么走错方向了"）。
             "last_locate": self._last_locate_result,
+            # 还没补上的材料缺口 + 容器取用审计（"用多少取多少"要能事后查）。
+            "craft_need": dict(self._craft_need),
+            "take_audit": self.take_audit(10),
         }

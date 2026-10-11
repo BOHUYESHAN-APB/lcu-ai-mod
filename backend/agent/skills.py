@@ -214,6 +214,48 @@ class Skills:
         """Close current container GUI."""
         return self._send_cmd("close_container", {})
 
+    # ── 容器 / 装备（Java 新命令，字段名逐字对齐 ActionExecutor） ──
+    # 容器槽位：0..slots-1（背包菜单即 0..45：5-8 盔甲 / 9-35 背包 / 36-44 快捷栏 /
+    # 45 副手）；`player_inv_start` 是玩家背包区在箱子菜单里的起始槽位。
+
+    def equip_armor(self) -> dict:
+        """在背包/快捷栏里找盔甲并穿上（Java 侧 QUICK_MOVE 到装备槽并校验真的穿上）。
+
+        用户口径："盔甲要点容器找盔甲" —— 这条就是那次点击；失败 reason="no_armor"。
+        """
+        return self._send_cmd("equip_armor", {})
+
+    def craft_via_recipe(self, item: str, count: int = 1) -> dict:
+        """用**原版配方**合成（Java 侧按配方放置，Python 不实现合成算法）。
+
+        `count` 缺省 1；>1 时 Java 侧 useMaxItems=true。材料够不够由 Python 侧先评估
+        （见 `agent.craft.evaluate_craft`），这里只负责把命令发出去。
+        """
+        return self._send_cmd("craft_via_recipe", {"item": str(item), "count": int(count)})
+
+    def container_move(self, from_slot: int, to_slot: Optional[int] = None,
+                       count: Optional[int] = None) -> dict:
+        """在当前打开的容器里把 `from_slot` 的物品移到 `to_slot`。
+
+        `to_slot` 省略（或 -1）＝ QUICK_MOVE（原版 shift 点击，背包↔快捷栏）；
+        `count` 省略＝整组。**取用要按缺口给 count**，别整组搬空。
+        """
+        args: dict[str, Any] = {"from_slot": int(from_slot)}
+        if to_slot is not None:
+            args["to_slot"] = int(to_slot)
+        if count is not None:
+            args["count"] = int(count)
+        return self._send_cmd("container_move", args)
+
+    def container_click(self, slot: int, button: int = 0, click_type: str = "pickup") -> dict:
+        """点当前容器菜单的某一格（`click_type` = Java `ContainerInput` 枚举小写）。"""
+        return self._send_cmd("container_click", {
+            "slot": int(slot), "button": int(button), "click_type": str(click_type)})
+
+    def container_close(self) -> dict:
+        """关掉当前打开的容器菜单（幂等：没开也返回成功）。"""
+        return self._send_cmd("container_close", {})
+
     # ── State Queries (mineflayer, mindcraft) ──────────────────
 
     def get_state(self) -> dict:

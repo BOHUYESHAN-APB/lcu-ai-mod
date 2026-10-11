@@ -35,7 +35,7 @@ from .llm_service import LLMService
 from .self_prompter import SelfPrompter
 from .message_db import MessageDB
 from .conversation import ConversationStore
-from .permissions import PermissionsStore, ReplyGate
+from .permissions import CraftPolicy, PermissionsStore, ReplyGate
 from .persona_store import PersonaStore
 from .task_list import TaskList
 
@@ -152,7 +152,7 @@ class Session:
         self.memory = Memory(path=f"data/memory/session_{self.id}.json")
         # POI 记忆：按「服务器 + 世界」命名空间持久化，跨局记住箱子位置与内容
         self.poi = WorldPoiMemory()
-        self.commands = Commands(self.skills)
+        self.commands = Commands(self.skills, authorizer=self._autonomous_craft_policy)
         self.modes_engine = ModesEngine(self.skills, self.memory,
                                         action_manager=self.action_manager)
         self.llm = LLMService()
@@ -218,6 +218,8 @@ class Session:
             self.llm, self.memory, self.skills,
             threshold_provider=get_config_store(DEFAULT_CONFIG_PATH).get_decision_threshold,
             chat_inbox=self.chat_inbox,
+            # 能力位（craft / containers / autonomy_craft）：合成与翻箱都要先过这张表。
+            permissions=self.permissions,
         )
 
         # Vision (Python 侧直接抓屏 -> VLM，后台线程低频刷新，不阻塞动作链路)
@@ -941,6 +943,18 @@ class Session:
         context["can_sleep"] = self.runtime.get("can_sleep", False)
         context["vision"] = self.vision.latest()
         context["known_poi"] = self.poi.describe()
+        # 结构化容器清单（POI storage）：制作缺料时"先查已知容器决定去哪"看这份。
+        try:
+            context["known_containers"] = self.poi.find("storage")
+        except Exception as e:
+            logger.debug("[Session] 容器清单读取失败: %s", e)
+            context["known_containers"] = []
+        # 当前打开的容器（Java state 上报的 open_container；含槽位内容时供取用定位）。
+        context["open_container"] = self.runtime.get("open_container") or {}
+        # 能力位：这一轮是谁在说话（制作/翻箱授权按它查表）；自主轮由 planner 侧改写。
+        actor = getattr(self, "_actor", None) or {}
+        context["actor_tier"] = str(actor.get("tier") or "guest")
+        context["autonomous"] = False
 
         # 语境：谁在线、谁刚说过话（以及他说那话时站在哪）、最近的聊天顺序。
         context["players"] = self._players_for_status()
@@ -987,6 +1001,8 @@ class Session:
         context = self._runtime_context()
         if event:
             context["event"] = event
+            # 事件注入＝**没有人下指令**：制作/翻箱只看 autonomy_craft，且一律不许翻箱。
+            context["autonomous"] = True
         # 场景：这条消息点名了 AI 就用"被点名"那一段规则，否则按私聊/公开服。
         mentioned = (not event) and self._is_mentioned(message)
         context["persona_blocks"] = self.persona_blocks(self._scene_for("", mentioned))
@@ -1294,7 +1310,8 @@ class Session:
     # 否则列表会被一闪而过的小动作刷满。
     TASK_KINDS = {
         "move_to": "move", "follow_player": "follow", "collect_blocks": "collect",
-        "craft_item": "craft", "build": "build", "explore": "explore",
+        "craft_item": "craft", "craft_via_recipe": "craft", "build": "build",
+        "explore": "explore",
         "eat": "eat", "sleep": "sleep", "trade": "trade",
         "go_to_block": "collect", "mine_block": "mine", "guard": "guard",
         "locate_structure": "locate",
@@ -1391,6 +1408,14 @@ class Session:
         if tasks is None:
             return False, "no_task_list"
         return tasks.activate(task_id, actor_tier=tier or self._tier_of(actor), actor=actor)
+
+    def _autonomous_craft_policy(self) -> CraftPolicy:
+        """自主行为（self-prompt / 事件）的制作授权：只看 `autonomy_craft`，且不许翻箱。"""
+        permissions = getattr(self, "permissions", None)
+        if permissions is None:
+            return CraftPolicy(tier="guest", autonomous=True, may_craft=False,
+                               may_open_containers=False, reason="no_permissions")
+        return permissions.craft_policy("", autonomous=True)
 
     def _handle_self_prompt(self, prompt: str):
         """Handle a self-prompt by routing through LLM to generate actions."""
