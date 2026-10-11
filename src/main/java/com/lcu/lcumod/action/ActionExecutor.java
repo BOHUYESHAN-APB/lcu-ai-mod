@@ -8,7 +8,9 @@ import com.lcu.lcumod.network.WireServer;
 import com.lcu.lcumod.state.StateCollector;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Holder;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.Identifier;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.protocol.game.ServerboundClientCommandPacket;
 import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
@@ -105,6 +107,20 @@ public class ActionExecutor {
     private static String pendingTradeItem = "";
     private static boolean pendingTradeListOnly = false;
     private static int pendingTradeSelected = -1;
+
+    // build：按结构一次放一批（复用 place 的校验路径 ✓；够不着的如实留给模型"走过去再叫一次"✓）
+    private static final int BUILD_BLOCK_TIMEOUT_TICKS = 20 * 5;
+    private static boolean pendingBuild = false;
+    private static String pendingBuildReqId = null;
+    private static String pendingBuildStructure = "";
+    private static String pendingBuildMaterial = "";
+    private static BlockPos pendingBuildBase = null;
+    private static java.util.List<BuildPlan.Block> pendingBuildQueue = null;
+    private static int pendingBuildTotal = 0;
+    private static int pendingBuildPlaced = 0;
+    private static int pendingBuildRemaining = 0;
+    private static int pendingBuildWaitTicks = 0;
+    private static BlockPos pendingBuildExpect = null;
 
     /** 饥饿反射：阈值取自参考实现（mineflayer-auto-eat 的 minHunger=15 / mindcraft 的 14）。 */
     private static final int HUNGER_REFLEX_FOOD = 14;
@@ -238,6 +254,7 @@ public class ActionExecutor {
         // ── 找方块/睡觉的两段式收尾（走过去 → 记忆/点床/诚实失败）──
         tickPendingBlockTasks(mc);
         tickPendingTrade(mc);
+        tickBuild(mc);
 
         // ── P0 饥饿反射：饿到一定程度自己吃 ──
         tickHungerReflex(mc);
@@ -761,12 +778,17 @@ public class ActionExecutor {
 
     /** 区域硬拦的统一回执：{@code {blocked_by_zone, rule, action}}（后端据此告诉 LLM"这里是农场"）。 */
     private void sendZoneBlocked(WireServer.WireCommand cmd, ZoneGuard.Block blocked, String action) {
+        sendZoneBlocked(cmd.id(), blocked, action);
+    }
+
+    /** 同上，但只给请求 id（`build` 复用放置核心时没有 WireCommand ✓）。 */
+    private void sendZoneBlocked(String reqId, ZoneGuard.Block blocked, String action) {
         JsonObject data = new JsonObject();
         data.addProperty("blocked_by_zone", blocked.zone());
         data.addProperty("rule", blocked.rule());
         data.addProperty("action", action);
         LCUMod.LOGGER.warn("[Zone] 拦截 {}：zone={} rule={}", action, blocked.zone(), blocked.rule());
-        sendResponse(cmd.id(), false, data, "blocked_by_zone:" + blocked.zone() + " rule:" + blocked.rule());
+        sendResponse(reqId, false, data, "blocked_by_zone:" + blocked.zone() + " rule:" + blocked.rule());
     }
 
     private Entity findTargetEntity(Minecraft mc, double range) {
@@ -1082,38 +1104,60 @@ public class ActionExecutor {
         }
 
         // 区域硬保护：农场/基地里不许放置方块（保护优先于允许）；判定的是"将要被放进去的那一格"
+        String requested = args != null && args.has("item") ? args.get("item").getAsString() : "";
+        String problem = beginPlacement(mc, targetPos, dir, requested, cmd.id());
+        if (problem != null) {
+            return;
+        }
+        sendResponse(cmd.id(), true, "Placing block at " + placeExpectPos.toShortString());
+    }
+
+    /**
+     * 放一块的**唯一**入口（`place_block` 与 `build` 共用 ✓）：区域门 → 点名物品（不在背包就如实失败，
+     * **绝不替换成别的方块** ✗）→ 换手/选中 → 看向目标面 → 按住 use 2 tick → 交给 {@link #tickPlace} 校验。
+     *
+     * @return {@code null} = 已开始（校验结果由 `tickPlace` 上报 ✓）；否则是机器可读的失败 code
+     *         （响应已按既有形状发出；{@code reqId} 为 null 时不发 —— `build` 自己汇总上报 ✓）。
+     */
+    private String beginPlacement(Minecraft mc, BlockPos targetPos, Direction dir,
+                                  String requested, String reqId) {
         BlockPos expectPos = targetPos.relative(dir);
         ZoneGuard.Block placeZone = ZoneGuard.block(
                 expectPos.getX() + 0.5, expectPos.getY() + 0.5, expectPos.getZ() + 0.5,
                 ZoneGuard.Action.PLACE, false);
         if (placeZone != null) {
-            sendZoneBlocked(cmd, placeZone, "place_block " + expectPos.toShortString());
-            return;
+            if (reqId != null) {
+                sendZoneBlocked(reqId, placeZone, "place_block " + expectPos.toShortString());
+            }
+            return "blocked_by_zone";
         }
 
         // 物品由**后端点名**（方块选择不在本地做启发式）。点名的物品必须真在背包里：找不到就如实失败，
         // **绝不回落到"手边随便一个方块"**（用户："若 place_block 收到一个不在背包里的物品 → 如实失败"）。
-        String requested = args != null && args.has("item") ? args.get("item").getAsString() : "";
         ItemPick.Result pick = resolvePlaceItem(mc, requested);
         switch (pick.outcome()) {
             case NOT_FOUND -> {
-                JsonObject data = new JsonObject();
-                data.addProperty("ok", false);
-                data.addProperty("reason", "item_not_in_inventory");
-                data.addProperty("item", pick.id());
+                if (reqId != null) {
+                    JsonObject data = new JsonObject();
+                    data.addProperty("ok", false);
+                    data.addProperty("reason", "item_not_in_inventory");
+                    data.addProperty("item", pick.id());
+                    sendResponse(reqId, false, data, "item_not_in_inventory: " + pick.id());
+                }
                 LCUMod.LOGGER.warn("[Place] 点名的物品不在背包：{}（不替换成别的方块）", pick.id());
-                sendResponse(cmd.id(), false, data, "item_not_in_inventory: " + pick.id());
-                return;
+                return "item_not_in_inventory";
             }
             case SELECT_HOTBAR, SWAP_INTO_HOTBAR -> {
                 if (pick.outcome() == ItemPick.Outcome.SWAP_INTO_HOTBAR
                         && !swapIntoHotbar(mc, pick.slot())) {
-                    JsonObject data = new JsonObject();
-                    data.addProperty("ok", false);
-                    data.addProperty("reason", "item_not_in_hotbar");
-                    data.addProperty("item", pick.id());
-                    sendResponse(cmd.id(), false, data, "item_not_in_hotbar: " + pick.id());
-                    return;
+                    if (reqId != null) {
+                        JsonObject data = new JsonObject();
+                        data.addProperty("ok", false);
+                        data.addProperty("reason", "item_not_in_hotbar");
+                        data.addProperty("item", pick.id());
+                        sendResponse(reqId, false, data, "item_not_in_hotbar: " + pick.id());
+                    }
+                    return "item_not_in_hotbar";
                 }
                 if (pick.outcome() == ItemPick.Outcome.SELECT_HOTBAR) {
                     mc.player.getInventory().setSelectedSlot(pick.slot());
@@ -1127,19 +1171,23 @@ public class ActionExecutor {
         // 手上必须是方块，否则校验的目标方块无从谈起
         ItemStack hand = mc.player.getItemInHand(InteractionHand.MAIN_HAND);
         if (!(hand.getItem() instanceof BlockItem blockItem)) {
-            sendResponse(cmd.id(), false, "No block in hand");
-            return;
+            if (reqId != null) {
+                sendResponse(reqId, false, "No block in hand");
+            }
+            return "no_block_in_hand";
         }
         if (!ItemPick.normalize(requested).isEmpty()
                 && !ItemPick.normalize(requested).equals(ItemPick.normalize(hand.getItem().toString()))) {
             // 点名的物品没能拿到手上（交换失败/被别的规则挪走）→ 如实失败，不拿别的方块顶
-            JsonObject data = new JsonObject();
-            data.addProperty("ok", false);
-            data.addProperty("reason", "item_not_in_hand");
-            data.addProperty("item", ItemPick.normalize(requested));
-            data.addProperty("held", ItemPick.normalize(hand.getItem().toString()));
-            sendResponse(cmd.id(), false, data, "item_not_in_hand");
-            return;
+            if (reqId != null) {
+                JsonObject data = new JsonObject();
+                data.addProperty("ok", false);
+                data.addProperty("reason", "item_not_in_hand");
+                data.addProperty("item", ItemPick.normalize(requested));
+                data.addProperty("held", ItemPick.normalize(hand.getItem().toString()));
+                sendResponse(reqId, false, data, "item_not_in_hand");
+            }
+            return "item_not_in_hand";
         }
 
         // 先把旧的 place 收尾（幂等：重复调用不叠加）
@@ -1154,10 +1202,10 @@ public class ActionExecutor {
         placePitch = mc.player.getXRot();
         // 单次 use：按住 use 2 tick 再松开
         placeHold = ControlStream.hold("use", 2);
-        placeReqId = cmd.id();
+        placeReqId = reqId;
         placeTicks = 0;
         setTaskState("place", "running", placeExpectPos.toShortString(), "placing block", 0.1);
-        sendResponse(cmd.id(), true, "Placing block at " + placeExpectPos.toShortString());
+        return null;
     }
 
     /** place_block 的收尾：保持朝向目标面，松手后校验目标位置是否变成要放的方块。 */
@@ -1442,6 +1490,7 @@ public class ActionExecutor {
         var mc = Minecraft.getInstance();
         followTargetName = null;
         clearPendingTrade();
+        abortPendingBuild();
         pendingCraftItem = null;
         pendingCraftReqId = null;
         pendingCraftTicks = 0;
@@ -3784,26 +3833,215 @@ public class ActionExecutor {
         }
     }
 
+    /**
+     * {@code build {x,y,z,structure,material,size?,height?}} —— **真**放一批方块（不再是桩 ✗）。
+     *
+     * <p>口径：① 结构由 {@link BuildPlan} 算（纯逻辑 ✓ `wall`/`pen`/`platform`/`pillar` ✓）；
+     * ② **材料由后端大模型点名** ✓（本地不做"用什么方块"的启发式 ✗，与 `place_block` 同一条口径 ✓）；
+     * ③ 一次只放**伸手够得着**的那批 ✓，够不着的**如实报** `remaining` 并提示"先走过去再叫一次" ✓
+     * （移动与重规划是模型自己的事 —— 它才是编排者 ✓）；④ 每块都走 {@link #beginPlacement} ✓ ——
+     * 区域保护 / 点名物品校验 / 逐块校验一个都不跳 ✓；⑤ 中途失败**如实报**放了几块、卡在第几块、为什么 ✓。
+     */
     private void handleBuild(WireServer.WireCommand cmd) {
+        var mc = Minecraft.getInstance();
         var args = cmd.args();
+        if (mc.player == null || mc.level == null || mc.gameMode == null) {
+            sendResponse(cmd.id(), false, "No player");
+            return;
+        }
         if (args == null || !args.has("x") || !args.has("y") || !args.has("z") || !args.has("structure")) {
             sendResponse(cmd.id(), false, "Need x, y, z, structure");
             return;
         }
-        double x = args.get("x").getAsDouble();
-        double y = args.get("y").getAsDouble();
-        double z = args.get("z").getAsDouble();
-        String structure = args.get("structure").getAsString();
-        
-        // Move to build position
-        MovementSystem.moveTo(x, y, z, 1.0f);
-        
-        // For now, just send chat about building
-        var mc = Minecraft.getInstance();
-        if (mc.player != null) {
-            mc.player.connection.sendChat("Building " + structure + " at " + (int)x + ", " + (int)y + ", " + (int)z);
+        String material = args.has("material") ? args.get("material").getAsString() : "";
+        if (material.isBlank()) {
+            sendResponse(cmd.id(), false,
+                    "need_material: 说清用哪种方块（材料由你点名 ✓ 本地不做启发式 ✗）");
+            return;
         }
-        sendResponse(cmd.id(), true, "Building " + structure);
+        int size = args.has("size") ? args.get("size").getAsInt() : 3;
+        int height = args.has("height") ? args.get("height").getAsInt() : 1;
+        BuildPlan.Plan plan = BuildPlan.plan(args.get("structure").getAsString(), size, height);
+        if (!plan.ok()) {
+            sendResponse(cmd.id(), false, plan.code() + ": " + plan.message());
+            return;
+        }
+        BlockPos base = new BlockPos(args.get("x").getAsInt(), args.get("y").getAsInt(),
+                args.get("z").getAsInt());
+        java.util.List<BuildPlan.Block> reachable = BuildPlan.withinReach(plan.blocks(),
+                base.getX(), base.getY(), base.getZ(),
+                mc.player.getX(), mc.player.getY(), mc.player.getZ(), BuildPlan.DEFAULT_REACH);
+        int remaining = plan.size() - reachable.size();
+        if (reachable.isEmpty()) {
+            sendResponse(cmd.id(), false, "out_of_reach: 这个结构一块都够不着（先走过去再叫一次；"
+                    + "base=" + base.toShortString() + " blocks=" + plan.size() + "）");
+            return;
+        }
+        java.util.List<BuildPlan.Block> todo = new java.util.ArrayList<>();
+        for (BuildPlan.Block block : reachable) {
+            BlockPos abs = base.offset(block.dx(), block.dy(), block.dz());
+            if (!isAlreadyBlock(mc, abs, material)) {
+                todo.add(block);
+            }
+        }
+        if (todo.isEmpty()) {
+            JsonObject data = new JsonObject();
+            data.addProperty("placed", 0);
+            data.addProperty("already", reachable.size());
+            data.addProperty("remaining", remaining);
+            data.addProperty("structure", plan.structure());
+            sendResponse(cmd.id(), true, data);
+            return;
+        }
+        int have = countInventoryItem(mc, material);
+        if (have < todo.size()) {
+            sendResponse(cmd.id(), false, "not_enough_material: 还差 " + (todo.size() - have)
+                    + " 块 " + material + "（需要 " + todo.size() + "，背包 " + have + "）");
+            return;
+        }
+        abortPendingBuild();
+        pendingBuild = true;
+        pendingBuildReqId = cmd.id();
+        pendingBuildStructure = plan.structure();
+        pendingBuildMaterial = material;
+        pendingBuildBase = base;
+        pendingBuildQueue = todo;
+        pendingBuildTotal = plan.size();
+        pendingBuildPlaced = 0;
+        pendingBuildRemaining = remaining + (reachable.size() - todo.size());
+        pendingBuildWaitTicks = 0;
+        pendingBuildExpect = null;
+        setTaskState("build", "running", plan.structure(), BuildPlan.describe(plan, size, height), 0.05);
+        if (LCUMod.WIRE != null) {
+            LCUMod.WIRE.sendProgress(cmd.id(), 0.05,
+                    "building " + plan.structure() + ": 0/" + todo.size());
+        }
+        sendResponse(cmd.id(), true, "Building " + plan.structure() + " (" + todo.size() + " blocks)");
+    }
+
+    /** 目标格现在是不是**就是**要点名的方块（幂等：重复 build 不重复放 ✓）。 */
+    private static boolean isAlreadyBlock(Minecraft mc, BlockPos pos, String material) {
+        // javap 实证（26.3）：① 这个类叫 **Identifier**（不是 ResourceLocation ✗）；
+        // ② Registry.get 回的是 Optional<Holder.Reference<T>>（不是 T ✗）⇒ 走 map 链 ✓。
+        Identifier id = Identifier.tryParse(ItemPick.normalize(material));
+        if (id == null) {
+            return false;
+        }
+        return BuiltInRegistries.ITEM.get(id)
+                .map(Holder.Reference::value)
+                .filter(BlockItem.class::isInstance)
+                .map(BlockItem.class::cast)
+                .map(blockItem -> mc.level.getBlockState(pos).is(blockItem.getBlock()))
+                .orElse(false);
+    }
+
+    /** build 的 tick 推进：一块一块放（每块都走 {@link #beginPlacement} ✓），放完/失败都**如实**汇总 ✓。 */
+    private void tickBuild(Minecraft mc) {
+        if (!pendingBuild) {
+            return;
+        }
+        if (mc.player == null || mc.level == null || mc.gameMode == null) {
+            failPendingBuild("no_player", "玩家不在了");
+            return;
+        }
+        pendingBuildWaitTicks++;
+        // 上一块还在放 ⇒ 等它（tickPlace 负责校验并松手 ✓）
+        if (placeHold != null) {
+            if (pendingBuildWaitTicks > BUILD_BLOCK_TIMEOUT_TICKS) {
+                abortPendingPlace();
+                failPendingBuild("place_timeout", "放这一块超时了");
+            }
+            return;
+        }
+        // 刚放完一块：**自己**校验它真变成了目标方块 ✓（placeExpectBlock 已被 tickPlace 清掉 ✓）
+        if (pendingBuildExpect != null) {
+            boolean placed = isAlreadyBlock(mc, pendingBuildExpect, pendingBuildMaterial);
+            BlockPos expect = pendingBuildExpect;
+            pendingBuildExpect = null;
+            if (!placed) {
+                failPendingBuild("block_not_placed",
+                        "第 " + (pendingBuildPlaced + 1) + " 块没放上去：" + expect.toShortString());
+                return;
+            }
+            pendingBuildPlaced++;
+            double progress = pendingBuildQueue.isEmpty() ? 1.0
+                    : Math.min(0.95, pendingBuildPlaced / (double) pendingBuildQueue.size());
+            if (LCUMod.WIRE != null && pendingBuildReqId != null) {
+                LCUMod.WIRE.sendProgress(pendingBuildReqId, progress,
+                        "built " + pendingBuildPlaced + "/" + pendingBuildQueue.size());
+            }
+            setTaskState("build", "running", pendingBuildStructure,
+                    "placed " + pendingBuildPlaced + "/" + pendingBuildQueue.size(), progress);
+        }
+        if (pendingBuildQueue.isEmpty()) {
+            finishPendingBuild();
+            return;
+        }
+        BuildPlan.Block block = pendingBuildQueue.remove(0);
+        BlockPos abs = pendingBuildBase.offset(block.dx(), block.dy(), block.dz());
+        // 一律"贴着下面那一格往上放"：底层贴地 ✓、上层贴刚放好的下一层 ✓（悬空结构会**如实**失败 ✓）
+        String problem = beginPlacement(mc, abs.below(), Direction.UP, pendingBuildMaterial, null);
+        if (problem != null) {
+            failPendingBuild(problem, "第 " + (pendingBuildPlaced + 1) + " 块放不了（" + problem + "）："
+                    + abs.toShortString());
+            return;
+        }
+        pendingBuildExpect = abs;
+        pendingBuildWaitTicks = 0;
+    }
+
+    private void finishPendingBuild() {
+        JsonObject data = new JsonObject();
+        data.addProperty("structure", pendingBuildStructure);
+        data.addProperty("placed", pendingBuildPlaced);
+        data.addProperty("total", pendingBuildTotal);
+        data.addProperty("remaining", pendingBuildRemaining);
+        if (pendingBuildReqId != null) {
+            sendResponse(pendingBuildReqId, true, data);
+        }
+        String detail = "placed " + pendingBuildPlaced + "/" + pendingBuildTotal
+                + (pendingBuildRemaining > 0 ? "（还差 " + pendingBuildRemaining + " 块，走过去再叫一次 ✓）" : "");
+        setTaskState("build", "done", pendingBuildStructure, detail, 1.0);
+        if (LCUMod.WIRE != null && pendingBuildReqId != null) {
+            LCUMod.WIRE.sendProgress(pendingBuildReqId, 1.0, detail);
+        }
+        abortPendingBuild();
+        StateCollector.requestRefresh();
+        sendBehaviorSnapshot();
+    }
+
+    /** 失败一律**如实**报：放了几块、卡在第几块、为什么（带 code ✓，job 层就靠这个 ✓）。 */
+    private void failPendingBuild(String code, String message) {
+        JsonObject data = new JsonObject();
+        data.addProperty("structure", pendingBuildStructure);
+        data.addProperty("placed", pendingBuildPlaced);
+        data.addProperty("total", pendingBuildTotal);
+        data.addProperty("remaining", pendingBuildRemaining);
+        data.addProperty("reason", code);
+        if (pendingBuildReqId != null) {
+            sendResponse(pendingBuildReqId, false, data, code + ": " + message);
+        }
+        String detail = code + ": " + message + "（已放 " + pendingBuildPlaced + "/" + pendingBuildTotal + "）";
+        setTaskState("build", "failed", pendingBuildStructure, detail, 0.0);
+        if (LCUMod.WIRE != null && pendingBuildReqId != null) {
+            LCUMod.WIRE.sendProgress(pendingBuildReqId, 0.0, detail);
+        }
+        abortPendingBuild();
+        sendBehaviorSnapshot();
+    }
+
+    private void abortPendingBuild() {
+        pendingBuild = false;
+        pendingBuildReqId = null;
+        pendingBuildStructure = "";
+        pendingBuildMaterial = "";
+        pendingBuildBase = null;
+        pendingBuildQueue = null;
+        pendingBuildTotal = 0;
+        pendingBuildPlaced = 0;
+        pendingBuildRemaining = 0;
+        pendingBuildWaitTicks = 0;
+        pendingBuildExpect = null;
     }
 
     private void handleShutdown() {

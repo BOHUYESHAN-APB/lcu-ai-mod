@@ -228,6 +228,7 @@ tasks.named('check').configure {
     dependsOn 'verifyLang'
     dependsOn 'verifyWalk'
     dependsOn 'verifyTrade'
+    dependsOn 'verifyBuild'
 }
 
 tasks.register('verifyWalk', JavaExec) {
@@ -244,6 +245,14 @@ tasks.register('verifyTrade', JavaExec) {
     dependsOn tasks.named('testClasses')
     classpath = sourceSets.test.output + sourceSets.main.output
     mainClass = 'com.lcu.lcumod.action.TradeCheck'
+}
+
+tasks.register('verifyBuild', JavaExec) {
+    group = 'verification'
+    description = '纯逻辑自检（真建造：4 种结构算块数/空心围栏留门/自下而上排序/认不出的结构如实拒/超单次上限如实拒；够得着判定与"够不着的那批"；静态扫描 BuildPlan 零依赖、place_block 与 build 共用同一条放置路径、全程不开界面、失败 code 真在源码里）'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.output + sourceSets.main.output
+    mainClass = 'com.lcu.lcumod.action.BuildCheck'
 }
 
 tasks.register('verifyMixin', JavaExec) {
