@@ -52,6 +52,24 @@ dialog{width:min(680px,calc(100vw - 24px));max-height:calc(100dvh - 24px);margin
 .inbox-layout{display:grid;grid-template-columns:minmax(240px,.7fr) minmax(360px,1.3fr);gap:16px;min-height:480px}.inbox-contacts,.inbox-messages{overflow:auto;max-height:calc(100dvh - 230px)}.contact-row{width:100%;display:block;text-align:left;background:transparent;color:#c9d1d9;border:0;border-bottom:1px solid #21262d;padding:11px 12px;cursor:pointer}.contact-row:hover,.contact-row.active{background:#21262d}.contact-name{font-size:12px;font-weight:600}.contact-meta{font-size:10px;color:#8b949e;margin-top:4px}.inbox-message{margin:10px 12px;padding:9px 10px;border-left:2px solid #30363d;background:#0d1117}.inbox-message.ai{border-left-color:#3fb950}.inbox-message.player{border-left-color:#58a6ff}.inbox-message-header{font-size:10px;color:#8b949e;margin-bottom:5px}.inbox-message-content{font-size:12px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere}
 .inbox-layout.contacts-hidden{grid-template-columns:1fr}.inbox-layout.contacts-hidden .contact-pane{display:none}.inventory-layout{display:grid;grid-template-columns:minmax(260px,.8fr) minmax(340px,1.2fr);gap:16px;margin-top:16px}.inventory-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:6px}.inventory-item{min-width:0;background:#0d1117;border:1px solid #21262d;border-radius:4px;padding:8px}.inventory-item-name{font-size:11px;font-weight:600;overflow-wrap:anywhere}.inventory-item-meta{font-size:10px;color:#8b949e;margin-top:3px;overflow-wrap:anywhere}
 
+/* Commands whitelist + OBS overlay list */
+.cmd-table{width:100%;border-collapse:collapse;font-size:12px}
+.cmd-table th{text-align:left;color:#8b949e;font-weight:600;padding:6px 8px;border-bottom:1px solid #30363d}
+.cmd-table td{padding:6px 8px;border-bottom:1px solid #21262d;vertical-align:top}
+.cmd-table tr.disabled{opacity:.5}
+.cmd-table input[type=checkbox]{width:15px;height:15px;accent-color:#1f6feb}
+.cmd-name{font-family:ui-monospace,Consolas,monospace;font-weight:600}
+.cmd-tags{display:flex;gap:4px;flex-wrap:wrap}
+.tag-pill{font-size:10px;border-radius:3px;padding:1px 6px;border:1px solid #30363d;color:#8b949e;white-space:nowrap}
+.tag-pill.hard{color:#f85149;border-color:#f85149}
+.tag-pill.risk{color:#d29922;border-color:#d29922}
+.tag-pill.scope{color:#58a6ff;border-color:#58a6ff}
+.ov-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:9px 10px;border:1px solid #30363d;border-radius:6px;margin-bottom:8px;background:#0d1117}
+.ov-row .nm{font-family:ui-monospace,Consolas,monospace;font-weight:600;color:#58a6ff;min-width:90px}
+.ov-row .desc{font-size:11px;color:#8b949e;flex:1;min-width:180px}
+.ov-row code{font-size:11px;background:#161b22;border:1px solid #30363d;border-radius:4px;padding:3px 7px}
+.ov-row a{color:#58a6ff}
+
 /* Buttons */
 .btn{background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:6px 12px;font-size:12px;cursor:pointer;transition:all .15s}
 .btn:hover{background:#30363d}
@@ -147,6 +165,8 @@ textarea{width:100%;min-height:68px;resize:vertical;background:#0d1117;border:1p
   <button class="tab" onclick="showPage('providers',this)">模型服务商（待移植）</button>
   <button class="tab" onclick="showPage('access',this)">访问权限（待移植）</button>
   <button class="tab" onclick="showPage('settings',this)">基础设置</button>
+  <button class="tab" onclick="showPage('commands',this)">指令白名单</button>
+  <button class="tab" onclick="showPage('overlay',this)">OBS 组件</button>
   <button class="tab" onclick="showPage('diagnostics',this)">Diagnostics（待移植）</button>
   <button class="tab" onclick="showPage('debug',this)">调试</button>
 </div>
@@ -480,6 +500,72 @@ textarea{width:100%;min-height:68px;resize:vertical;background:#0d1117;border:1p
   </div>
 </div>
 
+<!-- Commands Whitelist Page -->
+<div id="page-commands" class="page">
+  <div class="card">
+    <h3>✅ 指令白名单（唯一来源 <code>.local/commands.json</code>）</h3>
+    <div class="hint">
+      <b>默认空</b>：没勾选的指令一律拒（<code>blocked=not_whitelisted</code>）。
+      <b>硬黑名单</b>由服务端硬拒，这里灰掉、不可勾（配置也放不开）。
+      标「需二次确认」的是高风险指令，首调用要再确认一次。按服勾选（作用域 = 全局 / 本服）。
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;margin:10px 0;flex-wrap:wrap">
+      <span class="hint">本服：<code id="commandsServer">-</code></span>
+      <button class="btn" onclick="loadCommandsConfig()">刷新</button>
+      <span id="commandsStatus" class="hint">等待加载</span>
+    </div>
+    <div id="commandsTable"></div>
+    <div class="settings-section">
+      <h4>添加 / 更新一条指令</h4>
+      <div class="field-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px">
+        <div class="compact-field">
+          <label>指令名（可带命名空间，如 minecraft:tp）</label>
+          <input id="cmdName" placeholder="msg / tp / home">
+        </div>
+        <div class="compact-field">
+          <label>用途</label>
+          <input id="cmdDesc" placeholder="例：回主城">
+        </div>
+        <div class="compact-field">
+          <label>适用层级</label>
+          <div style="display:flex;gap:12px;font-size:12px">
+            <label><input type="checkbox" id="cmdTierMaster" checked> master</label>
+            <label><input type="checkbox" id="cmdTierFriend" checked> friend</label>
+            <label><input type="checkbox" id="cmdTierGuest"> guest</label>
+          </div>
+        </div>
+        <div class="compact-field">
+          <label>作用域</label>
+          <select id="cmdScope">
+            <option value="global">全局（所有服）</option>
+            <option value="server">仅本服</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-actions">
+        <button class="btn primary" onclick="addCommandEntry()">加入并保存</button>
+      </div>
+      <div class="hint" id="commandsHint">硬黑名单里的指令加不进来（服务端会剔掉并回报）。</div>
+    </div>
+  </div>
+  <div class="card">
+    <h3>🚫 硬黑名单 / ⚠️ 高风险清单（只读）</h3>
+    <div id="commandsReadonly" class="hint">等待加载</div>
+  </div>
+</div>
+
+<!-- Overlay Page -->
+<div id="page-overlay" class="page">
+  <div class="card">
+    <h3>🖼️ OBS 组件子页面</h3>
+    <div class="hint">
+      一个页面只渲染一个属性，透明背景、<code>100%</code> 自适应（OBS 里拉多大就多大，不写死尺寸）。
+      直接把下面的 URL 填进 OBS「浏览器源」。支持 <code>?theme=dark|light</code> 与 <code>?scale=</code> / <code>?max=</code> 微调。
+    </div>
+    <div id="overlayList" style="margin-top:12px">等待加载</div>
+  </div>
+</div>
+
 <!-- Diagnostics Page -->
 <div id="page-diagnostics" class="page">
   <div class="card">
@@ -578,6 +664,9 @@ function showPage(name, tab) {
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.getElementById('page-' + name).classList.add('active');
   if (tab) tab.classList.add('active');
+  // 新面板按需拉数据（避免初始化时打一堆 404/空请求）。
+  if (name === 'commands') loadCommandsConfig();
+  if (name === 'overlay') loadOverlayComponents();
 }
 
 // ── Local Settings Cache ──
@@ -1248,6 +1337,149 @@ function escapeHtml(str) {
   const d = document.createElement('div');
   d.textContent = str;
   return d.innerHTML;
+}
+
+// ── 指令白名单 UI ──
+// 数据源：GET/POST /api/commands。表格列出 .local/commands.json 的条目（**默认空**），
+// 硬黑名单行灰掉、不可勾（服务端硬拒，前端只展示）。勾选 = 启用。
+let commandsState = { global: [], server: [], key: '', hard: [], high: [] };
+
+function cmdEntryPayload(entry) {
+  return {
+    name: entry.name, usage: entry.usage || '', desc: entry.desc || '',
+    tiers: entry.tiers || ['master', 'friend'], enabled: entry.enabled !== false,
+    cooldown: Number(entry.cooldown) || 0,
+  };
+}
+
+function loadCommandsConfig() {
+  const status = document.getElementById('commandsStatus');
+  if (status) status.textContent = '读取中…';
+  return fetch('/api/commands').then(r => r.json()).then(d => {
+    commandsState.key = d.server || 'unknown';
+    commandsState.hard = d.hard_blacklist || [];
+    commandsState.high = d.high_risk || [];
+    const entries = Array.isArray(d.entries) ? d.entries : [];
+    const key = commandsState.key;
+    commandsState.global = entries.filter(e => e.scope === 'global');
+    commandsState.server = entries.filter(e => e.scope !== 'global'
+      && String(e.scope).toLowerCase() === String(key).toLowerCase());
+    if (status) status.textContent = `已加载 ${entries.length} 条（默认空=全拒）`;
+    const el = document.getElementById('commandsServer');
+    if (el) el.textContent = key;
+    renderCommands();
+    renderCommandsReadonly();
+  }).catch(e => { if (status) status.textContent = '读取失败: ' + e; });
+}
+
+function renderCommands() {
+  const box = document.getElementById('commandsTable');
+  if (!box) return;
+  const rows = [];
+  const push = (entries, scopeLabel) => entries.forEach((entry, idx) => {
+    const tiers = (entry.tiers || []).map(t => `<span class="tag-pill">${escapeHtml(t)}</span>`).join(' ');
+    const tags = [
+      `<span class="tag-pill scope">${escapeHtml(scopeLabel)}</span>`,
+      entry.high_risk ? '<span class="tag-pill risk">需二次确认</span>' : '',
+    ].join(' ');
+    rows.push(`<tr>
+      <td><input type="checkbox" ${entry.enabled !== false ? 'checked' : ''}
+        onchange="toggleCommandEntry('${scopeLabel}', ${idx}, this.checked)"></td>
+      <td><span class="cmd-name">${escapeHtml(entry.name)}</span></td>
+      <td>${escapeHtml(entry.desc || entry.usage || '—')}</td>
+      <td>${tiers || '—'}</td>
+      <td><div class="cmd-tags">${tags}</div></td>
+    </tr>`);
+  });
+  push(commandsState.global, 'global');
+  push(commandsState.server, 'server');
+  const hardRows = commandsState.hard.map(name => `<tr class="disabled">
+      <td><input type="checkbox" disabled></td>
+      <td><span class="cmd-name">${escapeHtml(name)}</span></td>
+      <td>服务端硬拒，配置放不开</td>
+      <td>—</td>
+      <td><div class="cmd-tags"><span class="tag-pill hard">硬拒</span></div></td>
+    </tr>`).join('');
+  box.innerHTML = `<table class="cmd-table">
+    <thead><tr><th>启用</th><th>指令</th><th>用途</th><th>适用层级</th><th>作用域 / 备注</th></tr></thead>
+    <tbody>${rows.join('') || '<tr><td colspan="5" style="color:#8b949e">还没有白名单条目（默认空 —— 什么都不能发）。用下面「添加」加一条。</td></tr>'}
+      ${hardRows}</tbody></table>`;
+}
+
+function renderCommandsReadonly() {
+  const el = document.getElementById('commandsReadonly');
+  if (!el) return;
+  el.innerHTML = `<div style="margin-bottom:6px">硬黑名单（${commandsState.hard.length}）：`
+    + commandsState.hard.map(n => `<span class="tag-pill hard">${escapeHtml(n)}</span>`).join(' ')
+    + '</div><div>高风险（首调用需二次确认，' + commandsState.high.length + '）：'
+    + commandsState.high.map(n => `<span class="tag-pill risk">${escapeHtml(n)}</span>`).join(' ')
+    + '</div>';
+}
+
+function toggleCommandEntry(scope, idx, enabled) {
+  const list = scope === 'global' ? commandsState.global : commandsState.server;
+  if (!list[idx]) return;
+  list[idx].enabled = !!enabled;
+  saveCommandsPayload();
+}
+
+function saveCommandsPayload() {
+  const key = commandsState.key;
+  const body = {
+    commands: commandsState.global.map(cmdEntryPayload),
+    servers: { [key]: commandsState.server.map(cmdEntryPayload) },
+  };
+  const hint = document.getElementById('commandsHint');
+  return fetch('/api/commands', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
+  }).then(r => r.json()).then(d => {
+    if (d.status !== 'ok') { if (hint) hint.textContent = '保存失败：' + (d.detail || 'unknown'); return; }
+    if (Array.isArray(d.rejected) && d.rejected.length) {
+      if (hint) { hint.textContent = `服务端剔除了硬黑名单条目：${d.rejected.join(', ')}（放不开）`; hint.style.color = '#f85149'; }
+    } else if (hint) {
+      hint.textContent = `已保存。本服生效：${(d.effective || []).join(', ') || '（空 —— 全拒）'}`;
+      hint.style.color = '#3fb950';
+    }
+    return loadCommandsConfig();
+  }).catch(e => { if (hint) hint.textContent = '保存失败: ' + e; });
+}
+
+function addCommandEntry() {
+  const name = (document.getElementById('cmdName').value || '').trim();
+  if (!name) return;
+  const tiers = [];
+  if (document.getElementById('cmdTierMaster').checked) tiers.push('master');
+  if (document.getElementById('cmdTierFriend').checked) tiers.push('friend');
+  if (document.getElementById('cmdTierGuest').checked) tiers.push('guest');
+  const entry = {
+    name, desc: (document.getElementById('cmdDesc').value || '').trim(),
+    usage: '', tiers: tiers.length ? tiers : ['master', 'friend'], enabled: true, cooldown: 0,
+  };
+  const scope = document.getElementById('cmdScope').value;
+  const list = scope === 'server' ? commandsState.server : commandsState.global;
+  const at = list.findIndex(e => e.name === entry.name);
+  if (at >= 0) list[at] = {...list[at], ...entry}; else list.push(entry);
+  document.getElementById('cmdName').value = '';
+  document.getElementById('cmdDesc').value = '';
+  saveCommandsPayload();
+}
+
+// ── OBS 组件清单 ──
+function loadOverlayComponents() {
+  const box = document.getElementById('overlayList');
+  if (!box) return;
+  fetch('/api/overlay/components').then(r => r.json()).then(d => {
+    const rows = (d.components || []).map(c => {
+      const url = `${location.origin}${c.url}`;
+      return `<div class="ov-row">
+        <span class="nm">${escapeHtml(c.name)}</span>
+        <span class="desc">${escapeHtml(c.title)} — ${escapeHtml(c.desc)}</span>
+        <code>${escapeHtml(url)}</code>
+        <a href="${escapeHtml(c.url)}" target="_blank" rel="noopener">预览</a>
+      </div>`;
+    }).join('');
+    box.innerHTML = rows || '<div class="hint">没有注册任何组件。</div>';
+  }).catch(e => { box.innerHTML = '<div class="hint">读取失败: ' + escapeHtml(String(e)) + '</div>'; });
 }
 
 // ── Init ──

@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>LCU Overlay</title>
+<style>
+/* OBS 浏览器源：透明背景、无滚动条、不写死尺寸（拉多大就多大）。 */
+html,body{margin:0;padding:0;width:100%;height:100%;background:transparent;overflow:hidden}
+#root{
+  width:100%;height:100%;display:flex;align-items:center;justify-content:center;
+  box-sizing:border-box;padding:0.4em;
+  font-family:'Segoe UI','PingFang SC','Microsoft YaHei',system-ui,sans-serif;
+  /* 字号跟随源的短边并给下限：OBS 里拉多大就多大（源很小也读得清），不写死像素尺寸。 */
+  font-size:calc(var(--scale,1) * max(11px, 6vmin));
+  line-height:1.3;
+}
+.unknown{color:#f85149;font-size:3vmin}
+.overlay{
+  --fg:#c9d1d9;--dim:#8b949e;--accent:#58a6ff;--ok:#3fb950;--warn:#d29922;--bad:#f85149;
+  --panel:transparent;--line:transparent;--shadow:0 1px 2px rgba(0,0,0,.85);
+  width:100%;max-height:100%;box-sizing:border-box;color:var(--fg);
+  background:var(--panel);border:1px solid var(--line);border-radius:.4em;
+  padding:.5em .7em;overflow:hidden;text-shadow:var(--shadow);
+}
+.overlay.light{
+  --fg:#1f2328;--dim:#3d444d;--accent:#0550ae;--ok:#116329;--warn:#7d4e00;--bad:#a40e26;
+  --panel:transparent;--line:transparent;--shadow:0 1px 2px rgba(255,255,255,.9);
+}
+.row{display:flex;align-items:baseline;gap:.5em;flex-wrap:wrap}
+.label{color:var(--dim);font-size:.85em}
+.value{font-weight:600}
+.big{font-size:2.1em;font-weight:700}
+.ph{color:var(--accent)}
+.note{color:var(--dim)}
+.bar{position:relative;height:.7em;margin-top:.35em;background:rgba(127,127,127,.25);border-radius:.35em;overflow:hidden}
+.bar>i{position:absolute;left:0;top:0;bottom:0;background:var(--accent)}
+.bar>i.done{background:var(--ok)}.bar>i.failed{background:var(--bad)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(6em,1fr));gap:.25em .6em}
+.cell{min-width:0}.cell .label{display:block;font-size:.75em}
+.cell .v{font-weight:600;overflow-wrap:anywhere}
+.pl{display:flex;align-items:center;gap:.45em;padding:.15em 0;min-width:0}
+.pl .dot{width:.5em;height:.5em;border-radius:50%;background:var(--dim);flex:0 0 auto}
+.pl.speaking .dot{background:var(--ok)}
+.pl.speaking .nm{color:var(--ok);font-weight:700}
+.pl .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pl .meta{color:var(--dim);font-size:.8em;margin-left:auto;padding-left:.5em}
+.tag{font-size:.75em;border:1px solid var(--line);border-radius:.3em;padding:0 .35em;color:var(--dim)}
+.tag.ok{color:var(--ok)}.tag.warn{color:var(--warn)}.tag.bad{color:var(--bad)}
+.muted{color:var(--dim);font-size:.9em}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+"use strict";
+/* ── 组件渲染表 ─────────────────────────────────────────────────────────
+   加新属性 = 只在这里加一条；服务端注册表 backend/server.py 的 OVERLAY_COMPONENTS
+   与 /api/overlay/components 是权威清单。下面每一项都只读 /api/status 的字段，
+   不写死数据、不写死尺寸。 */
+const OVERLAY_RENDERERS = {
+  status: renderStatus,
+  task: renderTask,
+  players: renderPlayers,
+  state: renderState,
+  backend: renderBackend,
+};
+
+/* 状态词表：与仪表盘 / 模组 ActivityPhrase 对齐。 */
+const STATUS_PHRASES = {
+  craft: '造东西中', collect: '挖矿中', follow: '跟着你呢', travel: '赶路中',
+  move: '赶路中', sleep: '找床睡觉中', eat: '吃东西中', guard: '守着这儿',
+  build: '盖房子中',
+};
+
+const params = new URLSearchParams(location.search);
+const parts = location.pathname.replace(/^\/+|\/+$/g, '').split('/');
+const COMPONENT = parts[parts.length - 1] || '';
+const THEME = params.get('theme') === 'light' ? 'light' : 'dark';
+const SCALE = clampNum(params.get('scale'), 0.25, 8, 1);
+let MAX = clampNum(params.get('max'), 1, 64, 0); // 0 = 不限制
+
+document.documentElement.style.setProperty('--scale', String(SCALE));
+
+function clampNum(raw, lo, hi, fallback) {
+  const n = parseFloat(raw);
+  if (!isFinite(n)) return fallback;
+  return Math.min(hi, Math.max(lo, n));
+}
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function num(v, digits) {
+  const n = Number(v);
+  return isFinite(n) ? n.toFixed(digits == null ? 0 : digits) : '?';
+}
+function set(html) { document.getElementById('root').innerHTML = html; }
+function shell(bgClass, inner) {
+  return `<div class="overlay ${bgClass}">${inner}</div>`;
+}
+
+/* ── 各组件 ── */
+
+function renderStatus(s) {
+  if (!inWorld(s)) {
+    return shell(THEME, `<div class="row"><span class="big" style="color:var(--warn)">未在游戏中</span></div>
+      <div class="muted">界面：${esc(s.ui_screen || (s.presence || {}).ui_screen || '?')}</div>`);
+  }
+  const task = s.task || {};
+  const kind = String(task.kind || 'idle').trim();
+  const phrase = STATUS_PHRASES[kind] || '发呆中';
+  const note = s.hud_note ? `<span class="note">${esc(s.hud_note)}</span>` : '';
+  return shell(THEME, `<div class="row"><span class="big ph">${esc(phrase)}</span>${note}</div>`);
+}
+
+function renderTask(s) {
+  const list = s.task_list || {};
+  const active = list.active || s.task || {};
+  const kind = String(active.kind || 'idle').trim();
+  if (!kind || kind === 'idle') {
+    return shell(THEME, `<div class="row"><span class="label">当前任务</span><span class="value">空闲中</span></div>`);
+  }
+  const pct = Math.max(0, Math.min(1, Number(active.progress) || 0));
+  const failed = String(active.status || '') === 'failed';
+  const target = active.target ? `<span class="label">目标</span><span class="value">${esc(active.target)}</span>` : '';
+  const detail = active.detail ? `<div class="muted">${esc(active.detail)}</div>` : '';
+  const count = Array.isArray(list.items) ? list.items.length : 0;
+  return shell(THEME, `
+    <div class="row"><span class="value">${esc(kind)}</span>
+      <span class="tag">${esc(active.status || '')}</span>${target}</div>
+    <div class="bar"><i class="${failed ? 'failed' : (pct >= 1 ? 'done' : '')}" style="width:${(pct * 100).toFixed(0)}%"></i></div>
+    <div class="row"><span class="label">${(pct * 100).toFixed(0)}%</span>
+      ${count > 1 ? `<span class="label">队列 ${count}</span>` : ''}</div>
+    ${detail}`);
+}
+
+function renderPlayers(s) {
+  let players = Array.isArray(s.players) ? s.players.slice() : [];
+  const speaker = s.last_speaker && (s.last_speaker.name || s.last_speaker);
+  if (MAX) players = players.slice(0, MAX);
+  if (!players.length) {
+    return shell(THEME, `<div class="row"><span class="label">在线玩家</span><span class="value">暂无</span></div>`);
+  }
+  const rows = players.map(p => {
+    const name = p.name || '?';
+    const speaking = !!p.speaking || (speaker && name === speaker);
+    const meta = [];
+    if (typeof p.distance === 'number') meta.push(num(p.distance, 1) + 'm');
+    if (p.dimension) meta.push(String(p.dimension));
+    if (p.loaded === false) meta.push('远处');
+    return `<div class="pl${speaking ? ' speaking' : ''}">
+      <span class="dot"></span><span class="nm">${esc(name)}</span>
+      ${speaking ? '<span class="tag ok">说话</span>' : ''}
+      <span class="meta">${esc(meta.join(' · ') || '在线')}</span></div>`;
+  }).join('');
+  return shell(THEME, `<div class="row"><span class="label">在线玩家 ${players.length}</span></div>${rows}`);
+}
+
+function renderState(s) {
+  const p = s.player || {};
+  const w = s.world || {};
+  const cells = [];
+  if (p.x !== undefined) cells.push(cell('坐标', `${num(p.x)},${num(p.y)},${num(p.z)}`));
+  if (p.health !== undefined) cells.push(cell('生命', `${num(p.health, 1)}/${num(p.max_health || 20)}`));
+  if (p.hunger !== undefined) {
+    const sat = (typeof p.saturation === 'number') ? `（饱和 ${num(p.saturation, 1)}）` : '';
+    cells.push(cell('饥饿', `${num(p.hunger)}/20${sat}`));
+  }
+  const dim = p.dimension || w.dimension;
+  if (dim) cells.push(cell('维度', String(dim)));
+  const time = firstDefined(w.time, w.time_of_day, w.day_time, p.time);
+  if (time !== undefined) cells.push(cell('时间', formatTime(time)));
+  if (typeof w.day === 'number') cells.push(cell('天数', num(w.day)));
+  if (!cells.length) {
+    return shell(THEME, `<div class="row"><span class="label">状态</span><span class="value">暂无数据</span></div>`);
+  }
+  const name = p.name ? `<div class="row"><span class="value">${esc(p.name)}</span></div>` : '';
+  return shell(THEME, `${name}<div class="grid">${cells.join('')}</div>`);
+}
+
+function renderBackend(s) {
+  const presence = s.presence || {};
+  const inW = inWorld(s);
+  const mode = (s.modes || s.behavior_state || {});
+  const usage = s.llm_usage || {};
+  const contacts = s.contacts || {};
+  const rows = [];
+  rows.push(`<div class="row"><span class="label">在场</span>
+    <span class="tag ${inW ? 'ok' : 'warn'}">${inW ? '在世界里' : esc(presence.label || '未在游戏中')}</span></div>`);
+  const modeName = mode.current || mode.mode || mode.name || mode.label;
+  rows.push(`<div class="row"><span class="label">模态</span><span class="value">${esc(modeName || '—')}</span></div>`);
+  rows.push(`<div class="row"><span class="label">联系人数</span><span class="value">${esc(contacts.count ?? 0)}</span></div>`);
+  const tokens = firstDefined(usage.total_tokens, usage.tokens, usage.total);
+  const cost = firstDefined(usage.total_cost, usage.cost);
+  rows.push(`<div class="row"><span class="label">Token 用量</span>
+    <span class="value">${tokens === undefined ? '—' : esc(num(tokens))}</span>
+    ${cost === undefined ? '' : `<span class="label">花费 ${esc(num(cost, 4))}</span>`}</div>`);
+  return shell(THEME, rows.join(''));
+}
+
+function cell(label, value) {
+  return `<div class="cell"><span class="label">${esc(label)}</span><span class="v">${esc(value)}</span></div>`;
+}
+function firstDefined() {
+  for (let i = 0; i < arguments.length; i++) if (arguments[i] !== undefined && arguments[i] !== null) return arguments[i];
+  return undefined;
+}
+function formatTime(v) {
+  const n = Number(v);
+  if (!isFinite(n)) return String(v);
+  // 0..24000 是按 Minecraft 时刻给的；折算成 24 小时制更直观。
+  if (n >= 0 && n <= 24000) {
+    const hours = Math.floor(((n / 1000) + 6) % 24);
+    const mins = Math.floor((n % 1000) / 1000 * 60);
+    return `${String(hours).padStart(2, '0')}:${String(mins).padStart(2, '0')}`;
+  }
+  return String(v);
+}
+function inWorld(s) {
+  if (s.in_world !== undefined) return !!s.in_world;
+  return (s.presence || {}).in_world !== false;
+}
+
+/* ── 组件解析 + 数据刷新 ─────────────────────────────────────────── */
+
+function render(session) {
+  const fn = OVERLAY_RENDERERS[COMPONENT];
+  if (!fn) {
+    set(`<div class="unknown">未知组件：${esc(COMPONENT)} —— 见 /api/overlay/components</div>`);
+    return;
+  }
+  set(fn(session || {}));
+}
+
+let lastPayload = null;
+function apply(payload) {
+  lastPayload = payload || {};
+  // /api/status 的形状是 {running, session:{…}}；`session.snapshot` 直接就是 session。
+  render(lastPayload.session || lastPayload);
+}
+
+async function refresh() {
+  try {
+    const r = await fetch('/api/status', {cache: 'no-store'});
+    if (r.ok) apply(await r.json());
+  } catch (e) { /* 断开/离线：静默，绝不刷屏报错 */ }
+}
+
+/* /ws 优先；连不上或只发不出状态就退化为轻量轮询。全程不 print 错误。 */
+let pollTimer = null;
+let wsFailures = 0;
+function startPolling(intervalMs) {
+  if (pollTimer) return;
+  pollTimer = setInterval(refresh, intervalMs);
+}
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  let ws;
+  try { ws = new WebSocket(`${proto}//${location.host}/ws`); } catch (e) { startPolling(5000); return; }
+  ws.onopen = () => {
+    wsFailures = 0;
+    refresh();
+    try { ws.send(JSON.stringify({type: 'status_subscribe'})); } catch (e) {}
+  };
+  ws.onmessage = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch (e) { return; }
+    if (msg && msg.type === 'status' && msg.data) apply(msg.data);
+    else if (msg && msg.type === 'session.snapshot') apply(msg.data || {});
+  };
+  ws.onerror = () => {};
+  ws.onclose = () => {
+    wsFailures += 1;
+    // 服务端不推状态 / 连接掉了 → 轻量轮询兜底；无错误输出。
+    startPolling(wsFailures > 3 ? 5000 : 3000);
+    setTimeout(connectWS, Math.min(30000, 2000 * wsFailures));
+  };
+}
+
+if (!OVERLAY_RENDERERS[COMPONENT]) {
+  render({});
+} else {
+  refresh();
+  connectWS();
+  startPolling(5000);
+}
+</script>
+</body>
+</html>

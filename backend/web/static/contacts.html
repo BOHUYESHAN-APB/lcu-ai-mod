@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>私信 · 通讯录</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{font-family:'Segoe UI','PingFang SC','Microsoft YaHei',system-ui,sans-serif;
+  background:#0d1117;color:#c9d1d9;display:flex;flex-direction:column;overflow:hidden}
+.topbar{display:flex;align-items:center;gap:12px;padding:10px 16px;background:#161b22;
+  border-bottom:1px solid #30363d;flex-shrink:0}
+.topbar .title{font-size:15px;font-weight:700;color:#58a6ff}
+.topbar .title span{color:#8b949e;font-weight:400;font-size:12px}
+.topbar .spacer{flex:1}
+.status{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px}
+.status.online{background:rgba(63,185,80,.15);color:#3fb950}
+.status.offline{background:rgba(139,148,158,.15);color:#8b949e}
+.btn{background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;
+  padding:6px 12px;font-size:12px;cursor:pointer}
+.btn:hover{background:#30363d}
+.btn.primary{background:#1f6feb;color:#fff;border-color:#1f6feb}
+.btn.primary:hover{background:#388bfd}
+.layout{flex:1;display:grid;grid-template-columns:minmax(220px,.7fr) minmax(320px,1.3fr);min-height:0}
+.contacts{border-right:1px solid #30363d;overflow-y:auto;background:#0d1117}
+.group-title{padding:8px 14px;font-size:11px;color:#8b949e;background:#161b22;
+  border-bottom:1px solid #21262d;position:sticky;top:0;z-index:1}
+.contact{width:100%;display:flex;gap:10px;align-items:flex-start;text-align:left;background:transparent;
+  color:#c9d1d9;border:0;border-bottom:1px solid #21262d;padding:10px 12px;cursor:pointer}
+.contact:hover,.contact.active{background:#21262d}
+.contact .av{width:34px;height:34px;border-radius:50%;background:#30363d;flex:0 0 auto;
+  display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:700;color:#8b949e}
+.contact .body{min-width:0;flex:1}
+.contact .line1{display:flex;align-items:center;gap:6px}
+.contact .nm{font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.contact .tier{font-size:10px;border-radius:3px;padding:1px 5px;border:1px solid #30363d;color:#8b949e}
+.tier.master{color:#d29922;border-color:#d29922}
+.tier.friend{color:#58a6ff;border-color:#58a6ff}
+.tier.guest{color:#8b949e;border-color:#30363d}
+.contact .badge{margin-left:auto;background:#da3633;color:#fff;border-radius:8px;
+  min-width:16px;text-align:center;font-size:10px;padding:1px 5px}
+.contact .preview{font-size:11px;color:#8b949e;margin-top:3px;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.contact .dot{width:7px;height:7px;border-radius:50%;flex:0 0 auto;background:#8b949e}
+.contact .dot.on{background:#3fb950}
+.chat{display:flex;flex-direction:column;min-width:0;min-height:0}
+.chat-head{padding:10px 14px;border-bottom:1px solid #30363d;background:#161b22;flex-shrink:0;
+  display:flex;align-items:center;gap:8px}
+.chat-head .nm{font-weight:600}
+.chat-head .meta{font-size:11px;color:#8b949e}
+.chat-body{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:10px;min-height:0}
+.bubble{max-width:76%;padding:8px 11px;border-radius:10px;position:relative;word-break:break-word;
+  white-space:pre-wrap;font-size:13px;line-height:1.45}
+.bubble .who{font-size:10px;color:#8b949e;margin-bottom:3px}
+.bubble .stamp{font-size:10px;color:#8b949e;margin-top:4px;text-align:right}
+.bubble.in{align-self:flex-start;background:#21262d;border-top-left-radius:2px}
+.bubble.out{align-self:flex-end;background:#1f6feb;color:#fff;border-top-right-radius:2px}
+.bubble.out .who,.bubble.out .stamp{color:rgba(255,255,255,.72)}
+.chat-foot{border-top:1px solid #30363d;padding:10px 12px;background:#161b22;flex-shrink:0}
+.chat-input{display:flex;gap:8px}
+.chat-input textarea{flex:1;resize:none;height:42px;background:#0d1117;border:1px solid #30363d;
+  border-radius:6px;padding:9px 10px;color:#c9d1d9;font-size:13px;font-family:inherit}
+.chat-input textarea:focus{border-color:#58a6ff;outline:none}
+.empty{padding:24px;color:#8b949e;font-size:12px;text-align:center}
+.hint{font-size:11px;color:#8b949e;margin-top:6px}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="title">私信 <span>通讯录</span></div>
+  <div class="spacer"></div>
+  <span id="conn" class="status offline">● 未连接</span>
+  <a class="btn" href="/" style="text-decoration:none">返回仪表盘</a>
+</div>
+<div class="layout">
+  <div id="contacts" class="contacts"><div class="empty">加载中…</div></div>
+  <div class="chat">
+    <div class="chat-head">
+      <span class="nm" id="peerName">未选择联系人</span>
+      <span class="meta" id="peerMeta"></span>
+    </div>
+    <div class="chat-body" id="messages"><div class="empty">左侧选一个联系人，看你们的来往私信</div></div>
+    <div class="chat-foot">
+      <div class="chat-input">
+        <textarea id="input" placeholder="以它的身份代发一条私信（会过服务端出站清洗 + 指令白名单）"></textarea>
+        <button class="btn primary" onclick="sendMessage()">发送</button>
+      </div>
+      <div class="hint" id="sendHint">人或 AI 都能收到这条；发送走 POST /api/contacts/&lt;uuid&gt;/send。</div>
+    </div>
+  </div>
+</div>
+<script>
+"use strict";
+const state = { contacts: [], current: null, currentKey: null, messages: [], sending: false };
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function fmtTime(ts) {
+  const n = Number(ts);
+  if (!isFinite(n) || n <= 0) return '';
+  const d = new Date(n * 1000);
+  const pad = x => String(x).padStart(2, '0');
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+async function api(path, options) {
+  const r = await fetch(path, options);
+  const data = await r.json().catch(() => ({}));
+  return { ok: r.ok, status: r.status, data };
+}
+
+/* ── 左栏 ── */
+function sameContact(c) {
+  if (!state.current) return false;
+  return [c.uuid, c.key, c.name].some(k => k && (k === state.current || k === state.currentKey));
+}
+function renderContacts() {
+  const box = document.getElementById('contacts');
+  if (!state.contacts.length) {
+    box.innerHTML = '<div class="empty">还没有私信往来记录。<br>等世界里的玩家先私信它。</div>';
+    return;
+  }
+  const rows = state.contacts.map(c => {
+    const tier = String(c.tier || '').toLowerCase();
+    const active = sameContact(c) ? ' active' : '';
+    const unread = Number(c.unread) || 0;
+    const dir = c.last_direction === 'out' ? '我：' : '';
+    return `<button class="contact${active}" onclick="selectContact('${esc(c.uuid || c.key)}')">
+      <span class="av">${esc((c.name || '?').slice(0, 1).toUpperCase())}</span>
+      <span class="body">
+        <span class="line1">
+          <span class="dot ${c.online ? 'on' : ''}"></span>
+          <span class="nm">${esc(c.name || c.uuid || '?')}</span>
+          ${tier ? `<span class="tier ${esc(tier)}">${esc(tier)}</span>` : ''}
+          ${unread ? `<span class="badge">${unread}</span>` : ''}
+        </span>
+        <span class="preview">${esc(dir + (c.last_text || '（无内容）'))}</span>
+      </span>
+    </button>`;
+  }).join('');
+  box.innerHTML = `<div class="group-title">联系人 · ${state.contacts.length}（本服）</div>${rows}`;
+}
+
+/* ── 右栏 ── */
+function renderMessages() {
+  const box = document.getElementById('messages');
+  if (!state.current) {
+    box.innerHTML = '<div class="empty">左侧选一个联系人，看你们的来往私信</div>';
+    return;
+  }
+  if (!state.messages.length) {
+    box.innerHTML = '<div class="empty">还没有消息。下面可以直接代它发第一条。</div>';
+    return;
+  }
+  box.innerHTML = state.messages.map(m => {
+    const out = m.direction === 'out';
+    const who = out ? '我（代发）' : '他发来';
+    const model = m.model ? ` · 模型 ${esc(m.model)}` : '';
+    return `<div class="bubble ${out ? 'out' : 'in'}">
+      <div class="who">${who}${model}</div>
+      <div class="text">${esc(m.text || '')}</div>
+      <div class="stamp">${esc(fmtTime(m.ts))}</div>
+    </div>`;
+  }).join('');
+  box.scrollTop = box.scrollHeight;
+}
+function renderPeerHeader() {
+  const c = state.contacts.find(sameContact);
+  document.getElementById('peerName').textContent = c ? (c.name || c.uuid) : (state.current || '未选择联系人');
+  const bits = [];
+  if (c && c.tier) bits.push('层级 ' + c.tier);
+  if (c) bits.push(c.online ? '在线' : '离线');
+  if (c && c.unreplied) bits.push(`未回 ${c.unreplied}`);
+  document.getElementById('peerMeta').textContent = bits.join(' · ');
+}
+
+/* ── 数据 ── */
+async function loadContacts() {
+  const { ok, data } = await api('/api/contacts');
+  if (!ok) return;
+  state.contacts = Array.isArray(data.contacts) ? data.contacts : [];
+  renderContacts();
+  renderPeerHeader();
+}
+
+async function selectContact(id) {
+  state.current = id;
+  state.currentKey = id;
+  renderContacts();
+  const { ok, data } = await api(`/api/contacts/${encodeURIComponent(id)}/messages`);
+  state.messages = ok && Array.isArray(data.messages) ? data.messages : [];
+  renderMessages();
+  renderPeerHeader();
+  // 进页/切换时清未读。
+  try { await api(`/api/contacts/${encodeURIComponent(id)}/read`, {method: 'POST'}); } catch (e) {}
+  await loadContacts();
+}
+
+async function sendMessage() {
+  if (!state.current || state.sending) return;
+  const input = document.getElementById('input');
+  const text = input.value.trim();
+  if (!text) return;
+  state.sending = true;
+  const hint = document.getElementById('sendHint');
+  const { data } = await api(`/api/contacts/${encodeURIComponent(state.current)}/send`,
+    {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text})});
+  state.sending = false;
+  if (data && data.status === 'ok') {
+    input.value = '';
+    hint.textContent = '已发出。';
+    hint.style.color = '#8b949e';
+    await selectContact(state.current);
+  } else {
+    const why = (data && (data.blocked || data.reason || data.detail)) || '未知原因';
+    hint.textContent = `被服务端拦下了：${why}（白名单未勾选 / 硬黑名单 / 需二次确认）。`;
+    hint.style.color = '#f85149';
+  }
+}
+
+/* 从 /contacts/<uuid> 直接进来时选中那个人。 */
+function initialTarget() {
+  const parts = location.pathname.replace(/^\/+|\/+$/g, '').split('/');
+  return parts[0] === 'contacts' && parts[1] ? decodeURIComponent(parts[1]) : '';
+}
+
+/* ── WS 优先，断开退化为轮询；断开不刷屏报错 ── */
+let pollTimer = null;
+function startPolling() { if (!pollTimer) pollTimer = setInterval(loadContacts, 5000); }
+function setConn(ok) {
+  const el = document.getElementById('conn');
+  el.className = 'status ' + (ok ? 'online' : 'offline');
+  el.textContent = ok ? '● 已连接' : '● 未连接（轮询中）';
+}
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  let ws;
+  try { ws = new WebSocket(`${proto}//${location.host}/ws`); } catch (e) { setConn(false); startPolling(); return; }
+  ws.onopen = () => setConn(true);
+  ws.onmessage = () => { loadContacts(); };
+  ws.onerror = () => {};
+  ws.onclose = () => { setConn(false); startPolling(); setTimeout(connectWS, 5000); };
+}
+
+document.getElementById('input').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+});
+
+(async () => {
+  await loadContacts();
+  const target = initialTarget();
+  if (target) await selectContact(target);
+  connectWS();
+})();
+</script>
+</body>
+</html>

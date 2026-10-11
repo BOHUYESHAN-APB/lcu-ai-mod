@@ -89,6 +89,34 @@ def _apply_persona_to_session():
 STATIC_DIR = Path(__file__).parent / "web" / "static"
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
 
+# OBS 组件注册表：一个组件 = 一个 `/overlay/<name>` 页（透明、100% 自适应、不写死尺寸）。
+# **加新属性只在这里加一条** —— 页面 `overlay.html` 按名字渲染，URL 固定可写进 OBS 浏览器源。
+OVERLAY_COMPONENTS: dict[str, dict[str, str]] = {
+    "status": {"title": "状态", "desc": "当前动作状态词 + HUD 描述词"},
+    "task": {"title": "任务", "desc": "当前任务与进度（含队列条数）"},
+    "players": {"title": "在线玩家", "desc": "在线玩家，最近发话者高亮"},
+    "state": {"title": "基础状态", "desc": "位置 / 生命 / 饥饿 / 维度 / 时间"},
+    "backend": {"title": "后端状态", "desc": "在场门 / 模态 / 联系人数 / Token 用量"},
+}
+
+
+def _overlay_manifest() -> list[dict[str, str]]:
+    """组件清单（前端/OBS 可直接消费；与 `/overlay/<name>` 路由一一对应）。"""
+    return [{"name": name, "title": meta["title"], "desc": meta["desc"],
+             "url": f"/overlay/{name}"}
+            for name, meta in OVERLAY_COMPONENTS.items()]
+
+
+def _static_html(filename: str, fallback: str) -> HTMLResponse:
+    """读 `web/static/<filename>`；文件缺失（打包/裁剪）时给最小兜底，端点不 500。"""
+    path = STATIC_DIR / filename
+    if path.exists():
+        try:
+            return HTMLResponse(path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            print(f"[Backend] 读取 {path} 失败: {exc}")
+    return HTMLResponse(fallback)
+
 
 def _seed_local_stores() -> None:
     """首次启动时把默认的人设/权限落成文件，方便操作者直接手改。
@@ -174,10 +202,36 @@ async def startup():
 @app.get("/", response_class=HTMLResponse)
 async def get_dashboard():
     """Serve the dashboard."""
-    html_path = STATIC_DIR / "index.html"
-    if html_path.exists():
-        return HTMLResponse(html_path.read_text(encoding="utf-8"))
-    return HTMLResponse("<h1>Dashboard</h1>")
+    return _static_html("index.html", "<h1>Dashboard</h1>")
+
+
+@app.get("/contacts", response_class=HTMLResponse)
+async def get_contacts_page():
+    """私信页（通讯录两栏）：左联系人 / 右对话。**不改 master 的 /api/v2/inbox**。"""
+    return _static_html("contacts.html", "<h1>Contacts</h1>")
+
+
+@app.get("/contacts/{uuid}", response_class=HTMLResponse)
+async def get_contacts_thread_page(uuid: str):
+    """同一页，深链到某个人（前端从路径里取 uuid）。`uuid` 只是展示用，不落库。"""
+    return _static_html("contacts.html", "<h1>Contacts</h1>")
+
+
+@app.get("/overlay/{component}", response_class=HTMLResponse)
+async def get_overlay_page(component: str):
+    """OBS 单属性子页面：一个页面只渲染一个组件，透明背景、100% 自适应。
+
+    组件名不在注册表里 → 404（避免 OBS 源静默挂在空白页上）。
+    """
+    if component not in OVERLAY_COMPONENTS:
+        raise HTTPException(status_code=404, detail=f"unknown overlay component: {component}")
+    return _static_html("overlay.html", "<h1>Overlay</h1>")
+
+
+@app.get("/api/overlay/components")
+async def get_overlay_components():
+    """组件注册表（OBS 里要写的 URL + 标题/说明）。加属性 = 加一条注册。"""
+    return {"components": _overlay_manifest()}
 
 
 @app.websocket("/ws")
@@ -226,6 +280,11 @@ async def websocket_endpoint(ws: WebSocket):
                     "data": {"response": response, "error": error},
                 }))
 
+            elif event_type == "status_subscribe":
+                # overlay / 通讯录订阅状态推送：优先走 /ws，别让浏览器源一直轮询。
+                if ws not in status_pushers:
+                    status_pushers[ws] = asyncio.create_task(_push_status(ws))
+
             elif event_type == "llm_config":
                 data = msg.get("data", {})
                 agent = data.get("agent", "default")
@@ -237,13 +296,34 @@ async def websocket_endpoint(ws: WebSocket):
     except Exception as e:
         print(f"[WS] Error: {e}")
     finally:
+        _stop_status_push(ws)
         if ws in connected_browsers:
             connected_browsers.remove(ws)
 
 
-@app.get("/api/status")
-async def get_status():
-    """REST endpoint for current status.
+# 订阅了状态推送的浏览器源（overlay）：一个 ws 一条任务，断开即取消（**不写死端口/尺寸**）。
+status_pushers: dict[WebSocket, "asyncio.Task[None]"] = {}
+OVERLAY_PUSH_INTERVAL = 2.0
+
+
+async def _push_status(ws: WebSocket) -> None:
+    """周期性往订阅方推 `/api/status`；写失败/断开就静默结束，让前端退化为轮询。"""
+    try:
+        while True:
+            await ws.send_text(json.dumps({"type": "status", "data": _status_payload()}))
+            await asyncio.sleep(OVERLAY_PUSH_INTERVAL)
+    except Exception:
+        return
+
+
+def _stop_status_push(ws: WebSocket) -> None:
+    task = status_pushers.pop(ws, None)
+    if task is not None and not task.done():
+        task.cancel()
+
+
+def _status_payload() -> dict:
+    """`/api/status` 的响应体（REST 与 overlay 的 `/ws` 推送共用同一份）。
 
     额外给出**模组连接状态**：前端那个"已连接"只代表浏览器↔后端的 WebSocket，
     与游戏/模组无关（这正是"连上了却什么都没有"的误导来源）。
@@ -254,6 +334,12 @@ async def get_status():
         status["wire"] = f"{os.getenv('MOD_HOST', '127.0.0.1')}:{os.getenv('MOD_PORT', '25568')}"
         return status
     return {"running": False, "mod_connected": False}
+
+
+@app.get("/api/status")
+async def get_status():
+    """REST endpoint for current status."""
+    return _status_payload()
 
 
 @app.get("/api/llm/effective")
@@ -597,6 +683,20 @@ def _contacts_namespace() -> str:
     return "unknown"
 
 
+def _online_names() -> list[str]:
+    """当前在世界的玩家名（模组按距离报的 `runtime["players"]`）；拿不到就空 —— **不猜**。"""
+    session = orchestrator.session if orchestrator else None
+    runtime = getattr(session, "runtime", None)
+    players = runtime.get("players") if isinstance(runtime, dict) else None
+    if not isinstance(players, list):
+        return []
+    names = []
+    for player in players:
+        if isinstance(player, dict) and player.get("name"):
+            names.append(str(player["name"]))
+    return names
+
+
 @app.get("/api/contacts")
 async def get_contacts():
     """通讯录：每个联系人的名字/uuid/层级/未读/未回/最后一条（按最后一条时间倒序）。"""
@@ -605,7 +705,8 @@ async def get_contacts():
     permissions = getattr(session, "permissions", None)
     tier_of = permissions.tier_of if isinstance(permissions, PermissionsStore) else None
     key = _contacts_namespace()
-    return {"server": key, "contacts": store.contacts(key, tier_of=tier_of)}
+    return {"server": key,
+            "contacts": store.contacts(key, tier_of=tier_of, online_names=_online_names())}
 
 
 @app.get("/api/contacts/{uuid}/messages")
@@ -619,18 +720,26 @@ async def get_contact_messages(uuid: str, limit: int = 50):
 
 @app.post("/api/contacts/{uuid}/send")
 async def send_contact_message(uuid: str, data: dict):
-    """人**代发**一条私信：同样过出站清洗 + 白名单（不许绕开闸门）。"""
+    """人**代发**一条私信：同样过出站清洗 + 白名单（不许绕开闸门）。
+
+    `send_whisper` 的目标必须是**能解析成唯一在线玩家的名字**，所以这里先把线程里的
+    显示名取出来（没有就用 uuid 兜底，让下游如实回 `not_found`）。
+    """
     text = str((data or {}).get("text") or (data or {}).get("message") or "")
     if not text.strip():
         raise HTTPException(status_code=400, detail="text is required")
     session = orchestrator.session if orchestrator else None
     if session is None:
         raise HTTPException(status_code=503, detail="session not ready")
+    store = _contacts_store()
+    key = _contacts_namespace()
+    thread = store.export_thread(key, uuid)
+    target = str(thread.get("name") or "").strip() or uuid
     # 仪表盘上的人手动代发 → 按 master 层级（和任务操作台同一口径）。
-    result = session.send_whisper(uuid, text, tier="master")
+    result = session.send_whisper(target, text, tier="master")
     if not result.get("ok"):
-        return {"status": "blocked", **result}
-    return {"status": "ok", **result}
+        return {"status": "blocked", "target": target, **result}
+    return {"status": "ok", "target": target, **result}
 
 
 @app.post("/api/contacts/{uuid}/read")
@@ -641,26 +750,98 @@ async def mark_contact_read(uuid: str):
     return {"status": "ok", "server": key, "marked": store.mark_read(key, uuid)}
 
 
+def _command_family(name: Any) -> str:
+    """指令族名（`minecraft:kill` → `kill`）；与 `CommandGate` 的判定口径一致。"""
+    text = str(name or "").strip()
+    while text.startswith("/"):
+        text = text[1:].strip()
+    return text.casefold().rsplit(":", 1)[-1]
+
+
+def _is_hard_rejected(name: Any) -> bool:
+    """这条指令是不是硬黑名单（代码里硬拒 → 配置也放不开，UI 不可勾选）。"""
+    return _command_family(name) in HARD_BLACKLIST
+
+
+def _requested_command_names(payload: Any) -> list[str]:
+    """从 UI 回包里收集"它请求登记的指令名"（global/commands/servers 都算）。"""
+    data = payload if isinstance(payload, dict) else {}
+    names: list[str] = []
+
+    def _collect(value: Any) -> None:
+        items = value if isinstance(value, (list, tuple, set)) else [value]
+        for item in items:
+            if isinstance(item, str):
+                names.append(item)
+            elif isinstance(item, dict):
+                picked = item.get("name") or item.get("command")
+                if picked:
+                    names.append(str(picked))
+
+    for key in ("global", "commands"):
+        if key in data:
+            _collect(data[key])
+    servers = data.get("servers")
+    if isinstance(servers, dict):
+        for value in servers.values():
+            _collect(value)
+    return names
+
+
+def _command_entries_view(store: "CommandsStore", server_key: str) -> list[dict]:
+    """UI 表格用的条目视图：全局 ∪ 本服，逐条标出**作用域 / 硬拒 / 需二次确认**。
+
+    形如 `[{name, usage, desc, tiers, enabled, cooldown, scope, hard_rejected, high_risk}]`。
+    """
+    current = store.get()
+    key = str(server_key or "").strip()
+    rows: list[dict] = []
+    for item in current.get("commands") or []:
+        rows.append({**item, "scope": "global"})
+    for candidate, entries in (current.get("servers") or {}).items():
+        if str(candidate).casefold() != key.casefold():
+            continue
+        for item in entries or []:
+            rows.append({**item, "scope": str(candidate)})
+    for row in rows:
+        row["hard_rejected"] = _is_hard_rejected(row.get("name"))
+        row["high_risk"] = _command_family(row.get("name")) in HIGH_RISK
+    return rows
+
+
 @app.get("/api/commands")
 async def get_commands_config():
     """指令白名单（唯一来源 `.local/commands.json`）+ 硬黑名单/高风险清单。
 
     硬黑名单**代码里硬拒、配置放不开**，列出来只是让 UI 不显示勾选框。
+    另给 `entries`（UI 表格直接消费的条目视图，默认空）。
     """
     store = _commands_store()
+    key = _contacts_namespace()
     return {
         "config": store.get(),
+        "entries": _command_entries_view(store, key),
         "hard_blacklist": sorted(HARD_BLACKLIST),
         "high_risk": sorted(HIGH_RISK),
-        "server": _contacts_namespace(),
-        "effective": store.whitelist_for(_contacts_namespace()),
+        "server": key,
+        "effective": store.whitelist_for(key),
     }
 
 
 @app.post("/api/commands")
 async def set_commands_config(data: dict):
-    """改指令白名单/私信指令族/TPA 话术；改完即时生效（同一个 store 实例）。"""
+    """改指令白名单/私信指令族/TPA 话术；改完即时生效（同一个 store 实例）。
+
+    **硬黑名单在服务端拦截**：请求里写进来的 kill/op/… 会被剔掉并在 `rejected` 里如实回报
+    （前端只是展示，不能靠它绕过）。
+    """
     store = _commands_store()
-    saved = store.set(data if isinstance(data, dict) else {})
+    payload = data if isinstance(data, dict) else {}
+    requested = _requested_command_names(payload)
+    saved = store.set(payload)
+    key = _contacts_namespace()
+    rejected = [name for name in requested if _is_hard_rejected(name)]
     return {"status": "ok", "config": saved,
-            "effective": store.whitelist_for(_contacts_namespace())}
+            "entries": _command_entries_view(store, key),
+            "effective": store.whitelist_for(key),
+            "rejected": rejected}
