@@ -283,10 +283,10 @@ tasks.register('verifyFinder', JavaExec) {
 
 tasks.register('verifyChat', JavaExec) {
     group = 'verification'
-    description = '纯逻辑自检（聊天回声去重：不能吃掉用户自己打的字），零第三方依赖'
+    description = '纯逻辑自检（聊天回声去重 + 聊天分类：翻译键优先、未知键当公屏、whisper_out 不算 incoming），零第三方依赖'
     dependsOn tasks.named('testClasses')
     classpath = sourceSets.test.output + sourceSets.main.output
-    mainClass = 'com.lcu.lcumod.chat.OutboundChatLogCheck'
+    mainClass = 'com.lcu.lcumod.chat.ChatCheck'
 }
 
 tasks.register('verifyTitle', JavaExec) {

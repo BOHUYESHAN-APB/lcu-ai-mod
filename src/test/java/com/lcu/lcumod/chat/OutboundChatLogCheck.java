@@ -14,6 +14,17 @@ public final class OutboundChatLogCheck {
     private static int failed = 0;
 
     public static void main(String[] args) {
+        int[] r = run();
+        if (r[1] > 0) {
+            System.exit(1);
+        }
+    }
+
+    /** 跑完整套自检并打印摘要，返回 {passed, failed}。 */
+    static int[] run() {
+        passed = 0;
+        failed = 0;
+
         // 1) 自己发的消息会被记录，并且只能消费一次
         OutboundChatLog.record("AI 已到达");
         check("own message consumed once", OutboundChatLog.consume("AI 已到达"));
@@ -45,9 +56,7 @@ public final class OutboundChatLogCheck {
         check("oldest evicted", !OutboundChatLog.consume("msg-0"));
 
         System.out.println("[OutboundChatLogCheck] " + passed + " checks passed, " + failed + " failed");
-        if (failed > 0) {
-            System.exit(1);
-        }
+        return new int[] { passed, failed };
     }
 
     private static void check(String name, boolean ok) {

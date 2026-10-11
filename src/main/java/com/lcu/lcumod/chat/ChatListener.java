@@ -4,6 +4,7 @@ import com.google.gson.JsonObject;
 import com.lcu.lcumod.LCUMod;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.contents.TranslatableContents;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
 import net.neoforged.neoforge.client.event.ClientChatReceivedEvent;
@@ -51,13 +52,30 @@ public class ChatListener {
             // 也被吃掉，表现为"在游戏里发消息，AI 从来没收到"（后端一个字节都没有）。
             if (OutboundChatLog.consume(stripSenderText(message))) return;
 
-            msgCount++;
-            LCUMod.LOGGER.info("[Chat] #{} received", msgCount);
+            ChatKind.Kind kind = classifyEvent(event);
 
-            String resolvedSender = resolveSender(event);
+            msgCount++;
+            LCUMod.LOGGER.info("[Chat] #{} received kind={}", msgCount, ChatKind.wire(kind));
+
+            String resolvedSender;
+            boolean senderUnknown = false;
+            if (kind == ChatKind.Kind.whisper_out) {
+                // 服务器把"我发出去的私信"回显：说话的是我自己，不能编出别人的名字
+                resolvedSender = "";
+            } else if (kind == ChatKind.Kind.whisper_in) {
+                // 私信我的人 —— 绝不是 "me"；拿不到名字就留空 + sender_unknown
+                resolvedSender = whisperSenderName(event);
+                senderUnknown = resolvedSender.isEmpty();
+            } else {
+                resolvedSender = resolveSender(event);
+            }
+
             // 记住"最近谁在说话"（仪表盘要显示"它在听谁"，守卫要按发言瞬间的坐标执行）
-            lastSpeakerName = resolvedSender;
-            lastSpeakerAt = System.currentTimeMillis();
+            // whisper_out 是自己在说，不覆盖"在听谁"
+            if (kind != ChatKind.Kind.whisper_out) {
+                lastSpeakerName = resolvedSender;
+                lastSpeakerAt = System.currentTimeMillis();
+            }
 
             JsonObject data = new JsonObject();
             data.addProperty("sender", resolvedSender);
@@ -65,6 +83,13 @@ public class ChatListener {
             data.addProperty("message", message);
             data.addProperty("is_system", event.isSystem());
             data.addProperty("type", event.isSystem() ? "system_chat" : "player_chat");
+            // 私信判据是**翻译键**（语言无关）：chat_kind 见 ChatKind；
+            // whisper 仅对"别人私信我"为 true —— whisper_out（自己的回显）不算有人在跟我说话。
+            data.addProperty("chat_kind", ChatKind.wire(kind));
+            data.addProperty("whisper", kind == ChatKind.Kind.whisper_in);
+            if (senderUnknown) {
+                data.addProperty("sender_unknown", true);
+            }
 
             // 发言那一瞬间的发送者坐标：守卫("在这儿守着")/找人 都要用它，而不是 AI 自己的位置
             var level = Minecraft.getInstance().level;
@@ -119,5 +144,93 @@ public class ChatListener {
             }
         }
         return event.getSender() != null ? event.getSender().toString() : "system";
+    }
+
+    /**
+     * 分类一次收到的聊天。候选键按「结构优先」顺序：
+     * <ol>
+     *   <li>ChatType 注册键（{@code chat} / {@code say_command} / {@code msg_command_incoming} …）—— 语言无关的结构；</li>
+     *   <li>ChatTypeDecoration 的翻译键（{@code chat.type.text} / {@code commands.message.display.incoming} …）；</li>
+     *   <li>消息组件里 {@code TranslatableContents} 的翻译键。</li>
+     * </ol>
+     * 任意一条能识别就识别；全不认识 → unknown（下游当公屏）。
+     */
+    static ChatKind.Kind classifyEvent(ClientChatReceivedEvent event) {
+        java.util.List<String> keys = new java.util.ArrayList<>(3);
+        var bound = event.getBoundChatType();
+        if (bound != null) {
+            try {
+                bound.chatType().unwrapKey().ifPresent(rk -> keys.add(rk.identifier().getPath()));
+            } catch (Exception ignored) {
+                // 结构读取失败不致命 —— 退化到翻译键
+            }
+            try {
+                String decoKey = bound.chatType().value().chat().translationKey();
+                if (decoKey != null && !decoKey.isEmpty()) {
+                    keys.add(decoKey);
+                }
+            } catch (Exception ignored) {
+                // 同上
+            }
+        }
+        String componentKey = firstTranslationKey(event.getMessage());
+        if (componentKey != null && !componentKey.isEmpty()) {
+            keys.add(componentKey);
+        }
+        return ChatKind.classifyFirst(event.isSystem(), keys.toArray(new String[0]));
+    }
+
+    /** 递归找消息里第一个 {@code TranslatableContents} 的翻译键（键与语言无关）。 */
+    static String firstTranslationKey(Component component) {
+        if (component == null) return null;
+        try {
+            if (component.getContents() instanceof TranslatableContents tc) {
+                String key = tc.getKey();
+                if (key != null && !key.isEmpty()) return key;
+            }
+            // 装饰后的消息是单个 TranslatableContents，但保守起见也走一遍 sibling
+            for (Component sibling : component.getSiblings()) {
+                String key = firstTranslationKey(sibling);
+                if (key != null) return key;
+            }
+        } catch (Exception ignored) {
+            // 拿不到就当没有
+        }
+        return null;
+    }
+
+    /**
+     * 取「私信我的人」的名字（**不是** "me"）：优先 {@code ChatType.Bound.name()}（发送者显示名），
+     * 退化到消息组件的第一个参数 —— 原版 {@code incomingDirectMessage} 的参数顺序是 [SENDER, CONTENT]。
+     * 拿不到就返回空串，由调用方标 {@code sender_unknown}（不编名字）。
+     */
+    static String whisperSenderName(ClientChatReceivedEvent event) {
+        var bound = event.getBoundChatType();
+        if (bound != null) {
+            try {
+                Component name = bound.name();
+                if (name != null) {
+                    String s = name.getString();
+                    if (s != null && !s.isBlank()) return s.trim();
+                }
+            } catch (Exception ignored) {
+                // 退化到参数
+            }
+        }
+        Component msg = event.getMessage();
+        if (msg != null) {
+            try {
+                if (msg.getContents() instanceof TranslatableContents tc) {
+                    Object[] args = tc.getArgs();
+                    if (args != null && args.length >= 1 && args[0] instanceof Component first) {
+                        String s = first.getString();
+                        if (s != null && !s.isBlank()) return s.trim();
+                    }
+                }
+            } catch (Exception ignored) {
+                // 拿不到就当空
+            }
+        }
+        return "";
     }
 }
