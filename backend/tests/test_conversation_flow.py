@@ -256,9 +256,6 @@ def make_session(tmp, *, in_world=True, server_mode="private", master=(),
     session._manual_task_kind = None
     session._task_idle_since = None
     session._last_save = time.monotonic()
-    session._night_auto_sleep_provider = lambda: True
-    session._auto_sleep_sent = False
-    session._last_auto_sleep = 0.0
     session._last_memory_summary = 0.0
     return session
 

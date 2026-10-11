@@ -112,10 +112,6 @@ ZONE_AUTHORITY: dict[str, bool] = {
 # 他要把自己箱子上的 `free`（随取）降成 `borrow_only`（走借用台账）。
 FRIEND_MAX_CONTAINER_POLICY = "borrow_only"
 
-# 无人指挥（自主 self-prompt / 外部事件）时能不能自造：默认 **false**
-# —— 没人授权就不动手，这是用户口径的默认值（要放开请显式打开 autonomy_craft）。
-DEFAULT_AUTONOMY_CRAFT = False
-
 DEFAULT_SESSION_ADJUST = 1.0
 
 # 各层"能干什么"的**自然语言范围**（设计文档 §4：表是硬门，文本是语义范围）。
@@ -142,12 +138,11 @@ def _default_permissions() -> dict[str, Any]:
         "debounce_seconds": DEFAULT_DEBOUNCE_SECONDS,
         "window_seconds": DEFAULT_WINDOW_SECONDS,
         "ban_patterns": [],
-        # 能力位：谁能让他造 / 谁能授权他翻箱 / 无人指挥时能否自造
+        # 能力位：谁能让他造 / 谁能授权他翻箱（"谁能让它做什么"＝授权门，保留）
         "craft": dict(CRAFT_AUTHORITY),
         "containers": dict(CONTAINER_AUTHORITY),
         "territory": dict(TERRITORY_AUTHORITY),
         "zones": dict(ZONE_AUTHORITY),
-        "autonomy_craft": DEFAULT_AUTONOMY_CRAFT,
         # TPA 分层策略（用户口径：master 自动接受 / friend 默认询问 / guest 拒绝且不点
         # / 主动发起仅 master）。默认值定义在 `agent/tpa.py`，这里只做挂载。
         "tpa": copy.deepcopy(TPA_POLICY_DEFAULTS),
@@ -311,7 +306,6 @@ def _normalize(raw: Any) -> dict[str, Any]:
     data["containers"] = _as_capability_map(source.get("containers"), CONTAINER_AUTHORITY)
     data["territory"] = _as_capability_map(source.get("territory"), TERRITORY_AUTHORITY)
     data["zones"] = _as_capability_map(source.get("zones"), ZONE_AUTHORITY)
-    data["autonomy_craft"] = _as_bool(source.get("autonomy_craft"), DEFAULT_AUTONOMY_CRAFT)
     data["tpa"] = normalize_tpa_policy(source.get("tpa"))
     data["scope"] = _normalize_scope(source.get("scope"))
     return data
@@ -374,16 +368,15 @@ class TierPolicy:
 class CraftPolicy:
     """一次制作/取物请求的授权结论（**全部查表**，决策链不写 `if tier`）。
 
-    - 有人指挥（directed）：能不能造看 `craft` 表；能不能翻箱看 `containers` 表。
-    - 无人指挥（autonomous，self-prompt / 事件注入）：能不能自造看 `autonomy_craft` 开关
-      （默认 false），并且**永远不能翻箱** —— 没人授权他去动别人的箱子。
+    能不能造看 `craft` 表；能不能翻箱看 `containers` 表。没人指挥（self-prompt /
+    事件注入）的轮次没有发话者 → 按 guest 处理（默认拒绝）——**没有自主开关**：
+    能力只是注册表里的工具（LLM 自己决定用不用），能不能用只看这张授权表。
     """
 
     tier: str
-    autonomous: bool
     may_craft: bool
     may_open_containers: bool
-    reason: str                # granted / tier_not_allowed / autonomy_craft_off / ...
+    reason: str                # granted / tier_not_allowed
 
 
 @dataclass
@@ -535,7 +528,7 @@ class PermissionsStore:
             can_use_containers=self.can_authorize_containers(tier),
         )
 
-    # ── 能力位（craft / containers / autonomy_craft） ──
+    # ── 能力位（craft / containers） ──
 
     def craft_authority(self) -> dict[str, bool]:
         """谁能让他造东西（tier → bool 的副本）。"""
@@ -546,11 +539,6 @@ class PermissionsStore:
         """谁能授权他翻箱/动容器（tier → bool 的副本）。"""
         with self._lock:
             return dict(self._data["containers"])
-
-    def autonomy_craft(self) -> bool:
-        """无人指挥（自主/事件）时能不能自造；默认 false。"""
-        with self._lock:
-            return bool(self._data["autonomy_craft"])
 
     # ── TPA 分层策略（`.local/permissions.json` 的 `tpa` 段） ──
 
@@ -624,21 +612,15 @@ class PermissionsStore:
                     "clamped": True}
         return {"ok": True, "policy": requested, "reason": "granted", "clamped": False}
 
-    def craft_policy(self, tier: str = "", *, autonomous: bool = False) -> CraftPolicy:
+    def craft_policy(self, tier: str = "") -> CraftPolicy:
         """一次制作/取物请求的授权结论（决策链的唯一入口，不看 tier 分支）。
 
-        `autonomous=True` 表示这一轮没有任何人下指令（self-prompt / 事件注入）：
-        能不能自造只看 `autonomy_craft`，且**一律不许翻箱**。
+        没人指挥的轮次没有发话者 → 调用方传空 tier，按 guest 处理（默认拒绝）。
         """
-        if autonomous:
-            allowed = self.autonomy_craft()
-            return CraftPolicy(tier=_as_tier(tier), autonomous=True, may_craft=allowed,
-                               may_open_containers=False,
-                               reason="autonomy_craft" if allowed else "autonomy_craft_off")
         resolved = _as_tier(tier)
         may_craft = self.can_craft(resolved)
         may_containers = self.can_authorize_containers(resolved)
-        return CraftPolicy(tier=resolved, autonomous=False, may_craft=may_craft,
+        return CraftPolicy(tier=resolved, may_craft=may_craft,
                            may_open_containers=may_containers,
                            reason="granted" if may_craft else "tier_not_allowed")
 

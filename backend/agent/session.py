@@ -163,7 +163,7 @@ class Session:
         self.memory = Memory(path=f"data/memory/session_{self.id}.json")
         # POI 记忆：按「服务器 + 世界」命名空间持久化，跨局记住箱子位置与内容
         self.poi = WorldPoiMemory()
-        self.commands = Commands(self.skills, authorizer=self._autonomous_craft_policy)
+        self.commands = Commands(self.skills, authorizer=self._command_craft_policy)
         self.modes_engine = ModesEngine(self.skills, self.memory,
                                         action_manager=self.action_manager)
         self.llm = LLMService()
@@ -281,7 +281,7 @@ class Session:
             self.llm, self.memory, self.skills,
             threshold_provider=get_config_store(DEFAULT_CONFIG_PATH).get_decision_threshold,
             chat_inbox=self.chat_inbox,
-            # 能力位（craft / containers / autonomy_craft）：合成与翻箱都要先过这张表。
+            # 能力位（craft / containers）：合成与翻箱都要先过这张表。
             permissions=self.permissions,
             # 借用规则（对话授权"仓库里的铁可以用"）：计划器只查表，不看 tier 分支。
             borrow_rules=self.borrow_rules,
@@ -293,6 +293,8 @@ class Session:
             tpa_responder=self.respond_tpa,
             tpa_requester=self.request_tpa,
             player_resolver=self.resolve_player,
+            # BackendEatYield 走 action_manager 的退避窗口（进食的让路/退避/冷却在这里收口）。
+            action_manager=self.action_manager,
         )
 
         # Vision (Python 侧直接抓屏 -> VLM，后台线程低频刷新，不阻塞动作链路)
@@ -322,11 +324,6 @@ class Session:
         self._manual_command_until = 0.0
         self._manual_action_reqs: set[str] = set()
         self._manual_task_kind: Optional[str] = None
-
-        # 夜晚自动睡觉：开关走共享 ConfigStore（UI 即时生效）；同一夜只发一次。
-        self._night_auto_sleep_provider = get_config_store(DEFAULT_CONFIG_PATH).get_night_auto_sleep
-        self._last_auto_sleep = 0.0
-        self._auto_sleep_sent = False
 
     # ── Event handlers ──
 
@@ -2102,11 +2099,10 @@ class Session:
             except Exception as e:
                 logger.debug("[Session] 借用欠账读取失败: %s", e)
                 context["borrow_pending"] = ""
-        # 能力位：这一轮是谁在说话（制作/翻箱/领地授权按它查表）；自主轮由 planner 侧改写。
+        # 能力位：这一轮是谁在说话（制作/翻箱/领地授权按它查表）；自主轮按 guest 处理。
         actor = getattr(self, "_actor", None) or {}
         context["actor_tier"] = str(actor.get("tier") or "guest")
         context["actor_name"] = str(actor.get("name") or "")
-        context["autonomous"] = False
         # 领地 / 基地 / 容器 / 区域（world 层）：授权范围 + 当前基地 + 回家事实 + 刚被拦的记录。
         self._fill_territory_context(context)
 
@@ -2208,8 +2204,6 @@ class Session:
             context["whisper_from"] = whisper_from
         if event:
             context["event"] = event
-            # 事件注入＝**没有人下指令**：制作/翻箱只看 autonomy_craft，且一律不许翻箱。
-            context["autonomous"] = True
         # 场景：这条消息点名了 AI 就用"被点名"那一段规则，否则按私聊/公开服。
         mentioned = (not event) and self._is_mentioned(message)
         context["persona_blocks"] = self.persona_blocks(self._scene_for("", mentioned))
@@ -2278,6 +2272,10 @@ class Session:
         if autonomy_enabled and not manual_override_active:
             with self.skills.command_context("mode"):
                 mode_action = self.modes_engine.tick(self.runtime, action_busy=self.action_manager.is_busy or task_active)
+        # BackendEatYield：回收上一次 `eat` 的终态（失败/超时 → 冷却 + 如实写 task_state）。
+        eat_yield = getattr(getattr(self, "planner", None), "eat_yield", None)
+        if eat_yield is not None:
+            eat_yield.absorb(self.runtime)
         if mode_action:
             self.self_prompter.mark_action()
 
@@ -2287,10 +2285,6 @@ class Session:
             logger.info("[Session] Self-prompt triggered: %s", prompt[:60])
             # Route through LLM service to generate commands
             self._handle_self_prompt(prompt)
-
-        # 夜晚自动睡觉：自主开启、无任务、天黑且能睡 → 限频下发一次。
-        self._maybe_auto_sleep(
-            autonomy_enabled and not manual_override_active, is_idle, task_active)
 
         # 控制流心跳：按住期间必须持续下发，否则 Java 侧 500ms 超时会自动松手。
         self.control.flush()
@@ -2627,13 +2621,13 @@ class Session:
             return False, "no_task_list"
         return tasks.activate(task_id, actor_tier=tier or self._tier_of(actor), actor=actor)
 
-    def _autonomous_craft_policy(self) -> CraftPolicy:
-        """自主行为（self-prompt / 事件）的制作授权：只看 `autonomy_craft`，且不许翻箱。"""
+    def _command_craft_policy(self) -> CraftPolicy:
+        """控制台 `!craft` 的制作授权：没人指挥 → 按 guest（默认拒绝），且不许翻箱。"""
         permissions = getattr(self, "permissions", None)
         if permissions is None:
-            return CraftPolicy(tier="guest", autonomous=True, may_craft=False,
+            return CraftPolicy(tier="guest", may_craft=False,
                                may_open_containers=False, reason="no_permissions")
-        return permissions.craft_policy("", autonomous=True)
+        return permissions.craft_policy("")
 
     def _handle_self_prompt(self, prompt: str):
         """Handle a self-prompt by routing through LLM to generate actions."""
@@ -2642,7 +2636,7 @@ class Session:
             logger.info("[Session] 不在世界 → 跳过 self-prompt")
             return
         # 自主轮＝**没有任何人授权**：改回 guest，免得上一轮主人说话留下的层级
-        # 让"没人指挥"的自发行为也能下白名单指令（与 autonomy_craft 默认关同一口径）。
+        # 让"没人指挥"的自发行为也能动手（没有人授权 → 默认什么能力都不给）。
         self._actor = {"name": "", "tier": "guest"}
         self.self_prompter.on_prompt_sent()
         # Build system context
@@ -2668,65 +2662,6 @@ class Session:
                 logger.info("[Session] Self-prompt generated %d commands", len(cmd_results))
         except Exception as e:
             logger.error("[Session] Self-prompt LLM error: %s", e)
-
-    # 同一夜最多自动睡一次；两次尝试之间至少间隔这么久（避免刷屏/抖动手）。
-    AUTO_SLEEP_COOLDOWN = 60.0
-
-    def _maybe_auto_sleep(self, autonomy_enabled: bool, is_idle: bool,
-                          task_active: bool, now: Optional[float] = None) -> bool:
-        """夜晚自动睡觉：满足条件时下发一次 sleep_in_bed，返回是否真的下发。
-
-        限频：天亮复位；同一夜只发一次；且两次尝试至少间隔 AUTO_SLEEP_COOLDOWN。
-        wire 命令是 `sleep`，Java 侧负责寻路 + 点床，进度由 task_state 反映。
-        """
-        runtime = self.runtime if isinstance(self.runtime, dict) else {}
-        if not bool(runtime.get("is_night")):
-            # 天亮：复位，下一夜可以再睡。
-            self._auto_sleep_sent = False
-            return False
-        if not (autonomy_enabled and is_idle and not task_active):
-            return False
-        if getattr(self, "_auto_sleep_sent", False):
-            return False
-        provider = getattr(self, "_night_auto_sleep_provider", None)
-        if provider is not None:
-            try:
-                if not provider():
-                    return False
-            except Exception as e:
-                logger.warning("[Session] night_auto_sleep 读取失败(%s)，按开启处理", e)
-        if not bool(runtime.get("can_sleep")):
-            return False
-        if not self._has_known_bed(runtime):
-            # 附近和记忆里都没床 → 不发 sleep，免得反复空转（Java 只会诚实回 no_bed）。
-            return False
-        current = time.time() if now is None else now
-        if current - getattr(self, "_last_auto_sleep", 0.0) < self.AUTO_SLEEP_COOLDOWN:
-            return False
-        with self.skills.command_context("auto_sleep"):
-            result = self.skills.sleep_in_bed()
-        self._last_auto_sleep = current
-        self._auto_sleep_sent = True
-        logger.info("[Session] 夜晚自动睡觉已下发: %s", (result or {}).get("message", "sleep sent"))
-        return True
-
-    @staticmethod
-    def _is_bed_poi(poi: dict) -> bool:
-        """recorded POI 是否是床（category=bed，或方块 id 是 *_bed / bed）。"""
-        if str(poi.get("category") or "").strip().lower() == "bed":
-            return True
-        local = str(poi.get("id") or poi.get("block_id") or "").strip().lower().rsplit(":", 1)[-1]
-        return local == "bed" or local.endswith("_bed")
-
-    @classmethod
-    def _has_known_bed(cls, runtime: dict) -> bool:
-        """视野附近有床，或持久记忆里有床 → 才值得尝试 sleep。"""
-        if runtime.get("nearby_beds"):
-            return True
-        for poi in runtime.get("remembered_pois") or []:
-            if isinstance(poi, dict) and cls._is_bed_poi(poi):
-                return True
-        return False
 
     def stop(self):
         """Gracefully stop the session."""

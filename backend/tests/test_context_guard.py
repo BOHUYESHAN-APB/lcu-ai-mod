@@ -4,14 +4,13 @@
   1. 技能层真要发出去的 wire 帧（参数名写错 Java 只会落进 default，静默不生效）；
   2. 有没有/怎么把"最近发话者 + 他发言那一刻的坐标 + 近期聊天"喂给 LLM 与仪表盘；
   3. `/locate` 的回复解析（成功/找不到/超时）与"绝不编坐标"的诚实回报；
-  4. 吃/饱食度：缺血先吃、选食物按饱和度/营养值分档。
+  4. 进食闸门（BackendEatYield）：让路本地反射 / 退避 / 失败冷却。
 """
 
 import json
 import unittest
 
-from agent.modes_engine import (AutoEatMode, FOOD_PROPERTIES, HARMFUL_FOOD,
-                                RAW_FOOD, select_food)
+from agent.modes_engine import EatYield
 from agent.planner import (GUARD_DEFAULT_RADIUS, Planner, is_locate_failure,
                            looks_like_locate_reply, normalize_locate_name,
                            parse_locate_reply)
@@ -582,103 +581,92 @@ class ContextPromptTests(unittest.TestCase):
 
 # ── 6. 吃 / 饱食度 ──────────────────────────────────────────────
 
-class AutoEatTests(unittest.TestCase):
-    def _state(self, **player):
-        base = {"health": 20, "max_health": 20, "hunger": 20}
-        base.update(player)
-        return {"player": base}
+class EatYieldTests(unittest.TestCase):
+    """BackendEatYield：`eat` 工具的让路 / 退避 / 冷却闸门（原 AutoEatMode 的三条约束）。"""
 
-    def _skills(self):
-        skills = DummySkills()
-        skills.select_hotbar = lambda index: skills.calls.append(("select_hotbar", index))
-        skills.use_item = lambda: skills.calls.append(("use_item",))
-        skills.eat = lambda: skills.calls.append(("eat",)) or {
-            "success": True, "message": "eat sent", "req_id": "req_eat"}
-        return skills
+    class _Manager:
+        def __init__(self, backed_off=False, outcome=None):
+            self.backed_off = backed_off
+            self.outcome = outcome
 
-    def test_hurt_with_unsaturated_hunger_triggers_eat(self):
-        """用户口径：健康不满就叫到饱食度 18+，不是只看到 14 才吃。"""
-        mode = AutoEatMode()
+        def is_backed_off(self, name):
+            return self.backed_off and name == "eat"
 
-        self.assertTrue(mode.should_activate(self._state(health=16, hunger=16)))
+        def outcome_since(self, name, since):
+            return self.outcome
 
-    def test_full_health_with_hunger_16_does_not_trigger(self):
-        mode = AutoEatMode()
+    def test_reflex_eat_makes_the_backend_yield(self):
+        allowed, note = EatYield().allow({"reflex_eat": True})
 
-        self.assertFalse(mode.should_activate(self._state(health=20, hunger=16)))
+        self.assertFalse(allowed)
+        self.assertIn("不抢", note)
 
-    def test_plain_hunger_still_triggers_at_14(self):
-        mode = AutoEatMode()
+    def test_backoff_window_blocks_the_dispatch(self):
+        guard = EatYield(self._Manager(backed_off=True))
 
-        self.assertTrue(mode.should_activate(self._state(health=20, hunger=13)))
+        allowed, note = guard.allow({})
 
-    def test_unknown_player_state_does_not_trigger(self):
-        mode = AutoEatMode()
+        self.assertFalse(allowed)
+        self.assertIn("退避", note)
 
-        self.assertFalse(mode.should_activate({"player": {}}))
+    def test_pending_eat_is_not_redispatched(self):
+        guard = EatYield()
+        guard.mark_sent()
 
-    def test_hurt_prefers_highest_saturation(self):
-        food = select_food([
-            {"slot": 0, "name": "minecraft:cooked_beef"},    # 8 / 12.8
-            {"slot": 1, "name": "minecraft:golden_carrot"},  # 6 / 14.4（饱和度最高）
-        ], hurt=True)
+        allowed, note = guard.allow({})
 
-        self.assertEqual(food["slot"], 1)
+        self.assertFalse(allowed)
+        self.assertIn("还没回执", note)
 
-    def test_plain_hunger_prefers_highest_nutrition(self):
-        food = select_food([
-            {"slot": 0, "name": "minecraft:cooked_beef"},    # 8 / 12.8
-            {"slot": 1, "name": "minecraft:rabbit_stew"},    # 10 / 12.0（营养最高）
-        ], hurt=False)
+    def test_failure_starts_cooldown_and_writes_task_state(self):
+        manager = self._Manager(outcome={"success": False, "error": "eat failed"})
+        guard = EatYield(manager)
+        guard.mark_sent()
+        state = {}
 
-        self.assertEqual(food["slot"], 1)
+        guard.absorb(state)
+        allowed, note = guard.allow(state)
 
-    def test_harmful_food_is_never_eaten(self):
-        for name in ("minecraft:rotten_flesh", "minecraft:pufferfish", "minecraft:spider_eye"):
-            self.assertIn(name, HARMFUL_FOOD)
-            self.assertIsNone(select_food([{"slot": 0, "name": name}], hurt=True))
+        self.assertFalse(allowed)
+        self.assertIn("冷却", note)
+        self.assertEqual(state["task_state"]["kind"], "eat")
+        self.assertEqual(state["task_state"]["status"], "failed")
+        self.assertEqual(state["task_state"]["source"], "eat_yield")
 
-    def test_raw_food_is_only_a_fallback(self):
-        self.assertIsNone(select_food([{"slot": 0, "name": "minecraft:unknown_stew"}], hurt=True))
+    def test_timeout_counts_as_failure(self):
+        guard = EatYield()               # 没有 action_manager → 只能靠超时
+        guard.mark_sent()
+        guard._pending_at -= (EatYield.EAT_TIMEOUT + 1.0)
+        state = {}
 
-        raw_only = select_food([{"slot": 3, "name": "minecraft:beef"}], hurt=True)
-        self.assertEqual(raw_only["slot"], 3)
-        self.assertIn("minecraft:beef", RAW_FOOD)
+        guard.absorb(state)
 
-        both = select_food([
-            {"slot": 3, "name": "minecraft:beef"},
-            {"slot": 4, "name": "minecraft:bread"},
-        ], hurt=True)
-        self.assertEqual(both["slot"], 4)
+        self.assertEqual(state["task_state"]["status"], "failed")
 
-    def test_tick_dispatches_eat_to_java(self):
-        mode = AutoEatMode()
-        skills = self._skills()
-        state = self._state(health=12, hunger=16)
-        state["inventory"] = [{"slot": 2, "name": "minecraft:golden_carrot"}]
+    def test_success_clears_the_cooldown(self):
+        manager = self._Manager(outcome={"success": True})
+        guard = EatYield(manager)
+        guard.mark_sent()
 
-        message = mode.tick(skills, state)
+        guard.absorb({})
 
-        # Java 新 `eat` 自己选格子 + 按住右键直到生效 → Python 不再 select_hotbar/use_item。
-        self.assertEqual(skills.calls, [("eat",)])
-        self.assertIn("saturation-first", message)
+        allowed, _ = guard.allow({})
+        self.assertTrue(allowed)
 
-    def test_tick_ignores_food_in_backpack(self):
-        mode = AutoEatMode()
-        skills = self._skills()
-        state = self._state(health=12, hunger=16)
-        state["inventory"] = [{"slot": 12, "name": "minecraft:golden_carrot"}]
+    def test_eat_tool_is_routed_through_the_yield_guard(self):
+        """`eat` 工具下发前必须过闸门：反射在吃时一帧都不发。"""
+        calls = []
 
-        message = mode.tick(skills, state)
+        class Skills:
+            def eat(self):
+                calls.append("eat")
 
-        self.assertEqual(skills.calls, [])
-        self.assertEqual(message, "auto_eat: no food in hotbar")
+        planner = Planner(llm_service=None, memory=DummyMemory(), skills=Skills())
+        handled = planner._dispatch_tool_call("eat", {}, {"reflex_eat": True})
 
-    def test_food_table_holds_vanilla_values(self):
-        # 抽查几个原版数值，防止表被改成"看起来差不多"的猜测值。
-        self.assertEqual(FOOD_PROPERTIES["minecraft:golden_carrot"], (6, 14.4))
-        self.assertEqual(FOOD_PROPERTIES["minecraft:cooked_beef"], (8, 12.8))
-        self.assertEqual(FOOD_PROPERTIES["minecraft:bread"], (5, 6.0))
+        self.assertFalse(handled)
+        self.assertEqual(calls, [], "本地反射在吃时后端不许抢")
+        self.assertIn("不抢", planner._action_note)
 
 
 # ── 7. /api/status 的新字段 ─────────────────────────────────────

@@ -64,117 +64,17 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(status["planner"]["last_decision"]["confidence"], 0.8)
 
 
-class _FakeSkills:
-    def __init__(self):
-        self.slept = 0
+class NightAutoTriggerRemovedTests(unittest.TestCase):
+    """自主开关已删除：夜晚自动睡觉这条**自动触发**不再存在（用户口径：后台不许有自动触发）。"""
 
-    def command_context(self, _name):
-        import contextlib
-        return contextlib.nullcontext()
+    def test_auto_sleep_hook_is_gone(self):
+        self.assertFalse(hasattr(Session, "_maybe_auto_sleep"))
+        self.assertFalse(hasattr(Session, "AUTO_SLEEP_COOLDOWN"))
+        self.assertFalse(hasattr(Session, "_has_known_bed"))
 
-    def sleep_in_bed(self):
-        self.slept += 1
-        return {"success": True, "message": "sleep sent"}
-
-
-class NightAutoSleepTests(unittest.TestCase):
-    """夜晚自动睡觉：状态门 + 限频（注入假时间/假状态，无网络无时钟依赖）。"""
-
-    NIGHT_WITH_BED = {
-        "is_night": True,
-        "sky_darken": 8,
-        "can_sleep": True,
-        "nearby_beds": [{"id": "minecraft:red_bed", "x": 3, "y": 64, "z": 5, "distance": 2.5}],
-    }
-
-    def _session(self, runtime, enabled=True):
-        session = Session.__new__(Session)
-        session.runtime = runtime
-        session.skills = _FakeSkills()
-        session._last_auto_sleep = 0.0
-        session._auto_sleep_sent = False
-        session._night_auto_sleep_provider = lambda: enabled
-        return session
-
-    def test_sleeps_once_per_night(self):
-        session = self._session(dict(self.NIGHT_WITH_BED))
-
-        self.assertTrue(Session._maybe_auto_sleep(session, True, True, False, now=1000.0))
-        # 同一夜不重复下发，即使已经过了冷却。
-        self.assertFalse(Session._maybe_auto_sleep(session, True, True, False, now=5000.0))
-        self.assertEqual(session.skills.slept, 1)
-
-    def test_day_resets_so_next_night_sleeps_again(self):
-        session = self._session(dict(self.NIGHT_WITH_BED))
-        Session._maybe_auto_sleep(session, True, True, False, now=1000.0)
-
-        session.runtime["is_night"] = False
-        self.assertFalse(Session._maybe_auto_sleep(session, True, True, False, now=1100.0))
-
-        session.runtime["is_night"] = True
-        self.assertTrue(Session._maybe_auto_sleep(session, True, True, False, now=2000.0))
-        self.assertEqual(session.skills.slept, 2)
-
-    def test_cooldown_blocks_immediate_retry(self):
-        session = self._session(dict(self.NIGHT_WITH_BED))
-        Session._maybe_auto_sleep(session, True, True, False, now=1000.0)
-        session._auto_sleep_sent = False  # 模拟状态被重新允许
-
-        self.assertFalse(Session._maybe_auto_sleep(session, True, True, False, now=1030.0),
-                         "冷却内不得重发")
-        self.assertTrue(Session._maybe_auto_sleep(session, True, True, False, now=1070.0))
-        self.assertEqual(session.skills.slept, 2)
-
-    def test_no_sleep_when_disabled_or_busy_or_day(self):
-        session = self._session(dict(self.NIGHT_WITH_BED), enabled=False)
-        self.assertFalse(Session._maybe_auto_sleep(session, True, True, False, now=1000.0))
-
-        session = self._session(dict(self.NIGHT_WITH_BED))
-        self.assertFalse(Session._maybe_auto_sleep(session, False, True, False, now=1000.0),
-                         "自主关闭时不动")
-        self.assertFalse(Session._maybe_auto_sleep(session, True, False, False, now=1000.0),
-                         "非 idle 不动")
-        self.assertFalse(Session._maybe_auto_sleep(session, True, True, True, now=1000.0),
-                         "有活跃任务不动")
-
-        day = self._session({"is_night": False, "can_sleep": True,
-                             "nearby_beds": self.NIGHT_WITH_BED["nearby_beds"]})
-        self.assertFalse(Session._maybe_auto_sleep(day, True, True, False, now=1000.0))
-
-        self.assertEqual(session.skills.slept, 0)
-        self.assertEqual(day.skills.slept, 0)
-
-    def test_no_sleep_when_cannot_sleep_yet(self):
-        runtime = dict(self.NIGHT_WITH_BED)
-        runtime["can_sleep"] = False
-        session = self._session(runtime)
-
-        self.assertFalse(Session._maybe_auto_sleep(session, True, True, False, now=1000.0))
-        self.assertEqual(session.skills.slept, 0)
-
-    def test_no_sleep_without_any_known_bed(self):
-        runtime = dict(self.NIGHT_WITH_BED)
-        runtime["nearby_beds"] = []
-        session = self._session(runtime)
-
-        self.assertFalse(Session._maybe_auto_sleep(session, True, True, False, now=1000.0),
-                         "附近和记忆里都没床 → 不空转")
-
-        runtime["remembered_pois"] = [{"name": "bed1", "category": "bed",
-                                       "x": 100, "y": 64, "z": 100}]
-        self.assertTrue(Session._maybe_auto_sleep(session, True, True, False, now=2000.0))
-        self.assertEqual(session.skills.slept, 1)
-
-    def test_bed_detection_by_id_does_not_match_bedrock(self):
-        self.assertTrue(Session._is_bed_poi({"id": "minecraft:white_bed"}))
-        self.assertTrue(Session._is_bed_poi({"category": "bed", "id": "whatever"}))
-        self.assertFalse(Session._is_bed_poi({"id": "minecraft:bedrock"}))
-        self.assertFalse(Session._is_bed_poi({"id": "minecraft:chest"}))
-
-    def test_has_known_bed_reads_remembered_pois(self):
-        self.assertTrue(Session._has_known_bed(
-            {"remembered_pois": [{"id": "minecraft:black_bed"}]}))
-        self.assertFalse(Session._has_known_bed({"remembered_pois": [{"id": "minecraft:chest"}]}))
+    def test_session_init_has_no_auto_sleep_bookkeeping(self):
+        self.assertFalse(hasattr(Session, "_auto_sleep_sent"))
+        self.assertFalse(hasattr(Session, "_night_auto_sleep_provider"))
 
 
 if __name__ == "__main__":

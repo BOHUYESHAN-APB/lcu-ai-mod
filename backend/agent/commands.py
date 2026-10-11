@@ -258,8 +258,8 @@ class Commands:
     def _act_craft(self, args: list[str], state: dict):
         """!craft [recipe_name] [count]
 
-        自主路的 `!craft`：先过授权（autonomy_craft），再按**自己背包**的材料评估 ——
-        缺料就什么都不做（自主时不许翻箱，用户口径："自己想造时优先只用背包里的材料"）。
+        控制台路的 `!craft`：先过授权（craft 能力表），再按**自己背包**的材料评估 ——
+        缺料就什么都不做（没人指挥时不许翻箱，用户口径："自己想造时优先只用背包里的材料"）。
         """
         if args:
             count = int(args[1]) if len(args) > 1 and args[1].isdigit() else 1

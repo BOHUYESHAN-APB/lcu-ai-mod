@@ -410,13 +410,6 @@ textarea{width:100%;min-height:68px;resize:vertical;background:#0d1117;border:1p
         <input type="number" id="patrolRadius" value="8" min="1" max="32">
       </div>
       <div class="form-row">
-        <label>夜晚自动睡觉</label>
-        <select id="nightAutoSleep">
-          <option value="true">是</option>
-          <option value="false">否</option>
-        </select>
-      </div>
-      <div class="form-row">
         <label>能力层级</label>
         <select id="capabilityLevel">
           <option value="1">L1 纯文本单模型（默认：不抓屏、不传图片）</option>
@@ -1144,7 +1137,6 @@ function savePermissionConfig() {
   const config = {
     patrol_radius: parseInt(document.getElementById('patrolRadius').value) || 8,
     capability_level: parseInt(document.getElementById('capabilityLevel').value) || 1,
-    night_auto_sleep: document.getElementById('nightAutoSleep').value === 'true',
     decision: {
       confidence_threshold: isNaN(thresholdRaw) ? 0.6 : thresholdRaw,
       semantic_gate: document.getElementById('semanticGate').value === 'true'
@@ -1188,7 +1180,6 @@ function loadPermissionConfig() {
   fetch('/api/config').then(r=>r.json()).then(cfg=>{
     document.getElementById('patrolRadius').value = cfg.patrol_radius || 8;
     document.getElementById('capabilityLevel').value = String(cfg.capability_level || 1);
-    document.getElementById('nightAutoSleep').value = String(cfg.night_auto_sleep !== false);
     const decision = cfg.decision || {};
     const threshold = decision.confidence_threshold;
     document.getElementById('confidenceThreshold').value = threshold !== undefined ? threshold : 0.6;

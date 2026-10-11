@@ -1,0 +1,298 @@
+"""Tool Registry —— 工具定义的**唯一事实来源**。
+
+用户口径：「工具只好建立为标准」（工具要有标准、要成为唯一事实来源）。本模块把
+每条工具的所有属性收在一处：
+
+    name / description / parameters(JSON Schema) / groups / phase 过滤 /
+    permission（tier 门 + 是否需要区域/容器/指令授权）/ handler（指向现有技能函数）
+
+- L3 工具表（OpenAI `tools` 形状）由 `build_tool_schemas(phase)` 从这里生成，
+  `planner` 只做转发，绝不另维护一份；
+- 阶段过滤（`idle` / `craft` / `gather` / `travel` / `survive`）逐字沿用旧 `PHASE_GROUPS`
+  的行为——注入哪些组、组内顺序、按名去重，全部不变；
+- 派发前由注册表驱动做一次统一授权（`planner._authorize_tool`），不再散在各 handler。
+
+背景：旧代码把工具清单拆在 `planner.ACTION_GROUPS`（分组动作表）与 `build_tool_schemas`
+两处，另有一套 `PHASE_GROUPS` 阶段映射；新增一条工具要改多处、容易漏。这里全部收敛。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+# ── 参数名 → JSON Schema 类型 ────────────────────────────────
+# 工具参数都可有默认值，故 `required` 一律留空；类型按参数名约定推断。
+_NUMERIC_TOOL_ARGS = frozenset({"x", "y", "z", "radius", "limit", "count", "index",
+                                "from_slot", "to_slot", "slot"})
+_BOOLEAN_TOOL_ARGS = frozenset({"remember"})
+# 数组参数：`run_server_command` 的 `args`（指令参数表，元素是字符串）。
+_ARRAY_TOOL_ARGS = frozenset({"args"})
+
+
+def tool_schema(args: str) -> dict:
+    """把 `"x,y,z"` 这样的参数名串渲染成 JSON Schema 的 properties。"""
+    properties: dict[str, dict] = {}
+    for raw in str(args or "").split(","):
+        name = raw.strip()
+        if not name:
+            continue
+        if name in _NUMERIC_TOOL_ARGS:
+            properties[name] = {"type": "number"}
+        elif name in _BOOLEAN_TOOL_ARGS:
+            properties[name] = {"type": "boolean"}
+        elif name in _ARRAY_TOOL_ARGS:
+            properties[name] = {"type": "array", "items": {"type": "string"}}
+        else:
+            properties[name] = {"type": "string"}
+    return properties
+
+
+# ── 权限门（注册表字段）──────────────────────────────────────
+# 「后台只留授权与偏好」——权限门本身是**授权**（谁能让它做什么），必须保留。
+# 每条工具的权限用这个描述符声明，派发前由 `planner._authorize_tool` **统一**执行；
+# 不再散落在各 handler 里各写各的 tier 判断。
+@dataclass(frozen=True)
+class ToolPermission:
+    """一条工具的授权要求（`planner` 统一校验用；空描述符＝无额外门）。
+
+    tier       : 需要的 tier 能力键（"" 表示无额外 tier 门）——
+                 craft→`PermissionsStore.can_craft`、territory→`can_authorize_territory`、
+                 zones→`can_define_zones`、containers→`can_authorize_containers`。
+    container  : 派发前统一走容器访问授权（箱子的 free/borrow_only/no_touch 策略 + 借用规则）。
+    command    : 走服务器指令白名单闸门（判定在 handler 内，因为需要白名单内容）。
+    borrow     : 走借用台账（借用规则 + 数量上限 + 归还）。
+    area       : 动手范围受领地/区域授权约束（handler 用 `may_act` 逐点判定）。
+    deny_label : 被拒时如实说明里用的动作名（"把一片地的所有权交给我" 这类）。
+    note       : 人读说明（进 TOOLS.md）。
+    """
+
+    tier: str = ""
+    container: bool = False
+    command: bool = False
+    borrow: bool = False
+    area: bool = False
+    deny_label: str = ""
+    note: str = ""
+
+
+_NO_PERM = ToolPermission()
+
+
+# ── 工具定义 ─────────────────────────────────────────────────
+@dataclass(frozen=True)
+class ToolSpec:
+    """一条工具的全部定义（唯一事实来源）。"""
+    name: str
+    description: str
+    args: str                                  # 参数名串（"x,y,z"，渲染成 JSON Schema）
+    groups: tuple[str, ...]                    # 属于哪些动作组（用于阶段过滤）
+    handler: str                               # Planner 上的派发方法名
+    permission: ToolPermission = _NO_PERM
+
+    def parameters(self) -> dict[str, Any]:
+        """OpenAI `tools` 形状里的 parameters 对象。"""
+        return {"type": "object", "properties": tool_schema(self.args), "required": []}
+
+    def schema(self) -> dict:
+        """本条工具的 OpenAI function schema。"""
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.parameters(),
+            },
+        }
+
+
+# 顺序即动作组内顺序：**逐字沿用**旧 `ACTION_GROUPS` 的组序与组内序，
+# 保证阶段过滤后的工具序列（进而 `build_tool_schemas` 的输出）与旧行为逐字节一致。
+TOOL_SPECS: tuple[ToolSpec, ...] = (
+    # ── move ──
+    ToolSpec("move_to", "移动到坐标", "x,y,z", ("move",), "_tool_move_to"),
+    ToolSpec("follow", "跟随玩家", "player", ("move",), "_tool_follow"),
+    ToolSpec("explore", "探索半径", "radius", ("move",), "_tool_explore"),
+    ToolSpec("stop", "停止动作", "", ("move",), "_tool_stop"),
+    # ── locate ──
+    ToolSpec("find_block", "扫附近有无该方块（只查不走）", "block,radius,limit",
+             ("locate",), "_tool_find_block"),
+    ToolSpec("go_to_block", "寻路过去，到达后记住", "block,radius,remember",
+             ("locate",), "_tool_go_to_block"),
+    ToolSpec("locate_structure", "/locate 查结构/群系（kind=structure|biome）", "name,kind",
+             ("locate",), "_tool_locate_structure"),
+    # ── gather ──
+    ToolSpec("mine_block", "挖面前方块", "", ("gather",), "_tool_mine_block",
+             ToolPermission(area=True, note="就近动手；受区域硬保护约束")),
+    ToolSpec("collect_blocks", "采集方块", "block_type,count", ("gather",),
+             "_tool_collect_blocks", ToolPermission(area=True, note="就近采集")),
+    ToolSpec("drop_item", "丢弃物品", "item,count", ("gather",), "_tool_drop_item"),
+    ToolSpec("sort_inventory", "整理背包", "", ("gather",), "_tool_sort_inventory"),
+    ToolSpec("get_inventory", "查看背包", "", ("gather",), "_tool_get_inventory"),
+    # ── craft ──
+    ToolSpec("craft_item", "合成物品", "item,count", ("craft",), "_tool_craft_item",
+             ToolPermission(tier="craft", deny_label="造东西",
+                            note="须被授权（craft 能力表）；缺料先只用背包，未授权不开箱")),
+    ToolSpec("craft_via_recipe", "原版配方合成（先看背包材料）", "item,count", ("craft",),
+             "_tool_craft_via_recipe",
+             ToolPermission(tier="craft", deny_label="造东西",
+                            note="同一道授权门；材料优先用自己背包")),
+    ToolSpec("place_block", "放置手中方块", "", ("craft",), "_tool_place_block",
+             ToolPermission(area=True, note="就近放置；受区域硬保护约束")),
+    ToolSpec("build", "建造结构", "x,y,z,structure", ("craft",), "_tool_build",
+             ToolPermission(area=True, note="在坐标处建造")),
+    # ── container ──
+    ToolSpec("container_move", "容器内移物（省 to_slot＝背包↔快捷栏）",
+             "from_slot,to_slot,count", ("container",), "_dispatch_container_move",
+             ToolPermission(container=True, deny_label="翻箱子",
+                            note="须获授权；no_touch 不碰、free 随取、其余走借用；用多少取多少")),
+    ToolSpec("container_click", "点容器一格（pickup|quick_move|swap|throw）",
+             "slot,click_type", ("container",), "_dispatch_container_click",
+             ToolPermission(container=True, deny_label="翻箱子",
+                            note="同容器访问授权；no_touch 不碰")),
+    ToolSpec("container_close", "关掉容器界面", "", ("container",), "_tool_container_close"),
+    ToolSpec("borrow_item", "从仓库借（须授权；不给 count＝整箱搬，拒绝）",
+             "item,count,container", ("container",), "_dispatch_borrow_item",
+             ToolPermission(container=True, borrow=True, deny_label="翻箱子",
+                            note="容器授权 + 借用规则；上限 min(256, 需求×2)；拒绝整箱搬")),
+    ToolSpec("return_item", "放回原容器（省 count＝全部剩余）", "item,count,container",
+             ("container",), "_dispatch_return_item",
+             ToolPermission(borrow=True,
+                            note="归还借用台账里的物品并核对；需翻箱授权")),
+    # ── farm ──
+    ToolSpec("haul", "在容器之间搬运（from/to＝已记住的容器名或 self；"
+                     "省 item＝搬全部可搬的；单趟≤256、源箱留底不搬空、两侧对账，卡住就报在哪一步）",
+             "from,to,item,count", ("farm",), "_dispatch_haul",
+             ToolPermission(note="no_touch 不碰、borrow_only 只借不搬；单趟≤256、源箱留底")),
+    ToolSpec("farm", "在授权农田里干活（action=till锄地|plant播种|harvest收割|replant补种；"
+                     "全走右键/挖，缺种子或锄头如实报）", "plot,action", ("farm",), "_dispatch_farm",
+             ToolPermission(area=True, deny_label="种田",
+                            note="只在已授权农田动手；保护区里的作物不碰")),
+    # ── combat ──
+    ToolSpec("attack", "攻击附近敌人", "", ("combat",), "_tool_attack"),
+    # ── items ──
+    ToolSpec("equip_armor", "穿背包里的盔甲（没有就去容器找）", "", ("items",),
+             "_tool_equip_armor",
+             ToolPermission(note="背包没有时按翻箱授权（may_open_containers）去已知容器找")),
+    ToolSpec("equip_weapon", "换上热栏里最好的武器", "", ("items",), "_tool_equip_weapon"),
+    ToolSpec("select_hotbar", "切到热栏第 index 格（0-8）", "index", ("items",),
+             "_tool_select_hotbar"),
+    # ── survive ──
+    ToolSpec("eat", "吃东西", "", ("survive",), "_tool_eat"),
+    ToolSpec("sleep", "睡觉", "", ("survive",), "_tool_sleep"),
+    ToolSpec("trade", "与村民交易", "villager_type", ("survive",), "_tool_trade"),
+    # ── night ──
+    ToolSpec("sleep_in_bed", "走到最近的床睡到天亮（只能夜里）", "", ("night",),
+             "_tool_sleep_in_bed"),
+    # ── guard ──
+    ToolSpec("guard", "水平半径内驻守（默认 32；省坐标＝最近发话者位置）",
+             "x,y,z,radius", ("guard",), "_dispatch_guard"),
+    ToolSpec("guard_off", "取消驻守", "", ("guard",), "_tool_guard_off"),
+    # ── hud ──
+    ToolSpec("set_hud_note", "把当前打算写进 HUD 描述词", "text", ("hud",),
+             "_tool_set_hud_note"),
+    # ── server ──
+    ToolSpec("run_server_command", "下一条原版指令（须已在白名单勾选；未勾选/黑名单一律不发）",
+             "command,args,confirm", ("server",), "_tool_run_server_command",
+             ToolPermission(command=True, deny_label="下服务器指令",
+                            note="须白名单勾选；黑名单/未确认一律不发")),
+    ToolSpec("send_whisper", "给某人发私信；用了它 reply 请留空", "player,text", ("server",),
+             "_tool_send_whisper", ToolPermission(note="私信走 outbound 清洗")),
+    ToolSpec("tpa_respond", "回应传送请求：action=accept|deny", "action,player", ("server",),
+             "_tool_tpa_respond", ToolPermission(note="按 TPA 分层策略回应")),
+    ToolSpec("tpa_request", "主动请求传送到某人（默认只有主人可以）", "player", ("server",),
+             "_tool_tpa_request", ToolPermission(note="TPA 策略决定谁能主动发起")),
+    # ── memory ──
+    ToolSpec("remember_poi", "记住当前位置", "name,category,x,y,z", ("memory",),
+             "_tool_remember_poi"),
+    # ── territory ──
+    ToolSpec("list_territory", "列出领地/基地/容器及其授权与保护项", "", ("territory",),
+             "_tool_list_territory"),
+    ToolSpec("grant_territory", "把这片区域的所有权授予我（master；grants=take,place,break,farm,store）",
+             "name,kind,radius,grants", ("territory",), "_dispatch_grant_territory",
+             ToolPermission(tier="territory", area=True, deny_label="把一片地的所有权交给我",
+                            note="只有 master 能授予区域所有权")),
+    ToolSpec("revoke_territory", "收回领地的所有权", "name", ("territory",),
+             "_dispatch_revoke_territory",
+             ToolPermission(tier="territory", deny_label="收回领地授权", note="master-only")),
+    ToolSpec("set_base", "设/更新一个基地（省坐标＝脚下）", "name,kind,radius,x,y,z",
+             ("territory",), "_dispatch_set_base",
+             ToolPermission(tier="territory", deny_label="设基地", note="master-only")),
+    ToolSpec("del_base", "删掉一个基地", "name", ("territory",), "_dispatch_del_base",
+             ToolPermission(tier="territory", deny_label="删基地", note="master-only")),
+    ToolSpec("remember_container", "记住箱子的确切位置与策略（free随取|borrow_only传递|no_touch不碰）",
+             "name,x,y,z,kind,policy", ("territory",), "_dispatch_remember_container",
+             ToolPermission(note="master 任意；friend 只能标自己的、且只到传递权（container_grant_policy）")),
+    ToolSpec("grant_container", "给箱子设/改访问策略（friend 只能给自己的，且只到传递）",
+             "name,policy", ("territory",), "_dispatch_grant_container",
+             ToolPermission(note="master 任意；friend 只能标自己的、且只到传递权（container_grant_policy）")),
+    ToolSpec("revoke_container", "收回箱子的访问授权（立即生效）", "name", ("territory",),
+             "_dispatch_revoke_container",
+             ToolPermission(note="master 任意；friend 只能收回自己的（can_authorize_containers + owner）")),
+    ToolSpec("define_zone", "声明区域语义与硬保护（protect=animals,crops,blocks,containers）",
+             "name,kind,x,y,z,radius,protect", ("territory",), "_dispatch_define_zone",
+             ToolPermission(tier="zones", area=True, deny_label="声明区域保护", note="master-only")),
+    ToolSpec("clear_zone", "删掉一个区域", "name", ("territory",), "_dispatch_clear_zone",
+             ToolPermission(tier="zones", deny_label="删除区域保护", note="master-only")),
+    ToolSpec("set_home", "在基地范围内自己找床；找不到就自己造（缺料/不安全如实报）",
+             "base", ("territory",), "_dispatch_set_home"),
+    ToolSpec("go_home", "回基地的床位（没床就回锚点）", "base", ("territory",), "_dispatch_go_home"),
+)
+
+# name → 规格（派发查表用）。
+TOOL_BY_NAME: dict[str, ToolSpec] = {spec.name: spec for spec in TOOL_SPECS}
+
+# ── 阶段 → 注入哪些组（顺序即 prompt 中的展示顺序）──────────────
+# night / guard / hud / memory 全局注入：睡觉、守点、HUD 描述词与记忆点在任何阶段
+# 都可能有意义（用户说"在这儿守着"时他可能正在看着 AI 挖矿）。
+PHASE_GROUPS: dict[str, tuple[str, ...]] = {
+    "idle": ("move", "locate", "gather", "craft", "container", "farm", "guard", "items",
+             "survive", "combat", "hud", "night", "server", "memory", "territory"),
+    "travel": ("move", "locate", "combat", "guard", "items", "container", "farm", "survive",
+               "hud", "night", "server", "memory", "territory"),
+    "gather": ("move", "locate", "gather", "guard", "items", "craft", "container", "farm",
+               "hud", "night", "server", "memory", "territory"),
+    "craft": ("move", "locate", "craft", "container", "farm", "guard", "items", "gather",
+              "hud", "night", "server", "memory", "territory"),
+    "survive": ("survive", "hud", "night", "server", "memory", "guard", "farm", "items",
+                "move", "locate", "territory"),
+}
+
+
+def _group_actions() -> dict[str, tuple[tuple[str, str, str], ...]]:
+    """从 `TOOL_SPECS` 生成分组动作表（组序、组内序沿用注册表顺序）。"""
+    grouped: dict[str, list[tuple[str, str, str]]] = {}
+    for spec in TOOL_SPECS:
+        for group in spec.groups:
+            grouped.setdefault(group, []).append((spec.name, spec.args, spec.description))
+    return {group: tuple(actions) for group, actions in grouped.items()}
+
+
+# ACTION_GROUPS：旧接口保留（测试与预览用），但**由注册表生成**，不再是第二份手写表。
+ACTION_GROUPS: dict[str, tuple[tuple[str, str, str], ...]] = _group_actions()
+
+
+def _actions_for_phase(phase: str) -> list[tuple[str, str, str]]:
+    """当前阶段该注入的动作（去重、保持顺序）。行为与旧实现逐字一致。"""
+    groups = PHASE_GROUPS.get(phase, PHASE_GROUPS["idle"])
+    seen: set[str] = set()
+    out: list[tuple[str, str, str]] = []
+    for group in groups:
+        for action in ACTION_GROUPS.get(group, ()):
+            if action[0] not in seen:
+                seen.add(action[0])
+                out.append(action)
+    return out
+
+
+def specs_for_phase(phase: str) -> list[ToolSpec]:
+    """当前阶段该注入的工具规格（顺序稳定、按名去重）。"""
+    return [TOOL_BY_NAME[name] for name, _, _ in _actions_for_phase(phase)]
+
+
+def build_tool_schemas(phase: str = "idle") -> list[dict]:
+    """L3：当前阶段该有的工具定义（OpenAI tools 格式）——由注册表生成。
+
+    工具走 API `tools` 参数，**不内联进提示词**；阶段过滤沿用 `PHASE_GROUPS`。
+    """
+    return [spec.schema() for spec in specs_for_phase(phase)]

@@ -2,7 +2,7 @@
 
 用户口径（本文件的验收对象）：
   - 造东西只有**被允许**才能造；翻箱子要**另外**授权；
-  - 无人指挥（自主/事件）时默认**不许自造**（`autonomy_craft=false`）；
+  - **没有自主开关**：没人指挥的轮次按 guest 处理（默认不许自造）；
   - 自己想造时**优先只用背包里的材料**；
   - 被授权翻箱时**用多少取多少**（不搬空）。
 
@@ -19,7 +19,7 @@ from agent.craft import (ARMOR_SLOT_ORDER, RECIPES, SLOT_ARMOR_END, SLOT_ARMOR_S
                          SLOT_HOTBAR_START, SLOT_OFFHAND, armor_in_containers, clamp_take,
                          describe_missing, evaluate_craft, inventory_counts, is_armor,
                          normalize_item, route_containers)
-from agent.permissions import (CONTAINER_AUTHORITY, CRAFT_AUTHORITY, DEFAULT_AUTONOMY_CRAFT,
+from agent.permissions import (CONTAINER_AUTHORITY, CRAFT_AUTHORITY,
                                TIER_FRIEND, TIER_GUEST, TIER_MASTER, CraftPolicy,
                                PermissionsStore)
 
@@ -32,10 +32,10 @@ class _StoreBase(unittest.TestCase):
         self.store = PermissionsStore(self.path)
 
 
-# ── 1. 能力位（craft / containers / autonomy_craft）────────────────
+# ── 1. 能力位（craft / containers）────────────────────────────────
 
 class CapabilityTableTests(_StoreBase):
-    def test_defaults_are_deny_for_guest_and_autonomy_off(self):
+    def test_defaults_are_deny_for_guest(self):
         craft = self.store.craft_authority()
         containers = self.store.container_authority()
         self.assertTrue(craft[TIER_MASTER])
@@ -44,8 +44,6 @@ class CapabilityTableTests(_StoreBase):
         self.assertTrue(containers[TIER_MASTER])
         self.assertTrue(containers[TIER_FRIEND])
         self.assertFalse(containers[TIER_GUEST], "guest 默认不许授权翻箱")
-        self.assertFalse(self.store.autonomy_craft(), "autonomy_craft 默认必须是 false")
-        self.assertEqual(DEFAULT_AUTONOMY_CRAFT, False)
 
     def test_capability_defaults_are_exported_tables(self):
         self.assertEqual(CRAFT_AUTHORITY[TIER_GUEST], False)
@@ -55,7 +53,8 @@ class CapabilityTableTests(_StoreBase):
         data = self.store.get()
         self.assertIn("craft", data)
         self.assertIn("containers", data)
-        self.assertIn("autonomy_craft", data)
+        # 自主开关已被删除：权限表里不再有 autonomy_craft 这个键。
+        self.assertNotIn("autonomy_craft", data)
 
     def test_tier_policy_carries_capability_bits(self):
         master = self.store.policy(TIER_MASTER)
@@ -85,34 +84,26 @@ class CapabilityTableTests(_StoreBase):
         self.assertEqual(self.store.container_authority(), CONTAINER_AUTHORITY)
 
     def test_capability_survives_disk_roundtrip(self):
-        self.store.set({"craft": ["friend"], "autonomy_craft": True})
+        self.store.set({"craft": ["friend"]})
         reopened = PermissionsStore(self.path)
         self.assertFalse(reopened.can_craft(TIER_MASTER))
         self.assertTrue(reopened.can_craft(TIER_FRIEND))
-        self.assertTrue(reopened.autonomy_craft())
         on_disk = json.loads(self.path.read_text(encoding="utf-8"))
-        self.assertEqual(on_disk["autonomy_craft"], True)
-
-    def test_loose_boolean_for_autonomy_craft(self):
-        for value in ("是", True, 1, "on"):
-            self.store.set({"autonomy_craft": value})
-            self.assertTrue(self.store.autonomy_craft(), f"{value!r}")
-        self.store.set({"autonomy_craft": "谁知道"})
-        self.assertFalse(self.store.autonomy_craft())
+        self.assertNotIn("autonomy_craft", on_disk, "自主开关不再落盘")
+        self.assertEqual(on_disk["craft"][TIER_FRIEND], True)
 
 
 # ── 2. craft_policy：一次请求的授权结论 ────────────────────────────
 
 class CraftPolicyTests(_StoreBase):
-    def test_directed_master_may_craft_and_open_containers(self):
+    def test_master_may_craft_and_open_containers(self):
         policy = self.store.craft_policy(TIER_MASTER)
         self.assertIsInstance(policy, CraftPolicy)
         self.assertEqual(policy.tier, TIER_MASTER)
-        self.assertFalse(policy.autonomous)
         self.assertTrue(policy.may_craft)
         self.assertTrue(policy.may_open_containers)
 
-    def test_directed_guest_is_denied(self):
+    def test_guest_is_denied(self):
         policy = self.store.craft_policy(TIER_GUEST)
         self.assertFalse(policy.may_craft)
         self.assertFalse(policy.may_open_containers)
@@ -123,25 +114,13 @@ class CraftPolicyTests(_StoreBase):
         self.assertEqual(policy.tier, TIER_GUEST)
         self.assertFalse(policy.may_craft)
 
-    def test_autonomous_is_denied_by_default_and_never_opens_containers(self):
-        policy = self.store.craft_policy("", autonomous=True)
-        self.assertTrue(policy.autonomous)
+    def test_no_commander_is_treated_as_guest_and_never_opens_containers(self):
+        """没人指挥（传空 tier）→ 按 guest 处理：不许造、绝不许翻箱（没有自主开关）。"""
+        policy = self.store.craft_policy("")
+        self.assertEqual(policy.tier, TIER_GUEST)
         self.assertFalse(policy.may_craft)
-        self.assertEqual(policy.reason, "autonomy_craft_off")
+        self.assertEqual(policy.reason, "tier_not_allowed")
         self.assertFalse(policy.may_open_containers, "没人指挥时绝不许翻箱")
-
-    def test_autonomy_craft_on_allows_craft_but_still_no_containers(self):
-        self.store.set({"autonomy_craft": True})
-        policy = self.store.craft_policy(TIER_MASTER, autonomous=True)
-        self.assertTrue(policy.may_craft)
-        self.assertFalse(policy.may_open_containers,
-                         "自主自造也只能用背包里的材料，翻箱仍要人授权")
-
-    def test_autonomous_ignores_tier_authority(self):
-        """自主轮里就算 tier=master 也不算"被授权翻箱"—— 没有人下过令。"""
-        policy = self.store.craft_policy(TIER_MASTER, autonomous=True)
-        self.assertFalse(policy.may_open_containers)
-        self.assertFalse(policy.may_craft)  # autonomy_craft 默认关
 
 
 # ── 3. 库存优先：材料评估 ──────────────────────────────────────────

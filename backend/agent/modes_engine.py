@@ -5,15 +5,11 @@ Replicates TouhouLittleMaid's Brain/Activity architecture.
 Each mode is a behavioral pattern that activates based on conditions
 and executes real actions via the Skills layer.
 
-Priority levels:
+Priority levels (只剩**生存反射**；自主行为已改为注册表里的工具，由 LLM 决定用不用):
   0: SelfPreservation — fire, drowning, void
   1: SelfHeal — use healing items when health is low
   2: Cowardice — flee from hostiles when low health
   3: SelfDefense — attack nearby hostiles
-  4: AutoEat — eat food when hungry
-  5: ItemCollect — pick up nearby items
-  6: TorchPlace — place torches in dark areas
-  7: Hunting — hunt animals for food
 """
 
 import logging
@@ -144,103 +140,6 @@ class Mode(ABC):
 def _yaw_towards(px: float, pz: float, tx: float, tz: float) -> float:
     """从 (px,pz) 指向 (tx,tz) 的 Minecraft yaw（度）。"""
     return math.degrees(math.atan2(-(tx - px), (tz - pz)))
-
-
-# ── 食物（原版 FoodProperties：营养值 / 饱和度）──────────────────
-# Java 侧能直接读物品组件 `FoodProperties.nutrition()/saturation()`；Python 侧拿不到组件，
-# 所以照抄原版数据包的数值做成表 —— 这比"名字里带 meat 就算好"这类猜测可靠得多。
-#
-# 两个数管的是两件事（用户点名要搞清楚）：
-#   nutrition  = 饱食度（food level）补多少，决定"饿不饿"
-#   saturation = 饱和度（隐藏值），决定"能不能回血 / 扛多久"
-# 自然回血的条件是「饱食度 ≥18 且饱和度 >0」，所以：
-#   - 缺血（血量不满）→ 优先**高饱和度**（金胡萝卜/熟肉/面包），先让回血转起来；
-#   - 单纯饿（血量满）→ 优先**高营养**，先把饥饿条补满。
-FOOD_PROPERTIES: dict[str, tuple[int, float]] = {
-    "minecraft:golden_apple": (4, 9.6),
-    "minecraft:enchanted_golden_apple": (4, 9.6),
-    "minecraft:golden_carrot": (6, 14.4),
-    "minecraft:cooked_beef": (8, 12.8),
-    "minecraft:cooked_porkchop": (8, 12.8),
-    "minecraft:cooked_mutton": (6, 9.6),
-    "minecraft:cooked_salmon": (6, 9.6),
-    "minecraft:cooked_chicken": (6, 7.2),
-    "minecraft:cooked_rabbit": (5, 6.0),
-    "minecraft:cooked_cod": (5, 6.0),
-    "minecraft:rabbit_stew": (10, 12.0),
-    "minecraft:baked_potato": (5, 6.0),
-    "minecraft:bread": (5, 6.0),
-    "minecraft:pumpkin_pie": (8, 4.8),
-    "minecraft:mushroom_stew": (6, 7.2),
-    "minecraft:beetroot_soup": (6, 7.2),
-    "minecraft:suspicious_stew": (6, 7.2),
-    "minecraft:apple": (4, 2.4),
-    "minecraft:carrot": (3, 3.6),
-    "minecraft:melon_slice": (2, 1.2),
-    "minecraft:glow_berries": (2, 0.4),
-    "minecraft:sweet_berries": (2, 0.4),
-    "minecraft:cookie": (2, 0.4),
-    "minecraft:beetroot": (1, 1.2),
-    "minecraft:dried_kelp": (1, 0.6),
-    "minecraft:potato": (1, 0.6),
-    "minecraft:beef": (3, 1.8),
-    "minecraft:porkchop": (3, 1.8),
-    "minecraft:rabbit": (3, 1.8),
-    "minecraft:chicken": (2, 1.2),
-    "minecraft:mutton": (2, 1.2),
-    "minecraft:cod": (2, 0.4),
-    "minecraft:salmon": (2, 0.4),
-    "minecraft:tropical_fish": (1, 0.2),
-}
-
-# 有害/带负面效果的：**永不自吃**（腐肉是"能填饱但会饿回去"，吃了等于白吃）。
-HARMFUL_FOOD = {
-    "minecraft:rotten_flesh",
-    "minecraft:spider_eye",
-    "minecraft:poisonous_potato",
-    "minecraft:pufferfish",
-    "minecraft:chorus_fruit",
-}
-
-# 生食：能吃但收益差，只在没有更好的选择时兜底（与 Java 侧反射同一口径）。
-# 注意用**精确 id**，别用 "chicken" 子串 —— 会误伤熟鸡肉。
-RAW_FOOD = {
-    "minecraft:chicken",
-    "minecraft:beef",
-    "minecraft:porkchop",
-    "minecraft:mutton",
-    "minecraft:rabbit",
-    "minecraft:cod",
-    "minecraft:salmon",
-    "minecraft:tropical_fish",
-}
-
-
-def select_food(items, hurt: bool = False):
-    """从物品里挑最该吃的那一件，挑不出返回 None。
-
-    hurt=True（血量不满）→ 按**饱和度**优先；否则按**营养值**优先。
-    有害食物永不自吃；生食只在没有熟食/加工食物时兜底。
-    """
-    preferred: list[tuple[tuple[int, float], dict]] = []
-    raw: list[tuple[tuple[int, float], dict]] = []
-    for item in items or []:
-        if not isinstance(item, dict):
-            continue
-        name = str(item.get("name") or "").strip().lower()
-        if name in HARMFUL_FOOD:
-            continue
-        props = FOOD_PROPERTIES.get(name)
-        if props is None:
-            continue
-        (raw if name in RAW_FOOD else preferred).append((props, item))
-    pool = preferred or raw
-    if not pool:
-        return None
-    if hurt:
-        # 饱和度优先、营养值次之
-        return max(pool, key=lambda pair: (pair[0][1], pair[0][0]))[1]
-    return max(pool, key=lambda pair: (pair[0][0], pair[0][1]))[1]
 
 
 class SelfPreservationMode(Mode):
@@ -433,115 +332,56 @@ class SelfDefenseMode(Mode):
         return None
 
 
-class AutoEatMode(Mode):
-    """P4 — Auto-eat：饿/缺血时吃热栏里的食物。
+class EatYield:
+    """BackendEatYield —— 进食的"让路 + 退避 + 冷却"反射闸门。
 
-    触发条件（用户口径："健康<满就叫到饱食度 18+，而不是只看到 14 才吃"）：
-      - 单纯饿：饱食度 < 14；
-      - 缺血：血量不满（< 上限）且饱食度 < 18 —— 自然回血要「饱食度 ≥18 且饱和度 >0」，
-        所以血量不满就该主动补到 18+，而不是等饿到见底。
-    选食物：缺血优先**高饱和度**（回血门槛靠饱和度），单纯饿优先**高营养**；
-    有害食物永不自吃、生食兜底 —— 见 `select_food`。
+    "吃"现在是注册表里的工具（`eat`，**由 LLM 决定用不用**），这里的**安全约束**一字不改地
+    保留下来（全部来自用户实机日志）：
+      1. 让路：本地饥饿反射（Java `reflex_eat`）正在按右键吃 → 后端**一个字都不发**；
+      2. 退避：`action_manager` 的退避窗口内不发（零 wire 帧）；
+      3. 冷却：上一次 `eat` 失败/超时 → 冷却 `FAIL_COOLDOWN` 秒，并把真实原因写进
+         `task_state`，绝不每 2 秒重试到触发 action_manager 的循环保护。
 
-    下发走 Java 的 `eat`（"按住右键直到食物生效"的长任务，参数名不变）：Java 侧自己会
-    选好热栏格子并持续右键，所以 Python 只负责"该不该吃 / 吃什么"，不再自己 select_hotbar。
-
-    三条硬约束（都来自用户实机日志）：
-      1. `state.reflex_eat == True` → 本地饥饿反射正在吃，后端**一个字都不发**；
-      2. 下发前先过 `_GatedSkills` 的退避闸门 → 退避期内不产生 wire 帧；
-      3. `eat` 失败/超时 → **本次任务结束 + 10s 冷却**，并如实把原因写进 `task_state`，
-         绝不每 2 秒重试到触发 action_manager 的循环保护。
+    它**不是模式**：没有"饿了自动吃"的自主触发（那是被删掉的 AutoEatMode）。
     """
 
-    # 单纯饿的阈值：到 14 就该补（与原版/参考实现一致的保守值）。
-    HUNGRY_HUNGER = 14
-    # 缺血时的目标饱食度：吃到 18+ 才可能自然回血。
-    HURT_HUNGER = 18
     # 一次 `eat` 的等待上限（Java 侧 task_state 的 running→done 一般 2~3s；超时＝没回执）。
     EAT_TIMEOUT = 8.0
     # 失败后的冷却：用户口径"不要每 2 秒重试到触发循环保护"。
     FAIL_COOLDOWN = 10.0
 
-    def __init__(self):
-        super().__init__("auto_eat", priority=4, interrupts=True, cooldown=5.0)
-        # 一次进食是持续动作，别在模式活跃期间每 tick 重发 `eat`。
-        self.redispatch_interval = 2.0
+    def __init__(self, action_manager=None):
+        self._action_manager = action_manager
         self._pending_at = 0.0          # 上一次 `eat` 的下发时刻
         self._pending = False           # 上一次 `eat` 还没收到终态
         self._fail_until = 0.0          # 失败冷却的截止时刻
         self._fail_reason = ""
 
-    @staticmethod
-    def _num(value, default: float) -> float:
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return float(default)
-
-    def _hunger_and_hurt(self, state: dict) -> tuple[float, bool]:
-        player = state.get("player", {}) if isinstance(state, dict) else {}
-        if not isinstance(player, dict):
-            player = {}
-        hunger = self._num(player.get("hunger"), 20.0)
-        health = self._num(player.get("health"), 20.0)
-        max_health = self._num(player.get("max_health"), 20.0)
-        return hunger, health < max_health
-
-    def should_activate(self, state: dict) -> bool:
-        # 本地饥饿反射（Java 侧"按住右键直到食物生效"）在吃 → 后端别抢：
-        # 两边一起补食就是日志里"每 2 秒重复吃、饥饿值一直不动"的那条线。
-        if state.get("reflex_eat"):
-            return False
+    def allow(self, state: dict) -> tuple[bool, str]:
+        """能否下发 `eat`：返回 `(是否放行, 被挡时的一句如实说明)`。"""
+        if isinstance(state, dict) and state.get("reflex_eat"):
+            return False, "（本地饥饿反射正在吃，我不抢）"
         if time.time() < self._fail_until:
-            return False
-        hunger, hurt = self._hunger_and_hurt(state)
-        if hunger < self.HUNGRY_HUNGER:
-            return True
-        return hurt and hunger < self.HURT_HUNGER
-
-    def tick(self, skills, state: dict) -> str | None:
-        if state.get("reflex_eat"):
-            return None
-        outcome = self._absorb_outcome(skills, state)
-        if outcome:
-            return outcome
-        if time.time() < self._fail_until:
-            return None
-        hunger, hurt = self._hunger_and_hurt(state)
-        # 只看热栏：Java 的 `eat` 也只在热栏里找食物，背包里的再好吃也吃不到。
-        hotbar = [
-            item for item in (state.get("inventory") or [])
-            if isinstance(item, dict) and 0 <= int(item.get("slot", -1)) < 9
-        ]
-        food = select_food(hotbar, hurt=hurt)
-        if food is None:
-            return "auto_eat: no food in hotbar"
+            return False, f"（上次进食没成：{self._fail_reason}；冷却中，稍后再吃）"
         if self._pending:
-            return None                 # Java 侧还在吃（按住右键）→ 别重复下发
-        slot = int(food.get("slot", -1))
-        if not self.should_dispatch(f"eat:{slot}:{food.get('name', '')}"):
-            return None
-        result = skills.eat()
-        if isinstance(result, dict) and result.get("backoff"):
-            return None                 # 退避闸门拦下：本次不下发、不算吃过、不记 pending
-        if getattr(skills, "action_manager", None) is not None:
-            self._pending = True
-            self._pending_at = time.time()
-        mode = "saturation-first" if hurt else "nutrition-first"
-        return (f"auto_eat: ate {food.get('name')} (hunger={hunger:.0f}, "
-                f"{'hurt ' if hurt else ''}{mode})")
+            return False, "（上一次进食还没回执，先等）"
+        manager = self._action_manager if self._action_manager is not None else \
+            getattr(state, "action_manager", None)
+        if manager is not None and manager.is_backed_off("eat"):
+            return False, "（进食正在退避，本次不发）"
+        return True, ""
 
-    # ── eat 结果回收 ──
+    def mark_sent(self) -> None:
+        """记下刚刚下发了一次 `eat`（等回执）。"""
+        self._pending = True
+        self._pending_at = time.time()
 
-    def _absorb_outcome(self, skills, state):
-        """收上一次 `eat` 的终态：失败/超时 → 结束本次任务 + 冷却 + 如实写 task_state。
-
-        返回一句描述（用于日志）或 None。
-        """
+    def absorb(self, state: dict) -> Optional[str]:
+        """回收上一次 `eat` 的终态：失败/超时 → 冷却 + 如实写 task_state。"""
         if not self._pending:
             return None
-        action_manager = getattr(skills, "action_manager", None)
-        outcome = action_manager.outcome_since("eat", self._pending_at) if action_manager else None
+        manager = self._action_manager
+        outcome = manager.outcome_since("eat", self._pending_at) if manager else None
         if outcome is None:
             if time.time() - self._pending_at < self.EAT_TIMEOUT:
                 return None             # 还在吃，等回执
@@ -556,9 +396,8 @@ class AutoEatMode(Mode):
         self._fail_until = time.time() + self.FAIL_COOLDOWN
         self._fail_reason = reason
         self._write_task_state(state, reason)
-        logger.warning("[Mode] auto_eat 失败（%s）→ 本次任务结束，冷却 %.0fs",
-                       reason, self.FAIL_COOLDOWN)
-        return f"auto_eat: failed ({reason}) → 冷却 {self.FAIL_COOLDOWN:.0f}s"
+        logger.warning("[EatYield] eat 失败（%s）→ 冷却 %.0fs", reason, self.FAIL_COOLDOWN)
+        return f"eat: failed ({reason}) → 冷却 {self.FAIL_COOLDOWN:.0f}s"
 
     @staticmethod
     def _write_task_state(state, reason: str) -> None:
@@ -571,115 +410,9 @@ class AutoEatMode(Mode):
             "kind": "eat",
             "status": "failed",
             "detail": reason,
-            "source": "auto_eat",
+            "source": "eat_yield",
         })
         state["task_state"] = task_state
-
-
-class ItemCollectMode(Mode):
-    """P5 — Pick up nearby items."""
-
-    def __init__(self):
-        super().__init__("item_collect", priority=5, interrupts=False, cooldown=3.0)
-
-    def should_activate(self, state: dict) -> bool:
-        entities = state.get("entities", [])
-        return any(e.get("type") == "item" and e.get("distance", 999) < 4
-                   for e in entities)
-
-    def tick(self, skills, state: dict) -> str | None:
-        entities = state.get("entities", [])
-        items = [e for e in entities if e.get("type") == "item"
-                 and e.get("distance", 999) < 4]
-        if items:
-            nearest = items[0]
-            target = f"item:{nearest.get('x', 0):.1f},{nearest.get('y', 0):.1f},{nearest.get('z', 0):.1f}"
-            if not self.should_dispatch(target):
-                return None
-            # Walk to the item
-            skills.move_to(nearest.get("x", 0), nearest.get("y", 0), nearest.get("z", 0))
-            return f"item_collect: picking up {nearest.get('name', 'item')}"
-        return None
-
-
-class TorchPlaceMode(Mode):
-    """P6 — Place torches in dark areas."""
-
-    def __init__(self):
-        super().__init__("torch_place", priority=6, interrupts=False, cooldown=2.0)
-        self._arming = False  # True after look_at; place_block fires next tick
-
-    def should_activate(self, state: dict) -> bool:
-        world = state.get("world", {})
-        light = world.get("light_level", 15)
-        if light >= 7:
-            self._arming = False
-            return False
-        return True
-
-    def tick(self, skills, state: dict) -> str | None:
-        torch = next((it for it in state.get("inventory", [])
-                      if str(it.get("name", "")).endswith("torch")), None)
-        if torch is None:
-            return "torch_place: dark area but no torch in inventory"
-        if torch.get("slot", 9) > 8:
-            return "torch_place: torch in backpack (hotbar slot needed)"
-
-        if not self._arming:
-            player = state.get("player", {})
-            px, py, pz = player.get("x", 0), player.get("y", 0), player.get("z", 0)
-            px_i, pz_i = int(px), int(pz)
-            # Aim at the exposed top face of a nearby solid block that is not
-            # in the player's own column (torch needs the space we occupy).
-            candidates = [
-                b for b in state.get("nearby_blocks", [])
-                if b.get("y") in (py - 1, py, py + 1)
-                and not (b.get("x") == px_i and b.get("z") == pz_i)
-                and abs(b.get("x", px) + 0.5 - px) < 4
-                and abs(b.get("z", pz) + 0.5 - pz) < 4
-            ]
-            if not candidates:
-                return "torch_place: no adjacent solid block to place on"
-            target = min(candidates, key=lambda b:
-                         (b.get("x", px) + 0.5 - px) ** 2 + (b.get("z", pz) + 0.5 - pz) ** 2)
-            skills.look_at(target["x"] + 0.5, target["y"] + 1.0, target["z"] + 0.5)
-            self._arming = True
-            return "torch_place: aiming at placement face"
-
-        self._arming = False
-        skills.place_block()
-        return "torch_place: placed torch"
-
-
-class HuntingMode(Mode):
-    """P7 — Hunt animals for food."""
-
-    def __init__(self):
-        super().__init__("hunting", priority=7, interrupts=False, cooldown=10.0)
-
-    def should_activate(self, state: dict) -> bool:
-        player = state.get("player", {})
-        hunger = player.get("hunger", 20)
-        if hunger > 12:
-            return False
-        entities = state.get("entities", [])
-        return any(e.get("type") == "animal" and e.get("distance", 999) < 12
-                   for e in entities)
-
-    def tick(self, skills, state: dict) -> str | None:
-        entities = state.get("entities", [])
-        animals = [e for e in entities if e.get("type") == "animal"
-                   and e.get("distance", 999) < 12]
-        if animals:
-            nearest = animals[0]
-            target = (f"animal:{nearest.get('name', '?')}:"
-                      f"{nearest.get('entity_id') or nearest.get('id') or ''}")
-            if not self.should_dispatch(target):
-                return None
-            skills.look_at(nearest.get("x", 0), nearest.get("y", 0), nearest.get("z", 0))
-            skills.attack()
-            return f"hunting: hunting {nearest.get('name', 'animal')}"
-        return None
 
 
 class StuckRecoveryMode(Mode):
@@ -755,60 +488,6 @@ class StuckRecoveryMode(Mode):
             return "stuck_recovery: recovery failed, waiting for user"
 
 
-class FollowMasterMode(Mode):
-    """P8 — Follow / patrol around a designated master player (TouhouLittleMaid-style)."""
-
-    def __init__(self):
-        super().__init__("follow_master", priority=8, interrupts=False, cooldown=4.0)
-        self._master_name = ""
-        self._patrol_angle = 0.0
-
-    def set_master(self, name: str):
-        self._master_name = name
-        logger.info("[Mode] Master set to: %s", name)
-
-    def should_activate(self, state: dict) -> bool:
-        if not self._master_name:
-            return False
-        entities = state.get("entities", [])
-        master = next((e for e in entities if e.get("type") == "player"
-                       and e.get("name", "") == self._master_name), None)
-        if master is None:
-            return False
-        dist = master.get("distance", 999)
-        return dist > 3  # only activate when >3 blocks away
-
-    def tick(self, skills, state: dict) -> str | None:
-        entities = state.get("entities", [])
-        master = next((e for e in entities if e.get("type") == "player"
-                       and e.get("name", "") == self._master_name), None)
-        if not master:
-            return None
-
-        import math
-        dist = master.get("distance", 999)
-        mx, my, mz = master.get("x", 0), master.get("y", 0), master.get("z", 0)
-
-        if dist > 6:
-            # Too far — walk toward master
-            if not self.should_dispatch(f"to_master:{dist:.0f}"):
-                return None
-            skills.move_to(mx, my, mz)
-            return f"follow_master: walking to {self._master_name}"
-        elif dist < 2:
-            # Too close — patrol in a circle around master
-            self._patrol_angle += 1.0
-            tx = mx + 3 * math.cos(self._patrol_angle)
-            tz = mz + 3 * math.sin(self._patrol_angle)
-            player = state.get("player", {})
-            target = f"patrol:{tx:.1f},{tz:.1f}"
-            if not self.should_dispatch(target):
-                return None
-            skills.move_to(tx, player.get("y", my), tz)
-            return f"follow_master: patrolling around {self._master_name}"
-        return None
-
-
 # ── Modes Engine ─────────────────────────────────────────────────
 
 class ModesEngine:
@@ -838,17 +517,17 @@ class ModesEngine:
         self._sorted = sorted(self.modes, key=lambda m: m.priority)
 
     def add_defaults(self):
-        """Add all built-in modes (matches TouhouLittleMaid activity groups).
+        """只装**生存反射**（P0/P1/P2/P3）：岩浆/着火/溺水/虚空、回血、低血逃跑、被打还手。
+
+        用户口径：「后台不许有'自主开关/自动触发'」——原来的 P4-P8（auto_eat / item_collect /
+        torch_place / hunting / follow_master）全部删除：它们对应的**能力**已经是注册表里的
+        工具（`eat` / `collect_blocks`+`move_to` / `place_block` / `attack` / `follow`），
+        用不用由 LLM 决定，不再由后台条件自动触发。
         Note: StuckRecoveryMode is NOT auto-triggered — only via user command."""
-        self.add_mode(SelfPreservationMode())    # CORE: survival
-        self.add_mode(SelfHealMode())            # CORE: health management
-        self.add_mode(CowardiceMode())           # PANIC: flee
-        self.add_mode(SelfDefenseMode())         # WORK: combat
-        self.add_mode(AutoEatMode())             # IDLE: eat
-        self.add_mode(ItemCollectMode())         # IDLE: collect
-        self.add_mode(TorchPlaceMode())          # WORK: utility
-        self.add_mode(HuntingMode())             # WORK: food
-        self.add_mode(FollowMasterMode())       # IDLE: follow/patrol
+        self.add_mode(SelfPreservationMode())    # P0 生存：岩浆/着火/溺水/虚空
+        self.add_mode(SelfHealMode())            # P1 生存：低血用治疗物品
+        self.add_mode(CowardiceMode())           # P2 生存：低血逃跑
+        self.add_mode(SelfDefenseMode())         # P3 生存：被打还手
 
     def tick(self, state: dict, action_busy: bool = False) -> str | None:
         """

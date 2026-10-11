@@ -109,35 +109,14 @@ class ConfigStoreTests(unittest.TestCase):
             store.set_app_config({"capability_level": "abc"})
             self.assertEqual(store.get_capability_level(), 1, "非法值回退 L1")
 
-    def test_night_auto_sleep_defaults_on(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            store = ConfigStore(Path(tmp) / "config.json")
-            self.assertTrue(store.get_night_auto_sleep(), "默认开：自主模式下夜里自己找床睡")
-
-    def test_night_auto_sleep_roundtrip_and_persistence(self):
+    def test_night_auto_sleep_flag_is_gone(self):
+        """自主开关已删除：写入不落盘、读取 API 也不存在。"""
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
             store = ConfigStore(path)
+            self.assertFalse(hasattr(store, "get_night_auto_sleep"))
             store.set_app_config({"night_auto_sleep": False})
-            self.assertFalse(store.get_night_auto_sleep())
-            self.assertFalse(ConfigStore(path).get_night_auto_sleep(), "要落盘")
-            store.set_app_config({"night_auto_sleep": True})
-            self.assertTrue(store.get_night_auto_sleep())
-
-    def test_night_auto_sleep_accepts_ui_string_form(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            store = ConfigStore(Path(tmp) / "config.json")
-            store.set_app_config({"night_auto_sleep": "false"})
-            self.assertFalse(store.get_night_auto_sleep())
-            store.set_app_config({"night_auto_sleep": "是"})
-            self.assertTrue(store.get_night_auto_sleep())
-
-    def test_night_auto_sleep_ignores_garbage_and_keeps_previous(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            store = ConfigStore(Path(tmp) / "config.json")
-            store.set_app_config({"night_auto_sleep": False})
-            store.set_app_config({"night_auto_sleep": "maybe"})
-            self.assertFalse(store.get_night_auto_sleep(), "非法值维持原状，不误开")
+            self.assertNotIn("night_auto_sleep", store.raw(redact=True))
 
     def test_api_key_is_persisted_but_redacted_by_default(self):
         with tempfile.TemporaryDirectory() as tmp:

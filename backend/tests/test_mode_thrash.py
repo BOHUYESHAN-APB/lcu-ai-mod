@@ -127,20 +127,16 @@ class SustainedActionSpamTests(unittest.TestCase):
 
         self.assertEqual(skills.count("move_to"), 1)
 
-    def test_auto_eat_does_not_spam_eat(self):
-        from agent.modes_engine import AutoEatMode
+    def test_auto_eat_mode_is_gone(self):
+        """auto_eat 模式已删除（改为 `eat` 工具 + EatYield 闸门）；引擎默认不再装它。"""
+        import agent.modes_engine as modes
 
-        engine, skills = self._engine(AutoEatMode())
-        state = _state({"health": 20, "max_health": 20, "hunger": 10},
-                       inventory=[{"slot": 1, "name": "minecraft:cooked_beef"}])
+        self.assertFalse(hasattr(modes, "AutoEatMode"))
 
-        for _ in range(5):
-            engine.tick(state)
+        engine = ModesEngine(DummySkills())
+        engine.add_defaults()
 
-        # 进食改走 Java 的 `eat`（Java 自己选格子 + 按住右键）→ 只该发一次。
-        self.assertEqual(skills.count("eat"), 1)
-        self.assertEqual(skills.count("select_hotbar"), 0)
-        self.assertEqual(skills.count("use_item"), 0)
+        self.assertNotIn("auto_eat", [m.name for m in engine.modes])
 
 
 class CooldownGateTests(unittest.TestCase):

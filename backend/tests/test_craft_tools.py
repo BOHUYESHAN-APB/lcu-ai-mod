@@ -4,7 +4,7 @@
   ① 未授权 craft / 翻箱被拒，且**一帧都不发**；
   ② 获授权后取用量 <= 需求（不搬空），并且取用有审计；
   ③ 背包材料齐时**不翻箱**（就地 craft_via_recipe，容器 0）；
-  ④ autonomy_craft=false 时自主行为不发起制作；
+  ④ 没人指挥（自主轮）时没有授权 → 不发起制作（也没有自主开关可开）；
   ⑤ 新工具（equip_armor / craft_via_recipe / container_move / container_click /
      container_close）的参数组装与 Java `ActionExecutor` 逐字对齐。
 
@@ -162,36 +162,36 @@ class CraftGateTests(unittest.TestCase):
         self.assertEqual(planner._craft_need, {"iron_ingot": 3})
         self.assertIn("还缺 iron_ingot x3", planner._craft_note)
 
-    def test_autonomous_craft_is_denied_while_autonomy_craft_is_off(self):
-        """④ autonomy_craft=false → 自主轮不发起制作（tier 再高也没用）。"""
+    def test_autonomous_craft_is_denied_without_a_commander(self):
+        """④ 没人指挥（没有 actor_tier）→ 按 guest：不许造，也没有开关可开。"""
         skills = RecordingSkills()
         planner = _planner(skills, _store(self.tmp.name))
 
         dispatched = planner._dispatch_tool_call(
             "craft_via_recipe", {"item": "stick", "count": 1},
-            {"autonomous": True, "actor_tier": TIER_MASTER,
-             "inventory": [{"name": "oak_planks", "count": 64}]})
+            {"inventory": [{"name": "oak_planks", "count": 64}]})
 
         self.assertFalse(dispatched)
         self.assertEqual(skills.calls, [])
-        self.assertIn("autonomy_craft", planner._craft_note)
+        self.assertIn("guest", planner._craft_note)
 
-    def test_autonomous_craft_allowed_only_when_the_switch_is_on(self):
+    def test_autonomous_craft_cannot_be_switched_on(self):
+        """自主开关已删除：权限表里没有 autonomy_craft 这个键，写了也不生效。"""
         skills = RecordingSkills()
-        planner = _planner(skills, _store(self.tmp.name, autonomy_craft=True))
+        store = _store(self.tmp.name, autonomy_craft=True)
 
-        dispatched = planner._dispatch_tool_call(
+        dispatched = _planner(skills, store)._dispatch_tool_call(
             "craft_via_recipe", {"item": "stick", "count": 1},
-            {"autonomous": True, "inventory": [{"name": "oak_planks", "count": 64}]})
+            {"inventory": [{"name": "oak_planks", "count": 64}]})
 
-        self.assertTrue(dispatched)
-        self.assertEqual(skills.calls, [("craft_via_recipe", "stick", 1)])
+        self.assertFalse(dispatched)
+        self.assertEqual(skills.calls, [])
+        self.assertNotIn("autonomy_craft", store.get())
 
     def test_autonomous_shortfall_never_opens_containers(self):
         skills = RecordingSkills()
-        planner = _planner(skills, _store(self.tmp.name, autonomy_craft=True))
+        planner = _planner(skills, _store(self.tmp.name))
         context = {
-            "autonomous": True,
             "inventory": [],
             "known_containers": [
                 {"block_id": "minecraft:chest", "x": 1, "y": 64, "z": 1,
@@ -200,7 +200,7 @@ class CraftGateTests(unittest.TestCase):
 
         self.assertFalse(planner._dispatch_tool_call(
             "craft_via_recipe", {"item": "iron_pickaxe", "count": 1}, context))
-        self.assertEqual(skills.calls, [], "自主时不许为了自造去翻箱")
+        self.assertEqual(skills.calls, [], "没人授权时不许为了自造去翻箱")
 
 
 class ContainerGateTests(unittest.TestCase):
@@ -364,27 +364,27 @@ class ArmorDispatchTests(unittest.TestCase):
         self.assertIn("没有盔甲", planner._craft_note)
 
 
-class AutonomousCommandGateTests(unittest.TestCase):
-    """④ 自主 self-prompt 路的 `!craft` 也要过门。"""
+class CommandCraftGateTests(unittest.TestCase):
+    """④ 控制台路的 `!craft` 也要过门（没人指挥 → 按 guest 拒绝）。"""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
 
-    def test_craft_command_is_refused_while_autonomy_craft_is_off(self):
+    def test_craft_command_is_refused_without_a_commander(self):
         skills = RecordingSkills()
         store = _store(self.tmp.name)
-        commands = Commands(skills, authorizer=lambda: store.craft_policy("", autonomous=True))
+        commands = Commands(skills, authorizer=lambda: store.craft_policy(""))
 
         commands.parse_and_execute("!craft wooden_sword 1",
                                    {"inventory": [{"name": "oak_planks", "count": 8}]})
 
         self.assertEqual(skills.calls, [])
 
-    def test_craft_command_runs_when_autonomy_craft_is_on_and_materials_are_held(self):
+    def test_craft_command_runs_when_authorized_and_materials_are_held(self):
         skills = RecordingSkills()
-        store = _store(self.tmp.name, autonomy_craft=True)
-        commands = Commands(skills, authorizer=lambda: store.craft_policy("", autonomous=True))
+        store = _store(self.tmp.name, craft={"guest": True})
+        commands = Commands(skills, authorizer=lambda: store.craft_policy(""))
 
         commands.parse_and_execute("!craft wooden_sword 1",
                                    {"inventory": [{"name": "oak_planks", "count": 2},
@@ -393,10 +393,10 @@ class AutonomousCommandGateTests(unittest.TestCase):
         self.assertEqual(skills.calls, [("craft_item", "wooden_sword", 1)])
 
     def test_craft_command_still_refuses_when_materials_are_short(self):
-        """自主时优先只用背包里的材料：缺料就什么都不做（也不许翻箱）。"""
+        """优先只用背包里的材料：缺料就什么都不做（也不许翻箱）。"""
         skills = RecordingSkills()
-        store = _store(self.tmp.name, autonomy_craft=True)
-        commands = Commands(skills, authorizer=lambda: store.craft_policy("", autonomous=True))
+        store = _store(self.tmp.name, craft={"guest": True})
+        commands = Commands(skills, authorizer=lambda: store.craft_policy(""))
 
         commands.parse_and_execute("!craft iron_pickaxe 1", {"inventory": []})
 
@@ -492,7 +492,7 @@ class NewCommandWireContractTests(unittest.TestCase):
 
 
 class SessionWiringTests(unittest.TestCase):
-    """session → planner 的接线：谁在说话、是不是自主轮、已知容器都要传下去。"""
+    """session → planner 的接线：谁在说话、已知容器都要传下去。"""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -524,23 +524,23 @@ class SessionWiringTests(unittest.TestCase):
         context = Session._runtime_context(self._session())
 
         self.assertEqual(context["actor_tier"], TIER_MASTER)
-        self.assertFalse(context["autonomous"], "普通聊天轮不是自主轮")
+        self.assertNotIn("autonomous", context, "已无自主开关这一说")
         self.assertEqual(context["known_containers"][0]["block_id"], "minecraft:chest")
         self.assertEqual(context["open_container"]["slots"], 63)
 
-    def test_autonomous_policy_follows_the_switch(self):
+    def test_command_craft_policy_is_guest_deny_by_default(self):
         session = self._session()
         session.permissions = PermissionsStore(Path(self.tmp.name) / "p.json")
 
-        off = Session._autonomous_craft_policy(session)
-        self.assertFalse(off.may_craft)
-        self.assertFalse(off.may_open_containers)
-        self.assertTrue(off.autonomous)
+        policy = Session._command_craft_policy(session)
+        self.assertFalse(policy.may_craft)
+        self.assertFalse(policy.may_open_containers)
+        self.assertEqual(policy.tier, TIER_GUEST)
 
-        session.permissions.set({"autonomy_craft": True})
-        on = Session._autonomous_craft_policy(session)
-        self.assertTrue(on.may_craft)
-        self.assertFalse(on.may_open_containers, "自主自造也不许翻箱")
+        session.permissions.set({"craft": {"guest": True}})
+        allowed = Session._command_craft_policy(session)
+        self.assertTrue(allowed.may_craft)
+        self.assertFalse(allowed.may_open_containers, "没人指挥也不许翻箱")
 
 
 class PromptWiringTests(unittest.TestCase):

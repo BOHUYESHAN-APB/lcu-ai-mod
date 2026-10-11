@@ -254,8 +254,6 @@ def _default_config() -> dict[str, Any]:
         # 注意：旧的 whitelist / listen_public 已由 `.local/permissions.json` 的
         # master / friends / server_mode / public_reply_guests 取代（M3-19 的分层权限模型）。
         "patrol_radius": 8,
-        # 夜晚自动睡觉（默认开）：自主模式下天黑且能睡时，自己走到床上睡到天亮。
-        "night_auto_sleep": True,
         # 能力分层（用户的"从最小开始、逐层加"）：
         #   1 = L1 纯文本单模型（默认；不抓屏、不传图片）
         #   2 = L2 单模型 + 视觉（同一个模型传截图）
@@ -390,10 +388,6 @@ class ConfigStore:
                     self._data[key] = payload[key]
             if "capability_level" in payload:
                 self._data["capability_level"] = _clamp_capability(payload["capability_level"])
-            if "night_auto_sleep" in payload:
-                parsed_flag = _parse_bool(payload["night_auto_sleep"])
-                if parsed_flag is not None:
-                    self._data["night_auto_sleep"] = parsed_flag
             if isinstance(payload.get("decision"), dict):
                 decision = payload["decision"]
                 threshold = decision.get("confidence_threshold")
@@ -413,12 +407,6 @@ class ConfigStore:
         with self._lock:
             raw = self._data.get("capability_level", 1)
         return _clamp_capability(raw)
-
-    def get_night_auto_sleep(self) -> bool:
-        """夜晚自动睡觉开关（默认开）。"""
-        with self._lock:
-            raw = self._data.get("night_auto_sleep", True)
-        return _as_bool(raw, True)
 
     def get_semantic_gate(self) -> bool:
         """回复语义门开关（config.json → decision.semantic_gate，默认开）。"""

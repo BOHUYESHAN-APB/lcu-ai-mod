@@ -68,7 +68,7 @@ class ActionManager:
         self._backoff_max = 60.0
         # 上报给上层重新规划的循环失败（拉取式：`pop_loop_failure()`）。
         self.last_loop_failure: Optional[dict] = None
-        # label → 最近一次**终态**结果（成功/失败/超时）。模式层（AutoEatMode 等）靠它
+        # label → 最近一次**终态**结果（成功/失败/超时）。EatYield（进食闸门）等靠它
         # 判断"我刚下发的动作到底成没成"——`handle_response`/`complete_current`/超时都会写。
         self.last_outcome: dict[str, dict] = {}
 

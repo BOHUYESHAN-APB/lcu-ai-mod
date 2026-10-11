@@ -34,10 +34,16 @@ from .haul import (HAUL_MAX_ATTEMPTS, HAUL_VERIFY_TIMEOUT, HAUL_WALK_TIMEOUT,
                    plan_put_moves, plan_take_moves, reconcile_sides, side_free_space,
                    side_items, success_receipt)
 from .llm_service import prompt_version, render_persona_triple
+from .modes_engine import EatYield
 from .permissions import CraftPolicy, TIER_GUEST
 from .territory import (ACTION_FARM, POLICY_BORROW_ONLY, POLICY_FREE, POLICY_NO_TOUCH,
                         bed_attempt, bed_note, current_base, may_act,
                         normalize_grants, normalize_policy, point_of)
+# 工具清单的**唯一事实来源**：定义、阶段过滤、权限描述符、handler 全在注册表，
+# planner 只消费（转发 ACTION_GROUPS/PHASE_GROUPS/tool_schema/build_tool_schemas/_actions_for_phase）。
+from .tool_registry import (ACTION_GROUPS as _ACTION_GROUPS,
+                            PHASE_GROUPS as _PHASE_GROUPS, TOOL_BY_NAME, ToolSpec,
+                            _actions_for_phase, build_tool_schemas, tool_schema)
 
 logger = logging.getLogger("planner")
 TOOL_CALL_RE = re.compile(r"tool\(\s*([a-zA-Z_]+)\s*,\s*(\{.*?\})\s*\)", re.DOTALL)
@@ -68,101 +74,13 @@ ITEM_ALIASES = {
     "木镐": "wooden_pickaxe",
 }
 
-# ── 动作 schema（按阶段分组）──────────────────────────────────
-# 只把与当前阶段相关的动作注入 prompt：16 条全量内联对 32k 上下文是隐患，
-# 且大部分动作与当前阶段无关。（见 ROADMAP M3-3）
+# ── 动作 / 工具定义 ──────────────────────────────────────────
+# 工具清单是**唯一事实来源**，全部登记在 `agent/tool_registry.py`：
+#   name / description / parameters / groups（阶段过滤）/ permission / handler。
+# 这里的 `ACTION_GROUPS` / `PHASE_GROUPS` / `tool_schema` / `build_tool_schemas`
+# 一律从注册表转发（旧接口保留给预览与测试），绝不另维护第二份。
 # 每项：(动作名, 参数示例, 说明)
-ACTION_GROUPS: dict[str, tuple[tuple[str, str, str], ...]] = {
-    "move": (
-        ("move_to", "x,y,z", "移动到坐标"),
-        ("follow", "player", "跟随玩家"),
-        ("explore", "radius", "探索半径"),
-        ("stop", "", "停止动作"),
-    ),
-    "locate": (
-        ("find_block", "block,radius,limit", "扫附近有无该方块（只查不走）"),
-        ("go_to_block", "block,radius,remember", "寻路过去，到达后记住"),
-        ("locate_structure", "name,kind", "/locate 查结构/群系（kind=structure|biome）"),
-    ),
-    "gather": (
-        ("mine_block", "", "挖面前方块"),
-        ("collect_blocks", "block_type,count", "采集方块"),
-        ("drop_item", "item,count", "丢弃物品"),
-        ("sort_inventory", "", "整理背包"),
-        ("get_inventory", "", "查看背包"),
-    ),
-    "craft": (
-        ("craft_item", "item,count", "合成物品"),
-        ("craft_via_recipe", "item,count", "原版配方合成（先看背包材料）"),
-        ("place_block", "", "放置手中方块"),
-        ("build", "x,y,z,structure", "建造结构"),
-    ),
-    "container": (
-        ("container_move", "from_slot,to_slot,count", "容器内移物（省 to_slot＝背包↔快捷栏）"),
-        ("container_click", "slot,click_type", "点容器一格（pickup|quick_move|swap|throw）"),
-        ("container_close", "", "关掉容器界面"),
-        ("borrow_item", "item,count,container", "从仓库借（须授权；不给 count＝整箱搬，拒绝）"),
-        ("return_item", "item,count,container", "放回原容器（省 count＝全部剩余）"),
-    ),
-    "farm": (
-        ("haul", "from,to,item,count",
-         "在容器之间搬运（from/to＝已记住的容器名或 self；省 item＝搬全部可搬的；"
-         "单趟≤256、源箱留底不搬空、两侧对账，卡住就报在哪一步）"),
-        ("farm", "plot,action",
-         "在授权农田里干活（action=till锄地|plant播种|harvest收割|replant补种；"
-         "全走右键/挖，缺种子或锄头如实报）"),
-    ),
-    "combat": (
-        ("attack", "", "攻击附近敌人"),
-    ),
-    "items": (
-        ("equip_armor", "", "穿背包里的盔甲（没有就去容器找）"),
-        ("equip_weapon", "", "换上热栏里最好的武器"),
-        ("select_hotbar", "index", "切到热栏第 index 格（0-8）"),
-    ),
-    "survive": (
-        ("eat", "", "吃东西"),
-        ("sleep", "", "睡觉"),
-        ("trade", "villager_type", "与村民交易"),
-    ),
-    "night": (
-        ("sleep_in_bed", "", "走到最近的床睡到天亮（只能夜里）"),
-    ),
-    "guard": (
-        ("guard", "x,y,z,radius", "水平半径内驻守（默认 32；省坐标＝最近发话者位置）"),
-        ("guard_off", "", "取消驻守"),
-    ),
-    "hud": (
-        ("set_hud_note", "text", "把当前打算写进 HUD 描述词"),
-    ),
-    "server": (
-        ("run_server_command", "command,args,confirm",
-         "下一条原版指令（须已在白名单勾选；未勾选/黑名单一律不发）"),
-        ("send_whisper", "player,text", "给某人发私信；用了它 reply 请留空"),
-        ("tpa_respond", "action,player", "回应传送请求：action=accept|deny"),
-        ("tpa_request", "player", "主动请求传送到某人（默认只有主人可以）"),
-    ),
-    "memory": (
-        ("remember_poi", "name,category,x,y,z", "记住当前位置"),
-    ),
-    "territory": (
-        ("list_territory", "", "列出领地/基地/容器及其授权与保护项"),
-        ("grant_territory", "name,kind,radius,grants",
-         "把这片区域的所有权授予我（master；grants=take,place,break,farm,store）"),
-        ("revoke_territory", "name", "收回领地的所有权"),
-        ("set_base", "name,kind,radius,x,y,z", "设/更新一个基地（省坐标＝脚下）"),
-        ("del_base", "name", "删掉一个基地"),
-        ("remember_container", "name,x,y,z,kind,policy",
-         "记住箱子的确切位置与策略（free随取|borrow_only传递|no_touch不碰）"),
-        ("grant_container", "name,policy", "给箱子设/改访问策略（friend 只能给自己的，且只到传递）"),
-        ("revoke_container", "name", "收回箱子的访问授权（立即生效）"),
-        ("define_zone", "name,kind,x,y,z,radius,protect",
-         "声明区域语义与硬保护（protect=animals,crops,blocks,containers）"),
-        ("clear_zone", "name", "删掉一个区域"),
-        ("set_home", "base", "在基地范围内自己找床；找不到就自己造（缺料/不安全如实报）"),
-        ("go_home", "base", "回基地的床位（没床就回锚点）"),
-    ),
-}
+ACTION_GROUPS: dict[str, tuple[tuple[str, str, str], ...]] = _ACTION_GROUPS
 
 # task_state.kind → 阶段
 _KIND_TO_PHASE = {
@@ -172,16 +90,8 @@ _KIND_TO_PHASE = {
     "eat": "survive",
 }
 
-# 阶段 → 注入哪些组（顺序即 prompt 中的展示顺序）
-# night / guard / hud / memory 全局注入：睡觉、守点、HUD 描述词与记忆点在任何阶段
-# 都可能有意义（用户说"在这儿守着"时他可能正在看着 AI 挖矿）。
-PHASE_GROUPS: dict[str, tuple[str, ...]] = {
-    "idle": ("move", "locate", "gather", "craft", "container", "farm", "guard", "items", "survive", "combat", "hud", "night", "server", "memory", "territory"),
-    "travel": ("move", "locate", "combat", "guard", "items", "container", "farm", "survive", "hud", "night", "server", "memory", "territory"),
-    "gather": ("move", "locate", "gather", "guard", "items", "craft", "container", "farm", "hud", "night", "server", "memory", "territory"),
-    "craft": ("move", "locate", "craft", "container", "farm", "guard", "items", "gather", "hud", "night", "server", "memory", "territory"),
-    "survive": ("survive", "hud", "night", "server", "memory", "guard", "farm", "items", "move", "locate", "territory"),
-}
+# 阶段 → 注入哪些组（顺序即 prompt 中的展示顺序）——由注册表给出，这里只转发。
+PHASE_GROUPS: dict[str, tuple[str, ...]] = _PHASE_GROUPS
 
 _TERMINAL_STATUSES = {"", "idle", "done", "failed", "cancelled", "error"}
 
@@ -194,19 +104,6 @@ def _phase_from_task(task: Any) -> str:
     if status in _TERMINAL_STATUSES:
         return "idle"
     return _KIND_TO_PHASE.get(str(task.get("kind", "")).strip().lower(), "idle")
-
-
-def _actions_for_phase(phase: str) -> list[tuple[str, str, str]]:
-    """当前阶段该注入的动作（去重、保持顺序）。"""
-    groups = PHASE_GROUPS.get(phase, PHASE_GROUPS["idle"])
-    seen: set[str] = set()
-    out: list[tuple[str, str, str]] = []
-    for group in groups:
-        for action in ACTION_GROUPS.get(group, ()):
-            if action[0] not in seen:
-                seen.add(action[0])
-                out.append(action)
-    return out
 
 
 def _render_actions(actions: list[tuple[str, str, str]]) -> str:
@@ -276,53 +173,8 @@ PLANNER_MECHANICS = (
     "- day_time 只是 gameTime 取模的近似值、不准，判断白天黑夜一律看「是否夜晚」。"
 )
 
-# 参数名 → JSON Schema 类型（其余按 string；工具参数都可有默认值，故 required 留空）。
-_NUMERIC_TOOL_ARGS = frozenset({"x", "y", "z", "radius", "limit", "count", "index",
-                                "from_slot", "to_slot", "slot"})
-_BOOLEAN_TOOL_ARGS = frozenset({"remember"})
-# 数组参数：`run_server_command` 的 `args`（指令参数表，元素是字符串）。
-_ARRAY_TOOL_ARGS = frozenset({"args"})
-
-
-def tool_schema(args: str) -> dict:
-    """把 `"x,y,z"` 这样的参数名串渲染成 JSON Schema 的 properties。"""
-    properties: dict[str, dict] = {}
-    for raw in str(args or "").split(","):
-        name = raw.strip()
-        if not name:
-            continue
-        if name in _NUMERIC_TOOL_ARGS:
-            properties[name] = {"type": "number"}
-        elif name in _BOOLEAN_TOOL_ARGS:
-            properties[name] = {"type": "boolean"}
-        elif name in _ARRAY_TOOL_ARGS:
-            properties[name] = {"type": "array", "items": {"type": "string"}}
-        else:
-            properties[name] = {"type": "string"}
-    return properties
-
-
-def build_tool_schemas(phase: str = "idle") -> list[dict]:
-    """L3：当前阶段该有的工具定义（OpenAI tools 格式）——走 API `tools` 参数，**不内联进提示词**。
-
-    复用 `_actions_for_phase`，把 M3-3 的"只注入当前阶段相关动作"继续落实在真实请求上
-    （idle 是全部动作组的超集）。顺序稳定，按动作名去重。
-    """
-    tools: list[dict] = []
-    for name, args, desc in _actions_for_phase(phase):
-        tools.append({
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": desc,
-                "parameters": {
-                    "type": "object",
-                    "properties": tool_schema(args),
-                    "required": [],
-                },
-            },
-        })
-    return tools
+# 参数名 → JSON Schema 类型、`tool_schema`、`build_tool_schemas` 全部在注册表里，
+# 这里只转发导入（见文件顶部 `from .tool_registry import ...`）。
 
 
 @dataclass
@@ -533,7 +385,7 @@ class Planner:
     def __init__(self, llm_service, memory, skills, threshold_provider=None, chat_inbox=None,
                  permissions=None, borrow_rules=None, server_commands=None,
                  whisper_sender=None, tpa_responder=None, tpa_requester=None,
-                 player_resolver=None, territory=None):
+                 player_resolver=None, territory=None, action_manager=None):
         self.llm = llm_service
         self.memory = memory
         self.skills = skills
@@ -553,7 +405,7 @@ class Planner:
         self.chat_inbox = chat_inbox
         # 本轮的 /locate 结果（`_locate_note()` 会把它如实附到回复后面）。
         self._last_locate_result: Optional[dict] = None
-        # 能力位来源（craft / containers / autonomy_craft）。没注入＝一律不放行（默认拒绝）。
+        # 能力位来源（craft / containers / territory / zones）。没注入＝一律不放行（默认拒绝）。
         self.permissions = permissions
         # 借用规则（对话授权的"仓库里所有铁可以用"）：没注入＝没有任何借用授权。
         self.borrow_rules = borrow_rules
@@ -590,6 +442,8 @@ class Planner:
         self._system_key: Optional[str] = None
         self._system_cache: str = ""
         self._tools_cache: dict[str, list[dict]] = {}
+        # BackendEatYield：进食的让路/退避/冷却闸门（`eat` 工具下发前都要过它）。
+        self.eat_yield = EatYield(action_manager)
 
     def _threshold(self) -> float:
         """当前 decider 置信度阈值：读注入的 provider，失败回退默认常量。"""
@@ -1473,205 +1327,302 @@ class Planner:
         return executed
 
     def _dispatch_tool_call(self, tool_name: str, payload: dict, context: dict) -> bool:
-        if tool_name == "move_to":
-            if {"x", "y", "z"}.issubset(payload):
-                self.skills.move_to(float(payload["x"]), float(payload["y"]), float(payload["z"]))
-                return True
-        elif tool_name == "follow":
-            player = payload.get("player") or payload.get("player_name")
-            if player and not self._is_duplicate_task(context, {"follow"}, str(player)):
-                self.skills.follow_player(str(player))
-                return True
-        elif tool_name == "attack":
-            self.skills.attack()
-            return True
-        elif tool_name == "mine_block":
-            self.skills.mine_block()
-            return True
-        elif tool_name == "place_block":
-            self.skills.place_block()
-            return True
-        elif tool_name in ("craft_item", "craft_via_recipe"):
-            # 两条合成命令**同一道门**：授权 + 库存优先（用户口径：没被允许不许造）。
-            return self._dispatch_craft(payload, context, command=tool_name)
-        elif tool_name == "collect_blocks":
-            block_type = payload.get("block_type") or payload.get("block")
-            normalized_block = self._normalize_block_name(str(block_type)) if block_type else ""
-            if block_type and not self._is_duplicate_task(context, {"collect"}, normalized_block):
-                self.skills.collect_blocks(normalized_block, int(payload.get("count", 1)))
-                return True
-        elif tool_name == "get_inventory":
-            self.skills.get_inventory()
-            return True
-        elif tool_name == "explore":
-            self.skills.explore(int(payload.get("radius", 16)))
-            return True
-        elif tool_name == "find_block":
-            block = payload.get("block") or payload.get("block_type")
-            if block and str(block).strip():
-                self.skills.find_block(
-                    self._normalize_block_name(str(block)),
-                    int(payload.get("radius", 32)),
-                    int(payload.get("limit", 8)),
-                )
-                return True
-        elif tool_name == "go_to_block":
-            block = payload.get("block") or payload.get("block_type")
-            if block and str(block).strip():
-                normalized_block = self._normalize_block_name(str(block))
-                if not self._is_duplicate_task(context, {"go_to_block"}, normalized_block):
-                    self.skills.go_to_block(
-                        normalized_block,
-                        int(payload.get("radius", 32)),
-                        bool(payload.get("remember", True)),
-                    )
-                    return True
-        elif tool_name == "sleep_in_bed":
-            self.skills.sleep_in_bed()
-            return True
-        elif tool_name == "guard":
-            return self._dispatch_guard(payload, context)
-        elif tool_name == "guard_off":
-            self.skills.guard_off()
-            return True
-        elif tool_name == "locate_structure":
-            name = (payload.get("name") or payload.get("structure")
-                    or payload.get("biome") or payload.get("target"))
-            kind = str(payload.get("kind") or ("biome" if payload.get("biome") else "structure"))
-            result = self.locate_structure(str(name or ""), kind=kind)
-            return bool(result.get("command"))
-        elif tool_name == "set_hud_note":
-            if "text" not in payload:
+        """工具派发：**注册表驱动**（单一事实来源）。
+
+        1) 查注册表 `TOOL_BY_NAME`（未登记的工具直接拒绝——没有第二份清单可漏）；
+        2) 由注册表的权限描述符做一次**统一授权**（`_authorize_tool`）；
+        3) 调注册表登记的 handler（指向现有技能函数）。
+        """
+        spec = TOOL_BY_NAME.get(str(tool_name or "").strip().lower())
+        if spec is None:
+            logger.debug("[Planner] 未登记的工具：%s", tool_name)
+            return False
+        payload = payload if isinstance(payload, dict) else {}
+        if not self._authorize_tool(spec, payload, context):
+            return False
+        handler = getattr(self, spec.handler, None)
+        if handler is None:
+            logger.warning("[Planner] 工具 %s 登记的 handler %s 不存在", spec.name, spec.handler)
+            return False
+        return bool(handler(payload, context))
+
+    # ── 统一授权（注册表权限字段驱动）──────────────────────────
+    def _authorize_tool(self, spec: ToolSpec, payload: dict, context: dict) -> bool:
+        """派发前的**唯一**授权点：tier 门 + 容器访问授权。
+
+        权限由注册表 `spec.permission` 声明，这里统一执行——不再散在各 handler 里。
+        被拒时把原因写成一句如实说明（回复会带上，绝不假装做了）。
+        """
+        perm = spec.permission
+        if perm.tier and not self._has_capability(perm.tier, context):
+            if perm.tier == "craft":
+                self._craft_note = self._auth_note(self._craft_policy(context), "造东西")
+            else:
+                self._territory_note = self._no_authority_note(
+                    perm.deny_label or spec.name, context)
+            logger.info("[Planner] 工具 %s 被拒：%s 权限不足", spec.name, perm.tier)
+            return False
+        if perm.container:
+            ok, note, _cpolicy, crow = self._container_access(context)
+            if not ok:
+                self._craft_note = note
+                logger.info("[Planner] 工具 %s 被拒：容器访问未授权 %s",
+                            spec.name, (crow or {}).get("name"))
                 return False
-            seconds = payload.get("seconds")
-            try:
-                seconds = float(seconds) if seconds is not None else 30.0
-            except (TypeError, ValueError):
-                seconds = 30.0
-            self.skills.set_hud_note(str(payload.get("text") or ""), seconds)
-            return True
-        elif tool_name == "remember_poi":
-            name = str(payload.get("name") or "").strip()
-            category = str(payload.get("category") or "").strip() or "waypoint"
-            self.skills.remember_poi(
-                name,
-                category,
-                _as_optional_float(payload.get("x")),
-                _as_optional_float(payload.get("y")),
-                _as_optional_float(payload.get("z")),
-            )
-            return True
-        elif tool_name == "trade":
-            villager = payload.get("villager_type") or payload.get("type")
-            if villager:
-                self.skills.trade(str(villager))
-                return True
-        elif tool_name == "sleep":
-            self.skills.sleep()
-            return True
-        elif tool_name == "eat":
-            self.skills.eat()
-            return True
-        elif tool_name == "drop_item":
-            item = payload.get("item")
-            if item:
-                self.skills.drop_item(str(item), int(payload.get("count", 1)))
-                return True
-        elif tool_name == "sort_inventory":
-            self.skills.sort_inventory()
-            return True
-        elif tool_name == "equip_weapon":
-            self.skills.equip_weapon()
-            return True
-        elif tool_name == "equip_armor":
-            return self._dispatch_equip_armor(context)
-        elif tool_name == "container_move":
-            return self._dispatch_container_move(payload, context)
-        elif tool_name == "container_click":
-            return self._dispatch_container_click(payload, context)
-        elif tool_name == "container_close":
-            self.skills.container_close()
-            return True
-        elif tool_name == "borrow_item":
-            return self._dispatch_borrow_item(payload, context)
-        elif tool_name == "return_item":
-            return self._dispatch_return_item(payload, context)
-        elif tool_name == "select_hotbar":
-            index = payload.get("index")
-            if index is not None:
-                self.skills.select_hotbar(int(index))
-                return True
-        elif tool_name == "build":
-            if {"x", "y", "z", "structure"}.issubset(payload):
-                self.skills.build(float(payload["x"]), float(payload["y"]), float(payload["z"]), str(payload["structure"]))
-                return True
-        elif tool_name == "run_server_command":
-            if self.server_commands is None:
-                return False
-            target_tool = str(payload.get("tool") or payload.get("command")
-                              or payload.get("name") or "")
-            result = self.server_commands(target_tool, payload.get("args"),
-                                          confirm=str(payload.get("confirm") or ""))
-            self._action_note = self._server_command_note(target_tool, result)
-            return bool(result.get("ok"))
-        elif tool_name == "send_whisper":
-            if self.whisper_sender is None:
-                return False
-            player = payload.get("player") or payload.get("to") or payload.get("target")
-            text = payload.get("text") or payload.get("message") or payload.get("content")
-            if not player or text is None or str(text).strip() == "":
-                return False
-            result = self.whisper_sender(str(player), str(text))
-            self._action_note = self._server_command_note("私信", result)
-            return bool(result.get("ok"))
-        elif tool_name == "tpa_respond":
-            if self.tpa_responder is None:
-                return False
-            action = payload.get("action") or payload.get("decision") or payload.get("answer")
-            result = self.tpa_responder(str(action or ""), str(payload.get("player") or ""))
-            self._action_note = self._server_command_note("传送请求回应", result)
-            return bool(result.get("ok"))
-        elif tool_name == "tpa_request":
-            if self.tpa_requester is None:
-                return False
-            player = payload.get("player") or payload.get("target")
-            if not player:
-                return False
-            result = self.tpa_requester(str(player))
-            self._action_note = self._server_command_note("主动传送请求", result)
-            return bool(result.get("ok"))
-        elif tool_name == "list_territory":
-            return self._dispatch_list_territory(context)
-        elif tool_name == "grant_territory":
-            return self._dispatch_grant_territory(payload, context)
-        elif tool_name == "revoke_territory":
-            return self._dispatch_revoke_territory(payload, context)
-        elif tool_name == "set_base":
-            return self._dispatch_set_base(payload, context)
-        elif tool_name == "del_base":
-            return self._dispatch_del_base(payload, context)
-        elif tool_name == "remember_container":
-            return self._dispatch_remember_container(payload, context)
-        elif tool_name == "grant_container":
-            return self._dispatch_grant_container(payload, context)
-        elif tool_name == "revoke_container":
-            return self._dispatch_revoke_container(payload, context)
-        elif tool_name == "define_zone":
-            return self._dispatch_define_zone(payload, context)
-        elif tool_name == "clear_zone":
-            return self._dispatch_clear_zone(payload, context)
-        elif tool_name == "set_home":
-            return self._dispatch_set_home(payload, context)
-        elif tool_name == "go_home":
-            return self._dispatch_go_home(payload, context)
-        elif tool_name == "haul":
-            return self._dispatch_haul(payload, context)
-        elif tool_name == "farm":
-            return self._dispatch_farm(payload, context)
-        elif tool_name == "stop":
-            self.skills.stop_all()
+        return True
+
+    def _has_capability(self, kind: str, context: dict) -> bool:
+        """查权限表的能力位（kind ∈ craft | containers | territory | zones）。
+
+        没权限表来源 → 一律不放行（默认拒绝）；认不出的 kind 也按拒绝处理。
+        """
+        tier, _ = self._actor_of(context)
+        store = self.permissions
+        if store is None:
+            return False
+        checks = {
+            "craft": store.can_craft,
+            "containers": store.can_authorize_containers,
+            "territory": store.can_authorize_territory,
+            "zones": store.can_define_zones,
+        }
+        check = checks.get(str(kind or ""))
+        if check is None:
+            logger.warning("[Planner] 未知能力位：%s", kind)
+            return False
+        try:
+            return bool(check(tier))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[Planner] 能力位 %s 查询失败: %s", kind, exc)
+            return False
+
+    def _container_access(self, context: dict) -> tuple[bool, str, str, Optional[dict]]:
+        """容器访问的**唯一**判定：no_touch 拒、free 随取、其余看翻箱授权。
+
+        返回 `(是否放行, 被拒时的如实说明, 该箱策略, 该箱登记行)`。
+        """
+        cpolicy, crow = self._container_policy(context)
+        if cpolicy == POLICY_NO_TOUCH:
+            return False, self._container_policy_note(crow), cpolicy, crow
+        policy = self._craft_policy(context)
+        if cpolicy != POLICY_FREE and not policy.may_open_containers:
+            return False, self._auth_note(policy, "翻箱子"), cpolicy, crow
+        return True, "", cpolicy, crow
+
+    # ── handler（注册表登记，指向现有技能函数）────────────────
+    def _tool_move_to(self, payload: dict, context: dict) -> bool:
+        if {"x", "y", "z"}.issubset(payload):
+            self.skills.move_to(float(payload["x"]), float(payload["y"]), float(payload["z"]))
             return True
         return False
+
+    def _tool_follow(self, payload: dict, context: dict) -> bool:
+        player = payload.get("player") or payload.get("player_name")
+        if player and not self._is_duplicate_task(context, {"follow"}, str(player)):
+            self.skills.follow_player(str(player))
+            return True
+        return False
+
+    def _tool_explore(self, payload: dict, context: dict) -> bool:
+        self.skills.explore(int(payload.get("radius", 16)))
+        return True
+
+    def _tool_stop(self, payload: dict, context: dict) -> bool:
+        self.skills.stop_all()
+        return True
+
+    def _tool_find_block(self, payload: dict, context: dict) -> bool:
+        block = payload.get("block") or payload.get("block_type")
+        if block and str(block).strip():
+            self.skills.find_block(
+                self._normalize_block_name(str(block)),
+                int(payload.get("radius", 32)),
+                int(payload.get("limit", 8)),
+            )
+            return True
+        return False
+
+    def _tool_go_to_block(self, payload: dict, context: dict) -> bool:
+        block = payload.get("block") or payload.get("block_type")
+        if block and str(block).strip():
+            normalized_block = self._normalize_block_name(str(block))
+            if not self._is_duplicate_task(context, {"go_to_block"}, normalized_block):
+                self.skills.go_to_block(
+                    normalized_block,
+                    int(payload.get("radius", 32)),
+                    bool(payload.get("remember", True)),
+                )
+                return True
+        return False
+
+    def _tool_locate_structure(self, payload: dict, context: dict) -> bool:
+        name = (payload.get("name") or payload.get("structure")
+                or payload.get("biome") or payload.get("target"))
+        kind = str(payload.get("kind") or ("biome" if payload.get("biome") else "structure"))
+        result = self.locate_structure(str(name or ""), kind=kind)
+        return bool(result.get("command"))
+
+    def _tool_mine_block(self, payload: dict, context: dict) -> bool:
+        self.skills.mine_block()
+        return True
+
+    def _tool_collect_blocks(self, payload: dict, context: dict) -> bool:
+        block_type = payload.get("block_type") or payload.get("block")
+        normalized_block = self._normalize_block_name(str(block_type)) if block_type else ""
+        if block_type and not self._is_duplicate_task(context, {"collect"}, normalized_block):
+            self.skills.collect_blocks(normalized_block, int(payload.get("count", 1)))
+            return True
+        return False
+
+    def _tool_drop_item(self, payload: dict, context: dict) -> bool:
+        item = payload.get("item")
+        if item:
+            self.skills.drop_item(str(item), int(payload.get("count", 1)))
+            return True
+        return False
+
+    def _tool_sort_inventory(self, payload: dict, context: dict) -> bool:
+        self.skills.sort_inventory()
+        return True
+
+    def _tool_get_inventory(self, payload: dict, context: dict) -> bool:
+        self.skills.get_inventory()
+        return True
+
+    def _tool_craft_item(self, payload: dict, context: dict) -> bool:
+        # 两条合成命令**同一道门**：授权（注册表统一校验）+ 库存优先。
+        return self._dispatch_craft(payload, context, command="craft_item")
+
+    def _tool_craft_via_recipe(self, payload: dict, context: dict) -> bool:
+        return self._dispatch_craft(payload, context, command="craft_via_recipe")
+
+    def _tool_place_block(self, payload: dict, context: dict) -> bool:
+        self.skills.place_block()
+        return True
+
+    def _tool_build(self, payload: dict, context: dict) -> bool:
+        if {"x", "y", "z", "structure"}.issubset(payload):
+            self.skills.build(float(payload["x"]), float(payload["y"]),
+                              float(payload["z"]), str(payload["structure"]))
+            return True
+        return False
+
+    def _tool_container_close(self, payload: dict, context: dict) -> bool:
+        self.skills.container_close()
+        return True
+
+    def _tool_attack(self, payload: dict, context: dict) -> bool:
+        self.skills.attack()
+        return True
+
+    def _tool_equip_armor(self, payload: dict, context: dict) -> bool:
+        return self._dispatch_equip_armor(context)
+
+    def _tool_equip_weapon(self, payload: dict, context: dict) -> bool:
+        self.skills.equip_weapon()
+        return True
+
+    def _tool_select_hotbar(self, payload: dict, context: dict) -> bool:
+        index = payload.get("index")
+        if index is not None:
+            self.skills.select_hotbar(int(index))
+            return True
+        return False
+
+    def _tool_eat(self, payload: dict, context: dict) -> bool:
+        """吃：工具驱动（LLM 决定用不用）；下发前仍过 **BackendEatYield**（让路/退避/冷却）。"""
+        allowed, note = self.eat_yield.allow(context)
+        if not allowed:
+            self._action_note = note
+            logger.info("[Planner] eat 被闸门挡下：%s", note)
+            return False
+        self.skills.eat()
+        self.eat_yield.mark_sent()
+        return True
+
+    def _tool_sleep(self, payload: dict, context: dict) -> bool:
+        self.skills.sleep()
+        return True
+
+    def _tool_trade(self, payload: dict, context: dict) -> bool:
+        villager = payload.get("villager_type") or payload.get("type")
+        if villager:
+            self.skills.trade(str(villager))
+            return True
+        return False
+
+    def _tool_sleep_in_bed(self, payload: dict, context: dict) -> bool:
+        self.skills.sleep_in_bed()
+        return True
+
+    def _tool_guard_off(self, payload: dict, context: dict) -> bool:
+        self.skills.guard_off()
+        return True
+
+    def _tool_set_hud_note(self, payload: dict, context: dict) -> bool:
+        if "text" not in payload:
+            return False
+        seconds = payload.get("seconds")
+        try:
+            seconds = float(seconds) if seconds is not None else 30.0
+        except (TypeError, ValueError):
+            seconds = 30.0
+        self.skills.set_hud_note(str(payload.get("text") or ""), seconds)
+        return True
+
+    def _tool_run_server_command(self, payload: dict, context: dict) -> bool:
+        if self.server_commands is None:
+            return False
+        target_tool = str(payload.get("tool") or payload.get("command")
+                          or payload.get("name") or "")
+        result = self.server_commands(target_tool, payload.get("args"),
+                                      confirm=str(payload.get("confirm") or ""))
+        self._action_note = self._server_command_note(target_tool, result)
+        return bool(result.get("ok"))
+
+    def _tool_send_whisper(self, payload: dict, context: dict) -> bool:
+        if self.whisper_sender is None:
+            return False
+        player = payload.get("player") or payload.get("to") or payload.get("target")
+        text = payload.get("text") or payload.get("message") or payload.get("content")
+        if not player or text is None or str(text).strip() == "":
+            return False
+        result = self.whisper_sender(str(player), str(text))
+        self._action_note = self._server_command_note("私信", result)
+        return bool(result.get("ok"))
+
+    def _tool_tpa_respond(self, payload: dict, context: dict) -> bool:
+        if self.tpa_responder is None:
+            return False
+        action = payload.get("action") or payload.get("decision") or payload.get("answer")
+        result = self.tpa_responder(str(action or ""), str(payload.get("player") or ""))
+        self._action_note = self._server_command_note("传送请求回应", result)
+        return bool(result.get("ok"))
+
+    def _tool_tpa_request(self, payload: dict, context: dict) -> bool:
+        if self.tpa_requester is None:
+            return False
+        player = payload.get("player") or payload.get("target")
+        if not player:
+            return False
+        result = self.tpa_requester(str(player))
+        self._action_note = self._server_command_note("主动传送请求", result)
+        return bool(result.get("ok"))
+
+    def _tool_remember_poi(self, payload: dict, context: dict) -> bool:
+        name = str(payload.get("name") or "").strip()
+        category = str(payload.get("category") or "").strip() or "waypoint"
+        self.skills.remember_poi(
+            name,
+            category,
+            _as_optional_float(payload.get("x")),
+            _as_optional_float(payload.get("y")),
+            _as_optional_float(payload.get("z")),
+        )
+        return True
+
+    def _tool_list_territory(self, payload: dict, context: dict) -> bool:
+        return self._dispatch_list_territory(context)
 
     @staticmethod
     def _server_command_note(what: str, result: Any) -> Optional[str]:
@@ -1709,19 +1660,17 @@ class Planner:
     def _craft_policy(self, context: dict) -> CraftPolicy:
         """本轮的制作/翻箱授权（**只查能力表**，不看 tier 分支）。
 
-        `context["autonomous"]=True` 表示这一轮没人下指令（self-prompt / 事件注入）：
-        能不能自造只看 `autonomy_craft`，并且**一律不许翻箱**。没有权限表来源时
-        默认**拒绝**（宁可不做，也不越权动别人的箱子）。
+        没人指挥的轮次（self-prompt / 事件注入）没有发话者 → 按 guest 处理（默认拒绝）；
+        没有权限表来源时同样默认**拒绝**（宁可不做，也不越权动别人的箱子）。
         """
         ctx = context if isinstance(context, dict) else {}
-        autonomous = bool(ctx.get("autonomous"))
         tier = str(ctx.get("actor_tier") or "")
         store = self.permissions
         if store is None:
-            return CraftPolicy(tier=tier or TIER_GUEST, autonomous=autonomous,
+            return CraftPolicy(tier=tier or TIER_GUEST,
                                may_craft=False, may_open_containers=False,
                                reason="no_permissions")
-        return store.craft_policy(tier, autonomous=autonomous)
+        return store.craft_policy(tier)
 
     def _track_craft_need(self, missing: Any) -> None:
         """登记本次制作的材料缺口（正数才算）：容器取用以它为上限，绝不搬空。"""
@@ -1800,8 +1749,6 @@ class Planner:
 
     def _auth_note(self, policy: CraftPolicy, what: str) -> str:
         """如实说明为什么没动手（缺授权时的统一话术）。"""
-        if policy.autonomous:
-            return f"（没人在指挥我，我自己不许{what}（autonomy_craft 关着），所以没动手）"
         return f"（{policy.tier} 没被允许让我{what}，所以没动手）"
 
     @staticmethod
@@ -1828,15 +1775,10 @@ class Planner:
         先看这个箱子登记的策略：`no_touch` 一律不许动；`free`（所有权已交给它）随取、
         不记欠账；剩下的（`borrow_only` / 没登记）落回借用台账那条保守路径。
         """
-        cpolicy, crow = self._container_policy(context)
-        if cpolicy == POLICY_NO_TOUCH:
-            self._craft_note = self._container_policy_note(crow)
-            logger.info("[Planner] container_move 被拒：no_touch %s", (crow or {}).get("name"))
-            return False
-        policy = self._craft_policy(context)
-        if not policy.may_open_containers and cpolicy != POLICY_FREE:
-            self._craft_note = self._auth_note(policy, "翻箱子")
-            logger.info("[Planner] container_move 被拒：%s", policy.reason)
+        allowed, note, cpolicy, crow = self._container_access(context)
+        if not allowed:
+            self._craft_note = note
+            logger.info("[Planner] container_move 被拒：%s", note)
             return False
         from_slot = _as_optional_int(payload.get("from_slot"))
         if from_slot is None:
@@ -1891,14 +1833,10 @@ class Planner:
 
     def _dispatch_container_click(self, payload: dict, context: dict) -> bool:
         """点容器里的一格（"点容器找盔甲"）：同样是容器操作，没授权不动。"""
-        cpolicy, crow = self._container_policy(context)
-        if cpolicy == POLICY_NO_TOUCH:
-            self._craft_note = self._container_policy_note(crow)
-            return False
-        policy = self._craft_policy(context)
-        if not policy.may_open_containers and cpolicy != POLICY_FREE:
-            self._craft_note = self._auth_note(policy, "翻箱子")
-            logger.info("[Planner] container_click 被拒：%s", policy.reason)
+        allowed, note, _cpolicy, crow = self._container_access(context)
+        if not allowed:
+            self._craft_note = note
+            logger.info("[Planner] container_click 被拒：%s", note)
             return False
         slot = _as_optional_int(payload.get("slot"))
         if slot is None:
@@ -1991,14 +1929,10 @@ class Planner:
         台账 —— 用完/任务结束/被叫停时由 `settle_borrows` 自动放回并核对。
         """
         policy = self._craft_policy(context)
-        cpolicy, crow = self._container_policy(context)
-        if cpolicy == POLICY_NO_TOUCH:
-            self._craft_note = self._container_policy_note(crow)
-            logger.info("[Planner] borrow_item 被拒：no_touch %s", (crow or {}).get("name"))
-            return False
-        if not policy.may_open_containers and cpolicy != POLICY_FREE:
-            self._craft_note = self._auth_note(policy, "翻箱子")
-            logger.info("[Planner] borrow_item 被拒：%s", policy.reason)
+        allowed, note, cpolicy, crow = self._container_access(context)
+        if not allowed:
+            self._craft_note = note
+            logger.info("[Planner] borrow_item 被拒：%s", note)
             return False
         raw = str(payload.get("item") or payload.get("name") or "").strip()
         item = normalize_item(raw)
@@ -2240,20 +2174,6 @@ class Planner:
         except (TypeError, ValueError):
             return None
 
-    def _may(self, kind: str, context: dict) -> tuple[bool, str]:
-        """查权限表：`kind` = territory | zones。没权限表来源 → 一律不放行。"""
-        tier, _ = self._actor_of(context)
-        store = self.permissions
-        if store is None:
-            return False, "no_permissions"
-        try:
-            allowed = (store.can_authorize_territory(tier) if kind == "territory"
-                       else store.can_define_zones(tier))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[Planner] %s 权限查询失败: %s", kind, exc)
-            return False, "no_permissions"
-        return (True, "granted") if allowed else (False, "tier_not_allowed")
-
     def _no_authority_note(self, what: str, context: dict) -> str:
         tier, name = self._actor_of(context)
         who = f"{name}（{tier}）" if name else tier
@@ -2308,11 +2228,7 @@ class Planner:
         return True
 
     def _dispatch_grant_territory(self, payload: dict, context: dict) -> bool:
-        """把一片区域的所有权授予它（**只有 master**）。"""
-        allowed, reason = self._may("territory", context)
-        if not allowed:
-            self._territory_note = self._no_authority_note("把一片地的所有权交给我", context)
-            return False
+        """把一片区域的所有权授予它（**只有 master**）。授权由注册表统一校验。"""
         store = self._territory_store()
         if store is None:
             self._territory_note = "（没有领地存储，我记不下来）"
@@ -2340,10 +2256,6 @@ class Planner:
         return True
 
     def _dispatch_revoke_territory(self, payload: dict, context: dict) -> bool:
-        allowed, _ = self._may("territory", context)
-        if not allowed:
-            self._territory_note = self._no_authority_note("收回领地授权", context)
-            return False
         store = self._territory_store()
         name = str(payload.get("name") or "").strip()
         if store is None or not name:
@@ -2357,10 +2269,6 @@ class Planner:
         return True
 
     def _dispatch_set_base(self, payload: dict, context: dict) -> bool:
-        allowed, _ = self._may("territory", context)
-        if not allowed:
-            self._territory_note = self._no_authority_note("设基地", context)
-            return False
         store = self._territory_store()
         name = str(payload.get("name") or "").strip()
         if store is None or not name:
@@ -2388,10 +2296,6 @@ class Planner:
         return True
 
     def _dispatch_del_base(self, payload: dict, context: dict) -> bool:
-        allowed, _ = self._may("territory", context)
-        if not allowed:
-            self._territory_note = self._no_authority_note("删基地", context)
-            return False
         store = self._territory_store()
         name = str(payload.get("name") or "").strip()
         if store is None or not name:
@@ -2510,11 +2414,7 @@ class Planner:
         return True
 
     def _dispatch_define_zone(self, payload: dict, context: dict) -> bool:
-        """声明区域：**语义 + 硬保护**（调 Java 硬拦，同时 world 层存盘以便回灌）。"""
-        allowed, _ = self._may("zones", context)
-        if not allowed:
-            self._territory_note = self._no_authority_note("声明区域保护", context)
-            return False
+        """声明区域：**语义 + 硬保护**（调 Java 硬拦，同时 world 层存盘以便回灌）。授权由注册表统一校验。"""
         store = self._territory_store()
         position = self._player_pos(context)
         x = _as_optional_float(payload.get("x"))
@@ -2564,10 +2464,6 @@ class Planner:
         return True
 
     def _dispatch_clear_zone(self, payload: dict, context: dict) -> bool:
-        allowed, _ = self._may("zones", context)
-        if not allowed:
-            self._territory_note = self._no_authority_note("删除区域保护", context)
-            return False
         store = self._territory_store()
         name = str(payload.get("name") or "").strip()
         if store is None or not name:
