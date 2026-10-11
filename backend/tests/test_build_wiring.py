@@ -8,8 +8,10 @@
 
 from __future__ import annotations
 
+import types
 import unittest
 
+from agent.planner import Planner
 from agent.skills import Skills
 from agent.tool_registry import TOOL_BY_NAME
 
@@ -44,6 +46,48 @@ class BuildWiringTests(unittest.TestCase):
         sent = self._sent(x=0, y=0, z=0, structure="platform", material="stone")
         self.assertEqual(sent["args"]["size"], 3)
         self.assertEqual(sent["args"]["height"], 1)
+
+
+class BuildToolHandlerTests(unittest.TestCase):
+    """`_tool_build` 的拒绝路径必须**如实**：不下发 ✓ 不编方块 ✗，并写明原因 ✓。"""
+
+    def _planner(self, sent: list):
+        """不跑 `Planner.__init__`（它要 session/wire ✗），只塞进截住 `skills.build` 的替身。"""
+        planner = Planner.__new__(Planner)
+        planner._action_note = None
+        planner.skills = types.SimpleNamespace(build=lambda *a: sent.append(a))
+        return planner
+
+    def test_missing_material_is_refused_and_sends_nothing(self):
+        sent: list = []
+        planner = self._planner(sent)
+        ok = planner._tool_build({"x": 1, "y": 2, "z": 3, "structure": "wall"}, {})
+        self.assertFalse(ok, "不点名材料必须如实拒（模组侧只会回 need_material）")
+        self.assertEqual(sent, [], "拒的时候一条命令都不许发")
+        self.assertIn("material", planner._action_note or "")
+
+    def test_bad_size_is_refused_and_sends_nothing(self):
+        sent: list = []
+        planner = self._planner(sent)
+        ok = planner._tool_build({"x": 1, "y": 2, "z": 3, "structure": "wall",
+                                  "material": "minecraft:stone", "size": "三"}, {})
+        self.assertFalse(ok)
+        self.assertEqual(sent, [])
+        self.assertIn("整数", planner._action_note or "")
+
+    def test_missing_position_is_refused(self):
+        sent: list = []
+        planner = self._planner(sent)
+        self.assertFalse(planner._tool_build({"structure": "wall", "material": "stone"}, {}))
+        self.assertEqual(sent, [])
+
+    def test_full_call_dispatches_the_mod_contract(self):
+        sent: list = []
+        planner = self._planner(sent)
+        ok = planner._tool_build({"x": 1, "y": 2, "z": 3, "structure": "pen",
+                                  "material": "minecraft:oak_fence", "size": 3, "height": 1}, {})
+        self.assertTrue(ok)
+        self.assertEqual(sent, [(1.0, 2.0, 3.0, "pen", "minecraft:oak_fence", 3, 1)])
 
 
 if __name__ == "__main__":
