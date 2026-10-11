@@ -19,6 +19,14 @@ import net.minecraft.client.Options;
  * 3. Switching is manual (F12 / command) — the AI never takes control on its own.
  * 4. The auto-return-to-AI-after-inactivity path exists but is OFF by default
  *    (see setAutoReturnEnabled), so a human is never hijacked mid-play.
+ * 5. VIEW: this class is the ONE AND ONLY writer of the player's yaw/pitch while the AI is in
+ *    control (see {@link LookArbiter}). Callers only ever *publish a target* — the pathfinder
+ *    through {@link #setNavigationLookTarget(float, float)}, the backend wire's look through
+ *    {@link #setAiLookTarget(float, float)}. Each tick {@link #tick} arbitrates: while navigating
+ *    the path direction wins and is turned gradually (never snapped); with no path the backend
+ *    look (an absolute one-shot target) applies; when the AI is not in control nothing is written.
+ *    Having two writers fight over the view was the root cause of the "AI stands still while
+ *    steering itself" bug.
  */
 public class InputIsolation {
 
@@ -39,10 +47,9 @@ public class InputIsolation {
     private static final long USER_TIMEOUT_MS = 10000;  // 10 seconds
     private static boolean autoReturnEnabled = false;  // OFF by default: never hijack control back
 
-    // Look target (applied by writing yaw/pitch — the cursor is never grabbed)
-    private static float aiYaw = 0;
-    private static float aiPitch = 0;
-    private static boolean aiHasTarget = false;
+    // View ownership (the cursor is never grabbed). All look targets live here; this class is the
+    // single writer of the player's yaw/pitch — see LookArbiter for the priority rules.
+    private static final LookArbiter LOOK = new LookArbiter();
 
     // ── Public API ──
 
@@ -107,7 +114,7 @@ public class InputIsolation {
         aiJump = false;
         aiSneak = false;
         aiSprint = false;
-        aiHasTarget = false;
+        LOOK.clearAll();
 
         Minecraft mc = Minecraft.getInstance();
         if (mc != null && mc.options != null) {
@@ -132,20 +139,40 @@ public class InputIsolation {
     }
 
     /**
-     * Set AI look target.
+     * Publish the backend wire's look target. This is an ABSOLUTE, one-shot target: it is written
+     * verbatim whenever the pathfinder is not navigating (see {@link LookArbiter}).
      */
     public static void setAiLookTarget(float yaw, float pitch) {
         if (!aiControlled) return;
-        aiYaw = yaw;
-        aiPitch = pitch;
-        aiHasTarget = true;
+        LOOK.setBackendTarget(yaw, pitch);
     }
 
     /**
-     * Clear AI look target.
+     * Clear the backend look target. (The player's view is left where it is — this class never
+     * writes anything just because a target disappeared.)
      */
     public static void clearAiLookTarget() {
-        aiHasTarget = false;
+        LOOK.clearBackendTarget();
+    }
+
+    /**
+     * Publish the pathfinder's look target for this tick. Navigation's direction wins over the
+     * backend look while a path exists, and it is turned GRADUALLY (see {@link LookArbiter}).
+     * The actual write happens in {@link #tick} — the single writer.
+     */
+    public static void setNavigationLookTarget(float yaw, float pitch) {
+        if (!aiControlled) return;
+        LOOK.setNavigationTarget(yaw, pitch);
+    }
+
+    /** Stop steering the view from navigation (called when navigation ends). */
+    public static void clearNavigationLookTarget() {
+        LOOK.clearNavigationTarget();
+    }
+
+    /** True while navigation currently owns the view. */
+    public static boolean isNavigationOwningLook() {
+        return LOOK.hasNavigationTarget();
     }
 
     /**
@@ -233,10 +260,13 @@ public class InputIsolation {
             aiKeysDirty = false;
         }
 
-        // Apply look target (only while the AI actually has one)
-        if (aiHasTarget) {
-            mc.player.setYRot(aiYaw);
-            mc.player.setXRot(aiPitch);
+        // Apply the view: the ONE place that writes the player's yaw/pitch. The arbiter decides who
+        // owns it this tick (navigation > backend look > nobody) — see LookArbiter.
+        LookArbiter.Frame look = LOOK.plan(aiControlled, Pathfinder.isNavigating(),
+                mc.player.getYRot(), mc.player.getXRot());
+        if (look.wrote()) {
+            mc.player.setYRot(look.yaw());
+            mc.player.setXRot(look.pitch());
         }
     }
 

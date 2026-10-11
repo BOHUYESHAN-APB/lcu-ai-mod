@@ -226,6 +226,15 @@ tasks.named('check').configure {
     dependsOn 'verifyMlg'
     dependsOn 'verifyMixin'
     dependsOn 'verifyLang'
+    dependsOn 'verifyWalk'
+}
+
+tasks.register('verifyWalk', JavaExec) {
+    group = 'verification'
+    description = '纯逻辑自检（视角单一写者 + 寻路收敛/退避：导航优先级 / 后端 look 绝对值 / 逐步转不瞬间对齐 / 转不过去如实停步上报 / 重算退避与结果去重 / 静态扫描 setYRot 只在单一写点）'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.output + sourceSets.main.output
+    mainClass = 'com.lcu.lcumod.action.WalkCheck'
 }
 
 tasks.register('verifyMixin', JavaExec) {

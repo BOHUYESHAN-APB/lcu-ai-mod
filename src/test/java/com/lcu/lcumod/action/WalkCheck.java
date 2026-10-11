@@ -1,0 +1,284 @@
+package com.lcu.lcumod.action;
+
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+/**
+ * 零依赖自检（接入 {@code check}）：**视角单一写者 + 寻路收敛/退避**。
+ *
+ * <p>用户实机根因："AI 在控制中、显示跟着我，但原地罚站"，日志每秒刷
+ * {@code Calculated path with 47 waypoints}——后端 look 与寻路转身**两个写者互相覆盖**，
+ * {@code yawDiff} 永不收敛 ⇒ 前进键永远 false。本批覆盖：
+ *
+ * <ol>
+ *   <li><b>导航中后端 look 不覆盖路径朝向</b>（{@link LookArbiter} 优先级）；</li>
+ *   <li><b>无导航时后端 look 生效</b>（绝对值、一次性）；</li>
+ *   <li><b>逐步转不会瞬间对齐</b>（限速 10°/6° per tick，且能收敛）；</li>
+ *   <li><b>收敛失败如实停步并回报原因</b>（{@link AlignmentGuard}）；</li>
+ *   <li><b>退避期内不重复计算 / 相同结果只报一次</b>（{@link ReplanGate}）；</li>
+ *   <li><b>静态扫描</b>：寻路不再直接写视角（{@code setYRot}/{@code setXRot} 只出现在
+ *       {@code InputIsolation} 的单一写点）。</li>
+ * </ol>
+ *
+ * <p>断言信息用 ASCII（Windows 控制台 GBK）；失败非零退出。
+ */
+public final class WalkCheck {
+
+    private static int passed = 0;
+    private static int failed = 0;
+
+    public static void main(String[] args) {
+        lookOwnershipChecks();
+        gradualTurnChecks();
+        alignmentGuardChecks();
+        replanGateChecks();
+        sourceScanChecks();
+
+        System.out.println("[WalkCheck] " + passed + " checks passed, " + failed + " failed");
+        if (failed > 0) {
+            System.exit(1);
+        }
+    }
+
+    // ── 1/2. 视角所有权：导航 > 后端 look > 不写 ──────────────────
+
+    private static void lookOwnershipChecks() {
+        // ① 导航中：后端 look 绝不覆盖路径朝向
+        LookArbiter a = new LookArbiter();
+        a.setBackendTarget(90f, 45f);
+        a.setNavigationTarget(-90f, 30f);
+        LookArbiter.Frame f = a.plan(true, true, 0f, 0f);
+        check("ownership: navigating -> NAVIGATION owns view", f.source() == LookArbiter.Source.NAVIGATION);
+        check("ownership: navigating -> backend yaw NOT applied", f.yaw() != 90f);
+        check("ownership: navigating -> backend pitch NOT applied", f.pitch() != 45f);
+        check("ownership: navigating -> turns toward path (-10 after 1 tick)", f.yaw() == -10f);
+        check("ownership: navigating -> pitch steps 6 toward path", f.pitch() == 6f);
+
+        // ② 无导航：后端 look 生效（绝对值，一次性）
+        LookArbiter b = new LookArbiter();
+        b.setBackendTarget(90f, 10f);
+        LookArbiter.Frame back = b.plan(true, false, 0f, 0f);
+        check("ownership: no navigation -> BACKEND owns view", back.source() == LookArbiter.Source.BACKEND);
+        check("ownership: backend look is absolute", back.yaw() == 90f && back.pitch() == 10f);
+        b.setNavigationTarget(-90f, 0f);
+        check("ownership: backend still owns while not navigating",
+                b.plan(true, false, 0f, 0f).source() == LookArbiter.Source.BACKEND);
+        check("ownership: nav target kicks in once navigating",
+                b.plan(true, true, 0f, 0f).source() == LookArbiter.Source.NAVIGATION);
+        b.clearNavigationTarget();
+        check("ownership: clearing nav target hands view back to backend",
+                b.plan(true, true, 0f, 0f).source() == LookArbiter.Source.NONE
+                        && b.plan(true, false, 0f, 0f).source() == LookArbiter.Source.BACKEND);
+
+        // ③ AI 不持控制时一律不写（即使两个目标都在）
+        LookArbiter c = new LookArbiter();
+        c.setBackendTarget(90f, 45f);
+        c.setNavigationTarget(-90f, 30f);
+        LookArbiter.Frame none = c.plan(false, true, 12f, -7f);
+        check("ownership: no AI control -> NONE", none.source() == LookArbiter.Source.NONE);
+        check("ownership: no AI control -> nothing written", !none.wrote());
+        check("ownership: no AI control -> yaw/pitch untouched",
+                none.yaw() == 12f && none.pitch() == -7f);
+
+        // 导航中但还没发布路径目标 -> 也不许让后端 look 抢（宁可本 tick 不写）
+        LookArbiter d = new LookArbiter();
+        d.setBackendTarget(90f, 0f);
+        LookArbiter.Frame first = d.plan(true, true, 0f, 0f);
+        check("ownership: navigating without nav target -> NONE (no backend hijack)",
+                first.source() == LookArbiter.Source.NONE && !first.wrote());
+
+        // 兜底：BACKEND 俯仰夹到 ±90；清空后什么也不写
+        LookArbiter e = new LookArbiter();
+        e.setBackendTarget(0f, 200f);
+        check("ownership: backend pitch clamped to +90", e.plan(true, false, 0f, 0f).pitch() == 90f);
+        e.setBackendTarget(0f, -200f);
+        check("ownership: backend pitch clamped to -90", e.plan(true, false, 0f, 0f).pitch() == -90f);
+        e.clearBackendTarget();
+        check("ownership: no targets -> NONE", e.plan(true, false, 0f, 0f).source() == LookArbiter.Source.NONE);
+
+        LookArbiter g = new LookArbiter();
+        g.setBackendTarget(1f, 2f);
+        g.setNavigationTarget(3f, 4f);
+        g.clearAll();
+        check("ownership: clearAll clears both", !g.hasBackendTarget() && !g.hasNavigationTarget());
+    }
+
+    // ── 3. 逐步转：不会瞬间对齐，且能收敛 ────────────────────────
+
+    private static void gradualTurnChecks() {
+        LookArbiter a = new LookArbiter();
+        a.setNavigationTarget(180f, 45f);
+        LookArbiter.Frame f = a.plan(true, true, 0f, 0f);
+        check("gradual: 180deg target is NOT snapped (yaw=10 after 1 tick)", f.yaw() == 10f);
+        check("gradual: yaw step is capped at 10", f.yaw() - 0f == LookArbiter.NAV_MAX_YAW_STEP);
+        check("gradual: pitch step is capped at 6", f.pitch() == 6f);
+
+        float yaw = 0f;
+        float pitch = 0f;
+        int ticks = 0;
+        LookArbiter sim = new LookArbiter();
+        sim.setNavigationTarget(180f, 45f);
+        while (LookArbiter.yawDiff(yaw, 180f) != 0f && ticks < 200) {
+            LookArbiter.Frame step = sim.plan(true, true, yaw, pitch);
+            // 单 tick 位移绝不越界
+            if (Math.abs(LookArbiter.yawDiff(yaw, step.yaw())) > LookArbiter.NAV_MAX_YAW_STEP + 0.001f) {
+                check("gradual: step never exceeds cap (tick " + ticks + ")", false);
+                return;
+            }
+            yaw = step.yaw();
+            pitch = step.pitch();
+            ticks++;
+        }
+        check("gradual: converges to 180 within 18 ticks (got " + ticks + ")", ticks == 18);
+        check("gradual: pitch converges to 45", Math.abs(pitch - 45f) < 0.001f);
+        check("gradual: once aligned it stays put",
+                sim.plan(true, true, yaw, pitch).yaw() == yaw);
+
+        // 跨 ±180 边界：170 -> -170 只差 20 度，往正方向转
+        LookArbiter wrap = new LookArbiter();
+        wrap.setNavigationTarget(-170f, 0f);
+        LookArbiter.Frame wf = wrap.plan(true, true, 170f, 0f);
+        check("gradual: crosses the +-180 seam the short way", wf.yaw() == 180f);
+        check("gradual: seam diff is 20 not 340", wf.yawDiff() == 20f);
+
+        // yawDiff 纯函数
+        check("yawDiff: 0 -> 350 is -10", LookArbiter.yawDiff(0f, 350f) == -10f);
+        check("yawDiff: 350 -> 10 is +20", LookArbiter.yawDiff(350f, 10f) == 20f);
+        check("yawDiff: 0 -> 190 is -170", LookArbiter.yawDiff(0f, 190f) == -170f);
+        check("yawDiff: 0 -> -190 is +170", LookArbiter.yawDiff(0f, -190f) == 170f);
+        check("yawDiff: 0 -> 720 normalizes to 0", LookArbiter.yawDiff(0f, 720f) == 0f);
+        check("yawDiff: 180 is kept (range is (-180,180])", LookArbiter.yawDiff(0f, 180f) == 180f);
+    }
+
+    // ── 4. 收敛保护：转不过去就如实停步 ──────────────────────────
+
+    private static void alignmentGuardChecks() {
+        AlignmentGuard g = new AlignmentGuard(5);
+        boolean fired = false;
+        for (int i = 0; i < 5; i++) {
+            fired |= g.tick(false);
+        }
+        check("align: 5 unaligned ticks are still tolerated", !fired);
+        check("align: stalledTicks counted", g.stalledTicks() == 5);
+        check("align: 6th unaligned tick -> stall reported", g.tick(false));
+        check("align: per-tick reporting is monotone", g.tick(false));
+
+        AlignmentGuard h = new AlignmentGuard(5);
+        for (int i = 0; i < 4; i++) {
+            h.tick(false);
+        }
+        check("align: getting aligned clears the counter", !h.tick(true) && h.stalledTicks() == 0);
+        check("align: after clearing it tolerates again", !h.tick(false));
+        h.reset();
+        check("align: reset clears stalledTicks", h.stalledTicks() == 0);
+        check("align: timeout exposed", g.timeoutTicks() == 5);
+
+        boolean threw = false;
+        try {
+            new AlignmentGuard(0);
+        } catch (IllegalArgumentException ex) {
+            threw = true;
+        }
+        check("align: ctor rejects timeout < 1", threw);
+    }
+
+    // ── 5. 退避 + 去重 ───────────────────────────────────────────
+
+    private static void replanGateChecks() {
+        ReplanGate gate = new ReplanGate(1000);
+        check("backoff: first replan allowed", gate.allow("1,64,2", 0));
+        check("backoff: same target inside window denied", !gate.allow("1,64,2", 999));
+        check("backoff: same target at window edge allowed", gate.allow("1,64,2", 1000));
+        check("backoff: window restarts from the allowed time", !gate.allow("1,64,2", 1999));
+        check("backoff: different target allowed immediately", gate.allow("9,70,9", 1999));
+        check("backoff: remainingMs reports full window right after allow",
+                gate.remainingMs("9,70,9", 1999) == 1000);
+        check("backoff: remainingMs reports the tail", gate.remainingMs("9,70,9", 2500) == 499);
+        check("backoff: unknown key has no wait", gate.remainingMs("other", 2500) == 0);
+
+        ReplanGate zero = new ReplanGate(0);
+        check("backoff: zero window never blocks", zero.allow("k", 0) && zero.allow("k", 0));
+
+        check("dedupe: first result reported", gate.allowOnce("path:1,64,2#47"));
+        check("dedupe: identical result suppressed", !gate.allowOnce("path:1,64,2#47"));
+        check("dedupe: different result reported", gate.allowOnce("path:1,64,2#46"));
+        check("dedupe: failure reason reported once", gate.allowOnce("fail:x#no path") && !gate.allowOnce("fail:x#no path"));
+
+        gate.reset();
+        check("dedupe: reset re-allows the same result", gate.allowOnce("path:1,64,2#47"));
+        check("backoff: reset clears the window", gate.allow("1,64,2", 0));
+
+        boolean threw = false;
+        try {
+            new ReplanGate(-1);
+        } catch (IllegalArgumentException ex) {
+            threw = true;
+        }
+        check("backoff: ctor rejects negative window", threw);
+    }
+
+    // ── 6. 静态扫描：单一写者 ────────────────────────────────────
+
+    private static void sourceScanChecks() {
+        Path root = Path.of("src", "main", "java", "com", "lcu", "lcumod", "action");
+        Path pathfinder = root.resolve("Pathfinder.java");
+        Path inputIsolation = root.resolve("InputIsolation.java");
+        if (!Files.isRegularFile(pathfinder) || !Files.isRegularFile(inputIsolation)) {
+            check("scan: sources found (cwd=" + Path.of(".").toAbsolutePath() + ")", false);
+            return;
+        }
+
+        String pf = read(pathfinder);
+        String ii = read(inputIsolation);
+
+        check("scan: Pathfinder never writes yaw directly", !pf.contains("setYRot"));
+        check("scan: Pathfinder never writes pitch directly", !pf.contains("setXRot"));
+        check("scan: Pathfinder publishes via the single writer", pf.contains("setNavigationLookTarget"));
+        check("scan: Pathfinder clears nav look target when it stops", pf.contains("clearNavigationLookTarget"));
+        check("scan: Pathfinder uses the convergence guard", pf.contains("ALIGNMENT.tick("));
+        check("scan: Pathfinder uses the replan backoff", pf.contains("REPLAN.allow("));
+        check("scan: Pathfinder keeps the alignment intent (65deg gate)",
+                pf.contains("ALIGN_TO_WALK_DEG") && pf.contains("65.0f"));
+        check("scan: Pathfinder keeps the no-rescue policy", pf.contains("NO_RESCUE_POLICY"));
+
+        check("scan: InputIsolation is the only writer (yaw)", countOf(ii, "mc.player.setYRot(") == 1);
+        check("scan: InputIsolation is the only writer (pitch)", countOf(ii, "mc.player.setXRot(") == 1);
+        check("scan: InputIsolation writes through the arbiter", ii.contains("LOOK.plan("));
+        check("scan: InputIsolation guards the write on the frame", ii.contains("look.wrote()"));
+        check("scan: InputIsolation no longer keeps a second look channel", !ii.contains("aiHasTarget"));
+    }
+
+    // ── helpers ──────────────────────────────────────────────────
+
+    private static String read(Path file) {
+        try {
+            return Files.readString(file, StandardCharsets.UTF_8);
+        } catch (Exception ex) {
+            return "";
+        }
+    }
+
+    private static int countOf(String haystack, String needle) {
+        int count = 0;
+        int from = 0;
+        while (true) {
+            int idx = haystack.indexOf(needle, from);
+            if (idx < 0) {
+                return count;
+            }
+            count++;
+            from = idx + needle.length();
+        }
+    }
+
+    private static void check(String name, boolean ok) {
+        if (ok) {
+            passed++;
+            System.out.println("  OK   " + name);
+        } else {
+            failed++;
+            System.out.println("  FAIL " + name);
+        }
+    }
+}

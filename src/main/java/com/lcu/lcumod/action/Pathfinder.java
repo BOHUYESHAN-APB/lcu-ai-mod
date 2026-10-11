@@ -40,6 +40,14 @@ public class Pathfinder {
     private static final double WAYPOINT_REACH_Y = 0.9;
     private static final int STUCK_TIMEOUT_TICKS = 40;
     private static final int MAX_SEARCH_EXPANSIONS = 2048;
+    /** 视角对准到多少度以内才允许按前进键（保留原意图）。 */
+    private static final float ALIGN_TO_WALK_DEG = 65.0f;
+    /** 对准到多少度以内才允许冲刺。 */
+    private static final float ALIGN_TO_SPRINT_DEG = 18.0f;
+    /** 连续多少 tick 仍转不过去 ⇒ 如实停步并上报（见 {@link AlignmentGuard}）。 */
+    private static final int ALIGN_TIMEOUT_TICKS = 100;
+    /** 同一目标的重算退避（见 {@link ReplanGate}）。 */
+    private static final long REPLAN_BACKOFF_MS = ReplanGate.DEFAULT_BACKOFF_MS;
 
     /**
      * 寻路失败时随原因一起上报的口径（**不搭方块**）。
@@ -65,6 +73,10 @@ public class Pathfinder {
     private static int stuckTicks = 0;
     private static String lastFailureReason = "";
     private static String activeRequestId = null;
+    /** 收敛保护：转不过去就如实停步，不原地无限转。 */
+    private static final AlignmentGuard ALIGNMENT = new AlignmentGuard(ALIGN_TIMEOUT_TICKS);
+    /** 卡住后"重算同一个目标"的退避 + 结果去重（治每秒多条 Calculated path 的抖动）。 */
+    private static final ReplanGate REPLAN = new ReplanGate(REPLAN_BACKOFF_MS);
 
     public static boolean navigateTo(String requestId, double x, double y, double z) {
         targetPos = new Vec3(x, y, z);
@@ -75,6 +87,10 @@ public class Pathfinder {
         stuckTicks = 0;
         lastFailureReason = "";
         activeRequestId = requestId;
+        // 新指令：退避/去重状态归零（每次导航至多上报一次相同结果），收敛计数归零。
+        REPLAN.reset();
+        ALIGNMENT.reset();
+        InputIsolation.clearNavigationLookTarget();
         return calculatePath();
     }
 
@@ -86,6 +102,9 @@ public class Pathfinder {
         isNavigating = false;
         lastPosition = null;
         stuckTicks = 0;
+        ALIGNMENT.reset();
+        // 交还视角：导航结束后，后端的 look（若有）从下一 tick 起重新生效（见 LookArbiter）。
+        InputIsolation.clearNavigationLookTarget();
         InputIsolation.setAiControlState("forward", false);
         InputIsolation.setAiControlState("sprint", false);
         InputIsolation.setAiControlState("jump", false);
@@ -110,17 +129,39 @@ public class Pathfinder {
         }
 
         if (isStuck(playerPos)) {
-            LCUMod.LOGGER.warn("[Pathfinder] Stuck, recalculating path...");
-            calculatePath();
             stuckTicks = 0;
+            long nowMs = System.currentTimeMillis();
+            String key = targetKey(targetPos);
+            if (REPLAN.allow(key, nowMs)) {
+                calculatePath();
+            } else if (REPLAN.allowOnce("stuck:" + key)) {
+                // 退避期内**不重复计算**（否则每秒多条 "Calculated path"）；仍按现有路继续尝试。
+                // 真的走不动时，由 ActionExecutor 的卡住看门狗如实停路并上报（本地不硬撑、不自救）。
+                LCUMod.LOGGER.warn("[Pathfinder] Stuck; replan backed off {}ms for target {}",
+                        REPLAN.remainingMs(key, nowMs), key);
+            }
         }
 
         if (currentPath.isEmpty() || currentPathIndex >= currentPath.size()) {
-            calculatePath();
+            String key = targetKey(targetPos);
+            boolean allowed = REPLAN.allow(key, System.currentTimeMillis());
+            if (allowed) {
+                calculatePath();
+            }
             if (currentPath.isEmpty()) {
-                LCUMod.LOGGER.warn("[Pathfinder] No path found to target");
-                reportProgress(0.0, lastFailureReason.isBlank() ? "no path found" : lastFailureReason);
+                // 真的没有路（或退避期内仍无路）→ 如实上报一次，然后停步（不假装在走、不越过退避重算）。
+                String reason = lastFailureReason.isBlank() ? "no path found" : lastFailureReason;
+                if (REPLAN.allowOnce("nopath:" + key + "#" + reason)) {
+                    LCUMod.LOGGER.warn("[Pathfinder] No path found to target {}", key);
+                    // 失败原因只报一次（相同目标 + 相同原因不重复上报）。
+                    reportProgress(0.0, reason);
+                }
                 stop();
+                return;
+            }
+            if (currentPathIndex >= currentPath.size()) {
+                // 路点走完但退避窗口还没过：本 tick 不重算，也不越界取点（等窗口过去再看；
+                // 真的卡死由 ActionExecutor 的看门狗如实处理）。
                 return;
             }
         }
@@ -152,13 +193,17 @@ public class Pathfinder {
                 : start == null
                     ? "could not resolve current stand position"
                     : "could not resolve target stand position";
-            LCUMod.LOGGER.warn("[Pathfinder] {}", lastFailureReason);
+            if (REPLAN.allowOnce("fail:" + failureKey() + "#" + lastFailureReason)) {
+                LCUMod.LOGGER.warn("[Pathfinder] {}", lastFailureReason);
+            }
             return false;
         }
 
         if (isGoal(start, goal)) {
             currentPath.add(goal.standingPos);
-            LCUMod.LOGGER.info("[Pathfinder] Start and goal share the same stand node; using direct target point");
+            if (REPLAN.allowOnce("direct:" + failureKey())) {
+                LCUMod.LOGGER.info("[Pathfinder] Start and goal share the same stand node; using direct target point");
+            }
             return true;
         }
 
@@ -169,13 +214,29 @@ public class Pathfinder {
             // 也无从断言"搭桥就能过"——所以只如实说"这里没有路，且本地不会造路"。
             lastFailureReason = String.format(
                     "no path from %s to %s (%s)", start.supportPos, goal.supportPos, NO_RESCUE_POLICY);
-            LCUMod.LOGGER.warn("[Pathfinder] {}", lastFailureReason);
+            if (REPLAN.allowOnce("fail:" + failureKey() + "#" + lastFailureReason)) {
+                LCUMod.LOGGER.warn("[Pathfinder] {}", lastFailureReason);
+            }
             return false;
         }
 
         currentPath.addAll(solved);
-        LCUMod.LOGGER.info("[Pathfinder] Calculated path with {} waypoints", currentPath.size());
+        // 相同目标的相同结果只打一次（与后端"变了才打日志"同一原则）——治每秒多条刷屏。
+        if (REPLAN.allowOnce("path:" + failureKey() + "#" + currentPath.size())) {
+            LCUMod.LOGGER.info("[Pathfinder] Calculated path with {} waypoints", currentPath.size());
+        }
         return true;
+    }
+
+    /** 当前目标的整数格键 + 出发点格键（日志/上报去重用）。 */
+    private static String failureKey() {
+        Minecraft mc = Minecraft.getInstance();
+        String target = targetKey(targetPos);
+        if (mc == null || mc.player == null) {
+            return target;
+        }
+        Vec3 p = mc.player.position();
+        return targetKey(p) + "->" + target;
     }
 
     private static List<Vec3> findPath(Minecraft mc, StandingNode start, StandingNode goal) {
@@ -414,16 +475,38 @@ public class Pathfinder {
         double dz = target.z - current.z;
         double dy = target.y - current.y;
         double horizontalDistance = Math.sqrt(dx * dx + dz * dz);
-        if (horizontalDistance < 0.01) return;
+        if (horizontalDistance < 0.01) {
+            ALIGNMENT.reset();
+            return;
+        }
 
         float targetYaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
         float targetPitch = (float) Math.toDegrees(-Math.atan2(dy, horizontalDistance));
-        float yawDiff = smoothLook(mc, targetYaw, targetPitch);
 
-        boolean alignedEnoughToWalk = Math.abs(yawDiff) < 65.0f;
-        boolean alignedEnoughToSprint = Math.abs(yawDiff) < 18.0f;
+        // View: publish the target only. InputIsolation (the single writer) turns toward it
+        // gradually this tick — navigation wins over the backend look while a path exists.
+        InputIsolation.setNavigationLookTarget(targetYaw, targetPitch);
+
+        // Alignment gate (intent preserved): only walk once we are roughly facing the waypoint.
+        float yawDiff = LookArbiter.yawDiff(mc.player.getYRot(), targetYaw);
+        boolean alignedEnoughToWalk = Math.abs(yawDiff) < ALIGN_TO_WALK_DEG;
+        boolean alignedEnoughToSprint = Math.abs(yawDiff) < ALIGN_TO_SPRINT_DEG;
+
+        // Convergence guard: if we keep failing to face the path, report honestly and stop —
+        // never spin in place, never pretend to be walking.
+        if (ALIGNMENT.tick(alignedEnoughToWalk)) {
+            String reason = String.format(
+                    "cannot align with path (yaw off %d deg after %d ticks; player input or collision?)",
+                    Math.round(yawDiff), ALIGNMENT.stalledTicks());
+            LCUMod.LOGGER.warn("[Pathfinder] {}", reason);
+            reportProgress(0.0, reason);
+            stop();
+            return;
+        }
+
         InputIsolation.setAiControlState("forward", alignedEnoughToWalk);
-        InputIsolation.setAiControlState("sprint", alignedEnoughToSprint && horizontalDistance > 4.0 && Math.abs(dy) < 0.2);
+        InputIsolation.setAiControlState("sprint",
+                alignedEnoughToSprint && horizontalDistance > 4.0 && Math.abs(dy) < 0.2);
 
         boolean shouldJump = dy > STEP_UP_HEIGHT || (dy > 0.18 && horizontalDistance < 1.2);
         if (!shouldJump && mc.player != null && mc.player.onGround()) {
@@ -433,22 +516,10 @@ public class Pathfinder {
         InputIsolation.setAiControlState("jump", alignedEnoughToWalk && shouldJump);
     }
 
-    private static float smoothLook(Minecraft mc, float targetYaw, float targetPitch) {
-        if (mc.player == null) return 0;
-        float currentYaw = mc.player.getYRot();
-        float currentPitch = mc.player.getXRot();
-
-        float yawDiff = targetYaw - currentYaw;
-        while (yawDiff > 180) yawDiff -= 360;
-        while (yawDiff < -180) yawDiff += 360;
-
-        float pitchDiff = targetPitch - currentPitch;
-        float yawStep = Math.max(-10.0f, Math.min(10.0f, yawDiff));
-        float pitchStep = Math.max(-6.0f, Math.min(6.0f, pitchDiff));
-
-        mc.player.setYRot(currentYaw + yawStep);
-        mc.player.setXRot(currentPitch + pitchStep);
-        return yawDiff;
+    /** 目标的整数格键（退避/去重都用它，避免浮点抖动造成"看起来是新目标"）。 */
+    private static String targetKey(Vec3 target) {
+        if (target == null) return "none";
+        return (int) Math.floor(target.x) + "," + (int) Math.floor(target.y) + "," + (int) Math.floor(target.z);
     }
 
     private static boolean isStuck(Vec3 currentPos) {
