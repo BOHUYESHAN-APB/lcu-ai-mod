@@ -17,7 +17,9 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from agent import LLMService
+from agent.command_gate import HARD_BLACKLIST, HIGH_RISK, CommandsStore
 from agent.config_store import get_config_store, DEFAULT_CONFIG_PATH
+from agent.contacts import ContactStore
 from agent.orchestrator import Orchestrator
 from agent.permissions import PermissionsStore
 from agent.persona_store import KNOWN_KEYS as PERSONA_KEYS, PersonaStore
@@ -550,3 +552,115 @@ async def search_database_messages(q: str, limit: int = 50):
         messages = db.search_messages(query=q, limit=limit)
         return {"messages": messages}
     return {"messages": []}
+
+
+# ── 私信（通讯录）+ 指令白名单 ──────────────────────────────────────
+# 端点全部自建（**不用** master 的 `/api/v2/inbox/*`）。运行期一律用 session 里那一份，
+# 进程还没起来时退回模块级实例（懒建，避免 import 时就写盘）。
+
+_fallback_commands: CommandsStore | None = None
+_fallback_contacts: ContactStore | None = None
+
+
+def _commands_store() -> CommandsStore:
+    global _fallback_commands
+    session = orchestrator.session if orchestrator else None
+    store = getattr(session, "commands_store", None)
+    if isinstance(store, CommandsStore):
+        return store
+    if _fallback_commands is None:
+        _fallback_commands = CommandsStore()
+    return _fallback_commands
+
+
+def _contacts_store() -> ContactStore:
+    global _fallback_contacts
+    session = orchestrator.session if orchestrator else None
+    store = getattr(session, "contacts", None)
+    if isinstance(store, ContactStore):
+        return store
+    if _fallback_contacts is None:
+        _fallback_contacts = ContactStore()
+    return _fallback_contacts
+
+
+def _contacts_namespace() -> str:
+    """通讯录的 server 分区键（与对话记忆/私信落盘同一套）。"""
+    session = orchestrator.session if orchestrator else None
+    if session is not None:
+        try:
+            key = str(session.current_server_key() or "")
+            if key:
+                return key
+        except Exception:
+            pass
+    return "unknown"
+
+
+@app.get("/api/contacts")
+async def get_contacts():
+    """通讯录：每个联系人的名字/uuid/层级/未读/未回/最后一条（按最后一条时间倒序）。"""
+    store = _contacts_store()
+    session = orchestrator.session if orchestrator else None
+    permissions = getattr(session, "permissions", None)
+    tier_of = permissions.tier_of if isinstance(permissions, PermissionsStore) else None
+    key = _contacts_namespace()
+    return {"server": key, "contacts": store.contacts(key, tier_of=tier_of)}
+
+
+@app.get("/api/contacts/{uuid}/messages")
+async def get_contact_messages(uuid: str, limit: int = 50):
+    """某个联系人在**本服**的往来消息（时间从早到晚）。"""
+    store = _contacts_store()
+    key = _contacts_namespace()
+    return {"server": key, "target": uuid,
+            "messages": store.messages(key, uuid, limit=max(1, min(int(limit), 500)))}
+
+
+@app.post("/api/contacts/{uuid}/send")
+async def send_contact_message(uuid: str, data: dict):
+    """人**代发**一条私信：同样过出站清洗 + 白名单（不许绕开闸门）。"""
+    text = str((data or {}).get("text") or (data or {}).get("message") or "")
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="text is required")
+    session = orchestrator.session if orchestrator else None
+    if session is None:
+        raise HTTPException(status_code=503, detail="session not ready")
+    # 仪表盘上的人手动代发 → 按 master 层级（和任务操作台同一口径）。
+    result = session.send_whisper(uuid, text, tier="master")
+    if not result.get("ok"):
+        return {"status": "blocked", **result}
+    return {"status": "ok", **result}
+
+
+@app.post("/api/contacts/{uuid}/read")
+async def mark_contact_read(uuid: str):
+    """把某人的来信标为已读；返回改动条数。"""
+    store = _contacts_store()
+    key = _contacts_namespace()
+    return {"status": "ok", "server": key, "marked": store.mark_read(key, uuid)}
+
+
+@app.get("/api/commands")
+async def get_commands_config():
+    """指令白名单（唯一来源 `.local/commands.json`）+ 硬黑名单/高风险清单。
+
+    硬黑名单**代码里硬拒、配置放不开**，列出来只是让 UI 不显示勾选框。
+    """
+    store = _commands_store()
+    return {
+        "config": store.get(),
+        "hard_blacklist": sorted(HARD_BLACKLIST),
+        "high_risk": sorted(HIGH_RISK),
+        "server": _contacts_namespace(),
+        "effective": store.whitelist_for(_contacts_namespace()),
+    }
+
+
+@app.post("/api/commands")
+async def set_commands_config(data: dict):
+    """改指令白名单/私信指令族/TPA 话术；改完即时生效（同一个 store 实例）。"""
+    store = _commands_store()
+    saved = store.set(data if isinstance(data, dict) else {})
+    return {"status": "ok", "config": saved,
+            "effective": store.whitelist_for(_contacts_namespace())}

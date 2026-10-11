@@ -41,6 +41,12 @@ from .world_memory import WorldMemoryStore, plan_replay
 from .permissions import CraftPolicy, PermissionsStore, ReplyGate
 from .persona_store import PersonaStore
 from .task_list import TaskList
+from .audit_log import AuditLog
+from .command_gate import CommandGate, CommandsStore
+from .contacts import ContactStore, WhisperDetector
+from .outbound import sanitize_outbound
+from .player_directory import resolve_player as resolve_player_name
+from .tpa import TpaCoordinator, TpaDetector
 
 logger = logging.getLogger("session")
 
@@ -214,6 +220,34 @@ class Session:
         self._present_person_facts: dict[str, dict] = {}
         # 任务列表（多任务 + 归属 + 优先级 + 状态 + 进度）
         self.tasks = TaskList()
+
+        # ── 出站/指令安全（这一批新增）──
+        # 统一安全审计：出站清洗 / 指令闸门 / TPA 都写到这里（内存环形 + 落盘）。
+        self._security_audit: list[dict] = []
+        self._security_log: Optional[AuditLog] = None
+        # 出站清洗接到本 session（Skills 的每个出站函数都会调用它）。
+        self.skills.set_outbound_observer(self._on_security_audit)
+        # 指令白名单（唯一来源 `.local/commands.json`，**默认空**）+ 硬黑名单 + 二次确认。
+        self.commands_store = CommandsStore()
+        self.command_gate = CommandGate(self.commands_store, audit=self._on_security_audit)
+        # 私信通讯录（server:<key> + person:<uuid> 两层分区）与接收识别。
+        self.contacts = ContactStore()
+        self.whisper_detector = WhisperDetector(
+            config_provider=lambda: (self.commands_store.get().get("whisper") or {}))
+        # TPA 两路径 + 分层策略（策略读 `.local/permissions.json` 的 `tpa` 段）。
+        self.tpa_detector = TpaDetector(config_provider=self.commands_store.tpa_config)
+        self.tpa = TpaCoordinator(
+            self.tpa_detector, policy_provider=self.permissions.tpa_policy,
+            command=self.run_server_command,
+            click=self._click_screen_button,
+            resolve=self.resolve_player,
+            audit=self._on_security_audit,
+        )
+        # 本轮的 TPA 上下文：最近一次收到的请求（触发词不带人名时用它）+
+        # 本轮是否已经私信过（避免"工具发了 + 回复又自动发一遍"）。
+        self._last_tpa_request: Optional[dict] = None
+        self._whisper_sent_this_turn: set[str] = set()
+        self._reply_whisper_to: str = ""
         # 当前对话的发起者（供任务归属/权限判定；没有对话时是空）
         self._actor: dict = {"name": "", "tier": "guest"}
         # 抗抖窗里攒下的那一条（tick 复查时才真正回）
@@ -240,6 +274,12 @@ class Session:
             permissions=self.permissions,
             # 借用规则（对话授权"仓库里的铁可以用"）：计划器只查表，不看 tier 分支。
             borrow_rules=self.borrow_rules,
+            # 单一指令口 + 私信 + TPA：全部走 session 的方法（规则只在这里实现一次）。
+            server_commands=self.run_server_command,
+            whisper_sender=self.send_whisper,
+            tpa_responder=self.respond_tpa,
+            tpa_requester=self.request_tpa,
+            player_resolver=self.resolve_player,
         )
 
         # Vision (Python 侧直接抓屏 -> VLM，后台线程低频刷新，不阻塞动作链路)
@@ -403,6 +443,8 @@ class Session:
     # 语义门说 wait 时的自续窗口与次数上限（设计文档 §5 的第二个入口：wait 超时自续）。
     WAIT_RETRY_SECONDS = 2.0
     WAIT_MAX_RETRIES = 2
+    # 收到 TPA 请求后，多久之内说"接受/拒绝"还算是在回应它（超了就当普通聊天）。
+    TPA_REQUEST_TTL = 120.0
     # "稀有掉落"只看这些 id（不是"任何掉落物都要起哄"）。
     RARE_DROP_IDS = (
         "diamond", "emerald", "netherite", "ancient_debris", "enchanted_golden_apple",
@@ -768,6 +810,10 @@ class Session:
                 facts[name] = person_facts
         self._present_person_facts = facts
 
+    def current_server_key(self) -> str:
+        """当前 server 分区键（通讯录、按服白名单等对外接口用）。"""
+        return self._current_server_key()
+
     def _current_server_key(self) -> str:
         """当前 server 分区键（供 person 层降级键/现役玩家取件用）。"""
         rules = getattr(self, "borrow_rules", None)
@@ -821,24 +867,40 @@ class Session:
         self._mark_layer(f"person:{entry.get('key')}",
                          f"person 层（{name} 的稳定事实）")
 
-    def _record_conversation_chat(self, data: dict) -> None:
+    def _record_conversation_chat(self, data: dict, whisper: Optional[dict] = None,
+                                  kind: str = "") -> None:
         """把一条聊天事件写进对话记忆（L1 落盘 + L2 窗口）。
 
         **权限过滤之前**就记：guest 在公开服只记录不回复，正是设计要的"听得见、不接话"。
+        `whisper` 非空表示这条是**私信**：落成 `whisper` 类型、发送者用识别出的人；
+        `kind` 是模组已经判明的类型（目前只有 `"emote"`）——给了就照它落。
         """
         store = getattr(self, "conversation", None)
         if store is None:
             return
         try:
-            entry = store.record_chat(
-                str(data.get("sender") or "?"),
-                str(data.get("message") or ""),
-                is_system=bool(data.get("is_system")),
-                x=data.get("sender_x"),
-                y=data.get("sender_y"),
-                z=data.get("sender_z"),
-                distance=data.get("sender_distance"),
-            )
+            if whisper:
+                entry = store.record_chat(
+                    str(whisper.get("player") or data.get("sender") or "?"),
+                    str(whisper.get("text") or data.get("message") or ""),
+                    kind="whisper",
+                    is_system=bool(data.get("is_system")),
+                    x=data.get("sender_x"),
+                    y=data.get("sender_y"),
+                    z=data.get("sender_z"),
+                    distance=data.get("sender_distance"),
+                )
+            else:
+                entry = store.record_chat(
+                    str(data.get("sender") or "?"),
+                    str(data.get("message") or ""),
+                    kind=str(kind or ""),
+                    is_system=bool(data.get("is_system")),
+                    x=data.get("sender_x"),
+                    y=data.get("sender_y"),
+                    z=data.get("sender_z"),
+                    distance=data.get("sender_distance"),
+                )
         except Exception as e:
             logger.warning("[Session] 对话记忆写入失败: %s", e)
             return
@@ -865,6 +927,422 @@ class Session:
         self._pending_death = {"player": player, "cause": str(data.get("cause") or ""),
                                "text": "玩家死亡"}
 
+    # ── 出站/指令安全：审计 / 单一指令口 / 私信 / TPA ──
+    # 规则只在这些方法里实现一次：planner 调它们，别的出口不直接拼指令。
+
+    def _on_security_audit(self, row: dict) -> None:
+        """统一安全审计（出站清洗 / 指令闸门 / TPA / 私信都进这里）：内存环形 + 落盘。
+
+        落盘用一个坏掉也不会拖垮链路的 AuditLog；建不出来就只留内存（并只 warning 一次）。
+        """
+        entry = dict(row or {})
+        entry.setdefault("ts", time.time())
+        log = getattr(self, "_security_audit", None)
+        if log is None:
+            self._security_audit = log = []
+        log.append(entry)
+        del log[:-100]
+
+        if getattr(self, "_security_log_failed", False):
+            return
+        store = getattr(self, "_security_log", None)
+        if store is None:
+            try:
+                store = AuditLog("data/audit/security.jsonl")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[Session] 安全审计落盘不可用: %s", exc)
+                self._security_log_failed = True
+                return
+            self._security_log = store
+        try:
+            store.append(
+                category="security",
+                action=str(entry.get("kind") or "event"),
+                target=str(entry.get("command") or entry.get("player")
+                           or entry.get("target") or ""),
+                actor=str(entry.get("actor") or entry.get("tier") or ""),
+                outcome=str(entry.get("outcome") or entry.get("blocked") or ""),
+                details=entry,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[Session] 安全审计落盘失败: %s", exc)
+
+    def security_audit(self, n: int = 20) -> list[dict]:
+        """最近 n 行安全审计（时间从早到晚）。"""
+        rows = list(getattr(self, "_security_audit", []) or [])
+        return rows[-int(n):] if n else rows
+
+    def _actor_identity(self) -> tuple[str, str]:
+        actor = getattr(self, "_actor", None) or {}
+        return str(actor.get("name") or ""), str(actor.get("tier") or "guest")
+
+    def resolve_player(self, name: str) -> dict:
+        """玩家名解析（不猜）：精确优先、歧义回候选、不在线/不在本服一律拒。"""
+        players = self.runtime.get("players") if isinstance(self.runtime, dict) else []
+        return resolve_player_name(name, players)
+
+    # 需要"玩家名 → 唯一在线玩家"解析的指令族（**不猜**：歧义/不在线一律拒）。
+    TARGET_FAMILIES = frozenset({"tp", "tpa", "tpaccept", "tpdeny"})
+    _COORD_RE = re.compile(r"^[~^]?-?\d+(?:\.\d+)?$")
+    _NAME_RE = re.compile(r"^[A-Za-z0-9_]{1,16}$")
+    # 原版世界边界（`/tp` 到边界外＝无效目标；更细的区域保护由 Java 侧硬拦）。
+    WORLD_BORDER = 30_000_000
+
+    @classmethod
+    def _looks_like_player_name(cls, token: Any) -> bool:
+        """像玩家名的 token（不是坐标）：`tp 100 64 100` 里的数字不该被当成玩家。"""
+        text = str(token or "").strip()
+        if not text or cls._COORD_RE.fullmatch(text):
+            return False
+        return bool(cls._NAME_RE.fullmatch(text))
+
+    @classmethod
+    def _coordinate_in_bounds(cls, token: Any) -> bool:
+        """绝对坐标要在原版世界边界内（相对坐标 `~` 不检查，由服务端自己算）。"""
+        text = str(token or "").strip()
+        if not text or text[0] in "~^":
+            return True
+        try:
+            return abs(float(text)) <= cls.WORLD_BORDER
+        except ValueError:
+            return True
+
+    def _resolve_command_targets(self, tool: Any, args: Any) -> tuple[Any, Optional[dict]]:
+        """把 `tp/tpa/tpaccept/tpdeny` 里的玩家名解析成**唯一在线玩家**。
+
+        返回 `(新 args, None)` 或 `(None, 拒绝结论)`。歧义（多个相似名）**回候选、不猜**；
+        不在线/不在本服直接拒 —— 传错人比不做更糟。绝对坐标越界也拒
+        （更细的"超距/区域保护"是 Java 侧的硬拦，见 `click_screen_button`/区域保护那批）。
+        """
+        family = str(tool or "").strip().casefold().lstrip("/")
+        family = family.split(":")[-1]
+        if family not in self.TARGET_FAMILIES or args is None:
+            return args, None
+        if isinstance(args, str):
+            tokens = args.split()
+        elif isinstance(args, dict):
+            tokens = [value for value in args.values()]
+        elif isinstance(args, (list, tuple, set)):
+            tokens = list(args)
+        else:
+            return args, None
+
+        resolved: list[Any] = []
+        for token in tokens:
+            text = str(token).strip()
+            if self._COORD_RE.fullmatch(text):
+                if not self._coordinate_in_bounds(text):
+                    self._on_security_audit({"kind": "command", "tool": family,
+                                             "target": text, "outcome": "blocked",
+                                             "blocked": "out_of_bounds"})
+                    return None, {"ok": False, "blocked": "out_of_bounds",
+                                  "reason": "out_of_bounds"}
+                resolved.append(token)
+                continue
+            if not self._looks_like_player_name(token):
+                resolved.append(token)
+                continue
+            found = self.resolve_player(text)
+            if not found.get("ok"):
+                reason = str(found.get("reason") or "not_found")
+                self._on_security_audit({"kind": "command", "tool": family,
+                                         "target": text, "outcome": "blocked",
+                                         "blocked": reason})
+                return None, {"ok": False, "blocked": reason, "reason": reason,
+                              "candidates": found.get("candidates", [])}
+            resolved.append(str(found["name"]))
+        return resolved, None
+
+    def run_server_command(self, tool: str, args: Any = None, *, confirm: str = "",
+                           free_text: str = "", tier: str = "",
+                           actor: str = "", reply: bool = False) -> dict:
+        """**单一指令口**：所有服务器指令都从这里出去。
+
+        顺序：玩家名解析（tp 类指令，不猜）→ 白名单（唯一来源，默认空）→ 硬黑名单
+        （配置放不开）→ 高风险二次确认 → 真正下发。没勾选的一律拒，如实回
+        `blocked=not_whitelisted`。
+        """
+        args, refusal = self._resolve_command_targets(tool, args)
+        if refusal is not None:
+            return refusal
+        name, default_tier = self._actor_identity()
+        result = self.command_gate.evaluate(
+            tool, args, server_key=self._current_server_key(),
+            actor=actor or name, tier=tier or default_tier,
+            confirm=confirm, free_text=free_text, reply=reply,
+        )
+        if not result.get("ok"):
+            return result
+        result["sent"] = self.skills.run_command(result["command"])
+        return result
+
+    def _click_screen_button(self, match: str) -> dict:
+        """路径 B：在**已打开**的界面里做控件级点击（Java 命令 `click_screen_button`）。
+
+        后端**不**做任何界面/鼠标模拟：只把 `match` 交给 Java 侧。
+        """
+        target = str(match or "").strip()
+        if not target:
+            return {"ok": False, "blocked": "empty_match"}
+        sent = self.skills.click_screen_button(target)
+        self._on_security_audit({"kind": "click_screen_button", "target": target,
+                                 "outcome": "sent"})
+        return {"ok": True, "match": target, "sent": sent}
+
+    def send_whisper(self, player: str, text: str, *, tier: str = "") -> dict:
+        """给某人发私信（悄悄话）：独立于 `send_chat`，走白名单里的 msg/tell/w。
+
+        约束：文本过出站清洗；**guest 不能借 AI 去私信别人**（只允许回那个 guest
+        自己发来的私信 —— 那是"回"，不是"去私信别人"）；目标必须能被解析成唯一在线玩家。
+        """
+        _, actor_tier = self._actor_identity()
+        effective_tier = str(tier or actor_tier)
+        cleaned = sanitize_outbound(text, kind="whisper", observer=self._on_security_audit)
+        if not cleaned.strip():
+            return {"ok": False, "blocked": "empty_text"}
+        target = self.resolve_player(player)
+        if not target.get("ok"):
+            reason = str(target.get("reason") or "not_found")
+            self._on_security_audit({"kind": "whisper", "player": str(player or ""),
+                                     "tier": effective_tier, "outcome": "blocked",
+                                     "blocked": reason})
+            return {"ok": False, "blocked": reason, "reason": reason,
+                    "candidates": target.get("candidates", [])}
+        name = str(target["name"])
+        reply_to = str(getattr(self, "_reply_whisper_to", "") or "")
+        # "回他发来的私信" vs "去私信别人"：只有前者允许 guest 触发。判定同时落在闸门
+        # （§2c）与这里 —— 这样无论走 send_whisper 还是 run_server_command 都逃不掉。
+        is_reply = bool(reply_to) and name.casefold() == reply_to.casefold()
+        if effective_tier == "guest" and not is_reply:
+            self._on_security_audit({"kind": "whisper", "player": name, "tier": effective_tier,
+                                     "outcome": "blocked", "blocked": "tier_not_allowed"})
+            return {"ok": False, "blocked": "tier_not_allowed", "reason": "tier_not_allowed"}
+        family = self.commands_store.whisper_family()
+        result = self.run_server_command(family, [name], free_text=cleaned,
+                                        tier=effective_tier, reply=is_reply)
+        if result.get("ok"):
+            self._whisper_sent_this_turn.add(name.casefold())
+            try:
+                self.contacts.record_out(self._current_server_key(),
+                                         str(target.get("uuid") or ""), name, cleaned)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[Session] 私信落盘失败: %s", exc)
+        return result
+
+    def respond_tpa(self, action: str, player: str = "", *, tier: str = "",
+                    via: str = "auto") -> dict:
+        """显式回应传送请求（模型调 `tpa_respond` / 人说了"接受/拒绝"）。"""
+        _, actor_tier = self._actor_identity()
+        target = str(player or "")
+        if not target:
+            pending = getattr(self, "_last_tpa_request", None) or {}
+            target = str(pending.get("player") or "")
+        result = self.tpa.respond(action, player=target, tier=str(tier or actor_tier),
+                                  via=via, server_key=self._current_server_key())
+        return {"ok": bool(result.get("ok")), **result}
+
+    def request_tpa(self, player: str, *, tier: str = "") -> dict:
+        """主动发起 tpa（默认只有 master；guest 一律不行）。"""
+        _, actor_tier = self._actor_identity()
+        result = self.tpa.initiate(str(player or ""), tier=str(tier or actor_tier),
+                                   server_key=self._current_server_key())
+        return {"ok": bool(result.get("ok")), **result}
+
+    def tpa_status(self) -> dict:
+        """TPA 快照：策略 + 最近审计（供 /api/status）。"""
+        coordinator = getattr(self, "tpa", None)
+        permissions = getattr(self, "permissions", None)
+        policy: dict[str, Any] = {}
+        if permissions is not None:
+            try:
+                policy = permissions.tpa_policy()
+            except Exception:
+                policy = {}
+        return {
+            "policy": policy,
+            "recent": coordinator.audit_log(10) if coordinator is not None else [],
+            "pending_request": dict(getattr(self, "_last_tpa_request", None) or {}),
+        }
+
+    def _security_status(self) -> dict:
+        """安全块（`/api/status`）：白名单/最近审计/待确认。半成品实例也不炸。"""
+        store = getattr(self, "commands_store", None)
+        gate = getattr(self, "command_gate", None)
+        key = self._current_server_key()
+        whitelist: dict[str, Any] = {"enabled": False, "global": [], "server": [],
+                                     "whisper_family": "msg"}
+        if store is not None:
+            try:
+                whitelist = {
+                    "enabled": store.enabled(),
+                    "global": store.whitelist_for(""),
+                    "server": store.whitelist_for(key),
+                    "whisper_family": store.whisper_family(),
+                }
+            except Exception:
+                pass
+        return {
+            "whitelist": whitelist,
+            "audit": self.security_audit(20),
+            "pending_confirms": gate.pending_confirms() if gate is not None else [],
+        }
+
+    def _contacts_status(self) -> dict:
+        """通讯录块（`/api/status`）：当前分区 + 联系人数。"""
+        contacts = getattr(self, "contacts", None)
+        key = self._current_server_key()
+        count = 0
+        if contacts is not None:
+            try:
+                count = len(contacts.contacts(key))
+            except Exception:
+                count = 0
+        return {"server": key, "count": count}
+
+    def _detect_whisper(self, sender: str, message: str, is_system: bool,
+                        chat_kind: str = "", whisper_flag: bool = False,
+                        sender_unknown: bool = False) -> Optional[dict]:
+        """把一条聊天判成私信；认不出返回 None（**退化为普通聊天**，不猜）。
+
+        判据以 Java 侧给的结构化字段为准（**翻译键**判定，与语言/服务器话术无关）：
+
+        - `chat_kind == "whisper_in"`（或旧模组只给了 `whisper: true`）→ 就是私信，
+          发话人用 `sender`；`sender_unknown` 时名字留空（**绝不从文本里抠名字** ✗）。
+        - `chat_kind` 是别的明确值（public_text / announcement / system / emote / …）→
+          一律**不是**私信（哪怕文本长得像）。
+        - `chat_kind` 缺省或 `unknown` 时才退回**可配的兜底正则**（默认可以不配）。
+          兜底路径要防冒名：玩家自己发的公屏，只有检测出的名字与说话人一致才算私信 ——
+          否则谁都能打一句 "Admin whispers to you: ..." 来冒充。
+        """
+        kind = str(chat_kind or "").strip().lower()
+        if kind == "whisper_in" or (not kind and whisper_flag):
+            return {"player": "" if sender_unknown else str(sender or "").strip(),
+                    "text": str(message or ""), "source": "chat_kind",
+                    "sender_unknown": bool(sender_unknown)}
+        if kind and kind != "unknown":
+            return None
+
+        detector = getattr(self, "whisper_detector", None)
+        if detector is None:
+            return None
+        found = detector.detect(message)
+        if not found:
+            return None
+        name = str(found.get("player") or "")
+        if not is_system:
+            known = str(sender or "").strip()
+            if not known or known == "?" or known.casefold() != name.casefold():
+                return None
+        found["source"] = "pattern"
+        return found
+
+    def _handle_whisper(self, whisper: dict, data: dict) -> None:
+        """一条私信的完整路径：落通讯录 → 回复门硬旁路（等同被 @）→ 回私信。
+
+        `sender_unknown=True`（模组拿不到私信者名字）时**不编名字**：只记审计与对话记忆，
+        不落通讯录（没有键）、也不回（没有收件人）。
+        """
+        partner = str(whisper.get("player") or "")
+        text = str(whisper.get("text") or "")
+        server = self._current_server_key()
+        if not partner:
+            self._on_security_audit({"kind": "whisper_in", "player": "", "outcome": "sender_unknown",
+                                     "text": text[:200]})
+            self._audit_chat({"sender": "", "tier": "", "decision": "none",
+                              "reason": "whisper_sender_unknown", "effective": 0.0,
+                              "threshold": 0, "pending": 0})
+            return
+        uuid = ""
+        if str(data.get("sender") or "").casefold() == partner.casefold():
+            uuid = str(data.get("uuid") or "")
+        if not uuid:
+            uuid = self._person_uuid(partner)
+        try:
+            self.contacts.record_in(server, uuid, partner, text)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[Session] 私信落盘失败: %s", exc)
+        # 交互库/记忆：私信也用**真实的发信人**当 sender（系统转达时原始 sender 可能是 "?"）。
+        try:
+            self.message_db.add_message(sender=partner, message=text,
+                                        is_system=False, is_ai=False)
+            self.memory.add_interaction(sender=partner, message=text,
+                                        response=str(data.get("response") or ""))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[Session] 私信入库失败: %s", exc)
+        self._on_security_audit({"kind": "whisper_in", "player": partner,
+                                 "tier": self.permissions.tier_of(partner),
+                                 "outcome": "received", "text": text[:200]})
+
+        if not self.llm_active():
+            self._audit_chat({"sender": partner, "tier": "", "decision": "silent",
+                              "reason": "not_in_world", "effective": 0.0,
+                              "threshold": 0, "pending": 0})
+            return
+        gate = getattr(self, "reply_gate", None)
+        if gate is None:
+            return
+        # 私信 = **定向** → 回复门硬旁路（等同被 @）；但仍受层级策略约束：
+        # 公开服 guest 的 effective<=0 在 submit 里先于点名旁路判定，所以照样静默。
+        decision = gate.submit(partner, text, is_system=False, mentioned=True)
+        self._audit_chat({"sender": partner, "tier": decision.tier,
+                          "effective": decision.effective, "threshold": decision.threshold,
+                          "pending": decision.pending, "decision": decision.decision,
+                          "reason": f"whisper:{decision.reason}"})
+        if decision.decision in {"silent", "drop", "cooldown", "none"}:
+            return
+        self._run_chat_turn(partner, text, whisper_to=partner)
+
+    def _handle_tpa_text(self, message: str, *, sender: str, is_system: bool) -> bool:
+        """TPA 文本的两条入口：收到请求 / 我们这边的人说"接受·拒绝"。
+
+        返回 True 表示这条文本已经被 TPA 消费（不再当普通聊天走语义门）。
+        """
+        tpa = getattr(self, "tpa", None)
+        if tpa is None or not message:
+            return False
+
+        request = tpa.detector.detect_request(message)
+        if request is not None:
+            player = str(request.get("player") or sender or "")
+            tier = self.permissions.tier_of(player) if player and player != "?" else "guest"
+            via = "popup" if str(getattr(self, "ui_screen", "") or "") else "chat"
+            result = tpa.handle_request(message, tier=tier, via=via, requester=player,
+                                        server_key=self._current_server_key())
+            action = str(result.get("action") or "none")
+            if action == "none":
+                return False
+            if player:
+                self._last_tpa_request = {"player": player, "ts": time.time(), "tier": tier,
+                                          "path": result.get("path", "")}
+            if action == "ask" and self.llm_active():
+                # 先问：走**同一个**语义门（可以 no_action），绝不"事件→必发消息"。
+                try:
+                    self.inject_event(
+                        "tpa_request",
+                        intent=f"{player} 请求传送到你这里，要不要接受？",
+                        event={"tpa": {"player": player, "path": result.get("path", "chat")}})
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[Session] TPA 询问注入失败: %s", exc)
+            return True
+
+        if is_system:
+            return False  # 系统消息里的触发词不算（只有人说的才算）
+        intent = tpa.detector.detect_intent(message)
+        if intent is None:
+            return False
+        player = str(intent.get("player") or "")
+        if not player:
+            pending = getattr(self, "_last_tpa_request", None) or {}
+            if not pending or time.time() - float(pending.get("ts", 0.0)) > self.TPA_REQUEST_TTL:
+                return False
+            player = str(pending.get("player") or "")
+        if not player:
+            return False
+        tier = self.permissions.tier_of(sender)
+        result = tpa.respond(str(intent.get("action") or ""), player=player, tier=tier,
+                             text=message, server_key=self._current_server_key())
+        return str(result.get("action") or "none") in {"accept", "deny"}
+
     # ── 聊天 → 回复决策（权限 + 频率门 + 抗抖 + 语义门）──
 
     def _handle_player_chat(self, data: dict) -> None:
@@ -876,6 +1354,11 @@ class Session:
         sender = str(data.get("sender") or "?")
         message = str(data.get("message") or "")
         is_system = bool(data.get("is_system"))
+        # Java 侧的结构化分类（翻译键判定，与语言/服务器话术无关）——
+        # 有它就信它；缺省/unknown 才退回可配的兜底正则（见 `_detect_whisper`）。
+        chat_kind = str(data.get("chat_kind") or "").strip().lower()
+        whisper_flag = bool(data.get("whisper"))
+        sender_unknown = bool(data.get("sender_unknown"))
 
         # L0 硬过滤：ban 词/正则 → 整条丢弃（连记忆都不进）。
         if self._is_banned(message):
@@ -884,8 +1367,30 @@ class Session:
                               "pending": 0})
             return
 
+        # `whisper_out`＝**我自己发出去的**私信回显：不是"有人在跟我说话" ✗
+        # 不触发回复、不进"最近聊天"当对方发言（线程里我方气泡在 send_whisper 时就记过了）。
+        if chat_kind == "whisper_out":
+            self._on_security_audit({"kind": "whisper_out", "player": str(sender or ""),
+                                     "outcome": "echo"})
+            return
+
+        # 私信（悄悄话）：必须在"系统消息只进记忆"那条早退**之前**判 ——
+        # 私信常常是以服务器消息的形式到达的。
+        whisper = self._detect_whisper(sender, message, is_system, chat_kind,
+                                       whisper_flag, sender_unknown)
+        if whisper is not None:
+            self._record_conversation_chat(data, whisper=whisper)
+            if not is_system:
+                self._note_person(data)
+            if not getattr(self, "_chat_tap_registered", False):
+                self._note_chat(data)
+            self._handle_whisper(whisper, data)
+            return
+
         # 对话记忆（L1+L2）与交互库：静默模式 / guest 也要"听见"。
-        self._record_conversation_chat(data)
+        # 表情落成 emote 类型（别的类型照原样走系统消息分类）。
+        self._record_conversation_chat(
+            data, kind="emote" if chat_kind == "emote" and not is_system else "")
         # person 层：认人（uuid↔名字）——只记身份，聊天内容留在 server 层。
         if not is_system:
             self._note_person(data)
@@ -900,8 +1405,12 @@ class Session:
         except Exception as e:
             logger.warning("[Session] 聊天入库失败: %s", e)
 
-        # 系统消息（死亡/进出/命令回话）只进记忆：它们不是"人在跟 AI 说话"。
-        if is_system:
+        # TPA 请求/触发词：同样可能在系统消息/公告里（服务器弹窗/插件播报）。
+        if self._handle_tpa_text(message, sender=sender, is_system=is_system):
+            return
+
+        # 系统消息（死亡/进出/命令回话）与公告/系统/表情：只进记忆，**不触发回复**。
+        if is_system or chat_kind in {"announcement", "system", "emote"}:
             return
 
         # 规则性记忆：这句人话里如果有仓库授权（"可以用仓库里所有铁"），落成带条件的规则。
@@ -998,8 +1507,14 @@ class Session:
                 lines.append(f"[{kind}] {text}")
         return "\n".join(lines)
 
-    def _run_chat_turn(self, sender: str, message: str, retry: bool = False) -> Optional[str]:
-        """过语义门并（可能）回复。语义门 = 本轮唯一"看语境"的廉价 LLM 调用。"""
+    def _run_chat_turn(self, sender: str, message: str, retry: bool = False,
+                       whisper_to: str = "") -> Optional[str]:
+        """过语义门并（可能）回复。语义门 = 本轮唯一"看语境"的廉价 LLM 调用。
+
+        `whisper_to` 非空表示这一轮是**私信**：回复也要走私信（不能当着全服说）。
+        """
+        self._reply_whisper_to = str(whisper_to or "")
+        self._whisper_sent_this_turn = set()
         verdict = self._semantic_gate(sender, message)
         decision = self.reply_gate
         if decision is not None and verdict == "no_action":
@@ -1012,15 +1527,17 @@ class Session:
                           "threshold": 0, "pending": 0})
         if verdict == "no_action":
             self._pending_chat = None
+            self._reply_whisper_to = ""
             logger.info("[Chat] 语义门判定 no_action（8s 冷却），本轮不回复")
             return None
         if verdict == "wait":
             if not retry:
                 self._pending_chat = {"sender": sender, "message": message,
                                       "due_at": time.time() + self.WAIT_RETRY_SECONDS,
-                                      "retries": 0}
+                                      "retries": 0, "whisper_to": str(whisper_to or "")}
             else:
                 self._pending_chat = None
+            self._reply_whisper_to = ""
             logger.info("[Chat] 语义门判定 wait（可能还在打字）")
             return None
 
@@ -1031,13 +1548,27 @@ class Session:
             response = self.handle_chat(sender, message, command_context="manual_chat")
         except Exception as e:
             logger.error("[Chat] LLM error: %s", e)
+            self._reply_whisper_to = ""
             return None
         if not response:
+            self._reply_whisper_to = ""
             return None
         logger.info("[Chat] AI response: %s", response[:80])
         try:
-            with self.skills.command_context("chat_reply"):
-                self.skills.send_chat(response)
+            if whisper_to:
+                # 私信：同一轮里模型可能已经用 send_whisper 发过了（那就不再发一遍）。
+                if whisper_to.casefold() in {key.casefold()
+                                             for key in self._whisper_sent_this_turn}:
+                    logger.info("[Chat] 私信已由工具发出，跳过自动回私信")
+                else:
+                    result = self.send_whisper(whisper_to, response)
+                    if not result.get("ok"):
+                        # 私信回不出去就**不发公开聊天**（那等于把私聊内容公开），只如实记日志。
+                        logger.warning("[Chat] 私信回复未发出: %s",
+                                       result.get("blocked") or result.get("reason"))
+            else:
+                with self.skills.command_context("chat_reply"):
+                    self.skills.send_chat(response)
             self.message_db.add_message(sender="AI", message=response,
                                         is_system=False, is_ai=True)
             self.memory.add_interaction(sender="AI", message=response, response="")
@@ -1046,6 +1577,7 @@ class Session:
                 store.record_chat(self._get_bot_name(), response)
         except Exception as e:
             logger.warning("[Chat] 回复落库/落记忆失败: %s", e)
+        self._reply_whisper_to = ""
         return response
 
     def _semantic_gate(self, sender: str, message: str,
@@ -1132,7 +1664,8 @@ class Session:
                 return
             pending["retries"] = int(pending.get("retries") or 0) + 1
             pending["due_at"] = 0.0
-            self._run_chat_turn(pending["sender"], pending["message"], retry=True)
+            self._run_chat_turn(pending["sender"], pending["message"], retry=True,
+                                whisper_to=str(pending.get("whisper_to") or ""))
             return
         if due_at:
             return
@@ -1149,7 +1682,8 @@ class Session:
             "pending": decision.pending, "decision": "act",
             "reason": decision.reason,
         })
-        self._run_chat_turn(pending["sender"], pending["message"])
+        self._run_chat_turn(pending["sender"], pending["message"],
+                            whisper_to=str(pending.get("whisper_to") or ""))
 
     # ── LLM-driven conversation ──
 
@@ -1375,6 +1909,9 @@ class Session:
             logger.info("[Session] 不在世界（界面 %s）→ 跳过 LLM 规划", self.ui_screen or "?")
             return None
         context = self._runtime_context()
+        whisper_from = str(getattr(self, "_reply_whisper_to", "") or "")
+        if whisper_from:
+            context["whisper_from"] = whisper_from
         if event:
             context["event"] = event
             # 事件注入＝**没有人下指令**：制作/翻箱只看 autonomy_craft，且一律不许翻箱。
@@ -1541,6 +2078,9 @@ class Session:
 
     def _run_event_turn(self, kind: str, payload: dict) -> Optional[str]:
         """事件过完语义门（continue）后才真正交给 planner —— 依旧可以不说话。"""
+        self._reply_whisper_to = ""  # 事件不是私信，别把上一轮的私信上下文串进来
+        # 外部事件同样"没人授权"：层级归零（事件不是主人下的指令）。
+        self._actor = {"name": "", "tier": "guest"}
         try:
             response = self.handle_chat("(事件)", str(payload.get("intent") or ""),
                                         command_context="event", event=payload)
@@ -1710,6 +2250,9 @@ class Session:
             return
         actor = getattr(self, "_actor", None) or {}
         detail = ", ".join(f"{key}={value}" for key, value in (args or {}).items())[:200]
+        # 任务 detail 也是 AI 生成的出站文本（会进 UI），同样过防注入清洗。
+        detail = sanitize_outbound(detail, kind="task_detail",
+                                   observer=self._on_security_audit)
         try:
             # 刚下发的指令按"进行中"登记：这样 task_state 的进度/终态能挂回同一条任务
             # （停在 pending 的话，终态事件会找不到它，进度也挂不上）。
@@ -1802,6 +2345,9 @@ class Session:
             # 在场门的第二道保险：不在世界里连自我提示都不许花 token。
             logger.info("[Session] 不在世界 → 跳过 self-prompt")
             return
+        # 自主轮＝**没有任何人授权**：改回 guest，免得上一轮主人说话留下的层级
+        # 让"没人指挥"的自发行为也能下白名单指令（与 autonomy_craft 默认关同一口径）。
+        self._actor = {"name": "", "tier": "guest"}
         self.self_prompter.on_prompt_sent()
         # Build system context
         context = self._runtime_context()
@@ -1988,6 +2534,11 @@ class Session:
                 "pending_death": bool(getattr(self, "_pending_death", None)),
             },
             "persona_sections": persona.status() if persona is not None else {},
+            # 出站/指令安全：白名单（唯一来源）+ 最近清洗/指令/点击审计 + TPA 策略与审计。
+            # 全部防御式取值：有测试用 `Session.__new__` 拼半成品实例再打 get_status。
+            "security": self._security_status(),
+            "tpa": self.tpa_status(),
+            "contacts": self._contacts_status(),
             "vision": self.vision.get_status(),
             "poi_memory": {
                 "namespace": self.poi.namespace,

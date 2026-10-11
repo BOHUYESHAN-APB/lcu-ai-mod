@@ -112,6 +112,13 @@ ACTION_GROUPS: dict[str, tuple[tuple[str, str, str], ...]] = {
     "hud": (
         ("set_hud_note", "text", "把当前打算写进 HUD 描述词"),
     ),
+    "server": (
+        ("run_server_command", "command,args,confirm",
+         "下一条原版指令（须已在白名单勾选；未勾选/黑名单一律不发）"),
+        ("send_whisper", "player,text", "给某人发私信；用了它 reply 请留空"),
+        ("tpa_respond", "action,player", "回应传送请求：action=accept|deny"),
+        ("tpa_request", "player", "主动请求传送到某人（默认只有主人可以）"),
+    ),
     "memory": (
         ("remember_poi", "name,category,x,y,z", "记住当前位置"),
     ),
@@ -129,11 +136,11 @@ _KIND_TO_PHASE = {
 # night / guard / hud / memory 全局注入：睡觉、守点、HUD 描述词与记忆点在任何阶段
 # 都可能有意义（用户说"在这儿守着"时他可能正在看着 AI 挖矿）。
 PHASE_GROUPS: dict[str, tuple[str, ...]] = {
-    "idle": ("move", "locate", "gather", "craft", "container", "guard", "items", "survive", "combat", "hud", "night", "memory"),
-    "travel": ("move", "locate", "combat", "guard", "items", "container", "survive", "hud", "night", "memory"),
-    "gather": ("move", "locate", "gather", "guard", "items", "craft", "container", "hud", "night", "memory"),
-    "craft": ("move", "locate", "craft", "container", "guard", "items", "gather", "hud", "night", "memory"),
-    "survive": ("survive", "hud", "night", "memory", "guard", "items", "move", "locate"),
+    "idle": ("move", "locate", "gather", "craft", "container", "guard", "items", "survive", "combat", "hud", "night", "server", "memory"),
+    "travel": ("move", "locate", "combat", "guard", "items", "container", "survive", "hud", "night", "server", "memory"),
+    "gather": ("move", "locate", "gather", "guard", "items", "craft", "container", "hud", "night", "server", "memory"),
+    "craft": ("move", "locate", "craft", "container", "guard", "items", "gather", "hud", "night", "server", "memory"),
+    "survive": ("survive", "hud", "night", "server", "memory", "guard", "items", "move", "locate"),
 }
 
 _TERMINAL_STATUSES = {"", "idle", "done", "failed", "cancelled", "error"}
@@ -229,6 +236,8 @@ PLANNER_MECHANICS = (
 _NUMERIC_TOOL_ARGS = frozenset({"x", "y", "z", "radius", "limit", "count", "index",
                                 "from_slot", "to_slot", "slot"})
 _BOOLEAN_TOOL_ARGS = frozenset({"remember"})
+# 数组参数：`run_server_command` 的 `args`（指令参数表，元素是字符串）。
+_ARRAY_TOOL_ARGS = frozenset({"args"})
 
 
 def tool_schema(args: str) -> dict:
@@ -242,6 +251,8 @@ def tool_schema(args: str) -> dict:
             properties[name] = {"type": "number"}
         elif name in _BOOLEAN_TOOL_ARGS:
             properties[name] = {"type": "boolean"}
+        elif name in _ARRAY_TOOL_ARGS:
+            properties[name] = {"type": "array", "items": {"type": "string"}}
         else:
             properties[name] = {"type": "string"}
     return properties
@@ -476,13 +487,22 @@ class Planner:
     """
     
     def __init__(self, llm_service, memory, skills, threshold_provider=None, chat_inbox=None,
-                 permissions=None, borrow_rules=None):
+                 permissions=None, borrow_rules=None, server_commands=None,
+                 whisper_sender=None, tpa_responder=None, tpa_requester=None,
+                 player_resolver=None):
         self.llm = llm_service
         self.memory = memory
         self.skills = skills
         self._is_planning = False
         self._last_plan_time = 0.0
         self._last_decision: dict = {}
+        # 指令闸门（白名单/黑名单/二次确认）与私信/TPA 的注入口：**都从 session 注入**
+        # （planner 不自己持有权限判定，避免同一套规则两处实现）。
+        self.server_commands = server_commands
+        self.whisper_sender = whisper_sender
+        self.tpa_responder = tpa_responder
+        self.tpa_requester = tpa_requester
+        self.player_resolver = player_resolver
         # 置信度阈值来源（可注入）。默认用模块常量；注入后可在 UI 改并即时生效。
         self._threshold_provider = threshold_provider
         # /locate 要等聊天回复：注入 Session 的 ChatInbox（读 wire 读取线程喂的那份）。
@@ -503,6 +523,8 @@ class Planner:
         self._take_audit: list[dict] = []
         # 本轮如实说明的补充（缺料 / 没授权 / 已经够了），拼在回复后面。
         self._craft_note: Optional[str] = None
+        # 本轮服务器指令/私信/TPA 的如实说明（被白名单拒了、要二次确认…）。
+        self._action_note: Optional[str] = None
         # L1 版本键 + 上一次组装的 L0+L1 字符串：键不变就复用**同一份字符串**
         # （前缀缓存友好）；L3 工具 schema 按阶段各建一次（M3-3 的阶段过滤继续生效）。
         self._system_key: Optional[str] = None
@@ -536,6 +558,7 @@ class Planner:
         self._last_locate_result = None
         # 本轮的"如实说明"也从零开始（缺料/没授权这类话不能串轮）。
         self._craft_note = None
+        self._action_note = None
 
         try:
             # 第一阶段：planner 结合状态产出候选动作（JSON）。
@@ -605,15 +628,15 @@ class Planner:
     def _with_notes(self, reply: Optional[str]) -> Optional[str]:
         """把本轮的**真实补充**拼到回复后面：/locate 的真实坐标 + 制作/取物的如实说明。
 
-        `_with_locate_note` 保持原样（有测试直接打它）；这里只是多贴一条缺料/授权说明。
+        `_with_locate_note` 保持原样（有测试直接打它）；这里只是多贴一条缺料/授权说明
+        与一条"指令被拒/要确认"的说明 —— 都不许编，有什么说什么。
         """
         text = self._with_locate_note(reply)
-        note = self._craft_note
-        if not note:
-            return text
-        if not text:
-            return note
-        return f"{text}\n{note}"
+        for note in (self._craft_note, self._action_note):
+            if not note:
+                continue
+            text = f"{text}\n{note}" if text else note
+        return text
     
     # ── 分层组装：L0 system 契约 / L1 人设·规则·授权 / L2 当轮动态 / L3 工具 ──
 
@@ -645,13 +668,35 @@ class Planner:
         return "借用授权：还没有人授权我从仓库取用任何东西——要用得先让人明说「可以用仓库里的…」。"
 
     def _build_l1(self, context: dict, bot_name: str) -> str:
-        """L1：人设三段 + 规则 + 机制说明 + 借用授权 —— 只在**内容变更**时才重组。"""
-        return "\n\n".join((
+        """L1：人设三段 + 规则 + 机制说明 + 借用授权 + 各层范围 —— 只在**内容变更**时才重组。
+
+        「各层范围」（`scope_text`）默认是空的 —— 空就**不进 L1**，静态前缀预算只降不抬；
+        操作者填了才随人设一起进（配了才生效，等于用配置换预算）。
+        """
+        parts = [
             self._render_persona(context, bot_name),
             render_planner_rules(),
             PLANNER_MECHANICS,
             self._render_borrow_authorization(context),
-        ))
+        ]
+        scope = self._render_scope()
+        if scope:
+            parts.append(scope)
+        return "\n\n".join(part for part in parts if part)
+
+    def _render_scope(self) -> str:
+        """各层"能干什么"的自然语言范围（硬门是权限表，这段只用于语义判断）。"""
+        store = self.permissions
+        if store is None:
+            return ""
+        try:
+            scope = store.scope_text()
+        except Exception:  # noqa: BLE001 —— 读不到就不加这一段
+            return ""
+        lines = [f"- {tier}：{text}" for tier, text in scope.items() if str(text or "").strip()]
+        if not lines:
+            return ""
+        return "各层能做什么（语义范围；硬规则以权限表为准）：\n" + "\n".join(lines)
 
     def build_prompt_layers(self, sender: str, message: str,
                             context: dict, bot_name: str = "AI") -> PromptLayers:
@@ -841,6 +886,14 @@ class Planner:
         hud_note = str(context.get("hud_note") or "").strip() if isinstance(context, dict) else ""
         hud_note_text = f"当前 HUD 描述词：{hud_note}" if hud_note else ""
 
+        # 私信（悄悄话）：这条话是**定向**的，回话也该回私信（不要当着全服说）。
+        whisper_from = str(context.get("whisper_from") or "").strip() if isinstance(context, dict) else ""
+        whisper_text = (
+            f"这条是 {whisper_from} 发来的**私信**（悄悄话）：只有你俩看得到。"
+            f"要回就用 send_whisper 回给 {whisper_from}，并把 reply 留空（别在公开聊天里说）。"
+            if whisper_from else ""
+        )
+
         # 对话记忆（按服务器分区的 L1/L2/L3）：死亡、进出也在同一份记忆里。
         conversation = context.get("conversation") if isinstance(context, dict) else None
         conversation = conversation if isinstance(conversation, dict) else {}
@@ -902,7 +955,7 @@ class Planner:
                        if health_value is not None else "未知")
 
         # L2 只在**当轮 user 消息**里；工具表、规则、人设都不在这里（分别走 tools 与 system）。
-        extras = "\n".join(part for part in (state_block_text, hud_note_text) if part)
+        extras = "\n".join(part for part in (state_block_text, hud_note_text, whisper_text) if part)
         extras_text = f"{extras}\n" if extras else ""
 
         prompt = f"""当前状态：
@@ -1474,10 +1527,76 @@ class Planner:
             if {"x", "y", "z", "structure"}.issubset(payload):
                 self.skills.build(float(payload["x"]), float(payload["y"]), float(payload["z"]), str(payload["structure"]))
                 return True
+        elif tool_name == "run_server_command":
+            if self.server_commands is None:
+                return False
+            target_tool = str(payload.get("tool") or payload.get("command")
+                              or payload.get("name") or "")
+            result = self.server_commands(target_tool, payload.get("args"),
+                                          confirm=str(payload.get("confirm") or ""))
+            self._action_note = self._server_command_note(target_tool, result)
+            return bool(result.get("ok"))
+        elif tool_name == "send_whisper":
+            if self.whisper_sender is None:
+                return False
+            player = payload.get("player") or payload.get("to") or payload.get("target")
+            text = payload.get("text") or payload.get("message") or payload.get("content")
+            if not player or text is None or str(text).strip() == "":
+                return False
+            result = self.whisper_sender(str(player), str(text))
+            self._action_note = self._server_command_note("私信", result)
+            return bool(result.get("ok"))
+        elif tool_name == "tpa_respond":
+            if self.tpa_responder is None:
+                return False
+            action = payload.get("action") or payload.get("decision") or payload.get("answer")
+            result = self.tpa_responder(str(action or ""), str(payload.get("player") or ""))
+            self._action_note = self._server_command_note("传送请求回应", result)
+            return bool(result.get("ok"))
+        elif tool_name == "tpa_request":
+            if self.tpa_requester is None:
+                return False
+            player = payload.get("player") or payload.get("target")
+            if not player:
+                return False
+            result = self.tpa_requester(str(player))
+            self._action_note = self._server_command_note("主动传送请求", result)
+            return bool(result.get("ok"))
         elif tool_name == "stop":
             self.skills.stop_all()
             return True
         return False
+
+    @staticmethod
+    def _server_command_note(what: str, result: Any) -> Optional[str]:
+        """把闸门/解析的结论翻成一句**如实**的补充（被拒就说被拒，不假装做了）。"""
+        if not isinstance(result, dict):
+            return None
+        if result.get("ok"):
+            command = str(result.get("command") or "")
+            if command:
+                return f"（已下发 /{command.lstrip('/')}）"
+            return None
+        reason = str(result.get("blocked") or result.get("reason") or "unknown")
+        if reason == "not_whitelisted":
+            return f"（{what}没被勾选进白名单，我没发）"
+        if reason == "hard_blacklist":
+            return f"（{what}在黑名单里，绝对不能发）"
+        if reason == "needs_confirm":
+            token = str(result.get("confirm") or "")
+            return (f"（{what}风险高：要再确认一次 —— 把同一条动作重发一遍，"
+                    f"args 里带上 confirm=\"{token}\"）")
+        if reason == "invalid" or reason == "invalid_text":
+            return f"（{what}的参数不合法，我没发）"
+        if reason == "disabled":
+            return f"（服务器指令自动化被关掉了，{what}没发）"
+        if reason == "tier_not_allowed":
+            return f"（{what}你的层级不够，我没做）"
+        if reason in {"not_found", "ambiguous", "empty"}:
+            candidates = "、".join(str(item) for item in (result.get("candidates") or []))
+            tail = f"，候选：{candidates}" if candidates else ""
+            return f"（{what}的目标没锁定（{reason}）{tail}，我不猜）"
+        return f"（{what}没成：{reason}）"
 
     # ── 制作 / 容器：授权 + 库存优先（用户口径） ──────────────────
 

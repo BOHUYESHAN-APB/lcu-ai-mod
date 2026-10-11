@@ -38,6 +38,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from .tpa import TPA_POLICY_DEFAULTS, decision_for as _tpa_decision, may_initiate as _tpa_may_initiate, normalize_tpa_policy
+
 logger = logging.getLogger("permissions")
 
 
@@ -97,6 +99,10 @@ DEFAULT_AUTONOMY_CRAFT = False
 
 DEFAULT_SESSION_ADJUST = 1.0
 
+# 各层"能干什么"的**自然语言范围**（设计文档 §4：表是硬门，文本是语义范围）。
+# 默认**全空** —— 空就不进 L1（静态前缀预算 1700 只降不抬），配了才随人设一起进。
+DEFAULT_SCOPE_TEXT: dict[str, str] = {"master": "", "friend": "", "guest": ""}
+
 
 def _default_permissions() -> dict[str, Any]:
     """默认权限：private 服（人人可聊）+ 公开服 guest 静默。
@@ -121,6 +127,11 @@ def _default_permissions() -> dict[str, Any]:
         "craft": dict(CRAFT_AUTHORITY),
         "containers": dict(CONTAINER_AUTHORITY),
         "autonomy_craft": DEFAULT_AUTONOMY_CRAFT,
+        # TPA 分层策略（用户口径：master 自动接受 / friend 默认询问 / guest 拒绝且不点
+        # / 主动发起仅 master）。默认值定义在 `agent/tpa.py`，这里只做挂载。
+        "tpa": copy.deepcopy(TPA_POLICY_DEFAULTS),
+        # 各层"能干什么"的自然语言范围（默认全空 → 不进 L1，预算不动）。
+        "scope": dict(DEFAULT_SCOPE_TEXT),
     }
 
 
@@ -278,7 +289,19 @@ def _normalize(raw: Any) -> dict[str, Any]:
     data["craft"] = _as_capability_map(source.get("craft"), CRAFT_AUTHORITY)
     data["containers"] = _as_capability_map(source.get("containers"), CONTAINER_AUTHORITY)
     data["autonomy_craft"] = _as_bool(source.get("autonomy_craft"), DEFAULT_AUTONOMY_CRAFT)
+    data["tpa"] = normalize_tpa_policy(source.get("tpa"))
+    data["scope"] = _normalize_scope(source.get("scope"))
     return data
+
+
+def _normalize_scope(raw: Any) -> dict[str, str]:
+    """各层范围文本解析：只认字符串（去首尾空白）；认不出回默认（全空）。"""
+    source = raw if isinstance(raw, dict) else {}
+    out: dict[str, str] = {}
+    for tier, default in DEFAULT_SCOPE_TEXT.items():
+        value = source.get(tier, default)
+        out[tier] = value.strip() if isinstance(value, str) else default
+    return out
 
 
 def _apply_patch(current: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
@@ -300,6 +323,11 @@ def _apply_patch(current: dict[str, Any], patch: dict[str, Any]) -> dict[str, An
                 else:
                     rates[mode] = tier_map
             merged[key] = rates
+        elif key == "scope" and isinstance(value, dict):
+            # 逐层合并：UI 只改一层时不该把另两层的范围文本清掉。
+            bucket = dict(merged.get("scope") or {})
+            bucket.update(value)
+            merged[key] = bucket
         else:
             merged[key] = value
     return merged
@@ -500,6 +528,27 @@ class PermissionsStore:
         """无人指挥（自主/事件）时能不能自造；默认 false。"""
         with self._lock:
             return bool(self._data["autonomy_craft"])
+
+    # ── TPA 分层策略（`.local/permissions.json` 的 `tpa` 段） ──
+
+    def tpa_policy(self) -> dict[str, Any]:
+        """TPA 策略副本：{master|friend|guest: accept|ask|deny, outgoing, path}。"""
+        with self._lock:
+            return copy.deepcopy(self._data.get("tpa") or TPA_POLICY_DEFAULTS)
+
+    def tpa_decision(self, tier: str) -> str:
+        """该 tier 收到 TPA 请求时怎么办（查表，认不出的 tier 当 guest → deny）。"""
+        return _tpa_decision(self.tpa_policy(), tier)
+
+    def tpa_may_initiate(self, tier: str) -> bool:
+        """该 tier 能否主动发起 tpa（默认只有 master）。"""
+        return _tpa_may_initiate(self.tpa_policy(), tier)
+
+    def scope_text(self) -> dict[str, str]:
+        """各层"能干什么"的自然语言范围（默认全空 —— 空就不进 L1）。"""
+        with self._lock:
+            return {tier: str((self._data.get("scope") or {}).get(tier) or "")
+                    for tier in TIERS}
 
     def can_craft(self, tier: str) -> bool:
         """该 tier 能否让他造东西（查表，guest 默认 False）。"""

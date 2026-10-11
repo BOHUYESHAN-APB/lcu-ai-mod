@@ -31,7 +31,8 @@ logger = logging.getLogger("conversation")
 # 分区名兜底：连世界信息都拿不到时也不能不落盘。
 UNKNOWN_KEY = "unknown"
 # 允许落进 L1 的事件类型；别的（打错的 type）一律降级成普通 chat。
-EVENT_TYPES = ("chat", "death", "join", "leave", "system")
+# `whisper`：私信（悄悄话）——**定向**消息，单独成一类，方便回看"谁私下跟我说了什么"。
+EVENT_TYPES = ("chat", "death", "join", "leave", "system", "whisper", "emote")
 # 摘要走独立角色，方便按角色配便宜的小模型，且不与 planner 的 prompt 缓存互相干扰。
 SUMMARY_AGENT = "summarizer"
 
@@ -275,17 +276,24 @@ class ConversationStore:
             self._pending.append(self._window.pop(0))
 
     def record_chat(self, sender, message, *, is_system=False, x=None, y=None, z=None,
-                    distance=None, ts=None) -> dict | None:
+                    distance=None, ts=None, kind="") -> dict | None:
         """聊天事件入口。
 
-        is_system=True 时先过 `classify_system_message`：认出 death/join/leave 就
+        `is_system=True` 时先过 `classify_system_message`：认出 death/join/leave 就
         落成对应类型（并让玩家名当 sender，因为"谁死了/谁进服"是事件主体），
         认不出才落成普通 system。普通玩家聊天（is_system=False）原样落 chat。
+
+        `kind` 由调用方**已经判明**的类型（目前只有 `"whisper"`：识别出是私信时的
+        定向消息）——给了就直接用它，跳过死亡/进出判定（私信文本不该被当成死亡公告）。
         """
         event: dict = {"type": "chat", "sender": sender, "message": message}
         for key, value in (("x", x), ("y", y), ("z", z), ("distance", distance), ("ts", ts)):
             if value is not None:
                 event[key] = value
+
+        if kind in EVENT_TYPES and kind != "chat":
+            event["type"] = kind
+            return self.record(event)
 
         if is_system:
             classified = classify_system_message(message)

@@ -14,6 +14,8 @@ import time
 from contextlib import contextmanager
 from typing import Any, Optional
 
+from .outbound import sanitize_outbound
+
 logger = logging.getLogger("skills")
 
 
@@ -30,12 +32,22 @@ class Skills:
         self._command_observer = None
         self._command_context = "default"
         self._control = None
+        # 出站清洗的审计回调（session 注入）：清洗真的发生时把"原文/清洗后"记下来。
+        self._outbound_observer = None
 
     def set_wire(self, wire):
         self.wire = wire
 
     def set_command_observer(self, observer):
         self._command_observer = observer
+
+    def set_outbound_observer(self, observer):
+        """挂上出站清洗审计（谁调用、原文、清洗后）；None 表示不记。"""
+        self._outbound_observer = observer if callable(observer) else None
+
+    def _sanitize(self, text, kind: str) -> str:
+        """出站文本的唯一清洗入口（本类所有出口都走它）。"""
+        return sanitize_outbound(text, kind=kind, observer=self._outbound_observer)
 
     # ── 低层直驱（控制流）───────────────────────────────────────
     # 命令通道是请求/响应，适合离散动作；控制流无 id、无回执、latest-wins，
@@ -265,8 +277,13 @@ class Skills:
     # ── Chat ────────────────────────────────────────────────────
 
     def send_chat(self, message: str) -> dict:
-        """Send a chat message (rate-limited at 1.5s)."""
-        return self._send_cmd("send_chat", {"message": message})
+        """Send a chat message (rate-limited at 1.5s).
+
+        出站**唯一出口**之一：文本先过 `sanitize_outbound` —— 以 `/`（或前面垫了空格/
+        全角空格的 `/`）开头的 AI 回复会被剥成普通聊天，**永远不变成指令**。
+        """
+        cleaned = self._sanitize(message, "send_chat")
+        return self._send_cmd("send_chat", {"message": cleaned})
 
     # ── Behavior Control (mindcraft modes.js) ───────────────────
 
@@ -408,20 +425,36 @@ class Skills:
     def set_hud_note(self, text: str, seconds: float = 30.0) -> dict:
         """把一句描述词挂到 HUD 状态词后面；seconds<=0 表示留到被替换/清空。
 
-        传空文本＝立刻清空（Java 侧 HudNote 的行为）。
+        传空文本＝立刻清空（Java 侧 HudNote 的行为）。描述词同样过出站清洗
+        （它是 AI 生成的文本，也一样不许以 `/` 开头）。
         """
-        return self._send_cmd("set_hud_note", {"text": str(text or ""), "seconds": float(seconds)})
+        cleaned = self._sanitize(text, "set_hud_note")
+        return self._send_cmd("set_hud_note", {"text": cleaned, "seconds": float(seconds)})
 
     def run_command(self, command: str) -> dict:
         """原版斜杠命令直通（如 `locate structure minecraft:village`）。
 
         前导 `/` 在这里就剥掉：`mc.player.connection.sendCommand()` 自己会再加一个，
-        双斜杠会被原版当成"聊天内容"而不是命令。
+        双斜杠会被原版当成"聊天内容"而不是命令。换行同样要清掉 —— 一条指令带上换行
+        就等于两条，那是注入的标准手法。
+
+        注意：这是**底层通道**，只允许被 `CommandGate`（白名单/黑名单/二次确认）
+        放行过的指令调用；调用方不得从模型文本直接拼字符串进这里。
         """
-        cleaned = str(command or "").strip()
+        cleaned = self._sanitize(command, "run_command")
+        cleaned = cleaned.replace("\r", " ").replace("\n", " ").strip()
         while cleaned.startswith("/"):
             cleaned = cleaned[1:]
         return self._send_cmd("run_command", {"command": cleaned.strip()})
+
+    def click_screen_button(self, match: str) -> dict:
+        """在**已打开**的界面里做**控件级**点击（Java 命令 `click_screen_button {match}`）。
+
+        参数名与 Java 侧逐字对齐：`match`（字符串，按钮上的文字）。Java 侧不移动鼠标、
+        不打开界面；这里也不做任何界面/鼠标模拟。`match` 同样过出站清洗（剥前导 `/`）。
+        """
+        target = self._sanitize(match, "click_screen_button").strip()
+        return self._send_cmd("click_screen_button", {"match": target})
 
     # ── Internal ────────────────────────────────────────────────
 
