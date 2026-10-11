@@ -99,9 +99,10 @@ class RegistryTests(unittest.TestCase):
             self.assertEqual(set(spec.schema()["function"]["parameters"]["properties"]),
                              set(args.split(",")), name)
 
-    def test_tool_count_grew_by_exactly_three(self):
+    def test_tool_names_are_unique(self):
+        """名字唯一是**不变量** ✓；**具体条数不测** ✗ —— "又长了几条"这种附带性断言，
+        每次加工具都会假红一次（这条以前写死 58，复合体一落地就红了 ✓）。"""
         self.assertEqual(len(TOOL_SPECS), len({spec.name for spec in TOOL_SPECS}))
-        self.assertEqual(len(TOOL_SPECS), 58)
 
     def test_declared_resources(self):
         """`use_on` 占 use（右键）、`view_container` 占 container（独占）、`find_entity` 不占。"""

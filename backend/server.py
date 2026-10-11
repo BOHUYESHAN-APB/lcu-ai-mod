@@ -939,3 +939,12 @@ async def set_commands_config(data: dict):
             "entries": _command_entries_view(store, key),
             "effective": store.whitelist_for(key),
             "rejected": rejected}
+
+
+# ── HTTP 面回捞（附加式）────────────────────────────────────────────────────────
+# master 有、26.3 缺、且**本机真有数据源**的端点全在 `api/http_surface.py` 里：
+# 这里只多做一件"挂上去"的事，上面任何既有路由/启动/鉴权/静态文件逻辑都不动。
+# 缺口与逐条理由见 `docs/dev/PORT_LIST.md` §4 的结项清单。
+from api import http_surface  # noqa: E402
+
+http_surface.install(app)
