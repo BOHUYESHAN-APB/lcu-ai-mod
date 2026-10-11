@@ -65,7 +65,7 @@ public class LCUMod {
             return;
         }
         LOGGER.info("[LCUMod] Initializing...");
-        WIRE = new WireServer(ModConfig.WIRE_PORT.getAsInt());
+        WIRE = new WireServer(ModConfig.WIRE_PORT.getAsInt(), ModConfig.WIRE_BIND_ADDRESS.get());
         WIRE.start();
         LOGGER.info("[LCUMod] Ready. Wire server listening on port {}", ModConfig.WIRE_PORT.getAsInt());
     }

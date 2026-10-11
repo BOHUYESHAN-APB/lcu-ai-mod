@@ -10,6 +10,14 @@ public class ModConfig {
             .comment("TCP port for the JSONL wire protocol (backend connects here)")
             .defineInRange("wirePort", 25568, 1024, 65535);
 
+    // Wire protocol listen address — tightened to loopback by default.
+    // Anything else (e.g. "0.0.0.0") restores the old wildcard listen for people who really run
+    // the backend on another machine. See docs/dev/SERVER_SIDE.md.
+    public static final ModConfigSpec.ConfigValue<String> WIRE_BIND_ADDRESS = BUILDER
+            .comment("Address the wire protocol listens on. Default 127.0.0.1 (loopback only).",
+                    "Set to 0.0.0.0 to restore the old wildcard listen (backend on another machine).")
+            .define("wireBindAddress", "127.0.0.1");
+
     // State push interval in ticks (20 ticks = 1 second)
     public static final ModConfigSpec.IntValue STATE_INTERVAL = BUILDER
             .comment("How often (in ticks) to push full state snapshot to backend")

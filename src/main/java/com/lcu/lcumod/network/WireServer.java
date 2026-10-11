@@ -5,8 +5,11 @@ import com.google.gson.JsonObject;
 import com.lcu.lcumod.LCUMod;
 import com.lcu.lcumod.action.ControlStream;
 import java.io.*;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -16,6 +19,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 public class WireServer {
     private final int port;
+    /** Requested bind address; blank/any-local means the old wildcard listen. */
+    private final String bindAddress;
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final Gson gson = new Gson();
     private Thread serverThread;
@@ -30,8 +35,33 @@ public class WireServer {
      *  必须在游戏里把原因显示出来，否则用户只看到"发消息没反应"。 */
     public static volatile String LISTEN_ERROR = null;
 
-    public WireServer(int port) {
+    /**
+     * @param port        TCP port to listen on
+     * @param bindAddress address to bind to. {@code "127.0.0.1"} (default) = loopback only;
+     *                    blank or {@code "0.0.0.0"} = wildcard (restores the pre-tightening listen).
+     */
+    public WireServer(int port, String bindAddress) {
         this.port = port;
+        this.bindAddress = bindAddress;
+    }
+
+    /**
+     * Resolve the configured bind address to an {@link InetAddress}.
+     * Returns {@code null} for a wildcard listen ({@code new InetSocketAddress((InetAddress) null, port)}).
+     * An unparseable address falls back to loopback so tightening never degrades into a wildcard.
+     */
+    private InetAddress resolveBindAddress() {
+        if (bindAddress == null || bindAddress.isBlank()) {
+            return null;
+        }
+        try {
+            InetAddress addr = InetAddress.getByName(bindAddress);
+            return addr.isAnyLocalAddress() ? null : addr;
+        } catch (UnknownHostException e) {
+            LCUMod.LOGGER.error("[WireServer] Invalid wireBindAddress '{}': {} — falling back to loopback",
+                    bindAddress, e.getMessage());
+            return InetAddress.getLoopbackAddress();
+        }
     }
 
     public void start() {
@@ -148,9 +178,11 @@ public class WireServer {
         // 端口被占用时**不要一次失败就永久残废**：每 5s 重绑一次。
         // 典型场景：用户之前那个游戏窗口没退干净；关掉它以后本窗口应自动恢复，不必重启游戏。
         while (running.get()) {
-            try (ServerSocket ss = new ServerSocket(port)) {
+            try (ServerSocket ss = new ServerSocket()) {
+                ss.bind(new InetSocketAddress(resolveBindAddress(), port));
                 LISTEN_ERROR = null;
-                LCUMod.LOGGER.info("[WireServer] Listening on port {}", port);
+                LCUMod.LOGGER.info("[WireServer] Listening on {}:{} (loopback only unless wireBindAddress overrides)",
+                        bindAddress == null || bindAddress.isBlank() ? "0.0.0.0" : bindAddress, port);
                 while (running.get()) {
                     try {
                         Socket sock = ss.accept();

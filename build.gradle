@@ -217,6 +217,24 @@ tasks.named('check').configure {
     dependsOn 'verifyGuard'
     dependsOn 'verifyProto'
     dependsOn 'verifyMlg'
+    dependsOn 'verifyMixin'
+    dependsOn 'verifyLang'
+}
+
+tasks.register('verifyMixin', JavaExec) {
+    group = 'verification'
+    description = '纯逻辑自检（lcumod.mixins.json：每个声明的 mixin 存在且能加载 / client 数组非空不再死掉 / MouseHandlerMixin 的 isAiControlled 守卫编译进字节码），零第三方依赖'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.output + sourceSets.main.output
+    mainClass = 'com.lcu.lcumod.mixin.MixinCheck'
+}
+
+tasks.register('verifyLang', JavaExec) {
+    group = 'verification'
+    description = '纯逻辑自检（zh_cn.json 的键集合与 en_us.json 逐一对应，不多不少；且不含 master 独有的 conversation/runtimeRole 键），零第三方依赖'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.output + sourceSets.main.output
+    mainClass = 'com.lcu.lcumod.chat.LangCheck'
 }
 
 tasks.register('verifyGuard', JavaExec) {

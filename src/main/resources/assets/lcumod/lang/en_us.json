@@ -3,6 +3,7 @@
   "lcumod.configuration.title": "LCU Mod Config",
   "lcumod.configuration.section.lcumod.common.toml": "LCU Mod Config",
   "lcumod.configuration.wirePort": "Wire Protocol Port",
+  "lcumod.configuration.wireBindAddress": "Wire Protocol Listen Address",
   "lcumod.configuration.stateInterval": "State Push Interval (ticks)",
   "lcumod.configuration.collectSurroundings": "Collect Surrounding Blocks/Entities",
   "lcumod.configuration.surroundingsRadius": "Surroundings Scan Radius"

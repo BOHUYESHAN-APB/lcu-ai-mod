@@ -1,0 +1,10 @@
+{
+  "itemGroup.lcumod": "LCU 模组",
+  "lcumod.configuration.title": "LCU 模组配置",
+  "lcumod.configuration.section.lcumod.common.toml": "LCU 模组配置",
+  "lcumod.configuration.wirePort": "线协议端口",
+  "lcumod.configuration.wireBindAddress": "线协议监听地址",
+  "lcumod.configuration.stateInterval": "状态推送间隔（刻）",
+  "lcumod.configuration.collectSurroundings": "采集周围方块/实体",
+  "lcumod.configuration.surroundingsRadius": "周围扫描半径"
+}
