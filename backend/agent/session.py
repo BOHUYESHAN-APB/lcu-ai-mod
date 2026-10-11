@@ -37,7 +37,8 @@ from .message_db import MessageDB
 from .conversation import ConversationStore, server_key
 from .borrow import BorrowRulesStore, parse_borrow_grant, parse_borrow_revoke
 from .person_memory import PersonMemoryStore
-from .world_memory import WorldMemoryStore, plan_replay, route_args
+from .world_memory import (WorldMemoryStore, plan_replay, route_args,
+                           route_point_count)
 from .territory import (TerritoryStore, current_base, home_situation, plan_zone_replay,
                         point_of)
 from .permissions import CraftPolicy, PermissionsStore, ReplyGate
@@ -857,7 +858,10 @@ class Session:
             result = export(name) or {}
             req_id = str(result.get("req_id") or "")
             if req_id:
-                self._route_exports[req_id] = {"name": name, "namespace": store.namespace}
+                row = store.route(name) if callable(getattr(store, "route", None)) else None
+                # 记下模组此前上报的点数：回执回来时若点数对不上，如实记差异（不静默）。
+                self._route_exports[req_id] = {"name": name, "namespace": store.namespace,
+                                               "count": route_point_count(row)}
                 while len(self._route_exports) > 20:
                     self._route_exports.pop(next(iter(self._route_exports)))
             requested.append(name)
@@ -881,20 +885,28 @@ class Session:
         if store is None or pending.get("namespace") != getattr(store, "namespace", None):
             logger.info("[Memory] 路径 '%s' 的回执已过期（分区已切换），丢弃（不灌）", name)
             return False
-        # 先按 Java 的同一口径验一遍（坏点 / 点数不在 [2,2000] 一律不要），**验不过就不落盘**：
+        # 点列以 Java 的同一口径验过才用（坏点/越界在 route_args 里已整条作废），**验不过就不落盘**：
         # 半条废点列存下来比没存更坏 —— 下次会被当成"模组侧已经有了"，真几何反而永远推不出去。
         args = route_args({"name": name, "points": payload.get("points")}) if name else None
         if not bool(data.get("success")) or args is None:
             reason = str(payload.get("reason") or data.get("error") or "no_geometry")
             logger.info("[Memory] 路径 '%s' 取不回点列（%s），维持 no_geometry（不编）", name, reason)
             return False
-        store.absorb_state({"routes": [{"name": args["name"], "points": args["points"]}]})
+        # 模组侧是执行者、它才是真相：取回的点列**原样**覆盖/补齐后端存盘（其余字段以已有那份为准）。
+        expected = pending.get("count")
+        actual = len(args["points"])
+        if expected is not None and expected != actual:
+            logger.info("[Memory] 路径 '%s' 取回 %d 个点，与模组此前上报的 %d 个不一致"
+                        "（以取回的点列为准，如实记差异）", args["name"], actual, expected)
+        old = store.route(args["name"]) if callable(getattr(store, "route", None)) else None
+        merged = dict(old) if isinstance(old, dict) else {}
+        merged.update({"name": args["name"], "points": args["points"]})
+        store.absorb_state({"routes": [merged]})
         skills = getattr(self, "skills", None)
         remember = getattr(skills, "remember_route", None) if skills is not None else None
         if callable(remember):
             remember(args["name"], args["points"])
-        logger.info("[Memory] 路径 '%s' 取回 %d 个点并灌回模组",
-                    args["name"], len(args["points"]))
+        logger.info("[Memory] 路径 '%s' 取回 %d 个点并灌回模组", args["name"], actual)
         return True
 
     # ── 领地 / 基地 / 容器 / 区域（world 层分区）──────────────────

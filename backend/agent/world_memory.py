@@ -153,8 +153,13 @@ def route_point_count(row: Any) -> Optional[int]:
 def routes_match(a: Any, b: Any) -> bool:
     """两条路径是不是同一份：两边都有点列就逐点比，否则退化成比点数。
 
-    模组当前只上报点数（`points` 是整数），此时"同名 + 点数相同"就算同一份
-    —— 这是能拿到的最强信号，好过每次都无脑重推。
+    模组当前只上报点数（`points` 是整数）。
+
+    * **只有一边有几何**（典型：后端存着点列、模组只报点数）→ "同名 + 点数相同"
+      就算同一份：这是能拿到的最强信号，好过每次都无脑重推。
+    * **两边都只有点数、都没几何** → 不算同一份：无从确认是不是同一条，而且这正是
+      **几何缺失**的缺口 —— 记成 identical 会让回灌永远不去取真几何（真几何就再也补不回来）。
+      所以走 `blocked(no_geometry)`，由 `_request_route_exports` 按需取一次。
     """
     if not isinstance(a, dict) or not isinstance(b, dict) or not entry_name(a):
         return False
@@ -165,6 +170,9 @@ def routes_match(a: Any, b: Any) -> bool:
         if len(left) != len(right):
             return False
         return all(_points_match(x, y) for x, y in zip(left, right))
+    if left is None and right is None:
+        # 都没有几何：不能据此断定"同一份"，它是待回灌的几何缺口。
+        return False
     left_count, right_count = route_point_count(a), route_point_count(b)
     if left_count is None or right_count is None:
         return False
@@ -421,10 +429,16 @@ class WorldMemoryStore:
         if kind == "route":
             old_points, new_points = route_points(old), route_points(new)
             if new_points is None and old_points is not None:
-                if route_point_count(new) in (None, len(old_points)):
+                count = route_point_count(new)
+                if count in (None, len(old_points)):
                     merged = copy.deepcopy(new)
                     merged["points"] = copy.deepcopy(old["points"])
                     return merged
+                # 模组上重记过（点数对不上）：后端那份坐标已过期，退回"只有点数"
+                # —— 如实记下这次差异，别静默；随后由 `route_export` 去取回真几何。
+                logger.info("[WorldMemory] 路径 '%s' 点数与存盘不一致（存 %d → 报 %s）："
+                            "旧坐标已过期、退回只有点数，待 route_export 取回真几何",
+                            entry_name(new), len(old_points), count)
             return copy.deepcopy(new)
         if _num(new.get("x")) is None and _num(old.get("x")) is not None:
             merged = copy.deepcopy(new)

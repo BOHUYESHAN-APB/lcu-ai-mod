@@ -269,6 +269,25 @@ class ReplayPlanTests(unittest.TestCase):
         self.assertEqual(plan["blocked"],
                          [{"kind": "route", "name": "tunnel", "reason": "no_geometry"}])
 
+    def test_two_count_only_routes_are_never_identical(self):
+        """两边都只有点数、都没几何 → 不记 identical：这是几何缺口，要留给 route_export 去取。"""
+        stored = {"name": "tunnel", "points": 3, "saved_at_tick": 200}
+        reported = {"name": "tunnel", "points": 3, "saved_at_tick": 250}
+
+        plan = plan_replay([], [stored], [], [reported])
+
+        self.assertEqual(plan["routes"], [], "没有几何就绝不推")
+        self.assertEqual(plan["skipped"], [], "几何缺失不能记成 identical（否则永远不去取）")
+        self.assertEqual(plan["blocked"],
+                         [{"kind": "route", "name": "tunnel", "reason": "no_geometry"}])
+
+    def test_geometry_backed_route_still_matches_a_reported_count(self):
+        """后端存着几何、模组只报点数：点数一致就算同一份（不每轮无脑重推）。"""
+        plan = plan_replay([], [route()], [], [{"name": "tunnel", "points": 3}])
+
+        self.assertEqual(plan["routes"], [])
+        self.assertEqual([row["reason"] for row in plan["skipped"]], ["identical"])
+
     def test_station_without_coordinates_is_blocked(self):
         plan = plan_replay([{"name": "home", "kind": "custom"}], [], [], [])
 
@@ -646,6 +665,81 @@ class RouteExportReplayTests(unittest.TestCase):
 
         with_points = [name for name, _ in session.skills.calls if name != "route_export"]
         self.assertEqual(with_points, [], "这一轮只有 route_export：点列不进 state")
+
+    # ── ⑥ 点数不一致：不记 identical，去核对一次 ──
+
+    def seed_geometry(self, store, points=None) -> None:
+        """后端存着**带几何**的路径（模组早先报过点列）。"""
+        store.use_namespace(SERVER, WORLD, OVERWORLD)
+        store.absorb_state(state(routes=[route(points=points or EXPORT_POINTS)]))
+        store.save()
+
+    def test_count_mismatch_triggers_one_export_and_never_pushes_stale_geometry(self):
+        store = self.places()
+        self.seed_geometry(store)
+        session = self.session(store)
+
+        session.handle_event("state_update",
+                             state(routes=[{"name": "tunnel", "points": 5, "saved_at_tick": 900}]))
+
+        self.assertEqual(store.route("tunnel")["points"], 5,
+                         "点数对不上 → 旧坐标已过期，退回只有点数")
+        self.assertEqual([call[0] for call in session.skills.calls], ["route_export"],
+                         "缺几何不能记 identical-by-count 了事：要核对一次")
+        self.assertEqual(len(session._route_exports), 1, "记下待办回执（回执到了才灌）")
+
+    def test_count_mismatch_is_not_requested_twice_in_one_session(self):
+        store = self.places()
+        self.seed_geometry(store)
+        session = self.session(store)
+
+        session.handle_event("state_update",
+                             state(routes=[{"name": "tunnel", "points": 5, "saved_at_tick": 900}]))
+        session.handle_event("state_update",
+                             state(routes=[{"name": "tunnel", "points": 5, "saved_at_tick": 901}]))
+
+        self.assertEqual([call[0] for call in session.skills.calls], ["route_export"],
+                         "同一条路径一次会话只试一次（不重试风暴）")
+
+    def test_count_mismatch_export_failure_keeps_the_honest_count_only_row(self):
+        store = self.places()
+        self.seed_geometry(store)
+        session = self.session(store)
+
+        session.handle_event("state_update",
+                             state(routes=[{"name": "tunnel", "points": 5, "saved_at_tick": 900}]))
+        session.handle_event("command_response",
+                             {"id": "export-1", "success": False, "error": "no_geometry",
+                              "data": {"ok": False, "name": "tunnel", "reason": "no_geometry"}})
+
+        self.assertEqual(store.route("tunnel"),
+                         {"name": "tunnel", "points": 5, "saved_at_tick": 900},
+                         "取不到就维持只有点数，绝不落盘废点列")
+        self.assertEqual([call[0] for call in session.skills.calls], ["route_export"],
+                         "失败不推任何东西")
+
+    def test_count_mismatch_recovered_geometry_is_stored_verbatim_and_pushed(self):
+        store = self.places()
+        self.seed_geometry(store)
+        session = self.session(store)
+
+        session.handle_event("state_update",
+                             state(routes=[{"name": "tunnel", "points": 5, "saved_at_tick": 900}]))
+        recovered = [{"x": 1.0, "y": 64.0, "z": 2.0, "yaw": 0.0},
+                     {"x": 5.0, "y": 65.0, "z": 2.0, "yaw": 45.0},
+                     {"x": 9.0, "y": 66.0, "z": 2.0, "yaw": 90.0},
+                     {"x": 13.0, "y": 68.0, "z": 4.0, "yaw": 135.0},
+                     {"x": 17.0, "y": 70.0, "z": 6.0, "yaw": 180.0}]
+        session.handle_event("command_response",
+                             {"id": "export-1", "success": True,
+                              "data": {"ok": True, "name": "tunnel",
+                                       "points": recovered, "count": len(recovered)}})
+
+        self.assertEqual(store.route("tunnel")["points"], recovered,
+                         "取回的真几何**逐字**落盘（模组侧是真相）")
+        self.assertEqual(session.skills.calls[-1],
+                         ("remember_route", {"name": "tunnel", "points": recovered}),
+                         "取回的点列原样灌回模组（不抽稀、不加工）")
 
 
 if __name__ == "__main__":
