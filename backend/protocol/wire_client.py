@@ -10,6 +10,8 @@ Usage:
         print(msg)
 """
 
+import collections
+import hashlib
 import json
 import socket
 import threading
@@ -20,6 +22,149 @@ from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger("wire")
+
+
+# ── 周期性入站事件的"变化才打行"日志 ───────────────────────────────
+# 背景（用户实机口径）：`← event: behavior_state` / `← event: control_state` 这类
+# **周期上报、内容却基本不变**的事件会每秒刷好几行，把真正要看的 `→ command` /
+# 错误 / 决策全淹掉。这里只对"周期性状态"事件做去重：内容没变就不打行，只在变化时
+# 打一行并交代"上一条相同了多久"。**绝不静音关键信息**：命令、回执、错误、决策、
+# 聊天一律不走这条路（见 `is_periodic_event`）。
+PERIODIC_EVENT_NAMES = frozenset({
+    "state_update", "behavior_state", "control_state", "task_state",
+})
+
+# 参与去重键的字段里"每次都变"的时间/序号/计时类字段：不剔除它们就永远判为"变了"。
+# 注意**只剔除时间与计数器**；业务计数字段（count/progress/health…）一律保留。
+_VOLATILE_KEYS = frozenset({
+    "ts", "timestamp", "time", "now", "server_time", "sent_at", "received_at",
+    "day_time", "game_time", "world_time", "uptime", "uptime_ms",
+    "tick", "ticks", "seq", "seq_id", "sequence", "frame", "elapsed",
+})
+_VOLATILE_SUFFIXES = ("_ms", "_at", "_ts", "_tick", "_ticks")
+
+# 单行里回显"新内容"的最大长度；超出用 `…(+N 字)` 诚实标注（不隐藏"被截断"这件事）。
+MAX_LOG_CONTENT_CHARS = 1500
+
+
+def _is_volatile_key(key: str) -> bool:
+    lowered = str(key).lower()
+    return lowered in _VOLATILE_KEYS or lowered.endswith(_VOLATILE_SUFFIXES)
+
+
+def _normalize_for_key(value: Any) -> Any:
+    """递归剔除易变字段（字典键序无关由后续 `sort_keys` 保证）。"""
+    if isinstance(value, dict):
+        return {k: _normalize_for_key(v) for k, v in value.items() if not _is_volatile_key(k)}
+    if isinstance(value, list):
+        return [_normalize_for_key(v) for v in value]
+    return value
+
+
+def event_fingerprint(obj: dict) -> str:
+    """周期性事件的去重指纹：规范化 JSON 的哈希（字段顺序无关、剔除时间戳/计数器）。"""
+    normalized = _normalize_for_key(obj)
+    blob = json.dumps(normalized, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"), default=str)
+    return hashlib.sha1(blob.encode("utf-8", "replace")).hexdigest()
+
+
+def is_periodic_event(msg_type: str, label: Any) -> bool:
+    """该入站消息是否为"周期上报的状态"事件（唯一允许做变化去重的类别）。"""
+    if msg_type != "event":
+        return False
+    name = str(label or "")
+    # 已知的四类 + 任何 `<something>_state` 快照（同类一并处理）。
+    return name in PERIODIC_EVENT_NAMES or name.endswith("_state")
+
+
+def format_event_content(obj: dict, limit: int = MAX_LOG_CONTENT_CHARS) -> str:
+    """把事件负载压成单行（紧凑 JSON），用于变化日志里的"新内容"。"""
+    payload = obj.get("data") if isinstance(obj, dict) else None
+    if payload is None:
+        payload = obj
+    try:
+        text = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                          separators=(",", ":"), default=str)
+    except (TypeError, ValueError):
+        text = repr(payload)
+    if len(text) > limit:
+        text = f"{text[:limit]}…(+{len(text) - limit} 字)"
+    return text
+
+
+class _LogDeduper:
+    """周期性状态事件的变化驱动日志器。
+
+    每个事件类型**各自**维护一份状态（上次指纹 + 抑制计数），互不串味；内存有上限
+    （只保留最近 `MAX_KEYS` 类，超出按 LRU 淘汰）。`emitted` / `suppressed` 两个计数
+    保证"信息没丢"：即使压掉了行，也能从计数把见过的总条数复原出来。
+    """
+
+    MAX_KEYS = 32
+
+    def __init__(self, enabled: bool = True, heartbeat_seconds: float = 0.0, clock=time.monotonic):
+        self.enabled = bool(enabled)
+        self.heartbeat_seconds = self._as_seconds(heartbeat_seconds)
+        self._clock = clock
+        self._states: "collections.OrderedDict[str, dict]" = collections.OrderedDict()
+        self.emitted = 0        # 真的打出来的"内容变化"行
+        self.suppressed = 0     # 因内容相同被压掉的行（每压一行 +1）
+        self.heartbeats = 0     # 心跳行（不参与 emitted+suppressed 的复原等式）
+
+    @staticmethod
+    def _as_seconds(value: Any) -> float:
+        try:
+            return max(0.0, float(value or 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def total_events(self) -> int:
+        """见过的周期性事件总数（= 变化行 + 被压掉的行）；信息没丢的复原依据。"""
+        return self.emitted + self.suppressed
+
+    def feed(self, name: str, fingerprint: str, content: str,
+             now: float | None = None) -> str | None:
+        """观察一条事件，返回要打印的一行；内容与上次相同则返回 None（只 +1 抑制计数）。"""
+        if not self.enabled:
+            return None
+        timestamp = self._clock() if now is None else now
+        entry = self._states.get(name)
+        if entry is None:
+            self._states[name] = {"fp": fingerprint, "since": timestamp, "seen": timestamp,
+                                  "repeats": 0, "emitted_at": timestamp}
+            self._trim()
+            self.emitted += 1
+            return f"← {name}: {content}"
+
+        self._states.move_to_end(name)
+        if entry["fp"] == fingerprint:
+            entry["repeats"] += 1
+            entry["seen"] = timestamp
+            heartbeat = self.heartbeat_seconds
+            if heartbeat > 0 and (timestamp - entry["emitted_at"]) >= heartbeat:
+                entry["emitted_at"] = timestamp
+                self.heartbeats += 1
+                elapsed = timestamp - entry["since"]
+                return (f"← {name}（未变，已持续 {elapsed:.1f} 秒，"
+                        f"累计相同 ×{entry['repeats']}）")
+            self.suppressed += 1
+            return None
+
+        # 内容变了：先交代"上一条相同了多久"，再给新内容。
+        repeats = entry["repeats"]
+        held = max(0.0, entry["seen"] - entry["since"])
+        self._states[name] = {"fp": fingerprint, "since": timestamp, "seen": timestamp,
+                              "repeats": 0, "emitted_at": timestamp}
+        self._states.move_to_end(name)
+        self.emitted += 1
+        if repeats > 0:
+            return f"← {name}（与上一条相同 ×{repeats}，持续 {held:.1f} 秒）: {content}"
+        return f"← {name}: {content}"
+
+    def _trim(self) -> None:
+        while len(self._states) > self.MAX_KEYS:
+            self._states.popitem(last=False)
 
 
 @dataclass
@@ -46,6 +191,22 @@ class WireClient:
         self._send_lock = threading.Lock()
         # 聊天事件监听器（在**读取线程**里被调用，不走事件队列）。见 add_chat_listener。
         self._chat_listeners: list = []
+        # 周期性状态事件的"变化才打行"去重（默认开；开关与心跳见 configure_log_dedupe）。
+        self._log_deduper = _LogDeduper()
+
+    def configure_log_dedupe(self, enabled: bool | None = None,
+                             heartbeat_seconds: float | None = None) -> None:
+        """配置入站周期性状态日志（对应 config.json 的 `log_*` 键）。
+
+        `enabled=False` → 逐字回到旧行为（每个事件一行 `← type: name`）；
+        `heartbeat_seconds>0` → 内容长时间没变也每隔 N 秒强打一行"未变"，用于区分
+        "链路还活着但状态没变" 与 "链路断了"。默认两个值都不动。
+        """
+        deduper = self._log_deduper
+        if enabled is not None:
+            deduper.enabled = bool(enabled)
+        if heartbeat_seconds is not None:
+            deduper.heartbeat_seconds = _LogDeduper._as_seconds(heartbeat_seconds)
 
     def connect(self) -> bool:
         """Connect to the mod's wire server."""
@@ -174,7 +335,17 @@ class WireClient:
                         try:
                             obj = json.loads(line)
                             msg_type = obj.get("type", "unknown")
-                            logger.debug(f"← {msg_type}: {obj.get('event') or obj.get('id') or '?'}")
+                            label = obj.get("event") or obj.get("id") or "?"
+                            deduper = self._log_deduper
+                            if deduper.enabled and is_periodic_event(msg_type, label):
+                                log_line = deduper.feed(str(label), event_fingerprint(obj),
+                                                        format_event_content(obj))
+                                if log_line is not None:
+                                    logger.debug(log_line)
+                            else:
+                                # 非周期性消息（命令/回执/错误/决策/聊天）与关闭开关时：
+                                # 逐字沿用旧格式，绝不静音关键信息。
+                                logger.debug(f"← {msg_type}: {label}")
                             self._event_queue.put(WireMessage(
                                 type=msg_type,
                                 data=obj,

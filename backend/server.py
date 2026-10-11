@@ -144,6 +144,10 @@ async def startup():
     port = int(os.getenv("MOD_PORT", "25568"))
 
     wire = WireClient(host, port)
+    wire.configure_log_dedupe(
+        enabled=config_store.get_log_changes_only(),
+        heartbeat_seconds=config_store.get_log_heartbeat_seconds(),
+    )
     orchestrator = Orchestrator(wire)
     _apply_config_to_llm_services()
     _apply_persona_to_session()
@@ -461,6 +465,12 @@ async def set_config(data: dict):
     """Update backend configuration."""
     global app_config
     app_config = config_store.set_app_config(data)
+    # 日志开关改动立刻生效（不必重启）：wire 还没连上时也无害。
+    if wire is not None:
+        wire.configure_log_dedupe(
+            enabled=config_store.get_log_changes_only(),
+            heartbeat_seconds=config_store.get_log_heartbeat_seconds(),
+        )
     return {"status": "ok", "config": app_config}
 
 

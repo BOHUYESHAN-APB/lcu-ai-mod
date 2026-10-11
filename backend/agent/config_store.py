@@ -270,6 +270,14 @@ def _default_config() -> dict[str, Any]:
         # 打开 → 「对话历史的读取」改走 session_core 纯投影 + 只读适配（写侧仍归旧链路）。
         # 默认关闭是刻意的：新链路未逐项验收前不许默认生效。
         "session_tree": False,
+        # 周期性状态事件的日志（`backend/protocol/wire_client.py`）：
+        #   log_changes_only=true（默认）→ 只有内容**变了**才打行（相同就压掉并计数），
+        #     避免 behavior_state/control_state 每秒刷屏把关键日志淹掉；
+        #   log_heartbeat_seconds=0（默认关）→ 内容长时间没变时每隔 N 秒强打一行"未变"，
+        #     用来区分"链路活着但状态没变"与"链路断了"。用户口径是"没刷新就不刷新"，
+        #     所以默认必须是 0；需要时再开。
+        "log_changes_only": True,
+        "log_heartbeat_seconds": 0,
     }
 
 
@@ -408,6 +416,16 @@ class ConfigStore:
                 parsed_tree = _parse_bool(payload["session_tree"])
                 if parsed_tree is not None:
                     self._data["session_tree"] = parsed_tree
+            if "log_changes_only" in payload:
+                parsed_changes = _parse_bool(payload["log_changes_only"])
+                if parsed_changes is not None:
+                    self._data["log_changes_only"] = parsed_changes
+            if "log_heartbeat_seconds" in payload:
+                try:
+                    self._data["log_heartbeat_seconds"] = max(
+                        0.0, float(payload["log_heartbeat_seconds"]))
+                except (TypeError, ValueError):
+                    pass
             self.save()
             return self.raw(redact=True)
 
@@ -432,6 +450,28 @@ class ConfigStore:
         with self._lock:
             raw = self._data.get("session_tree", False)
         return _as_bool(raw, False)
+
+    def get_log_changes_only(self) -> bool:
+        """周期性状态日志只打"变化"行（config.json → log_changes_only，默认开）。
+
+        关闭 → wire 日志逐字回到旧行为（每个事件一行），给靠旧日志排障的人留退路。
+        """
+        with self._lock:
+            raw = self._data.get("log_changes_only", True)
+        return _as_bool(raw, True)
+
+    def get_log_heartbeat_seconds(self) -> float:
+        """心跳间隔（config.json → log_heartbeat_seconds，**默认 0 = 关**）。
+
+        设了正数 → 内容长时间没变也每隔 N 秒强打一行"未变"，区分"链路活着但状态没变"
+        与"链路断了"。非法/负值一律回退 0（关）。
+        """
+        with self._lock:
+            raw = self._data.get("log_heartbeat_seconds", 0)
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return 0.0
 
     def get_decision_threshold(self) -> float:
         """decider 置信度阈值；非法值回退默认。"""
