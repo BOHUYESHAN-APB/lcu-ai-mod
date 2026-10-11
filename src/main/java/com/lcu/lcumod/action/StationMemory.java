@@ -104,6 +104,29 @@ public final class StationMemory {
         return name == null ? null : STATIONS.get(name.strip());
     }
 
+    /**
+     * 后端回灌（持久化的真相来源在后端）：**显式参数优先、缺省回退当前位姿**。
+     *
+     * <p>与 {@link #remember} 同名同义、只是参数可为 null —— 于是同一条命令既能"用当前位姿指认"
+     * 也能"把后端存着的坐标推回来"，两条路径共用同一份落库逻辑（字段天然一致）。
+     * 缺省口径：坐标/朝向缺失 → 当前位姿；{@code radius} 缺失 → {@link #DEFAULT_RADIUS}；
+     * {@code kind} 缺失 → {@link #DEFAULT_KIND}。
+     */
+    public static Station rememberWithPoseFallback(String name, String kind,
+                                                   Double x, Double y, Double z,
+                                                   Float yaw, Float pitch, Double radius,
+                                                   double poseX, double poseY, double poseZ,
+                                                   float poseYaw, float posePitch, int tickCount) {
+        return remember(name, kind,
+                x == null ? poseX : x,
+                y == null ? poseY : y,
+                z == null ? poseZ : z,
+                yaw == null ? poseYaw : yaw,
+                pitch == null ? posePitch : pitch,
+                radius == null ? DEFAULT_RADIUS : radius,
+                tickCount);
+    }
+
     public static boolean has(String name) {
         return get(name) != null;
     }

@@ -525,6 +525,8 @@ public class ActionExecutor {
                 case "route_record_start" -> handleRouteRecordStart(cmd);
                 case "route_record_stop" -> handleRouteRecordStop(cmd);
                 case "route_follow" -> handleRouteFollow(cmd);
+                // 后端回灌：把持久化在**后端**的路径整条推回模组（灌进来即可直接 route_follow）
+                case "remember_route" -> handleRememberRoute(cmd);
                 case "equip_weapon" -> {
                     String weapon = equipBestWeapon(mc);
                     sendResponse(cmd.id(), weapon != null,
@@ -1810,7 +1812,10 @@ public class ActionExecutor {
     // 用户原话："让 AI 去某些点位去挂机（刷怪塔/小黑塔）……它得记住精准的 xyz"；
     // "还要记录路径（玩家挖的洞穴可能超出原版最大寻路距离）"。
 
-    /** 记一个站点：用**当前位姿**（精准 xyz + 朝向）+ 水平容差；同名覆盖。 */
+    /**
+     * 记一个站点：**显式坐标优先、缺省回退当前位姿**（同一条命令既用于"用当前位姿指认"，
+     * 也用于后端把持久化的坐标回灌）；同名覆盖。
+     */
     private void handleRememberStation(WireServer.WireCommand cmd) {
         var mc = Minecraft.getInstance();
         if (mc.player == null || mc.level == null) {
@@ -1823,19 +1828,95 @@ public class ActionExecutor {
             sendResponse(cmd.id(), false, "Need name");
             return;
         }
-        String kind = args != null && args.has("kind") ? args.get("kind").getAsString() : StationMemory.DEFAULT_KIND;
-        double radius = args != null && args.has("radius")
-                ? args.get("radius").getAsDouble() : StationMemory.DEFAULT_RADIUS;
+        String kind = args != null && args.has("kind") ? args.get("kind").getAsString() : null;
+        Double x = optDouble(args, "x");
+        Double y = optDouble(args, "y");
+        Double z = optDouble(args, "z");
+        boolean explicit = x != null && y != null && z != null;
         boolean existed = StationMemory.has(name);
-        StationMemory.Station station = StationMemory.remember(name, kind,
+        StationMemory.Station station = StationMemory.rememberWithPoseFallback(name, kind,
+                x, y, z, optFloat(args, "yaw"), optFloat(args, "pitch"), optDouble(args, "radius"),
                 mc.player.getX(), mc.player.getY(), mc.player.getZ(),
-                mc.player.getYRot(), mc.player.getXRot(), radius, tickCount);
+                mc.player.getYRot(), mc.player.getXRot(), tickCount);
         StateCollector.requestRefresh();
 
         JsonObject data = stationJson(station);
         data.addProperty("saved", true);
         data.addProperty("overwritten", existed);
+        data.addProperty("explicit_coords", explicit);
         sendResponse(cmd.id(), true, data);
+    }
+
+    /**
+     * 后端回灌整条路径（{@code remember_route}）：把后端持久化的路径点灌回模组，灌进来即可直接
+     * {@code route_follow}。同名覆盖；点数 <2 或 >{@link RouteMemory#MAX_POINTS} 直接拒绝并给原因。
+     */
+    private void handleRememberRoute(WireServer.WireCommand cmd) {
+        JsonObject args = cmd.args();
+        String name = args != null && args.has("name") ? args.get("name").getAsString().strip() : "";
+        if (name.isEmpty()) {
+            sendResponse(cmd.id(), false, "Need name");
+            return;
+        }
+        var raw = args != null && args.has("points") && args.get("points").isJsonArray()
+                ? args.getAsJsonArray("points") : null;
+        if (raw == null) {
+            sendResponse(cmd.id(), false, "Need points array");
+            return;
+        }
+        List<RouteMemory.RoutePoint> points = new ArrayList<>();
+        for (int i = 0; i < raw.size(); i++) {
+            var el = raw.get(i);
+            if (!el.isJsonObject()) {
+                sendResponse(cmd.id(), false, "Malformed point at index " + i + ": expected object");
+                return;
+            }
+            Double px = optDouble(el.getAsJsonObject(), "x");
+            Double py = optDouble(el.getAsJsonObject(), "y");
+            Double pz = optDouble(el.getAsJsonObject(), "z");
+            if (px == null || py == null || pz == null) {
+                sendResponse(cmd.id(), false, "Malformed point at index " + i + ": need numeric x,y,z");
+                return;
+            }
+            Float yaw = optFloat(el.getAsJsonObject(), "yaw");
+            points.add(new RouteMemory.RoutePoint(px, py, pz, yaw == null ? 0f : yaw));
+        }
+
+        boolean existed = RouteMemory.has(name);
+        RouteMemory.IngestResult result = RouteMemory.ingest(name, points, tickCount);
+        StateCollector.requestRefresh();
+
+        JsonObject data = new JsonObject();
+        data.addProperty("saved", result.ok());
+        data.addProperty("name", name);
+        data.addProperty("received", points.size());
+        data.addProperty("overwritten", existed);
+        if (result.ok()) {
+            data.addProperty("points", result.route().points().size());
+            data.addProperty("source", "backend");
+            sendResponse(cmd.id(), true, data);
+        } else {
+            data.addProperty("error", result.error().name().toLowerCase(java.util.Locale.ROOT));
+            data.addProperty("reason", result.detail());
+            sendResponse(cmd.id(), false, data);
+        }
+    }
+
+    /** 可空数值参数（缺省/JSON null 都返回 null → 走回退）。 */
+    private static Double optDouble(JsonObject args, String key) {
+        if (args == null || !args.has(key) || args.get(key).isJsonNull()) {
+            return null;
+        }
+        try {
+            return args.get(key).getAsDouble();
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    private static Float optFloat(JsonObject args, String key) {
+        Double v = optDouble(args, key);
+        return v == null ? null : v.floatValue();
     }
 
     /** 挂机：寻路到站点 → 到点后驻守（停止寻路、待在半径内，被撞出去自己走回）。 */

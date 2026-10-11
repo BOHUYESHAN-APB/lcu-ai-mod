@@ -41,6 +41,7 @@ public final class RouteCheck {
         afkKeepaliveDoesNotMove();
         sameNameOverwrites();
         persistenceFieldsComplete();
+        backendIngestPushesMemoryBack();
 
         System.out.println("[RouteCheck] " + passed + " checks passed, " + failed + " failed");
         if (failed > 0) {
@@ -353,6 +354,120 @@ public final class RouteCheck {
         // 清理，避免影响同 JVM 内的其它自检（正常情况下每个 verify 任务各自独立进程）
         StationMemory.clear();
         RouteMemory.clear();
+    }
+
+    /**
+     * ⑦ 后端回灌（持久化的真相来源在**后端**）：显式坐标的 remember_station、
+     * remember_route 灌入后可直接重放、过少/过多被拒且带原因、同名覆盖、参数缺省回退。
+     */
+    private static void backendIngestPushesMemoryBack() {
+        // ① 显式坐标版与当前位姿版走同一份落库逻辑 → 字段集合完全一致（只是坐标来源不同）
+        StationMemory.clear();
+        StationMemory.Station explicit =
+                StationMemory.remember("tower", "mob_farm", 10, 64, 20, 90f, -5f, 2.0, 7);
+        StationMemory.Station fromPose = StationMemory.rememberWithPoseFallback("tower2", "mob_farm",
+                10d, 64d, 20d, 90f, -5f, 2.0d, 0.0, 0.0, 0.0, 0f, 0f, 7);
+        Map<String, Object> explicitFields = explicit.toFields();
+        Map<String, Object> poseFields = fromPose.toFields();
+        check("explicit coords use the same field set as the pose path",
+                explicitFields.keySet().equals(poseFields.keySet()));
+        check("explicit coords and the pose path agree on every field but the name", () -> {
+            Map<String, Object> a = new java.util.LinkedHashMap<>(explicitFields);
+            Map<String, Object> b = new java.util.LinkedHashMap<>(poseFields);
+            a.remove("name");
+            b.remove("name");
+            return a.equals(b);
+        });
+        check("explicit coordinate station keeps the given radius/kind",
+                explicit.radius() == 2.0 && explicit.kind().equals("mob_farm"));
+
+        // ⑤ 参数缺省回退：坐标/朝向缺失 → 当前位姿；radius 缺失 → 默认 1 格；kind 缺失 → custom
+        StationMemory.Station fallback = StationMemory.rememberWithPoseFallback("fallback", null,
+                null, null, null, null, null, null, 5.5, 64.25, -3.75, 45f, -10f, 9);
+        check("missing xyz falls back to the current pose",
+                fallback.x() == 5.5 && fallback.y() == 64.25 && fallback.z() == -3.75);
+        check("missing yaw/pitch falls back to the current pose",
+                fallback.yaw() == 45f && fallback.pitch() == -10f);
+        check("missing radius falls back to the default 1 block",
+                fallback.radius() == StationMemory.DEFAULT_RADIUS);
+        check("missing kind falls back to custom", fallback.kind().equals(StationMemory.DEFAULT_KIND));
+
+        StationMemory.Station partial = StationMemory.rememberWithPoseFallback("partial", "crop",
+                100d, null, null, null, null, 3.0d, 5.5, 64.25, -3.75, 45f, -10f, 10);
+        check("partial coords fall back per-field (x given, y/z from pose)",
+                partial.x() == 100.0 && partial.y() == 64.25 && partial.z() == -3.75);
+        check("partial coords keep the given radius", partial.radius() == 3.0);
+
+        // ② remember_route 灌入后可被 route_follow 直接重放（复用同一个重放状态机）
+        RouteMemory.clear();
+        List<RouteMemory.RoutePoint> dense = new ArrayList<>();
+        for (int i = 0; i < 12; i++) {
+            dense.add(new RouteMemory.RoutePoint(i, 64, 0, 90f));
+        }
+        RouteMemory.IngestResult ingested = RouteMemory.ingest("cave_line", dense, 500);
+        check("backend route ingest succeeds", ingested.ok() && ingested.error() == RouteMemory.IngestError.NONE);
+        check("ingest keeps the route intact (no extra compression)",
+                RouteMemory.get("cave_line").points().size() == 12);
+        check("ingest keeps every coordinate + yaw",
+                RouteMemory.get("cave_line").points().get(5).x() == 5.0
+                        && RouteMemory.get("cave_line").points().get(5).yaw() == 90f);
+        check("ingest records the tick", RouteMemory.get("cave_line").savedAtTick() == 500);
+
+        RouteFollower follower = new RouteFollower();
+        check("an ingested route can be replayed",
+                follower.begin("cave_line", RouteMemory.get("cave_line").points(), 1.0));
+        int steps = 0;
+        while (follower.isActive() && steps < 100) {
+            RouteMemory.RoutePoint cur = follower.current();
+            follower.advanceIfReached(cur.x(), cur.y(), cur.z(), 1.5, 2.0);
+            steps++;
+        }
+        check("replay chains through every ingested point (12 steps)", steps == 12);
+        check("replay of an ingested route finishes at the end",
+                follower.isDone() && follower.index() == follower.total());
+
+        // ③ 点太少 / 超上限 → 拒绝并给原因（且不破坏同名旧条目）
+        RouteMemory.IngestResult tooFew = RouteMemory.ingest("short", List.of(p(0, 64, 0)), 1);
+        check("a 1-point route is rejected", !tooFew.ok() && tooFew.error() == RouteMemory.IngestError.TOO_FEW);
+        check("too-few reason says how many are needed",
+                tooFew.detail().contains("too few") && tooFew.detail().contains(">= 2"));
+        check("empty point list is rejected", !RouteMemory.ingest("empty", List.of(), 1).ok());
+        check("null point list is rejected", !RouteMemory.ingest("null", null, 1).ok());
+        check("blank name is rejected",
+                !RouteMemory.ingest("  ", dense, 1).ok()
+                        && RouteMemory.ingest("  ", dense, 1).error() == RouteMemory.IngestError.NO_NAME);
+
+        List<RouteMemory.RoutePoint> huge = new ArrayList<>();
+        for (int i = 0; i <= RouteMemory.MAX_POINTS; i++) {
+            huge.add(new RouteMemory.RoutePoint(i, 64, 0, 0f));
+        }
+        check("the point cap is 2000", RouteMemory.MAX_POINTS == 2000 && huge.size() == 2001);
+        RouteMemory.IngestResult tooMany = RouteMemory.ingest("cave_line", huge, 600);
+        check("an over-cap route is rejected",
+                !tooMany.ok() && tooMany.error() == RouteMemory.IngestError.TOO_MANY);
+        check("too-many reason says the cap",
+                tooMany.detail().contains("too many") && tooMany.detail().contains("2000"));
+        check("a rejected ingest does not clobber the existing route",
+                RouteMemory.has("cave_line") && RouteMemory.get("cave_line").points().size() == 12);
+        check("a rejected ingest is not stored under its own name",
+                !RouteMemory.ingest("huge", huge, 600).ok() && !RouteMemory.has("huge"));
+
+        // ④ 同名覆盖（后端改名/重录后重推）
+        RouteMemory.IngestResult overwrite = RouteMemory.ingest("cave_line",
+                List.of(p(0, 64, 0), p(8, 64, 0), p(8, 64, 8)), 700);
+        check("re-ingest with the same name overwrites", overwrite.ok() && RouteMemory.size() == 1);
+        check("overwrite keeps the latest points", RouteMemory.get("cave_line").points().size() == 3);
+        check("overwrite keeps the latest tick", RouteMemory.get("cave_line").savedAtTick() == 700);
+        check("overwriting station keeps a single entry",
+                StationMemory.remember("tower", "mob_farm", 11, 65, 21, 0f, 0f, 1.0, 99) != null
+                        && StationMemory.all().size() == 4);
+
+        StationMemory.clear();
+        RouteMemory.clear();
+    }
+
+    private static void check(String name, java.util.function.BooleanSupplier ok) {
+        check(name, ok.getAsBoolean());
     }
 
     private static StationMemory.Station station(String name, double x, double y, double z, double radius) {

@@ -32,6 +32,10 @@ public final class RouteMemory {
     public static final double MIN_TURN_DEGREES = 30.0;
     /** 小于这个位移视为抖动/原地转身，不更新方向基准。 */
     public static final double MIN_MOVE = 0.35;
+    /** 后端回灌一条路径至少要有 2 个点（1 个点的"路径"没有意义，直接拒绝）。 */
+    public static final int MIN_POINTS = 2;
+    /** 后端回灌单条路径的点数上限（防呆：异常大 payload 直接拒绝，不落库）。 */
+    public static final int MAX_POINTS = 2000;
 
     /** 路径上的一个点：精准 xyz + 朝向。 */
     public record RoutePoint(double x, double y, double z, float yaw) {
@@ -109,9 +113,59 @@ public final class RouteMemory {
         if (clean.isEmpty() || points == null || points.isEmpty()) {
             return null;
         }
-        Route route = new Route(clean, points, tickCount);
-        ROUTES.put(clean, route);
+        return store(clean, points, tickCount);
+    }
+
+    private static Route store(String cleanName, List<RoutePoint> points, int tickCount) {
+        Route route = new Route(cleanName, points, tickCount);
+        ROUTES.put(cleanName, route);
         return route;
+    }
+
+    /** 回灌失败的原因（{@link IngestError#reason()} 给稳定的线上字符串）。 */
+    public enum IngestError {
+        NONE(""), NO_NAME("need name"), TOO_FEW("too few points"), TOO_MANY("too many points");
+
+        private final String reason;
+
+        IngestError(String reason) {
+            this.reason = reason;
+        }
+
+        public String reason() {
+            return reason;
+        }
+    }
+
+    /** 回灌结果：成功时带落库后的路径，失败时带原因（**失败绝不改动已有条目**）。 */
+    public record IngestResult(Route route, IngestError error, String detail) {
+        public boolean ok() {
+            return error == IngestError.NONE;
+        }
+    }
+
+    /**
+     * 后端回灌（持久化的真相来源在后端）：把后端存着的整条路径灌回模组。
+     *
+     * <p>与现场录像的区别：**不做任何抽稀**（后端存的就是真相，抽稀过一次了），
+     * 只做防呆校验 —— 名字必填、点数 ∈ [{@link #MIN_POINTS}, {@link #MAX_POINTS}]。
+     * 校验在落库之前，因此被拒的请求不会破坏同名旧条目。灌进来即可直接 {@code route_follow}。
+     */
+    public static IngestResult ingest(String name, List<RoutePoint> points, int tickCount) {
+        String clean = name == null ? "" : name.strip();
+        if (clean.isEmpty()) {
+            return new IngestResult(null, IngestError.NO_NAME, IngestError.NO_NAME.reason());
+        }
+        int size = points == null ? 0 : points.size();
+        if (size < MIN_POINTS) {
+            return new IngestResult(null, IngestError.TOO_FEW,
+                    IngestError.TOO_FEW.reason() + ": " + size + " (need >= " + MIN_POINTS + ")");
+        }
+        if (size > MAX_POINTS) {
+            return new IngestResult(null, IngestError.TOO_MANY,
+                    IngestError.TOO_MANY.reason() + ": " + size + " (max " + MAX_POINTS + ")");
+        }
+        return new IngestResult(store(clean, points, tickCount), IngestError.NONE, "");
     }
 
     public static Route get(String name) {
