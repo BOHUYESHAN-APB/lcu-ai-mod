@@ -215,6 +215,7 @@ tasks.named('check').configure {
     dependsOn 'verifyRoute'
     dependsOn 'verifyRecipe'
     dependsOn 'verifyGuard'
+    dependsOn 'verifyProto'
 }
 
 tasks.register('verifyGuard', JavaExec) {
@@ -223,6 +224,14 @@ tasks.register('verifyGuard', JavaExec) {
     dependsOn tasks.named('testClasses')
     classpath = sourceSets.test.output + sourceSets.main.output
     mainClass = 'com.lcu.lcumod.action.GuardCheck'
+}
+
+tasks.register('verifyProto', JavaExec) {
+    group = 'verification'
+    description = '纯逻辑自检（Body 抽象：接口/能力面方法齐全/签名无 net.minecraft 泄露；WireMessage 前向兼容：往返/未知字段忽略/未知 type 归一/缺 v 记 0/坏 JSON 返回 null/超长上限；能力位非空唯一；版本常量稳定）'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.output + sourceSets.main.output
+    mainClass = 'com.lcu.lcumod.proto.ProtoCheck'
 }
 
 tasks.register('verifyRecipe', JavaExec) {
