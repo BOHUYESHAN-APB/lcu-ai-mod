@@ -290,6 +290,9 @@ class Session:
             borrow_rules=self.borrow_rules,
             # 领地 / 基地 / 容器 / 区域（world 层分区）：授权判定与回灌都在计划器里。
             territory=self.territories,
+            # 持久记忆点（POI）与站点（places）：`where_is` 要用它们回答"某个东西在哪"。
+            poi=self.poi,
+            places=self.places,
             # 单一指令口 + 私信 + TPA：全部走 session 的方法（规则只在这里实现一次）。
             server_commands=self.run_server_command,
             whisper_sender=self.send_whisper,

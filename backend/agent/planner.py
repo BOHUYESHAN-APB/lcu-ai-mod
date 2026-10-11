@@ -19,6 +19,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from . import where
 from .borrow import BorrowLedger
 from .control_lease import ControlLease
 from .craft import (ContainerPick, armor_in_containers, clamp_take, describe_missing,
@@ -400,7 +401,8 @@ class Planner:
     def __init__(self, llm_service, memory, skills, threshold_provider=None, chat_inbox=None,
                  permissions=None, borrow_rules=None, server_commands=None,
                  whisper_sender=None, tpa_responder=None, tpa_requester=None,
-                 player_resolver=None, territory=None, action_manager=None):
+                 player_resolver=None, territory=None, action_manager=None,
+                 poi=None, places=None):
         self.llm = llm_service
         self.memory = memory
         self.skills = skills
@@ -426,6 +428,10 @@ class Planner:
         self.borrow_rules = borrow_rules
         # 领地 / 基地 / 容器 / 区域（world 层分区）：没注入＝没有任何授权与保护声明。
         self.territory = territory
+        # `where_is` 的 world 层记忆来源（现成存储，只读）：POI 记忆（记录点/箱子/工作站）
+        # 与站点记忆。没注入＝少两个来源（工具照答，只是能问到的更少——如实说不知道）。
+        self.poi = poi
+        self.places = places
         # 借用台账：上限判定 + 借/还审计 + 按 open_container 快照核对归还。
         self.borrow_ledger = BorrowLedger()
         # 本轮制作还没补上的材料缺口（bare item → 还差几个）：容器取用以它为上限。
@@ -1453,6 +1459,28 @@ class Planner:
 
     def _tool_stop(self, payload: dict, context: dict) -> bool:
         self.skills.stop_all()
+        return True
+
+    def _tool_where_is(self, payload: dict, context: dict) -> bool:
+        """问位置：**只答坐标候选，绝不移动**（移动由模型另外调 move_to/go_to_block/follow）。
+
+        来源全是现成的：state 里的在线玩家 + world 层记忆（记忆点/站点/容器/区域/基地）。
+        问不到就返回空清单 + 一句如实的说明——**绝不编坐标**。
+        """
+        target = str(payload.get("target") or payload.get("name")
+                     or payload.get("query") or "").strip()
+        kind = str(payload.get("kind") or "").strip().lower() or where.KIND_AUTO
+        sources = where.gather_sources(
+            context,
+            poi=getattr(self, "poi", None),
+            places=getattr(self, "places", None),
+            territory=self._territory_store(),
+        )
+        result = where.find(target, kind=kind, player_pos=self._player_pos(context),
+                            sources=sources)
+        self._action_note = str(result.get("note") or where.describe(result))
+        logger.info("[Planner] where_is %s（kind=%s）：%d 个候选",
+                    target or "(空)", kind, len(result.get("candidates") or []))
         return True
 
     def _tool_find_block(self, payload: dict, context: dict) -> bool:

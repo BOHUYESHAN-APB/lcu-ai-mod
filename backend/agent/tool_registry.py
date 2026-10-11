@@ -118,6 +118,12 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("explore", "探索半径", "radius", ("move",), "_tool_explore"),
     ToolSpec("stop", "停止动作", "", ("move",), "_tool_stop"),
     # ── locate ──
+    ToolSpec("where_is", "问「某东西在哪」：先调 where_is 拿候选清单（在线玩家/记忆点/站点/"
+                         "容器/区域/基地），每条带坐标、距离与来源；再从候选里挑一个用 "
+                         "move_to/go_to_block/follow 过去——「先问位置、挑一个、再过去」的闭环。"
+                         "只答位置：不移动、不扫描、不猜坐标，问不到就如实说不知道"
+                         "（kind=auto|player|poi|station|container|zone，默认 auto）",
+             "target,kind", ("locate",), "_tool_where_is"),
     ToolSpec("find_block", "扫附近有无该方块（只查不走）", "block,radius,limit",
              ("locate",), "_tool_find_block"),
     ToolSpec("go_to_block", "寻路过去，到达后记住", "block,radius,remember",
