@@ -7,6 +7,8 @@
   ④ **防串号**：同一 server 的两个 world（主世界 vs 下界）同名站点互不影响，
      切 world 后推的是该 world 的那条路径；
   ⑤ 只报事实：没有点列（模组只报点数）的路径**不推**，如实记进 blocked。
+  ⑥ 模组只报点数、后端也只有点数 → `route_export` 按需取回几何 → 灌回；拿不到就维持
+     `no_geometry`（不现编）；坏点/超 2000 点**既不推也不落盘**；点列不进每帧 state。
 
 全部离线：临时目录落盘 + 假 skills/wire 记录下发帧，不碰真实 data/。
 """
@@ -16,10 +18,12 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+from agent.action_manager import ActionManager
 from agent.person_memory import PersonMemoryStore
 from agent.session import Session
 from agent.skills import Skills
 from agent.world_memory import (
+    MAX_ROUTE_POINTS,
     MIN_ROUTE_POINTS,
     WorldMemoryStore,
     plan_replay,
@@ -446,6 +450,202 @@ class SessionReplayTests(unittest.TestCase):
             ("remember_station", {"name": "spawn", "kind": "custom",
                                   "x": 0.5, "y": 70.0, "z": 0.5}),
         ])
+
+
+# ── ⑥ route_export 回灌（模组只报点数 → 按需取回几何 → 灌回）──────
+
+# 后端只存到"点数"的那种路径（模组当时只报了点数，没几何）。
+COUNT_ONLY = {"name": "tunnel", "points": 3, "saved_at_tick": 200}
+
+# `route_export` 回执里的点列（Java 侧原样导出：`{x,y,z,yaw}`）。
+EXPORT_POINTS = [{"x": 1.0, "y": 64.0, "z": 2.0, "yaw": 0.0},
+                 {"x": 9.0, "y": 66.0, "z": 2.0, "yaw": 90.0},
+                 {"x": 17.0, "y": 70.0, "z": 6.0, "yaw": 180.0}]
+
+
+class ExportSkills(RecordingSkills):
+    """回灌 skills + `route_export`：`calls` 里同时记下按需取几何的那一帧。"""
+
+    def route_export(self, name):
+        self.calls.append(("route_export", {"name": name}))
+        return {"success": True, "req_id": f"export-{len(self.calls)}"}
+
+
+class RouteExportReplayTests(unittest.TestCase):
+    """拿得到几何就取回并灌回；拿不到就维持诚实的 `no_geometry`（绝不现编坐标）。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+    def places(self) -> WorldMemoryStore:
+        return WorldMemoryStore(stations_root=self.root / "stations",
+                                routes_root=self.root / "routes")
+
+    def session(self, store=None) -> Session:
+        session = Session.__new__(Session)
+        session.runtime = {}
+        session.places = store or self.places()
+        session.people = PersonMemoryStore(root=self.root / "people")
+        session.poi = SimpleNamespace(use_namespace=lambda *a: "", observe_state=lambda *a: 0)
+        session.conversation = None
+        session.skills = ExportSkills()
+        session.action_manager = ActionManager()
+        session._replay_layers = set()
+        session._route_exports = {}
+        session._route_exported = set()
+        session._manual_action_reqs = set()
+        session._manual_task_kind = None
+        session._people_seen = {}
+        session._present_person_facts = {}
+        return session
+
+    def seed_count_only(self, store) -> None:
+        """后端只有"点数"的那条路径（模组侧没上报它 → 回灌时缺几何）。"""
+        store.use_namespace(SERVER, WORLD, OVERWORLD)
+        store.absorb_state(state(routes=[dict(COUNT_ONLY)]))
+        store.save()
+
+    def blocked(self, name="tunnel"):
+        return [{"kind": "route", "name": name, "reason": "no_geometry"}]
+
+    # ── ① 有几何 → 取回 → 下发 ──
+
+    def test_count_only_route_is_exported_then_pushed_back_verbatim(self):
+        store = self.places()
+        self.seed_count_only(store)
+        session = self.session(store)
+
+        session.handle_event("state_update", state(routes=[]))
+        self.assertEqual(session.skills.calls,
+                         [("route_export", {"name": "tunnel"})],
+                         "只有这一条按需出口，帧里**只有名字**（点列不进 state）")
+
+        session.handle_event("command_response",
+                             {"id": "export-1", "success": True,
+                              "data": {"ok": True, "name": "tunnel",
+                                       "points": EXPORT_POINTS,
+                                       "count": len(EXPORT_POINTS),
+                                       "saved_at_tick": 200}})
+
+        self.assertEqual(session.skills.calls[-1],
+                         ("remember_route", {"name": "tunnel", "points": EXPORT_POINTS}),
+                         "取回的点列**原样**灌回（不抽稀、不加工）")
+        self.assertEqual(store.route("tunnel")["points"], EXPORT_POINTS,
+                         "取回的几何要落盘，下次才灌得出去")
+        self.assertEqual(session._route_exports, {}, "回执到了就把待办清掉（不重发）")
+
+    # ── ② 取不到：如实 blocked，不编坐标 ──
+
+    def test_unknown_route_reply_is_reported_without_raising(self):
+        store = self.places()
+        self.seed_count_only(store)
+        session = self.session(store)
+        session.handle_event("state_update", state(routes=[]))
+
+        session.handle_event("command_response",
+                             {"id": "export-1", "success": False, "error": "unknown_route",
+                              "data": {"ok": False, "name": "tunnel",
+                                       "reason": "unknown_route"}})
+
+        self.assertEqual([call[0] for call in session.skills.calls], ["route_export"],
+                         "unknown_route 不报错、也不灌任何东西")
+        self.assertEqual(store.route("tunnel"), COUNT_ONLY, "维持只有点数，绝不现编坐标")
+
+    def test_no_geometry_reply_keeps_the_honest_blocked_state(self):
+        store = self.places()
+        self.seed_count_only(store)
+        session = self.session(store)
+        session.handle_event("state_update", state(routes=[]))
+
+        session.handle_event("command_response",
+                             {"id": "export-1", "success": False, "error": "no_geometry",
+                              "data": {"ok": False, "name": "tunnel",
+                                       "reason": "no_geometry"}})
+
+        self.assertEqual([call[0] for call in session.skills.calls], ["route_export"])
+        self.assertEqual(store.route("tunnel"), COUNT_ONLY)
+
+    # ── ③ 坏点 / 超限：不推，也不落盘 ──
+
+    def test_malformed_reply_is_neither_stored_nor_pushed(self):
+        store = self.places()
+        self.seed_count_only(store)
+        session = self.session(store)
+        session.handle_event("state_update", state(routes=[]))
+
+        session._absorb_route_export(
+            {"id": "export-1", "success": True,
+             "data": {"ok": True, "name": "tunnel",
+                      "points": [{"x": 1.0, "y": 64.0, "z": 2.0},
+                                 {"x": None, "y": 66.0, "z": 2.0}],
+                      "count": 2}})
+
+        self.assertEqual([call[0] for call in session.skills.calls], ["route_export"],
+                         "有一个坏点就整条作废，绝不推")
+        self.assertEqual(store.route("tunnel"), COUNT_ONLY,
+                         "半条废点列**不落盘**（存下来就会被当成'模组侧已经有了'）")
+
+    def test_oversized_reply_is_neither_stored_nor_pushed(self):
+        store = self.places()
+        self.seed_count_only(store)
+        session = self.session(store)
+        session.handle_event("state_update", state(routes=[]))
+
+        too_many = [{"x": float(i), "y": 64.0, "z": 0.0} for i in range(MAX_ROUTE_POINTS + 1)]
+        session._absorb_route_export({"id": "export-1", "success": True,
+                                      "data": {"ok": True, "name": "tunnel",
+                                               "points": too_many, "count": len(too_many)}})
+
+        self.assertEqual([call[0] for call in session.skills.calls], ["route_export"],
+                         f"点数 >{MAX_ROUTE_POINTS} 会被 Java 整条拒，本地先挡（不推）")
+        self.assertEqual(store.route("tunnel"), COUNT_ONLY, "超限的点列也不落盘")
+
+    # ── ④ 不重试风暴 / 不串号 ──
+
+    def test_one_export_attempt_per_route_per_session(self):
+        store = self.places()
+        session = self.session(store)
+
+        first = session._request_route_exports(self.blocked(), store)
+        second = session._request_route_exports(self.blocked(), store)
+
+        self.assertEqual(first, ["tunnel"])
+        self.assertEqual(second, [], "同一条路径一次会话只试一次（失败等下次进世界）")
+        self.assertEqual([call[0] for call in session.skills.calls], ["route_export"])
+
+    def test_a_late_reply_for_another_world_is_dropped(self):
+        store = self.places()
+        self.seed_count_only(store)
+        session = self.session(store)
+        session._route_exports["export-1"] = {"name": "tunnel",
+                                             "namespace": "other__world__dim"}
+
+        absorbed = session._absorb_route_export(
+            {"id": "export-1", "success": True,
+             "data": {"ok": True, "name": "tunnel", "points": EXPORT_POINTS,
+                      "count": len(EXPORT_POINTS)}})
+
+        self.assertFalse(absorbed, "分区早就换了：迟到回执灌错 world 就是串号，宁可丢掉")
+        self.assertEqual(session.skills.calls, [])
+        self.assertEqual(store.route("tunnel"), COUNT_ONLY)
+
+    # ── ⑤ 点列绝不进每帧 state ──
+
+    def test_no_state_frame_carries_a_point_array(self):
+        """每帧走的是"有没有点数/哪条路径"，点列只从**按需动作**出口走。"""
+        store = self.places()
+        self.seed_count_only(store)
+        session = self.session(store)
+
+        # 模组报这条路径时**只报点数**：存下来就是那三个字段，后端不凭空补点列。
+        session.handle_event("state_update",
+                             state(routes=[{"name": "tunnel", "points": 3, "saved_at_tick": 250}]))
+        self.assertEqual(store.route("tunnel")["points"], 3, "点数照存，几何不臆造")
+
+        with_points = [name for name, _ in session.skills.calls if name != "route_export"]
+        self.assertEqual(with_points, [], "这一轮只有 route_export：点列不进 state")
 
 
 if __name__ == "__main__":

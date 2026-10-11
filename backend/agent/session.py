@@ -216,6 +216,8 @@ class Session:
         # 回灌时"模组只报点数、后端没几何"的路径 → 记下 route_export 的请求 id，
         # 等回执（`command_response`）拿到点列再推回去（拿不到就维持 no_geometry）。
         self._route_exports: dict[str, dict] = {}
+        # 本 session 已经试过 `route_export` 的路径名（一条只试一次，失败等下次进世界）。
+        self._route_exported: set[str] = set()
         # 最近被区域硬拦的记录（`blocked_by_zone`）：进 L2 上下文 + 归入任务失败原因。
         self._zone_blocks: list[dict] = []
         # "离家多久"的计时（进基地范围就清零；只上报，绝不自己偷跑回去）。
@@ -838,6 +840,10 @@ class Session:
         export = getattr(skills, "route_export", None) if skills is not None else None
         if not callable(export):
             return []
+        # 一条路径一次会话只试**一次**（不放重试风暴）：失败就维持 no_geometry，等下次进这个世界。
+        attempted = getattr(self, "_route_exported", None)
+        if attempted is None:
+            attempted = self._route_exported = set()
         requested: list[str] = []
         for item in blocked or []:
             if not isinstance(item, dict) or item.get("kind") != "route":
@@ -845,8 +851,9 @@ class Session:
             if item.get("reason") != "no_geometry":
                 continue
             name = str(item.get("name") or "").strip()
-            if not name:
+            if not name or name in attempted:
                 continue
+            attempted.add(name)
             result = export(name) or {}
             req_id = str(result.get("req_id") or "")
             if req_id:
@@ -870,19 +877,18 @@ class Session:
         store = getattr(self, "places", None)
         payload = data.get("data") if isinstance(data.get("data"), dict) else {}
         name = str(pending.get("name") or payload.get("name") or "")
-        points = payload.get("points")
-        if not bool(data.get("success")) or not isinstance(points, list) or len(points) < 2:
+        # 迟到的回执可能已经换了 world（换世界＝换分区）：灌错分区就是串号，宁可丢掉。
+        if store is None or pending.get("namespace") != getattr(store, "namespace", None):
+            logger.info("[Memory] 路径 '%s' 的回执已过期（分区已切换），丢弃（不灌）", name)
+            return False
+        # 先按 Java 的同一口径验一遍（坏点 / 点数不在 [2,2000] 一律不要），**验不过就不落盘**：
+        # 半条废点列存下来比没存更坏 —— 下次会被当成"模组侧已经有了"，真几何反而永远推不出去。
+        args = route_args({"name": name, "points": payload.get("points")}) if name else None
+        if not bool(data.get("success")) or args is None:
             reason = str(payload.get("reason") or data.get("error") or "no_geometry")
             logger.info("[Memory] 路径 '%s' 取不回点列（%s），维持 no_geometry（不编）", name, reason)
             return False
-        if store is None:
-            return False
-        store.absorb_state({"routes": [{"name": name, "points": points}]})
-        row = store.route(name) or {}
-        args = route_args(row) if isinstance(row, dict) else None
-        if args is None:
-            logger.info("[Memory] 路径 '%s' 的回执点列不完整，没推", name)
-            return False
+        store.absorb_state({"routes": [{"name": args["name"], "points": args["points"]}]})
         skills = getattr(self, "skills", None)
         remember = getattr(skills, "remember_route", None) if skills is not None else None
         if callable(remember):
