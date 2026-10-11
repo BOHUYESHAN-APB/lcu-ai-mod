@@ -362,7 +362,8 @@ tasks.register('runWireFixture', JavaExec) {
     classpath = sourceSets.test.runtimeClasspath
     mainClass = 'com.lcu.lcumod.network.WireServerFixtureMain'
     args providers.gradleProperty('wireFixturePort').getOrElse('0'),
-            providers.gradleProperty('wireFixtureBind').getOrElse('127.0.0.1')
+            providers.gradleProperty('wireFixtureBind').getOrElse('127.0.0.1'),
+            providers.gradleProperty('wireFixtureToken').getOrElse('')
 }
 
 tasks.named('test').configure {

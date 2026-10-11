@@ -1,7 +1,11 @@
 package com.lcu.lcumod.proto;
 
+import com.lcu.lcumod.network.WireAuth;
 import java.lang.reflect.Method;
 import java.lang.reflect.RecordComponent;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -35,6 +39,7 @@ public final class ProtoCheck {
         wireChecks();
         capabilityChecks();
         versionChecks();
+        tokenChecks();
 
         System.out.println("[ProtoCheck] " + passed + " checks passed, " + failed + " failed");
         if (failed > 0) {
@@ -238,6 +243,48 @@ public final class ProtoCheck {
     }
 
     // ── helpers ──────────────────────────────────────────────────
+
+    // ── 5. 线协议 token 鉴权（可选握手）────────────────────────────
+
+    private static void tokenChecks() {
+        // 空 token = 不鉴权 ⇒ 老链路一字不变（这就是向后兼容的根据）。
+        check("auth: blank configured token accepts anything",
+                WireAuth.matches("", "whatever") && WireAuth.matches(null, "x")
+                        && WireAuth.matches("   ", "x"));
+        check("auth: matching token accepted", WireAuth.matches("s3cret", "s3cret"));
+        check("auth: surrounding whitespace tolerated", WireAuth.matches(" s3cret ", "s3cret"));
+        check("auth: wrong token rejected", !WireAuth.matches("s3cret", "wrong"));
+        check("auth: empty offer rejected when a token is set", !WireAuth.matches("s3cret", ""));
+        check("auth: null offer rejected when a token is set", !WireAuth.matches("s3cret", null));
+
+        String wire = readSource("network/WireServer.java");
+        String config = readSource("config/ModConfig.java");
+        String auth = readSource("network/WireAuth.java");
+        check("auth: WireServer delegates to WireAuth", wire.contains("WireAuth.matches"));
+        check("auth: WireAuth is dependency-free (no gson / no minecraft / no mod logger)",
+                !auth.isBlank() && !auth.contains("gson") && !auth.contains("net.minecraft")
+                        && !auth.contains("LCUMod"));
+        check("auth: WireServer gates on a hello frame", wire.contains("\"hello\".equals(type)"));
+        int gate = wire.indexOf("!authed");
+        int dispatch = wire.indexOf("\"command\".equals(type)");
+        check("auth: hello gate runs before command dispatch",
+                gate >= 0 && dispatch >= 0 && gate < dispatch);
+        check("auth: unauthenticated connections time out", wire.contains("setSoTimeout(HELLO_TIMEOUT_MS)"));
+        check("auth: config key wireToken defaults to empty",
+                config.contains("\"wireToken\"") && config.contains(".define(\"wireToken\", \"\")"));
+    }
+
+    /** 读主源码（cwd = 工程根，与 WalkCheck 同一约定）。 */
+    private static String readSource(String relative) {
+        try {
+            return Files.readString(
+                    Path.of("src", "main", "java", "com", "lcu", "lcumod", relative),
+                    StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            System.out.println("  INFO could not read " + relative + ": " + e.getMessage());
+            return "";
+        }
+    }
 
     private static void check(String name, boolean ok) {
         if (ok) {

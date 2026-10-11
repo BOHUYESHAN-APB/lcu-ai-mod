@@ -85,9 +85,7 @@ class JavaWireProtocolIntegrationTests(unittest.TestCase):
             "--console=plain",
             "-q",
             "runWireFixture",
-            "-PwireFixturePort=0",
-            "-PwireFixtureBind=127.0.0.1",
-        ]
+        ] + cls._fixture_properties()
         cls.process = subprocess.Popen(
             argv,
             cwd=str(ROOT),
@@ -111,7 +109,7 @@ class JavaWireProtocolIntegrationTests(unittest.TestCase):
 
         try:
             cls.port = cls._await_ready(stream)
-            cls.wire = WireClient("127.0.0.1", cls.port)
+            cls.wire = cls._make_client(cls.port)
             cls._connect_with_retry()
         except BaseException:
             cls._teardown_fixture()
@@ -124,13 +122,26 @@ class JavaWireProtocolIntegrationTests(unittest.TestCase):
     @classmethod
     def _teardown_fixture(cls):
         if cls.wire is not None:
-            if cls.wire.connected:
+            if not cls.wire.connected:
+                # 连接可能已被**服务端**关掉（例如"坏 token 被拒"那个用例）⇒ 重连一次再请它退出。
+                # 否则夹具会空跑到 180 秒自毁，这里还会报"没退出" —— 那是误导，不是夹具的问题。
+                try:
+                    cls.wire.disconnect()
+                    cls.wire = cls._make_client(cls.port)
+                    for _ in range(50):
+                        if cls.wire.connect():
+                            break
+                        time.sleep(0.2)
+                except Exception:
+                    pass
+            if cls.wire is not None and cls.wire.connected:
                 # Graceful: the fixture then leaves its loop, stops the server and exits 0.
                 try:
                     cls.wire.send_command("fixture_shutdown")
                 except Exception:
                     pass
-            cls.wire.disconnect()
+            if cls.wire is not None:
+                cls.wire.disconnect()
             cls.wire = None
         proc = cls.process
         cls.process = None
@@ -157,6 +168,16 @@ class JavaWireProtocolIntegrationTests(unittest.TestCase):
         with cls._lines_lock:
             lines = list(cls.fixture_lines)
         return "--- java fixture output (last %d lines) ---\n%s" % (n, "\n".join(lines[-n:]))
+
+    @classmethod
+    def _fixture_properties(cls) -> list[str]:
+        """Gradle -P properties for the fixture launch; subclasses add e.g. a token."""
+        return ["-PwireFixturePort=0", "-PwireFixtureBind=127.0.0.1"]
+
+    @classmethod
+    def _make_client(cls, port: int) -> WireClient:
+        """The client the harness connects with; subclasses may pass a token."""
+        return WireClient("127.0.0.1", port)
 
     @classmethod
     def _await_ready(cls, stream: queue.Queue) -> int:
@@ -312,6 +333,53 @@ class JavaWireProtocolIntegrationTests(unittest.TestCase):
             lambda m: m.type == "response" and m.data.get("id") == req_id,
             what="response after the control frame",
         )
+
+
+class JavaWireTokenGateTests(JavaWireProtocolIntegrationTests):
+    """Token handshake end to end: the **real Java gate** decides, not a Python stand-in.
+
+    The fixture is launched with ``-PwireFixtureToken``, so ``WireServer`` requires a matching
+    ``hello`` before it accepts anything. The base class's own cases assume "no token configured",
+    so they are unregistered below instead of being left to fail or to silently skip.
+    """
+
+    TOKEN = "fixture-token"
+
+    @classmethod
+    def _fixture_properties(cls):
+        return super()._fixture_properties() + ["-PwireFixtureToken=" + cls.TOKEN]
+
+    @classmethod
+    def _make_client(cls, port):
+        return WireClient("127.0.0.1", port, token=cls.TOKEN)
+
+    def test_00_valid_hello_is_accepted_and_events_flow(self):
+        self.wait_fixture_line("TOKEN required")
+        self.wait_fixture_line("Hello accepted")
+        msg = self.wait_for(
+            lambda m: self.is_event("state_update")(m)
+            and m.data.get("data", {}).get("fixture") == "java-production-wire",
+            what="state_update after a valid hello",
+        )
+        self.assertTrue(msg.data["data"]["in_world"])
+
+    def test_01_wrong_token_is_rejected_and_nothing_is_delivered(self):
+        bad = WireClient("127.0.0.1", self.port, token="wrong-token")
+        try:
+            bad.connect()
+            line = self.wait_fixture_line("bad token", timeout=20.0)
+            self.assertIn("Rejected", line)
+            # 反证：被拒绝之后**一个事件都不许到**（否则就是"假拒绝"）。
+            time.sleep(1.5)
+            self.assertEqual([m for m in bad.drain() if m.type == "event"], [])
+        finally:
+            bad.disconnect()
+
+
+# 基类那 5 个用例假定"模组没设 token"；在带 token 的夹具下它们必然失败 ✗ ——
+# 明确注销（而不是让它们变红、或者偷偷 skip 掉）。
+for _name in [n for n in dir(JavaWireProtocolIntegrationTests) if n.startswith("test_")]:
+    setattr(JavaWireTokenGateTests, _name, None)
 
 
 if __name__ == "__main__":

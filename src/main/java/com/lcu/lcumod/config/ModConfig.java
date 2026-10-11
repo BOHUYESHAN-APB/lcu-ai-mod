@@ -18,6 +18,14 @@ public class ModConfig {
                     "Set to 0.0.0.0 to restore the old wildcard listen (backend on another machine).")
             .define("wireBindAddress", "127.0.0.1");
 
+    // Wire protocol auth token — empty means "no auth", which keeps the old behaviour for
+    // loopback setups. When set, the backend must send a `hello` frame carrying this token as
+    // the first line, otherwise the connection is closed. See docs/dev/SERVER_SIDE.md.
+    public static final ModConfigSpec.ConfigValue<String> WIRE_TOKEN = BUILDER
+            .comment("Auth token for the wire protocol. Empty (default) = no auth.",
+                    "When set, the backend must send {\"type\":\"hello\",\"token\":\"...\"} first.")
+            .define("wireToken", "");
+
     // State push interval in ticks (20 ticks = 1 second)
     public static final ModConfigSpec.IntValue STATE_INTERVAL = BUILDER
             .comment("How often (in ticks) to push full state snapshot to backend")

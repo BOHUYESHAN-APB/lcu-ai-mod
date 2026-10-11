@@ -214,11 +214,26 @@ public class WireServer {
         }
     }
 
+    /** How long a connection may stay silent before sending its first frame when a token is set. */
+    private static final int HELLO_TIMEOUT_MS = 5000;
+
+    /** Auth token required from the backend. Blank (default) = no auth, i.e. old behaviour. */
+    private volatile String requiredToken = "";
+
+    /** Set by the mod from config at startup, and by the headless fixture in tests. */
+    public void setRequiredToken(String token) {
+        this.requiredToken = token == null ? "" : token.trim();
+    }
+
+    // token 比对在 WireAuth 里（零依赖，好让零依赖自检直接调用它）。
+
     class Connection {
         final Socket socket;
         final BufferedReader reader;
         final BufferedWriter writer;
         final AtomicBoolean open = new AtomicBoolean(true);
+        /** False until a valid `hello` arrives; immediately true when no token is required. */
+        volatile boolean authed = requiredToken.isBlank();
 
         Connection(Socket socket) throws IOException {
             this.socket = socket;
@@ -248,6 +263,10 @@ public class WireServer {
         void startReader() {
             Thread readerThread = new Thread(() -> {
                 try {
+                    if (!authed) {
+                        // Don't let an unauthenticated connection hold the slot forever.
+                        try { socket.setSoTimeout(HELLO_TIMEOUT_MS); } catch (IOException ignored) {}
+                    }
                     String line;
                     while (open.get() && (line = reader.readLine()) != null) {
                         if (line.isBlank()) continue;
@@ -256,6 +275,23 @@ public class WireServer {
                             if (msg == null) continue;
                             String type = msg.get("type") != null && !msg.get("type").isJsonNull()
                                     ? msg.get("type").getAsString() : null;
+                            if (!authed) {
+                                // A token is configured: the first frame must be a matching hello.
+                                String offered = msg.get("token") != null && !msg.get("token").isJsonNull()
+                                        ? msg.get("token").getAsString() : "";
+                                if ("hello".equals(type) && WireAuth.matches(requiredToken, offered)) {
+                                    authed = true;
+                                    try { socket.setSoTimeout(0); } catch (IOException ignored) {}
+                                    LCUMod.LOGGER.info("[WireServer] Hello accepted — token ok");
+                                } else {
+                                    LCUMod.LOGGER.warn("[WireServer] Rejected {}: a token is required and the first frame was {}",
+                                            socket.getRemoteSocketAddress(),
+                                            "hello".equals(type) ? "a hello with a bad token" : "\"" + type + "\"");
+                                    close();
+                                    return;
+                                }
+                                continue;
+                            }
                             if ("command".equals(type)) {
                                 WireCommand cmd = new WireCommand(
                                         msg.get("id") != null ? msg.get("id").getAsString() : null,

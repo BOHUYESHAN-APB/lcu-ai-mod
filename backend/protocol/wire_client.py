@@ -17,6 +17,8 @@ import socket
 import threading
 import time
 import logging
+import os
+from pathlib import Path
 from queue import Queue
 from dataclasses import dataclass
 from typing import Any
@@ -174,12 +176,30 @@ class WireMessage:
     data: dict
 
 
+def _resolve_wire_token() -> str:
+    """可选握手 token：环境变量 `LCU_WIRE_TOKEN` → 其次 `.local/wire_token` 文件 → 否则空。
+
+    空 = 不鉴权（与模组侧 `wireToken` 默认空一致）⇒ 老链路一字不变。
+    放环境变量/独立文件而不是 config.json，是因为这是密钥：UI 不该有地方把它回显出来。
+    """
+    env = os.environ.get("LCU_WIRE_TOKEN")
+    if env and env.strip():
+        return env.strip()
+    try:
+        return (Path(__file__).resolve().parent.parent / ".local" / "wire_token") \
+            .read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
 class WireClient:
     """Connects to the LCU Mod via TCP and communicates with JSONL."""
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 25568):
+    def __init__(self, host: str = "127.0.0.1", port: int = 25568, token: str | None = None):
         self.host = host
         self.port = port
+        # 可选握手 token（None = 按环境变量/文件解析；空串 = 明确不鉴权）。
+        self.token = _resolve_wire_token() if token is None else str(token)
         self.sock: socket.socket | None = None
         self._buffer = ""
         self._decode_warned = False
@@ -214,6 +234,9 @@ class WireClient:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.connect((self.host, self.port))
             self._running = True
+            # 可选握手：模组侧配了 token 时，**首帧**必须是匹配的 hello，否则连接会被关掉。
+            # 没配 token 时模组会忽略它；老模组不认识这个 type 也会忽略 ⇒ 双向向后兼容。
+            self._send_line(json.dumps({"type": "hello", "token": self.token}))
             self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
             self._reader_thread.start()
             return True

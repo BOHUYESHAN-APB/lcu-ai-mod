@@ -27,9 +27,10 @@ import java.net.ServerSocket;
  * <p>Usage: {@code WireServerFixtureMain [port] [bindAddress]} — port {@code 0} (the default)
  * makes the fixture pick a free port itself and print {@code READY <port>} on stdout.
  *
- * <p>Protocol notes for 26.3: there is no handshake and no auth token on the wire (the old
- * 1.21.1 token/hello exchange was dropped); the first frame the fixture sends is an ordinary
- * {@code state_update} event.
+ * <p>Protocol notes for 26.3: the wire has an <b>optional</b> token handshake. With no token
+ * configured (the default) behaviour is unchanged and any {@code hello} frame from the backend is
+ * simply ignored; with a token configured, the first frame from the backend must be a matching
+ * {@code hello} or the connection is closed. The fixture takes the token as its third argument.
  */
 public final class WireServerFixtureMain {
 
@@ -45,10 +46,15 @@ public final class WireServerFixtureMain {
     public static void main(String[] args) throws Exception {
         int requestedPort = args.length > 0 ? Integer.parseInt(args[0]) : 0;
         String bindAddress = args.length > 1 && !args[1].isBlank() ? args[1] : "127.0.0.1";
+        String token = args.length > 2 ? args[2] : "";
         int port = requestedPort != 0 ? requestedPort : freePort();
 
         WireServer server = new WireServer(port, bindAddress);
+        server.setRequiredToken(token);
         server.start();
+        if (!token.isBlank()) {
+            trace("TOKEN required (len=" + token.length() + ")");
+        }
 
         // The server thread binds asynchronously. Give it a moment, then report the port: the
         // driver retries `connect` anyway (the server re-binds every 5s after a busy port), so
