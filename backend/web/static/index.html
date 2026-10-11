@@ -100,15 +100,49 @@ dialog{width:min(680px,calc(100vw - 24px));max-height:calc(100dvh - 24px);margin
 .chat-messages{flex:1;overflow-y:auto;padding:10px;background:var(--ov-bg,#0d1117);border-radius:6px;margin-bottom:10px}
 .chat-input{display:flex;gap:8px}
 .chat-input input{flex:1}
-/* 私信两栏（聊天页签）：别人靠左、AI 靠右，像聊天软件。 */
-.dm-list{display:flex;flex-direction:column;gap:8px;padding:12px}
-.dm-bubble{max-width:78%;padding:8px 11px;border-radius:10px;font-size:12px;line-height:1.45;white-space:pre-wrap;overflow-wrap:anywhere}
-.dm-bubble.in{align-self:flex-start;background:#21262d;border-top-left-radius:2px}
-.dm-bubble.out{align-self:flex-end;background:#1f6feb;color:#fff;border-top-right-radius:2px}
-.dm-bubble .stamp{font-size:10px;color:#8b949e;margin-top:4px;text-align:right}
+/* ── 私信两栏（聊天页签）：微信那样的会话观感 ───────────────────────────────
+   别人靠左、AI 靠右；同一个人**连续消息成组**（只有组首带小尾巴 + 头像，组内收紧）；
+   **时间按分钟分组**（同一分钟只标一次，跨分钟/跨天插时间条）；
+   头像＝名字首字 + 由名字派生的稳定底色（**绝不引入假头像链接**，AI 用自己的样式）；
+   底部输入固定、回车发送、发送后滚到最新（滚上去看历史时给"回到最新"按钮，不硬拽）。 */
+.dm-list{display:flex;flex-direction:column;gap:1px;padding:12px}
+.dm-timesep{align-self:center;margin:8px 0 6px;font-size:10px;color:#8b949e;background:rgba(110,118,129,.18);border-radius:4px;padding:2px 8px}
+.dm-line{display:flex;gap:8px;align-items:flex-start;margin-top:2px}
+.dm-line.out{flex-direction:row-reverse}
+.dm-line.first{margin-top:10px}
+.dm-avatar{width:32px;height:32px;flex:0 0 32px;border-radius:5px;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;color:#fff;background:#30363d;user-select:none;overflow:hidden}
+.dm-avatar.spacer{background:transparent;color:transparent}
+.dm-avatar.ai{background:linear-gradient(135deg,#1f6feb,#3fb950)}
+.dm-stack{display:flex;flex-direction:column;min-width:0;max-width:74%}
+.dm-line.out .dm-stack{align-items:flex-end}
+.dm-who{font-size:10px;color:#8b949e;margin:0 2px 3px}
+.dm-bubble{position:relative;padding:7px 10px;border-radius:6px;font-size:13px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word}
+.dm-bubble.in{background:#262c36;color:#e6edf3}
+.dm-bubble.out{background:#1f6feb;color:#fff}
+/* 小尾巴：只挂在同一组的**第一条**（挨着头像那条）上，指向头像。 */
+.dm-bubble.tail::before{content:'';position:absolute;top:9px;border:5px solid transparent}
+.dm-bubble.in.tail::before{left:-8px;border-right-color:#262c36}
+.dm-bubble.out.tail::before{right:-8px;border-left-color:#1f6feb}
+.dm-bubble .stamp{font-size:9px;color:#8b949e;margin-top:3px;text-align:right}
 .dm-bubble.out .stamp{color:rgba(255,255,255,.72)}
-.dm-row{width:100%;display:block;text-align:left;background:transparent;color:var(--ov-fg,#c9d1d9);border:0;border-bottom:1px solid #21262d;padding:10px 12px;cursor:pointer}
+.dm-bubble .relabel{font-size:9px;margin-left:6px;color:rgba(255,255,255,.78)}
+.dm-foot{border-top:1px solid #30363d;padding:8px 10px;flex-shrink:0}
+.dm-inputrow{display:flex;gap:8px;align-items:flex-end}
+.dm-inputrow textarea{flex:1;resize:none;height:40px;max-height:120px;background:var(--ov-bg,#0d1117);border:1px solid #30363d;border-radius:6px;padding:9px 10px;color:var(--ov-fg,#c9d1d9);font-size:13px;font-family:inherit;line-height:1.4}
+.dm-inputrow textarea:focus{border-color:#58a6ff;outline:none}
+.dm-jump{align-self:center;font-size:11px;background:#1f6feb;color:#fff;border:0;border-radius:12px;padding:3px 12px;cursor:pointer;margin:4px 0}
+.dm-row{width:100%;display:block;text-align:left;background:transparent;color:var(--ov-fg,#c9d1d9);border:0;border-bottom:1px solid #21262d;padding:9px 12px;cursor:pointer}
 .dm-row:hover,.dm-row.active{background:#21262d}
+.dm-row .rowtop{display:flex;align-items:center;gap:8px}
+.dm-row .dm-avatar{width:30px;height:30px;flex:0 0 30px;font-size:12px;border-radius:5px}
+.dm-row .rowmain{flex:1;min-width:0}
+.dm-row .nm{font-size:12px;font-weight:600;display:flex;align-items:center;gap:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dm-row .preview{font-size:11px;color:#8b949e;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dm-row .ts{font-size:10px;color:#8b949e;flex:0 0 auto;align-self:flex-start}
+.dm-unread{background:#da3633;color:#fff;border-radius:9px;min-width:17px;text-align:center;font-size:10px;padding:1px 5px}
+.dm-dot{width:7px;height:7px;border-radius:50%;background:#8b949e;flex:0 0 auto}
+.dm-dot.on{background:#3fb950}
+.dm-fixed{height:min(560px,calc(100dvh - 260px))}
 .msg{margin-bottom:8px;padding:8px;background:var(--ov-surface,#161b22);border-radius:6px}
 .msg .sender{font-size:11px;color:#58a6ff;margin-bottom:4px}
 .msg .text{font-size:13px}
@@ -220,6 +254,7 @@ textarea{width:100%;min-height:68px;resize:vertical;background:var(--ov-bg,#0d11
   <button class="tab" onclick="showPage('settings',this)">基础设置</button>
   <button class="tab" onclick="showPage('commands',this)">指令白名单</button>
   <button class="tab" onclick="showPage('overlay',this)">OBS 组件</button>
+  <button class="tab" onclick="showPage('tools',this)">工具目录</button>
   <button class="tab" onclick="showPage('diagnostics',this)">Diagnostics</button>
   <button class="tab" onclick="showPage('debug',this)">调试</button>
 </div>
@@ -315,6 +350,17 @@ textarea{width:100%;min-height:68px;resize:vertical;background:var(--ov-bg,#0d11
     <div class="memory-status-strip" id="opsStatus">加载中…</div>
     <div id="opsTasks">—</div>
   </div>
+  <div class="card">
+    <h3>🧰 操作 · job 句柄（长任务）</h3>
+    <div class="hint">
+      数据源：<code>/api/status</code> → <code>jobs</code>（<code>JobRegistry</code> 台账直出，只读）。
+      登记一个 job 要求四样门槛齐备——<b>进度来源 / 终止条件 / 失败原因 / 取消路径</b>，缺一不许登记；
+      所以有句柄就一定走得通它自己的取消路径。<b>取消</b>走 <code>POST /api/jobs/cancel</code>
+      （后端拿 job 自己的回调去停副作用，前端不假装已停）。
+    </div>
+    <div class="memory-status-strip" id="jobsStatus">加载中…</div>
+    <div id="jobsList">—</div>
+  </div>
 </div>
 <!-- Chat Page -->
 <div id="page-chat" class="page">
@@ -329,15 +375,21 @@ textarea{width:100%;min-height:68px;resize:vertical;background:var(--ov-bg,#0d11
         <div class="memory-pane-header"><h3>通讯簿</h3><span class="contact-meta" id="dmCount"></span></div>
         <div class="memory-list" id="dmContacts" style="max-height:460px"><div class="empty">加载中…</div></div>
       </div>
-      <div class="memory-pane" style="display:flex;flex-direction:column">
-        <div class="memory-pane-header"><h3 id="dmPeerName">未选择联系人</h3><span class="contact-meta" id="dmPeerMeta"></span></div>
-        <div id="dmMessages" class="chat-messages dm-list" style="flex:1;max-height:420px;margin:0;border-radius:0;background:transparent"><div class="empty">左侧点一个联系人，看你们的来往私信</div></div>
-        <div style="padding:10px 12px;border-top:1px solid var(--ov-line,#30363d)">
-          <div class="chat-input">
-            <input type="text" id="dmInput" placeholder="以 AI 的身份代发一条私信（会过服务端出站清洗 + 指令白名单）" onkeydown="if(event.key==='Enter')sendDm()">
+      <div class="memory-pane dm-fixed" style="display:flex;flex-direction:column">
+        <div class="memory-pane-header">
+          <h3 id="dmPeerName">未选择联系人</h3>
+          <span class="contact-meta" id="dmPeerMeta"></span>
+        </div>
+        <div id="dmMessages" class="dm-list" style="flex:1;min-height:0;overflow-y:auto;background:transparent">
+          <div class="empty">还没有私下聊过 —— 左侧选一个人，看你们的来往私信</div>
+        </div>
+        <div class="dm-foot">
+          <button id="dmJump" class="dm-jump" style="display:none" onclick="dmScrollToBottom(true)">有新消息 · 回到最新 ↓</button>
+          <div class="dm-inputrow">
+            <textarea id="dmInput" rows="1" placeholder="以 AI 的身份代发一条私信（回车发送 / Shift+回车换行。会过服务端出站清洗 + 指令白名单）"></textarea>
             <button class="btn primary" onclick="sendDm()">发送</button>
           </div>
-          <div class="hint" id="dmHint">发送走 POST /api/contacts/&lt;uuid&gt;/send。</div>
+          <div class="hint" id="dmHint">代发＝<b>以 AI 的身份</b>发出去（不是以你的名义）；走 POST /api/contacts/&lt;uuid&gt;/send。</div>
         </div>
       </div>
     </div>
@@ -599,6 +651,44 @@ textarea{width:100%;min-height:68px;resize:vertical;background:var(--ov-bg,#0d11
     </div>
     <div id="effectiveTable"></div>
   </div>
+
+  <div class="card">
+    <h3>⚙️ 运行开关（这些键早就存在，以前只是没有 UI）</h3>
+    <div class="hint">
+      数据源：<code>/api/config</code>（<code>.local/config.json</code> 里已有的键）。这里只把它们**摆出来**：
+      不改任何行为、也不会有别的进程去动它们 —— 只有你点「保存运行开关」才写回同一份配置。
+      每一项都写清"改了会发生什么"。
+    </div>
+    <label class="toggle-field" for="cfgGovernorEnabled">
+      <span>状态治理 <code>state_governor.enabled</code><br>
+        <span class="hint">开（默认）＝卡死判定生效：某个在跑的状态 <b>N 秒没有进展</b> 就被摘掉，取消时带<b>真实原因</b>（位置没动 / 工具结果重复 / Java 报卡住 / 超时），并进入退避窗口。关＝这套逻辑完全不跑（不注册、不判定、不取消、不占资源），回到没有治理前的老样子。</span>
+      </span>
+      <input type="checkbox" id="cfgGovernorEnabled">
+    </label>
+    <div class="hint" id="cfgGovernorThresholds">当前阈值：—</div>
+    <label class="toggle-field" for="cfgJobOrchestration">
+      <span>编排轮次 <code>job_orchestration</code><br>
+        <span class="hint">开（默认）＝当 <b>task_list 里有模型自己创建的活跃任务</b>且发生了事件（进度变化 / 出结果 / 卡住 / 玩家说话）时，把模型请回来做下一步；事件驱动，<b>不是定时器</b>，每轮只喂一段紧凑进展摘要。关＝不请回来，模型要等下一次被叫到才看到进展。</span>
+      </span>
+      <input type="checkbox" id="cfgJobOrchestration">
+    </label>
+    <label class="toggle-field" for="cfgLogChangesOnly">
+      <span>周期性状态日志只打变化 <code>log_changes_only</code><br>
+        <span class="hint">开（默认）＝模组周期性状态日志只有内容<b>变了</b>才打一行，相同就压掉并计数（日志短、好看）。关＝每次上报都打一行（排查时用，日志会变长很多）。</span>
+      </span>
+      <input type="checkbox" id="cfgLogChangesOnly">
+    </label>
+    <div class="form-row">
+      <label for="cfgLogHeartbeat">状态日志心跳秒</label>
+      <input type="number" id="cfgLogHeartbeat" min="0" step="1" placeholder="0">
+    </div>
+    <div class="hint"><code>log_heartbeat_seconds</code>：<b>0（默认）＝不打心跳</b>；填 N&gt;0 ＝内容长时间没变时，每 N 秒强打一行"未变"，用来确认模组还活着（数字非法会被后端回退为 0）。</div>
+    <div class="form-actions">
+      <button class="btn primary" onclick="saveRuntimeSwitches()">保存运行开关</button>
+      <button class="btn" onclick="loadRuntimeSwitches()">重新读取</button>
+    </div>
+    <div class="hint" id="runtimeSwitchesStatus">等待加载</div>
+  </div>
 </div>
 
 <!-- Commands Whitelist Page -->
@@ -692,6 +782,33 @@ textarea{width:100%;min-height:68px;resize:vertical;background:var(--ov-bg,#0d11
   </div>
 </div>
 
+<!-- Tools Catalog Page -->
+<div id="page-tools" class="page">
+  <div class="card">
+    <h3>📚 工具目录（只读 · 单一事实来源＝注册表）</h3>
+    <div class="hint">
+      数据源：<code>/api/tools</code> —— 由 <code>agent/tool_registry.py</code> 的 <code>TOOL_SPECS</code>
+      直接投影，<b>不是手写清单</b>（注册表加一条，这里就多一条）。<b>权限</b>列＝派发前由 planner
+      统一执行的门（tier / 容器 / 指令白名单 / 借用 / 区域）；<b>job</b> 列＝这条工具跑起来会登记
+      job 句柄，可在「操作」页看到并取消。
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;margin:8px 0">
+      <button class="btn" onclick="loadToolsPage()">刷新</button>
+      <span id="toolsStatus" class="hint">等待加载</span>
+    </div>
+    <div id="toolsTable">加载中…</div>
+  </div>
+  <div class="card">
+    <h3>🧩 复合体（声明式 · 内部只调已注册工具）</h3>
+    <div class="hint">
+      数据源：<code>/api/composites</code>（<code>agent/composites.py</code> 的 <code>COMPOSITES</code>）。
+      每一步只声明"调哪个已注册工具 + 参数从哪来（+ 具名前置条件）"，不许内联逻辑；每条工具名都标了
+      <code>registered</code>（在注册表里是否真的存在）。模型眼里它就是一条普通工具。
+    </div>
+    <div id="compositesList">加载中…</div>
+  </div>
+</div>
+
 <!-- Diagnostics Page -->
 <div id="page-diagnostics" class="page">
   <div class="card">
@@ -713,6 +830,32 @@ textarea{width:100%;min-height:68px;resize:vertical;background:var(--ov-bg,#0d11
     <div class="settings-section">
       <h4>最近会话决策</h4>
       <div class="memory-json" id="diagDecisions">—</div>
+    </div>
+  </div>
+  <div class="card">
+    <h3>🧾 治理 / 租约审计（只读 · <b>仅进程内</b>）</h3>
+    <div class="hint">
+      数据源：<code>/api/governance</code>。读的是 <code>state_governor</code> /
+      <code>resource_lease</code> / <code>control_lease</code> 的<b>内存环形缓冲</b>：
+      <b>谁、何时、为何、抢了谁的什么</b>。这些缓冲<b>不落盘</b> —— 进程重启即清空，
+      页面也不会假装有历史（容量见每段的 ring）。
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;margin:8px 0">
+      <button class="btn" onclick="loadGovernancePage()">刷新</button>
+      <span id="govStatus" class="hint">等待加载</span>
+    </div>
+    <div class="hint" id="govNote">—</div>
+    <div class="settings-section">
+      <h4>状态治理（卡死即摘掉）</h4>
+      <div id="govGovernor">—</div>
+    </div>
+    <div class="settings-section">
+      <h4>资源租约（按资源分租 / 抢占：抢了谁的什么）</h4>
+      <div id="govResourceLease">—</div>
+    </div>
+    <div class="settings-section">
+      <h4>控制租约（底层输入控制权 · 右脑不可持）</h4>
+      <div id="govControlLease">—</div>
     </div>
   </div>
 </div>
@@ -809,12 +952,14 @@ function showPage(name, tab) {
   // 新面板按需拉数据（避免初始化时打一堆 404/空请求）。
   if (name === 'commands') loadCommandsConfig();
   if (name === 'overlay') { loadOverlayComponents(); loadOverlayTheme(); }
+  if (name === 'tools') loadToolsPage();
   if (name === 'chat') loadDmInbox();
   if (name === 'memory') loadMemoryPanel();
   if (name === 'providers') loadProvidersPage();
   if (name === 'access') loadAccessPage();
   if (name === 'operations') loadOperationsPage();
-  if (name === 'diagnostics') loadDiagnosticsPage();
+  if (name === 'settings') loadRuntimeSwitches();
+  if (name === 'diagnostics') { loadDiagnosticsPage(); loadGovernancePage(); }
 }
 
 // ── Local Settings Cache ──
@@ -1663,25 +1808,73 @@ function saveOverlayTheme() {
 }
 
 // ── 私信 · 通讯簿（/api/contacts 系列；后端已按 server + person 存线程）──
-const dmState = { contacts: [], current: null, currentIndex: -1, messages: [], sending: false };
+// 观感照微信：别人靠左 / AI 靠右；同一个人**连续消息成组**（组首带头像 + 小尾巴 + 时间）；
+// 时间**按分钟分组**（同一分钟的连续消息共用一个时间标，跨分钟另起一组，跨天插时间条）；
+// 头像＝名字首字 + 由名字派生的稳定底色（**不引入任何假头像链接**；AI 用自己的样式）。
+// 数据源**只有**自建的 /api/contacts 系列。
+const dmState = { contacts: [], current: null, currentIndex: -1, messages: [], sending: false,
+                  atBottom: true, aiName: 'AI', aiNameChecked: false };
 
+const dmPad = x => String(x).padStart(2, '0');
 function dmFmtTime(ts) {
   const n = Number(ts);
   if (!isFinite(n) || n <= 0) return '';
   const d = new Date(n * 1000);
-  const pad = x => String(x).padStart(2, '0');
-  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  return `${dmPad(d.getMonth() + 1)}-${dmPad(d.getDate())} ${dmPad(d.getHours())}:${dmPad(d.getMinutes())}`;
+}
+function dmFmtClock(ts) {
+  const n = Number(ts);
+  if (!isFinite(n) || n <= 0) return '';
+  const d = new Date(n * 1000);
+  return `${dmPad(d.getHours())}:${dmPad(d.getMinutes())}`;
+}
+/* 联系人列表里的时间：今天＝HH:MM；昨天＝昨天；今年＝MM-DD；更早＝YYYY-MM-DD。 */
+function dmListTime(ts) {
+  const n = Number(ts);
+  if (!isFinite(n) || n <= 0) return '';
+  const d = new Date(n * 1000), now = new Date();
+  const sameDay = d.toDateString() === now.toDateString();
+  if (sameDay) return dmFmtClock(n);
+  const yest = new Date(now.getTime() - 86400000);
+  if (d.toDateString() === yest.toDateString()) return '昨天';
+  if (d.getFullYear() === now.getFullYear()) return `${dmPad(d.getMonth() + 1)}-${dmPad(d.getDate())}`;
+  return `${d.getFullYear()}-${dmPad(d.getMonth() + 1)}-${dmPad(d.getDate())}`;
+}
+/* 名字 → 稳定底色（纯哈希，不加载任何外部图片/链接）。 */
+function dmAvatarColor(name) {
+  const s = String(name || '?');
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) % 360;
+  return `hsl(${h},42%,38%)`;
+}
+function dmInitial(name) { return (String(name || '?').trim().charAt(0) || '?').toUpperCase(); }
+function dmAvatarHtml(name, ai) {
+  const cls = ai ? 'dm-avatar ai' : 'dm-avatar';
+  const style = ai ? '' : ` style="background:${dmAvatarColor(name)}"`;
+  return `<span class="${cls}"${style}>${escapeHtml(ai ? 'AI' : dmInitial(name))}</span>`;
 }
 function dmSameContact(c) {
   if (!dmState.current) return false;
   return [c.uuid, c.key, c.name].some(k => k && k === dmState.current);
 }
+/* AI 的名字：优先读设置页已经填好的输入框，读不到就查一次 /api/persona（真实数据，不猜）。 */
+function dmResolveAiName() {
+  const el = document.getElementById('aiName');
+  if (el && el.value && el.value.trim()) { dmState.aiName = el.value.trim(); return Promise.resolve(); }
+  if (dmState.aiNameChecked) return Promise.resolve();
+  dmState.aiNameChecked = true;
+  return fetch('/api/persona').then(r => r.json()).then(p => {
+    if (p && p.name && String(p.name).trim()) { dmState.aiName = String(p.name).trim(); renderDmMessages(); }
+  }).catch(() => {});
+}
 function loadDmInbox() {
   const box = document.getElementById('dmContacts');
-  return fetch('/api/contacts').then(r => r.json()).then(d => {
-    dmState.contacts = Array.isArray(d.contacts) ? d.contacts : [];
-    renderDmContacts(); renderDmPeerHeader();
-  }).catch(() => { if (box) box.innerHTML = '<div class="empty">读取通讯簿失败（后端未连上？）</div>'; });
+  return dmResolveAiName()
+    .then(() => fetch('/api/contacts'))
+    .then(r => r.json()).then(d => {
+      dmState.contacts = Array.isArray(d.contacts) ? d.contacts : [];
+      renderDmContacts(); renderDmPeerHeader();
+    }).catch(() => { if (box) box.innerHTML = '<div class="empty">读取通讯簿失败（后端未连上？）</div>'; });
 }
 function renderDmContacts() {
   const box = document.getElementById('dmContacts');
@@ -1695,13 +1888,19 @@ function renderDmContacts() {
   box.innerHTML = dmState.contacts.map((c, i) => {
     const active = dmSameContact(c) ? ' active' : '';
     const unread = Number(c.unread) || 0;
-    const dir = c.last_direction === 'out' ? '我：' : '';
+    const dir = c.last_direction === 'out' ? (dmState.aiName + '：') : '';
     const tier = String(c.tier || '').toLowerCase();
-    const tierTag = tier ? ` <span class="tag-pill">${escapeHtml(tier)}</span>` : '';
-    const unreadTag = unread ? ` <span class="tag-pill risk">未读 ${unread}</span>` : '';
+    const tierTag = tier ? `<span class="tag-pill">${escapeHtml(tier)}</span>` : '';
+    const badge = unread ? `<span class="dm-unread">${unread > 99 ? '99+' : unread}</span>` : '';
     return `<button class="dm-row${active}" onclick="selectDmContact(${i})">
-      <div class="contact-name">${c.online ? '🟢 ' : '⚪ '}${escapeHtml(c.name || c.uuid || '?')}${tierTag}${unreadTag}</div>
-      <div class="contact-meta">${escapeHtml(dir + (c.last_text || '（无内容）'))}</div>
+      <span class="rowtop">
+        ${dmAvatarHtml(c.name || c.uuid || '?', false)}
+        <span class="rowmain">
+          <span class="nm"><span class="dm-dot ${c.online ? 'on' : ''}"></span>${escapeHtml(c.name || c.uuid || '?')}${tierTag}${badge}</span>
+          <span class="preview">${escapeHtml(dir + (c.last_text || '（无内容）'))}</span>
+        </span>
+        <span class="ts">${escapeHtml(dmListTime(c.last_ts))}</span>
+      </span>
     </button>`;
   }).join('');
 }
@@ -1715,6 +1914,7 @@ function renderDmPeerHeader() {
     const bits = [];
     if (c && c.tier) bits.push('层级 ' + c.tier);
     if (c) bits.push(c.online ? '在线' : '离线');
+    if (c && c.unreplied) bits.push('未回 ' + c.unreplied);
     metaEl.textContent = bits.join(' · ');
   }
 }
@@ -1723,29 +1923,75 @@ function selectDmContact(index) {
   if (!c) return Promise.resolve();
   dmState.currentIndex = index;
   dmState.current = c.uuid || c.key || c.name;
+  dmState.atBottom = true;
   renderDmContacts(); renderDmPeerHeader();
   const key = dmState.current;
   return fetch(`/api/contacts/${encodeURIComponent(key)}/messages`).then(r => r.json()).then(d => {
     dmState.messages = Array.isArray(d.messages) ? d.messages : [];
-    renderDmMessages();
+    renderDmMessages(true);
   }).catch(() => {})
     .then(() => fetch(`/api/contacts/${encodeURIComponent(key)}/read`, {method: 'POST'}).catch(() => {}))
     .then(loadDmInbox);
 }
-function renderDmMessages() {
+/* 同一组 = 同一个说话人 + 同一分钟 + 间隔 < 5 分钟（微信那种"连着几句"）。 */
+function dmSameRun(prev, m) {
+  if (!prev || prev.direction !== m.direction) return false;
+  const a = Number(prev.ts) || 0, b = Number(m.ts) || 0;
+  return Math.floor(a / 60) === Math.floor(b / 60) && (b - a) < 300;
+}
+/* 时间**按分钟分组**：同一分钟的连续消息共用一个时间标（挂在组首气泡上）；
+   跨分钟另起一组并带自己的时间；跨天在组前插一条完整时间条。 */
+function dmMinuteChanged(prev, m) {
+  if (!prev) return true;
+  return Math.floor((Number(prev.ts) || 0) / 60) !== Math.floor((Number(m.ts) || 0) / 60);
+}
+function dmDayChanged(prev, m) {
+  if (!prev) return true;
+  return new Date((Number(prev.ts) || 0) * 1000).toDateString()
+      !== new Date((Number(m.ts) || 0) * 1000).toDateString();
+}
+function renderDmMessages(force) {
   const box = document.getElementById('dmMessages');
   if (!box) return;
-  if (!dmState.current) { box.innerHTML = '<div class="empty">左侧点一个联系人，看你们的来往私信</div>'; return; }
-  if (!dmState.messages.length) { box.innerHTML = '<div class="empty">还没有消息。下面可以直接代它发第一条。</div>'; return; }
-  box.innerHTML = dmState.messages.map(m => {
+  if (!dmState.current) {
+    box.innerHTML = '<div class="empty">左侧点一个联系人，看你们的来往私信</div>';
+    return;
+  }
+  if (!dmState.messages.length) {
+    box.innerHTML = '<div class="empty">还没有消息。下面可以直接代它发第一条。</div>';
+    return;
+  }
+  const rows = [];
+  dmState.messages.forEach((m, i) => {
+    const prev = i > 0 ? dmState.messages[i - 1] : null;
     const out = m.direction === 'out';
-    const model = m.model ? ` · 模型 ${escapeHtml(m.model)}` : '';
-    return `<div class="dm-bubble ${out ? 'out' : 'in'}">
-      <div>${escapeHtml(m.text || '')}</div>
-      <div class="stamp">${out ? 'AI（代发）' : '对方'}${model} · ${escapeHtml(dmFmtTime(m.ts))}</div>
-    </div>`;
-  }).join('');
-  box.scrollTop = box.scrollHeight;
+    const first = !dmSameRun(prev, m);
+    const dayBreak = dmDayChanged(prev, m);
+    const minuteBreak = first && dmMinuteChanged(prev, m);
+    if (minuteBreak && prev) rows.push(`<div class="dm-timesep">${escapeHtml(dmFmtTime(m.ts))}</div>`);
+    const who = first
+      ? `<div class="dm-who">${escapeHtml(out ? dmState.aiName : (m.name || '对方'))}</div>` : '';
+    const shownAt = dayBreak ? '' : dmFmtClock(m.ts);
+    const stamp = first && (shownAt || out)
+      ? `<div class="stamp"><span>${escapeHtml(shownAt)}</span>${out ? '<span class="relabel">代发</span>' : ''}</div>`
+      : '';
+    rows.push(`<div class="dm-line ${out ? 'out' : 'in'}${first ? ' first' : ''}">
+      ${first ? dmAvatarHtml(out ? dmState.aiName : (m.name || '对方'), out) : '<span class="dm-avatar spacer"></span>'}
+      <span class="dm-stack">${who}
+        <div class="dm-bubble ${out ? 'out' : 'in'}${first ? ' tail' : ''}">${escapeHtml(m.text || '')}${stamp}</div>
+      </span>
+    </div>`);
+  });
+  box.innerHTML = rows.join('');
+  if (force !== undefined) dmScrollToBottom(force);
+  else dmScrollToBottom(dmState.atBottom);
+}
+function dmScrollToBottom(force) {
+  const box = document.getElementById('dmMessages');
+  if (!box) return;
+  if (force) { box.scrollTop = box.scrollHeight; dmState.atBottom = true; }
+  const jump = document.getElementById('dmJump');
+  if (jump) jump.style.display = dmState.atBottom ? 'none' : '';
 }
 function sendDm() {
   if (!dmState.current || dmState.sending) return;
@@ -1758,11 +2004,30 @@ function sendDm() {
     method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text})
   }).then(r => r.json()).catch(() => ({})).then(d => {
     dmState.sending = false;
-    if (d && d.status === 'ok') { input.value = ''; hint.textContent = '已发出。'; }
-    else { hint.textContent = '被服务端拦下了：' + ((d && (d.blocked || d.reason || d.detail)) || '未知原因') + '（白名单未勾选 / 硬黑名单 / 需二次确认）。'; }
+    if (d && d.status === 'ok') {
+      input.value = '';
+      hint.textContent = `已以 ${dmState.aiName} 的身份代发。`;
+      hint.style.color = '#8b949e';
+    } else {
+      hint.textContent = '被服务端拦下了：' + ((d && (d.blocked || d.reason || d.detail)) || '未知原因') + '（白名单未勾选 / 硬黑名单 / 需二次确认）。';
+      hint.style.color = '#f85149';
+    }
     return selectDmContact(dmState.currentIndex);
   });
 }
+(function dmWireInput() {
+  const input = document.getElementById('dmInput');
+  if (!input) return;
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendDm(); }
+  });
+  const box = document.getElementById('dmMessages');
+  if (box) box.addEventListener('scroll', () => {
+    dmState.atBottom = (box.scrollHeight - box.scrollTop - box.clientHeight) < 60;
+    const jump = document.getElementById('dmJump');
+    if (jump) jump.style.display = dmState.atBottom ? 'none' : '';
+  });
+})();
 
 // ── 记忆概览（只读）──
 function loadMemoryPanel() {
@@ -1869,6 +2134,7 @@ function loadOperationsPage() {
       </div></div>`;
     }).join('') : '<div class="empty">没有任务。让 AI 开始干活后这里会出现。</div>';
   }).catch(e => { document.getElementById('opsTasks').innerHTML = '<div class="hint">读取失败: ' + escapeHtml(String(e)) + '</div>'; });
+  loadJobsPanel();
 }
 function opsTaskAction(action, index) {
   const t = opsState.items[index];
@@ -1893,6 +2159,258 @@ function loadDiagnosticsPage() {
     const dec = Array.isArray(s.chat_decisions) ? s.chat_decisions : [];
     document.getElementById('diagDecisions').textContent = dec.length ? JSON.stringify(dec, null, 2) : '（暂无决策记录）';
   }).catch(e => { document.getElementById('diagGate').textContent = '读取失败: ' + e; });
+}
+
+// ── 工具目录 · 复合体（只读；单一事实来源＝注册表）──
+function loadToolsPage() {
+  const st = document.getElementById('toolsStatus');
+  const box = document.getElementById('toolsTable');
+  if (st) st.textContent = '读取中…';
+  fetch('/api/tools').then(r => r.json()).then(d => {
+    const tools = Array.isArray(d.tools) ? d.tools : [];
+    if (st) st.textContent = `${tools.length} 条工具（其中 ${d.job_count || 0} 条会登记 job 句柄）· 来源 ${d.source || '注册表'}`;
+    if (!box) return;
+    if (!tools.length) { box.innerHTML = '<div class="empty">注册表是空的。</div>'; return; }
+    box.innerHTML = `<table class="cmd-table"><thead><tr>
+        <th>名字</th><th>说明</th><th>参数</th><th>权限门（派发前统一执行）</th><th>job</th><th>动作组</th>
+      </tr></thead><tbody>${tools.map(t => {
+        const perm = t.permission || {};
+        const gates = perm.gates || {};
+        const pills = (perm.active || []).map(k =>
+          `<span class="tag-pill${k === 'tier' ? ' scope' : ''}">${escapeHtml(k === 'tier' ? ('tier:' + (gates.tier || '')) : k)}</span>`).join(' ');
+        const args = t.arg_names || [];
+        return `<tr>
+          <td><span class="cmd-name">${escapeHtml(t.name)}</span>${t.handler ? `<div class="hint">${escapeHtml(t.handler)}</div>` : ''}</td>
+          <td>${escapeHtml(t.description || '')}</td>
+          <td><div class="cmd-tags">${args.length ? args.map(a => `<span class="tag-pill">${escapeHtml(a)}</span>`).join(' ') : '<span class="hint">无</span>'}</div></td>
+          <td><div class="cmd-tags">${pills || '<span class="hint">无额外门</span>'}</div>
+            ${perm.deny_label ? `<div class="hint">被拒时如实说明：${escapeHtml(perm.deny_label)}</div>` : ''}
+            ${perm.note ? `<div class="hint">${escapeHtml(perm.note)}</div>` : ''}</td>
+          <td>${t.job ? '<span class="tag-pill risk">job</span>' : '<span class="hint">否</span>'}</td>
+          <td><div class="cmd-tags">${(t.groups || []).map(g => `<span class="tag-pill">${escapeHtml(g)}</span>`).join(' ')}</div></td>
+        </tr>`;
+      }).join('')}</tbody></table>`;
+  }).catch(e => { if (st) st.textContent = '读取失败: ' + e; });
+  loadCompositesList();
+}
+function loadCompositesList() {
+  const box = document.getElementById('compositesList');
+  if (!box) return;
+  fetch('/api/composites').then(r => r.json()).then(d => {
+    const rows = Array.isArray(d.composites) ? d.composites : [];
+    if (!rows.length) { box.innerHTML = '<div class="empty">注册表里还没有复合体声明。</div>'; return; }
+    box.innerHTML = rows.map(c => `<div class="ov-row" style="flex-direction:column;align-items:stretch">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <span class="nm">${escapeHtml(c.name)}</span>
+        <span class="desc">${escapeHtml(c.description || '')}</span>
+        <span class="hint">${(c.args || []).length ? '入参：' + (c.args || []).map(a => escapeHtml(a)).join('、') : '无入参'}</span>
+      </div>
+      <ol style="margin:6px 0 0 18px;font-size:11px;color:#8b949e">
+        ${(c.steps || []).map((s, i) => `<li style="margin-bottom:4px">
+          <code>${escapeHtml(s.tool)}</code>${s.label ? ' ' + escapeHtml(s.label) : ''}
+          ${s.optional ? '<span class="tag-pill">可选：失败也继续</span>' : ''}
+          ${s.registered === false ? '<span class="tag-pill hard">未注册</span>' : ''}
+          ${(s.when && s.when.kind) ? `<span class="tag-pill">当 ${escapeHtml(s.when.kind)}${s.when.item ? ':' + escapeHtml(s.when.item) : ''}${s.when_missing === 'skip' ? ' / 不成立就跳过' : ' / 不成立就停下'}</span>` : ''}
+          ${s.note ? `<div class="hint">${escapeHtml(s.note)}</div>` : ''}
+        </li>`).join('')}
+      </ol>
+    </div>`).join('');
+  }).catch(e => { box.innerHTML = '<div class="hint">读取失败: ' + escapeHtml(String(e)) + '</div>'; });
+}
+
+// ── 治理 / 租约审计（只读；内存环形缓冲，**不落盘**）──
+function govTime(ts) {
+  const n = Number(ts);
+  if (!isFinite(n) || n <= 0) return '—';
+  const d = new Date(n * 1000);
+  const pad = x => String(x).padStart(2, '0');
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+function govTable(rows, cols) {
+  if (!rows.length) return '<div class="empty">环形缓冲是空的（要么没发生，要么进程刚重启）—— 这些审计本来就不落盘。</div>';
+  return `<table class="cmd-table"><thead><tr>${cols.map(c => `<th>${escapeHtml(c.label)}</th>`).join('')}</tr></thead><tbody>`
+    + rows.map(row => `<tr>${cols.map(c => `<td>${c.fn(row)}</td>`).join('')}</tr>`).join('')
+    + '</tbody></table>';
+}
+function govDetail(x) {
+  const detail = x && x.detail;
+  return (detail && Object.keys(detail).length) ? `<div class="hint">${escapeHtml(JSON.stringify(detail))}</div>` : '';
+}
+function loadGovernancePage() {
+  const st = document.getElementById('govStatus');
+  const note = document.getElementById('govNote');
+  if (st) st.textContent = '读取中…';
+  fetch('/api/governance').then(r => r.json()).then(d => {
+    if (note) note.textContent = d.note || '';
+    if (!d.running) {
+      if (st) st.textContent = '会话未启动';
+      ['govGovernor', 'govResourceLease', 'govControlLease'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.innerHTML = '<div class="empty">会话未启动（模组未连接）：没有运行中的实例可读，也没有历史可翻。</div>';
+      });
+      return;
+    }
+    const gov = d.governor || {}, rl = d.resource_lease || {}, cl = d.control_lease || {};
+    if (st) st.textContent = `进程内审计：治理 ${(gov.audit || []).length} 条 / 资源租约 ${(rl.audit || []).length} 条 / 控制租约 ${(cl.audit || []).length} 条（不落盘）`;
+
+    const gEl = document.getElementById('govGovernor');
+    if (gEl) {
+      const cfg = gov.config || {};
+      const tracked = Array.isArray(gov.tracked) ? gov.tracked : [];
+      gEl.innerHTML = `<div class="hint">开关 ${gov.enabled ? '<b>开</b>' : '关'} · 阈值：${escapeHtml(String(cfg.no_progress_seconds != null ? cfg.no_progress_seconds : '—'))}s 无进展就摘 / 退避 ${escapeHtml(String(cfg.retry_cooldown_seconds != null ? cfg.retry_cooldown_seconds : '—'))}s / 最多跟踪 ${escapeHtml(String(cfg.max_tracked != null ? cfg.max_tracked : '—'))} 条 · ring ${escapeHtml(String(gov.ring != null ? gov.ring : '—'))}</div>`
+        + (tracked.length ? `<div class="data-list" style="margin:6px 0">${tracked.map(t => `<div class="data-row"><div>
+            <div class="data-title">${escapeHtml(t.key || '?')} <span class="tag-pill">${escapeHtml(t.kind || '')}</span>${t.survival ? '<span class="tag-pill hard">P0 反射（只观察不摘）</span>' : ''}</div>
+            <div class="data-meta">资源 ${escapeHtml((t.resources || []).join('、') || '无')} · 优先级 ${escapeHtml(String(t.priority != null ? t.priority : '—'))} · 上次进展 ${escapeHtml(govTime(t.last_progress_at))}</div>
+          </div></div>`).join('')}</div>` : '<div class="empty">当前没有在跟踪的状态。</div>')
+        + govTable(gov.audit || [], [
+            {label: '时刻', fn: x => escapeHtml(govTime(x.at))},
+            {label: '谁', fn: x => escapeHtml(x.key || '')},
+            {label: '何事', fn: x => `<span class="tag-pill">${escapeHtml(x.kind || '')}</span>`},
+            {label: '为何', fn: x => escapeHtml(x.reason || '（未给原因）') + govDetail(x)},
+          ]);
+    }
+
+    const rEl = document.getElementById('govResourceLease');
+    if (rEl) {
+      const holders = Array.isArray(rl.holders) ? rl.holders : [];
+      const pending = Array.isArray(rl.pending) ? rl.pending : [];
+      rEl.innerHTML = `<div class="hint">ring ${escapeHtml(String(rl.ring != null ? rl.ring : '—'))} · 当前持租 ${holders.length} · 排队 ${pending.length}</div>`
+        + (holders.length ? `<div class="data-list" style="margin:6px 0">${holders.map(h => `<div class="data-row"><div>
+            <div class="data-title">${escapeHtml(h.owner || '?')} <span class="tag-pill scope">${escapeHtml((h.resources || []).join('、'))}</span>${h.survival ? '<span class="tag-pill hard">生存反射</span>' : ''}</div>
+            <div class="data-meta">因为 ${escapeHtml(h.reason || '（未给原因）')} · 优先级 ${escapeHtml(String(h.priority != null ? h.priority : '—'))}</div>
+          </div></div>`).join('')}</div>` : '<div class="empty">当前没有资源被占用。</div>')
+        + (pending.length ? `<div class="hint">排队中：${pending.map(p => `${escapeHtml(p.owner || '?')}（${escapeHtml((p.resources || []).join('、'))}）`).join('、')}</div>` : '')
+        + govTable(rl.audit || [], [
+            {label: '时刻', fn: x => escapeHtml(govTime(x.at))},
+            {label: '谁', fn: x => escapeHtml(x.owner || '')},
+            {label: '抢了谁的什么', fn: x => `<span class="tag-pill">${escapeHtml(x.kind || '')}</span> ${escapeHtml((x.resources || []).join('、'))}${x.detail && x.detail.victim ? ` ← 被抢：${escapeHtml(String(x.detail.victim))}` : ''}`},
+            {label: '为何', fn: x => escapeHtml(x.reason || '（未给原因）') + govDetail(x)},
+          ]);
+    }
+
+    const cEl = document.getElementById('govControlLease');
+    if (cEl) {
+      const caps = cl.capabilities || {};
+      cEl.innerHTML = `<div class="hint">当前持租人 ${cl.holder ? `<b>${escapeHtml(cl.holder)}</b>` : '（空闲）'} · 理由 ${escapeHtml(cl.reason || '（无）')} · 到点 ${escapeHtml(govTime(cl.expires_at))} · ring ${escapeHtml(String(cl.ring != null ? cl.ring : '—'))}</div>`
+        + `<div class="cmd-tags" style="margin:6px 0">${Object.keys(caps).map(k => `<span class="tag-pill${caps[k] ? '' : ' hard'}">${escapeHtml(k)}:${caps[k] ? '是' : '否'}</span>`).join('')}</div>`
+        + govTable(cl.audit || [], [
+            {label: '时刻', fn: x => escapeHtml(govTime(x.at))},
+            {label: '谁（actor）', fn: x => escapeHtml(x.actor || '')},
+            {label: '何事', fn: x => `<span class="tag-pill">${escapeHtml(x.kind || '')}</span>`},
+            {label: '抢了谁的什么', fn: x => `${escapeHtml(x.holder || '（空闲）')}${x.previous ? ' ← 被抢：' + escapeHtml(x.previous) : ''}`},
+            {label: '为何 / 时限', fn: x => `${escapeHtml(x.reason || '（未给原因）')}${x.ttl != null && x.ttl !== null ? ` · 时限 ${escapeHtml(String(x.ttl))}s` : ''}` + govDetail(x)},
+          ]);
+    }
+  }).catch(e => { if (st) st.textContent = '读取失败: ' + e; });
+}
+
+// ── 操作 · job 句柄（只读列表；取消走 job 自己的取消路径）──
+let jobsState = { jobs: [], active: 0 };
+function jobColor(status) {
+  const s = String(status || '');
+  if (s === 'running') return '#58a6ff';
+  if (s === 'done') return '#3fb950';
+  if (s === 'failed') return '#f85149';
+  return '#8b949e';
+}
+function loadJobsPanel() {
+  const box = document.getElementById('jobsList');
+  if (!box) return;
+  return fetch('/api/status').then(r => r.json()).then(d => {
+    const jobs = (d && d.jobs) || {};
+    jobsState.jobs = Array.isArray(jobs.jobs) ? jobs.jobs : [];
+    jobsState.active = Number(jobs.active) || 0;
+    const st = document.getElementById('jobsStatus');
+    if (st) st.textContent = jobsState.jobs.length
+      ? `共 ${jobsState.jobs.length} 个句柄（活跃 ${jobsState.active}）` : '当前没有 job 句柄。';
+    if (!jobsState.jobs.length) {
+      box.innerHTML = '<div class="empty">没有 job 句柄。模型请求长任务（移动 / 采集 / 合成 / 守点…）时这里会出现。</div>';
+      return;
+    }
+    box.innerHTML = jobsState.jobs.map((job, i) => {
+      const pct = Math.round((Number(job.progress) || 0) * 100);
+      const color = jobColor(job.status);
+      const terminal = ['done', 'failed', 'cancelled'].indexOf(String(job.status)) >= 0;
+      return `<div class="task-card" style="margin-bottom:8px">
+        <div class="task-head">
+          <span class="task-kind">${escapeHtml(job.tool || '?')}</span>
+          <span class="task-status">#${escapeHtml(String(job.id || ''))}</span>
+          <span class="tag-pill" style="color:${color};border-color:${color}">${escapeHtml(String(job.status || ''))}</span>
+          ${job.has_cancel_path ? '' : '<span class="tag-pill hard">无取消路径</span>'}
+        </div>
+        <div class="progress"><div class="progress-bar" style="width:${pct}%;background:${color}"></div></div>
+        <div class="progress-text">${pct}%${job.detail ? ' · ' + escapeHtml(job.detail) : ''}</div>
+        <div class="task-detail">
+          资源 ${escapeHtml((job.resources || []).join('、') || '无')} · 优先级 ${escapeHtml(String(job.priority != null ? job.priority : '—'))}${job.actor ? ' · 请求者 ' + escapeHtml(job.actor) : ''}
+          ${job.failure_code ? ` · 失败码 <span style="color:#f85149">${escapeHtml(job.failure_code)}</span>` : ''}
+          ${job.result ? `<div class="hint">结果：${escapeHtml(JSON.stringify(job.result))}</div>` : ''}
+          ${job.progress_source ? `<div class="hint">进度来源：${escapeHtml(job.progress_source)} · 终止条件：${escapeHtml(job.terminal_condition || '—')}</div>` : ''}
+        </div>
+        <div style="margin-top:6px">
+          ${terminal ? '<span class="hint">已结束（终态）。</span>'
+                     : `<button class="btn danger" onclick="cancelJob(${i})">取消</button>`}
+        </div>
+      </div>`;
+    }).join('');
+  }).catch(e => { box.innerHTML = '<div class="hint">读取失败: ' + escapeHtml(String(e)) + '</div>'; });
+}
+function cancelJob(index) {
+  const job = jobsState.jobs[index];
+  if (!job) return;
+  fetch('/api/jobs/cancel', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({id: job.id, reason: 'operator cancelled from dashboard'})
+  }).then(r => r.json()).catch(() => ({})).then(d => {
+    if (d && d.status === 'denied') dbgLog(`job ${job.id} 取消失败：${d.reason || ''}`);
+    else dbgLog(`已取消 job ${job.id}（走它自己的取消路径）`);
+    loadJobsPanel();
+  });
+}
+
+// ── 运行开关（这些键**早就存在**，这里只是把 UI 补上；后台不会自己去动）──
+function loadRuntimeSwitches() {
+  const st = document.getElementById('runtimeSwitchesStatus');
+  if (st) st.textContent = '读取中…';
+  return fetch('/api/config').then(r => r.json()).then(cfg => {
+    const gov = (cfg && cfg.state_governor) || {};
+    const box = (id, value) => { const el = document.getElementById(id); if (el) el.checked = !!value; };
+    box('cfgGovernorEnabled', gov.enabled);
+    box('cfgJobOrchestration', cfg.job_orchestration);
+    box('cfgLogChangesOnly', cfg.log_changes_only);
+    const hb = document.getElementById('cfgLogHeartbeat');
+    if (hb) hb.value = (cfg.log_heartbeat_seconds != null ? String(cfg.log_heartbeat_seconds) : '0');
+    const th = document.getElementById('cfgGovernorThresholds');
+    if (th) th.textContent = `当前阈值（同一份配置，本行只读）：无进展 ${gov.no_progress_seconds != null ? gov.no_progress_seconds : '—'}s 摘掉 / 退避 ${gov.retry_cooldown_seconds != null ? gov.retry_cooldown_seconds : '—'}s / 最多跟踪 ${gov.max_tracked != null ? gov.max_tracked : '—'} 条`;
+    if (st) st.textContent = '已读取后端的 .local/config.json。';
+  }).catch(e => { if (st) st.textContent = '读取失败: ' + e; });
+}
+function saveRuntimeSwitches() {
+  const st = document.getElementById('runtimeSwitchesStatus');
+  const raw = (document.getElementById('cfgLogHeartbeat').value || '').trim();
+  const heartbeat = raw === '' ? 0 : Number(raw);
+  if (!Number.isFinite(heartbeat) || heartbeat < 0) {
+    st.textContent = '心跳秒必须是 ≥ 0 的数字（0＝不打心跳；非法会被后端回退为 0）。';
+    return;
+  }
+  fetch('/api/config').then(r => r.json()).then(cfg => {
+    // 只改总开关：同段里的阈值原样带回去（后端会把缺失字段补默认，所以必须整段回传，
+    // 否则会把你手改过的阈值抹掉）。
+    const gov = Object.assign({}, (cfg && cfg.state_governor) || {});
+    gov.enabled = !!document.getElementById('cfgGovernorEnabled').checked;
+    return fetch('/api/config', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        state_governor: gov,
+        job_orchestration: !!document.getElementById('cfgJobOrchestration').checked,
+        log_changes_only: !!document.getElementById('cfgLogChangesOnly').checked,
+        log_heartbeat_seconds: heartbeat,
+      })
+    });
+  }).then(r => r.json()).then(d => {
+    const c = (d && d.config) || {};
+    const g = c.state_governor || {};
+    st.textContent = `已保存：状态治理 ${g.enabled ? '开' : '关'} / 编排轮次 ${c.job_orchestration ? '开' : '关'} / 日志只打变化 ${c.log_changes_only ? '开' : '关'} / 心跳 ${c.log_heartbeat_seconds}s`;
+  }).catch(e => { if (st) st.textContent = '保存失败: ' + e; });
 }
 
 // ── Init ──

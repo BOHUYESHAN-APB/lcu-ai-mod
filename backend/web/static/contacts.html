@@ -29,48 +29,71 @@ body{font-family:'Segoe UI','PingFang SC','Microsoft YaHei',system-ui,sans-serif
 .btn:hover{background:#30363d}
 .btn.primary{background:#1f6feb;color:#fff;border-color:#1f6feb}
 .btn.primary:hover{background:#388bfd}
-.layout{flex:1;display:grid;grid-template-columns:minmax(220px,.7fr) minmax(320px,1.3fr);min-height:0}
+.layout{flex:1;display:grid;grid-template-columns:minmax(230px,.72fr) minmax(340px,1.28fr);min-height:0}
+/* ── 左栏：联系人列表（头像 / 名字 / 层级 / 未读徽标 / 最后一条预览 + 时间）── */
 .contacts{border-right:1px solid var(--ov-line,#30363d);overflow-y:auto;background:var(--ov-bg,#0d1117)}
 .group-title{padding:8px 14px;font-size:11px;color:#8b949e;background:var(--ov-surface,#161b22);
   border-bottom:1px solid #21262d;position:sticky;top:0;z-index:1}
-.contact{width:100%;display:flex;gap:10px;align-items:flex-start;text-align:left;background:transparent;
-  color:var(--ov-fg,#c9d1d9);border:0;border-bottom:1px solid #21262d;padding:10px 12px;cursor:pointer}
+.contact{width:100%;display:block;text-align:left;background:transparent;
+  color:var(--ov-fg,#c9d1d9);border:0;border-bottom:1px solid #21262d;padding:9px 12px;cursor:pointer}
 .contact:hover,.contact.active{background:#21262d}
-.contact .av{width:34px;height:34px;border-radius:50%;background:#30363d;flex:0 0 auto;
-  display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:700;color:#8b949e}
-.contact .body{min-width:0;flex:1}
+.contact .rowtop{display:flex;align-items:center;gap:9px}
+.contact .av{width:36px;height:36px;border-radius:6px;background:#30363d;flex:0 0 36px;
+  display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:700;color:#fff;
+  user-select:none;overflow:hidden}
+.contact .rowmain{flex:1;min-width:0}
 .contact .line1{display:flex;align-items:center;gap:6px}
-.contact .nm{font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.contact .nm{font-size:13px;font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .contact .tier{font-size:10px;border-radius:3px;padding:1px 5px;border:1px solid #30363d;color:#8b949e}
 .tier.master{color:#d29922;border-color:#d29922}
 .tier.friend{color:#58a6ff;border-color:#58a6ff}
 .tier.guest{color:#8b949e;border-color:#30363d}
-.contact .badge{margin-left:auto;background:#da3633;color:#fff;border-radius:8px;
-  min-width:16px;text-align:center;font-size:10px;padding:1px 5px}
+.contact .badge{background:#da3633;color:#fff;border-radius:9px;
+  min-width:17px;text-align:center;font-size:10px;padding:1px 5px}
 .contact .preview{font-size:11px;color:#8b949e;margin-top:3px;overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap}
+.contact .ts{font-size:10px;color:#8b949e;flex:0 0 auto;align-self:flex-start}
 .contact .dot{width:7px;height:7px;border-radius:50%;flex:0 0 auto;background:#8b949e}
 .contact .dot.on{background:#3fb950}
+/* ── 右栏：会话（别人靠左 / AI 靠右；连续消息成组；时间按分钟分组）── */
 .chat{display:flex;flex-direction:column;min-width:0;min-height:0}
 .chat-head{padding:10px 14px;border-bottom:1px solid var(--ov-line,#30363d);background:var(--ov-surface,#161b22);flex-shrink:0;
   display:flex;align-items:center;gap:8px}
 .chat-head .nm{font-weight:600}
 .chat-head .meta{font-size:11px;color:#8b949e}
-.chat-body{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:10px;min-height:0}
-.bubble{max-width:76%;padding:8px 11px;border-radius:10px;position:relative;word-break:break-word;
-  white-space:pre-wrap;font-size:13px;line-height:1.45}
-.bubble .who{font-size:10px;color:#8b949e;margin-bottom:3px}
-.bubble .stamp{font-size:10px;color:#8b949e;margin-top:4px;text-align:right}
-.bubble.in{align-self:flex-start;background:#21262d;border-top-left-radius:2px}
-.bubble.out{align-self:flex-end;background:#1f6feb;color:#fff;border-top-right-radius:2px}
-.bubble.out .who,.bubble.out .stamp{color:rgba(255,255,255,.72)}
-.chat-foot{border-top:1px solid var(--ov-line,#30363d);padding:10px 12px;background:var(--ov-surface,#161b22);flex-shrink:0}
-.chat-input{display:flex;gap:8px}
-.chat-input textarea{flex:1;resize:none;height:42px;background:var(--ov-bg,#0d1117);border:1px solid #30363d;
-  border-radius:6px;padding:9px 10px;color:var(--ov-fg,#c9d1d9);font-size:13px;font-family:inherit}
+.chat-body{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:1px;min-height:0}
+.timesep{align-self:center;margin:8px 0 6px;font-size:10px;color:#8b949e;background:rgba(110,118,129,.18);
+  border-radius:4px;padding:2px 8px}
+.line{display:flex;gap:8px;align-items:flex-start;margin-top:2px}
+.line.out{flex-direction:row-reverse}
+.line.first{margin-top:10px}
+.av{width:32px;height:32px;flex:0 0 32px;border-radius:5px;display:flex;align-items:center;
+  justify-content:center;font-size:13px;font-weight:700;color:#fff;background:#30363d;user-select:none;overflow:hidden}
+.av.spacer{background:transparent;color:transparent}
+.av.ai{background:linear-gradient(135deg,#1f6feb,#3fb950)}
+.stack{display:flex;flex-direction:column;min-width:0;max-width:76%}
+.line.out .stack{align-items:flex-end}
+.who{font-size:10px;color:#8b949e;margin:0 2px 3px}
+.bubble{position:relative;padding:7px 10px;border-radius:6px;font-size:13px;line-height:1.5;
+  white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere}
+.bubble.in{background:#262c36;color:#e6edf3}
+.bubble.out{background:#1f6feb;color:#fff}
+/* 小尾巴：只挂在同一组的**第一条**（挨着头像那条）上，指向头像。 */
+.bubble.tail::before{content:'';position:absolute;top:9px;border:5px solid transparent}
+.bubble.in.tail::before{left:-8px;border-right-color:#262c36}
+.bubble.out.tail::before{right:-8px;border-left-color:#1f6feb}
+.bubble .stamp{font-size:9px;color:#8b949e;margin-top:3px;text-align:right}
+.bubble.out .stamp{color:rgba(255,255,255,.72)}
+.relabel{font-size:9px;margin-left:6px;color:rgba(255,255,255,.78)}
+.jump{align-self:center;font-size:11px;background:#1f6feb;color:#fff;border:0;border-radius:12px;
+  padding:3px 12px;cursor:pointer;margin:4px 0}
+.chat-foot{border-top:1px solid var(--ov-line,#30363d);padding:9px 12px;background:var(--ov-surface,#161b22);flex-shrink:0}
+.chat-input{display:flex;gap:8px;align-items:flex-end}
+.chat-input textarea{flex:1;resize:none;height:42px;max-height:120px;background:var(--ov-bg,#0d1117);border:1px solid #30363d;
+  border-radius:6px;padding:9px 10px;color:var(--ov-fg,#c9d1d9);font-size:13px;font-family:inherit;line-height:1.4}
 .chat-input textarea:focus{border-color:#58a6ff;outline:none}
 .empty{padding:24px;color:#8b949e;font-size:12px;text-align:center}
-.hint{font-size:11px;color:#8b949e;margin-top:6px}
+.hint{font-size:11px;color:#8b949e;margin-top:6px;line-height:1.5}
 </style>
 <script>
 /* ── OBS 外观（bg / fg / accent / font_scale）──────────────────────────────
@@ -127,30 +150,61 @@ body{font-family:'Segoe UI','PingFang SC','Microsoft YaHei',system-ui,sans-serif
       <span class="nm" id="peerName">未选择联系人</span>
       <span class="meta" id="peerMeta"></span>
     </div>
-    <div class="chat-body" id="messages"><div class="empty">左侧选一个联系人，看你们的来往私信</div></div>
+    <div class="chat-body" id="messages"><div class="empty">还没有私下聊过 —— 左侧选一个人，看你们的来往私信</div></div>
+    <button id="jump" class="jump" style="display:none" onclick="scrollBottom(true)">有新消息 · 回到最新 ↓</button>
     <div class="chat-foot">
       <div class="chat-input">
-        <textarea id="input" placeholder="以它的身份代发一条私信（会过服务端出站清洗 + 指令白名单）"></textarea>
+        <textarea id="input" rows="1" placeholder="以 AI 的身份代发一条私信（回车发送 / Shift+回车换行；会过服务端出站清洗 + 指令白名单）"></textarea>
         <button class="btn primary" onclick="sendMessage()">发送</button>
       </div>
-      <div class="hint" id="sendHint">人或 AI 都能收到这条；发送走 POST /api/contacts/&lt;uuid&gt;/send。</div>
+      <div class="hint" id="sendHint">代发＝<b>以 AI 的身份</b>发出去（不是以你的名义）；走 POST /api/contacts/&lt;uuid&gt;/send。</div>
     </div>
   </div>
 </div>
 <script>
 "use strict";
-const state = { contacts: [], current: null, currentKey: null, messages: [], sending: false };
+const state = { contacts: [], current: null, currentKey: null, messages: [], sending: false,
+                atBottom: true, aiName: 'AI', aiNameChecked: false };
 
 function esc(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
     ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
+const pad2 = x => String(x).padStart(2, '0');
 function fmtTime(ts) {
   const n = Number(ts);
   if (!isFinite(n) || n <= 0) return '';
   const d = new Date(n * 1000);
-  const pad = x => String(x).padStart(2, '0');
-  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  return `${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+function fmtClock(ts) {
+  const n = Number(ts);
+  if (!isFinite(n) || n <= 0) return '';
+  const d = new Date(n * 1000);
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+/* 左栏时间：今天＝HH:MM；昨天＝昨天；今年＝MM-DD；更早＝YYYY-MM-DD。 */
+function listTime(ts) {
+  const n = Number(ts);
+  if (!isFinite(n) || n <= 0) return '';
+  const d = new Date(n * 1000), now = new Date();
+  if (d.toDateString() === now.toDateString()) return fmtClock(n);
+  const yest = new Date(now.getTime() - 86400000);
+  if (d.toDateString() === yest.toDateString()) return '昨天';
+  if (d.getFullYear() === now.getFullYear()) return `${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+/* 头像：名字首字 + 由名字派生的稳定底色（**不加载任何外部图片/链接**）。 */
+function avatarColor(name) {
+  const s = String(name || '?');
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) % 360;
+  return `hsl(${h},42%,38%)`;
+}
+function initial(name) { return (String(name || '?').trim().charAt(0) || '?').toUpperCase(); }
+function avatarHtml(name, ai) {
+  if (ai) return `<span class="av ai">AI</span>`;
+  return `<span class="av" style="background:${avatarColor(name)}">${esc(initial(name))}</span>`;
 }
 async function api(path, options) {
   const r = await fetch(path, options);
@@ -166,24 +220,27 @@ function sameContact(c) {
 function renderContacts() {
   const box = document.getElementById('contacts');
   if (!state.contacts.length) {
-    box.innerHTML = '<div class="empty">还没有私信往来记录。<br>等世界里的玩家先私信它。</div>';
+    box.innerHTML = '<div class="empty">还没有私下聊过的人。<br>等世界里的玩家先私信它。</div>';
     return;
   }
   const rows = state.contacts.map(c => {
     const tier = String(c.tier || '').toLowerCase();
     const active = sameContact(c) ? ' active' : '';
     const unread = Number(c.unread) || 0;
-    const dir = c.last_direction === 'out' ? '我：' : '';
+    const dir = c.last_direction === 'out' ? (state.aiName + '：') : '';
     return `<button class="contact${active}" onclick="selectContact('${esc(c.uuid || c.key)}')">
-      <span class="av">${esc((c.name || '?').slice(0, 1).toUpperCase())}</span>
-      <span class="body">
-        <span class="line1">
-          <span class="dot ${c.online ? 'on' : ''}"></span>
-          <span class="nm">${esc(c.name || c.uuid || '?')}</span>
-          ${tier ? `<span class="tier ${esc(tier)}">${esc(tier)}</span>` : ''}
-          ${unread ? `<span class="badge">${unread}</span>` : ''}
+      <span class="rowtop">
+        ${avatarHtml(c.name || c.uuid || '?', false)}
+        <span class="rowmain">
+          <span class="line1">
+            <span class="dot ${c.online ? 'on' : ''}"></span>
+            <span class="nm">${esc(c.name || c.uuid || '?')}</span>
+            ${tier ? `<span class="tier ${esc(tier)}">${esc(tier)}</span>` : ''}
+            ${unread ? `<span class="badge">${unread > 99 ? '99+' : unread}</span>` : ''}
+          </span>
+          <span class="preview">${esc(dir + (c.last_text || '（无内容）'))}</span>
         </span>
-        <span class="preview">${esc(dir + (c.last_text || '（无内容）'))}</span>
+        <span class="ts">${esc(listTime(c.last_ts))}</span>
       </span>
     </button>`;
   }).join('');
@@ -191,27 +248,62 @@ function renderContacts() {
 }
 
 /* ── 右栏 ── */
-function renderMessages() {
+/* 同一组 = 同一个说话人 + 同一分钟 + 间隔 < 5 分钟（微信那种"连着几句"）。 */
+function sameRun(prev, m) {
+  if (!prev || prev.direction !== m.direction) return false;
+  const a = Number(prev.ts) || 0, b = Number(m.ts) || 0;
+  return Math.floor(a / 60) === Math.floor(b / 60) && (b - a) < 300;
+}
+function minuteChanged(prev, m) {
+  if (!prev) return true;
+  return Math.floor((Number(prev.ts) || 0) / 60) !== Math.floor((Number(m.ts) || 0) / 60);
+}
+function dayChanged(prev, m) {
+  if (!prev) return true;
+  return new Date((Number(prev.ts) || 0) * 1000).toDateString()
+      !== new Date((Number(m.ts) || 0) * 1000).toDateString();
+}
+/* 时间**按分钟分组**：同一分钟的连续消息共用一个时间标（挂在组首气泡上）；
+   跨分钟另起一组并带自己的时间；跨天在组前插一条完整时间条。 */
+function renderMessages(force) {
   const box = document.getElementById('messages');
   if (!state.current) {
-    box.innerHTML = '<div class="empty">左侧选一个联系人，看你们的来往私信</div>';
+    box.innerHTML = '<div class="empty">还没有私下聊过 —— 左侧选一个人，看你们的来往私信</div>';
     return;
   }
   if (!state.messages.length) {
     box.innerHTML = '<div class="empty">还没有消息。下面可以直接代它发第一条。</div>';
     return;
   }
-  box.innerHTML = state.messages.map(m => {
+  const rows = [];
+  state.messages.forEach((m, i) => {
+    const prev = i > 0 ? state.messages[i - 1] : null;
     const out = m.direction === 'out';
-    const who = out ? '我（代发）' : '他发来';
-    const model = m.model ? ` · 模型 ${esc(m.model)}` : '';
-    return `<div class="bubble ${out ? 'out' : 'in'}">
-      <div class="who">${who}${model}</div>
-      <div class="text">${esc(m.text || '')}</div>
-      <div class="stamp">${esc(fmtTime(m.ts))}</div>
-    </div>`;
-  }).join('');
-  box.scrollTop = box.scrollHeight;
+    const first = !sameRun(prev, m);
+    const dayBreak = dayChanged(prev, m);
+    if (first && minuteChanged(prev, m) && prev) {
+      rows.push(`<div class="timesep">${esc(fmtTime(m.ts))}</div>`);
+    }
+    const who = first ? `<div class="who">${esc(out ? state.aiName : (m.name || '对方'))}</div>` : '';
+    const shownAt = dayBreak ? '' : fmtClock(m.ts);
+    const stamp = first && (shownAt || out)
+      ? `<div class="stamp"><span>${esc(shownAt)}</span>${out ? '<span class="relabel">代发</span>' : ''}</div>`
+      : '';
+    rows.push(`<div class="line ${out ? 'out' : 'in'}${first ? ' first' : ''}">
+      ${first ? avatarHtml(out ? state.aiName : (m.name || '对方'), out) : '<span class="av spacer"></span>'}
+      <span class="stack">${who}
+        <div class="bubble ${out ? 'out' : 'in'}${first ? ' tail' : ''}">${esc(m.text || '')}${stamp}</div>
+      </span>
+    </div>`);
+  });
+  box.innerHTML = rows.join('');
+  scrollBottom(force === undefined ? state.atBottom : !!force);
+}
+function scrollBottom(force) {
+  const box = document.getElementById('messages');
+  const jump = document.getElementById('jump');
+  if (force) { box.scrollTop = box.scrollHeight; state.atBottom = true; }
+  if (jump) jump.style.display = state.atBottom ? 'none' : '';
 }
 function renderPeerHeader() {
   const c = state.contacts.find(sameContact);
@@ -223,8 +315,20 @@ function renderPeerHeader() {
   document.getElementById('peerMeta').textContent = bits.join(' · ');
 }
 
+/* AI 的名字：查一次 /api/persona（真实数据，不猜）；拿不到就用 "AI"。 */
+async function resolveAiName() {
+  if (state.aiNameChecked) return;
+  state.aiNameChecked = true;
+  const { ok, data } = await api('/api/persona');
+  if (ok && data && data.name && String(data.name).trim()) {
+    state.aiName = String(data.name).trim();
+    renderContacts(); renderMessages();
+  }
+}
+
 /* ── 数据 ── */
 async function loadContacts() {
+  await resolveAiName();
   const { ok, data } = await api('/api/contacts');
   if (!ok) return;
   state.contacts = Array.isArray(data.contacts) ? data.contacts : [];
@@ -235,10 +339,11 @@ async function loadContacts() {
 async function selectContact(id) {
   state.current = id;
   state.currentKey = id;
+  state.atBottom = true;
   renderContacts();
   const { ok, data } = await api(`/api/contacts/${encodeURIComponent(id)}/messages`);
   state.messages = ok && Array.isArray(data.messages) ? data.messages : [];
-  renderMessages();
+  renderMessages(true);
   renderPeerHeader();
   // 进页/切换时清未读。
   try { await api(`/api/contacts/${encodeURIComponent(id)}/read`, {method: 'POST'}); } catch (e) {}
@@ -257,7 +362,7 @@ async function sendMessage() {
   state.sending = false;
   if (data && data.status === 'ok') {
     input.value = '';
-    hint.textContent = '已发出。';
+    hint.textContent = `已以 ${state.aiName} 的身份代发。`;
     hint.style.color = '#8b949e';
     await selectContact(state.current);
   } else {
@@ -291,8 +396,15 @@ function connectWS() {
   ws.onclose = () => { setConn(false); startPolling(); setTimeout(connectWS, 5000); };
 }
 
+/* 回车发送、Shift+回车换行；滚上去看历史时给"回到最新"按钮，不硬拽。 */
 document.getElementById('input').addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+});
+document.getElementById('messages').addEventListener('scroll', () => {
+  const box = document.getElementById('messages');
+  state.atBottom = (box.scrollHeight - box.scrollTop - box.clientHeight) < 60;
+  const jump = document.getElementById('jump');
+  if (jump) jump.style.display = state.atBottom ? 'none' : '';
 });
 
 (async () => {

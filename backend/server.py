@@ -941,6 +941,172 @@ async def set_commands_config(data: dict):
             "rejected": rejected}
 
 
+# ── 只读目录 · 治理审计 · job 取消（附加式）─────────────────────────────────────
+# 三条纪律（全部是**只读暴露**，不改任何既有路由/启动/鉴权行为）：
+#   ① 工具/复合体目录的**单一事实来源就是注册表**（`agent/tool_registry.py` 的 `TOOL_SPECS`
+#      与 `agent/composites.py` 的 `COMPOSITES`）—— 不手写第二份清单 ✗；
+#   ② 治理/租约审计读的是**进程内环形缓冲**（各模块自带容量上限），**不落盘** ✗，
+#      拿不到历史就如实说"仅进程内最近 N 条"，不假装有台账；
+#   ③ job 取消走 job **自己的取消路径**（`JobRegistry.cancel` → 回调），这里只补一个 HTTP 口。
+from agent.composites import COMPOSITES  # noqa: E402
+from agent.control_lease import AUDIT_MAX as CONTROL_LEASE_RING  # noqa: E402
+from agent.job_registry import AUDIT_MAX as JOB_RING  # noqa: E402
+from agent.resource_lease import AUDIT_MAX as RESOURCE_LEASE_RING  # noqa: E402
+from agent.state_governor import GOV_AUDIT_MAX as GOVERNOR_RING  # noqa: E402
+from agent.tool_registry import TOOL_BY_NAME, TOOL_SPECS  # noqa: E402
+
+# 审计缓冲**不落盘**这一点的诚实口径（口径统一，前端直接显示）。
+AUDIT_NOTE = ("仅展示**进程内**最近的环形缓冲：这些审计不落盘、进程重启即清空；"
+              "每段都标了容量（ring），拿不到就是真的没有，不假装有历史。")
+
+
+def _permission_view(permission: Any) -> dict:
+    """`ToolPermission` → 一读就懂的门清单（空描述符＝无额外门）。"""
+    fields = ("tier", "container", "read_only", "command", "borrow", "area")
+    gates: dict[str, Any] = {name: getattr(permission, name, "") or False for name in fields}
+    gates["tier"] = str(getattr(permission, "tier", "") or "")
+    return {
+        "gates": gates,
+        "active": [name for name in fields if gates[name]],
+        "deny_label": str(getattr(permission, "deny_label", "") or ""),
+        "note": str(getattr(permission, "note", "") or ""),
+    }
+
+
+def _check_view(check: Any) -> dict:
+    """复合体一步的**具名**前置条件（`Check`）→ 人读；没有就是"总是跑"。"""
+    if check is None:
+        return {}
+    kind = str(getattr(check, "kind", "") or "")
+    item = str(getattr(check, "item", "") or "")
+    return {"kind": kind, "item": item, "count": int(getattr(check, "count", 1) or 1)}
+
+
+@app.get("/api/tools")
+async def get_tools_catalog():
+    """工具目录（只读）。**单一事实来源 = `agent/tool_registry.TOOL_SPECS`**。
+
+    `job=true` 的条目在派发时登记 job 句柄（在「操作」页能看到句柄并走它自己的取消路径）。
+    """
+    rows = [{
+        "name": spec.name,
+        "description": spec.description,
+        "args": spec.args,
+        "arg_names": list(spec.parameters()["properties"]),
+        "parameters": spec.parameters(),
+        "groups": list(spec.groups),
+        "handler": spec.handler,
+        "job": bool(spec.job),
+        "permission": _permission_view(spec.permission),
+    } for spec in TOOL_SPECS]
+    return {"tools": rows, "count": len(rows),
+            "job_count": sum(1 for row in rows if row["job"]),
+            "source": "agent/tool_registry.TOOL_SPECS"}
+
+
+@app.get("/api/composites")
+async def get_composites_catalog():
+    """复合体清单（只读）。**单一事实来源 = `agent/composites.COMPOSITES`**。
+
+    每一步只声明"调哪个已注册工具 + 参数从哪来（+ 具名前置条件）"；`registered` 逐条
+    标出它引用的工具在注册表里是否真的存在（不猜）。
+    """
+    rows = [{
+        "name": comp.name,
+        "description": comp.description,
+        "args": list(comp.args),
+        "steps": [{
+            "tool": step.tool,
+            "label": step.label,
+            "args": dict(step.args),
+            "when": _check_view(step.when),
+            "when_missing": str(getattr(step, "when_missing", "") or ""),
+            "optional": bool(step.optional),
+            "note": str(step.note or ""),
+            "registered": step.tool in TOOL_BY_NAME,
+        } for step in comp.steps],
+    } for comp in COMPOSITES]
+    return {"composites": rows, "count": len(rows), "available": True,
+            "source": "agent/composites.COMPOSITES"}
+
+
+def _audit_of(owner: Any, n: int = 0) -> list[dict]:
+    """防御式取某个审计句柄的环形缓冲（拿不到就是空列表，绝不把异常甩给前端）。"""
+    getter = getattr(owner, "events", None)
+    if not callable(getter):
+        return []
+    try:
+        rows = getter(n)
+    except Exception:  # noqa: BLE001 —— 审计读失败不拖垮面板
+        return []
+    return [dict(row) for row in rows] if isinstance(rows, list) else []
+
+
+def _snapshot_of(owner: Any) -> dict:
+    getter = getattr(owner, "snapshot", None)
+    if not callable(getter):
+        return {}
+    try:
+        data = getter()
+    except Exception:  # noqa: BLE001
+        return {}
+    return dict(data) if isinstance(data, dict) else {}
+
+
+@app.get("/api/governance")
+async def get_governance():
+    """治理 / 资源租约 / 控制租约 / job 的**进程内**审计（只读）。
+
+    分开三块，因为它们是三件事：
+      * `governor`：状态治理（卡死即摘掉）——谁卡住、何时、为什么、被谁摘掉；
+      * `resource_lease`：按**资源**分租——谁持有、排队、**抢了谁的什么**；
+      * `control_lease`：底层**控制权**租约（左脑一方；右脑不可持）= 持租人/理由/时限/能力位。
+    """
+    session = orchestrator.session if orchestrator else None
+    if session is None:
+        return {"running": False, "persisted": False, "note":
+                "会话未启动（模组未连接）：没有运行中的治理/租约实例可读；"
+                "这些审计本来就只在进程内，没有历史可翻。",
+                "governor": {}, "resource_lease": {}, "control_lease": {}, "jobs": {}}
+    planner = getattr(session, "planner", None)
+    governor = getattr(session, "state_governor", None)
+    resource_lease = getattr(session, "resource_lease", None)
+    control_lease = getattr(planner, "control_lease", None)
+    jobs = getattr(session, "jobs", None)
+    return {
+        "running": True, "persisted": False, "note": AUDIT_NOTE,
+        "governor": {**_snapshot_of(governor), "ring": GOVERNOR_RING,
+                     "audit": _audit_of(governor)},
+        "resource_lease": {**_snapshot_of(resource_lease), "ring": RESOURCE_LEASE_RING,
+                           "audit": _audit_of(resource_lease)},
+        "control_lease": {**_snapshot_of(control_lease), "ring": CONTROL_LEASE_RING,
+                          "audit": _audit_of(control_lease)},
+        "jobs": {**_snapshot_of(jobs), "ring": JOB_RING},
+    }
+
+
+@app.post("/api/jobs/cancel")
+async def cancel_job(data: dict):
+    """取消一个 job 句柄：走**它自己的取消路径**（`JobRegistry.cancel` → 回调），再标 cancelled。
+
+    句柄列表是只读的 `/api/status` → `jobs`；这里只补一个取消口（附加式）。
+    四样门槛里的「取消路径」在登记时就必须可执行，所以运行中的 job 一定有路径可走。
+    """
+    session = orchestrator.session if orchestrator else None
+    if session is None:
+        raise HTTPException(status_code=409, detail="会话未启动（模组未连接）")
+    registry = getattr(session, "jobs", None)
+    if registry is None:
+        raise HTTPException(status_code=409, detail="本会话没有 job 台账")
+    job_id = str((data or {}).get("id") or "").strip()
+    if not job_id:
+        raise HTTPException(status_code=400, detail="id is required")
+    reason = str((data or {}).get("reason") or "operator cancelled")
+    ok, why = registry.cancel(job_id, reason=reason)
+    return {"status": "ok" if ok else "denied", "reason": why, "job": job_id,
+            "jobs": registry.snapshot()}
+
+
 # ── HTTP 面回捞（附加式）────────────────────────────────────────────────────────
 # master 有、26.3 缺、且**本机真有数据源**的端点全在 `api/http_surface.py` 里：
 # 这里只多做一件"挂上去"的事，上面任何既有路由/启动/鉴权/静态文件逻辑都不动。
