@@ -400,6 +400,42 @@ class Skills:
         return self._send_cmd("remember_route",
                               {"name": str(name), "points": list(points or [])})
 
+    def route_export(self, name: str) -> dict:
+        """向模组**按需**取一条路径的点列（`route_export {name}`，Java 侧一手导出）。
+
+        `state.routes[]` 只报点数（每帧几十 KB 不能塞点列），所以跨重启回灌时先来这里
+        取点列，再用 `remember_route` 灌回去。回执里失败原因逐字对齐 Java：
+        `unknown_route`（没这条）/ `no_geometry`（有点数没坐标）/ `need_name`。
+        **点列不进每帧 state**，只有这一条按需出口。
+        """
+        return self._send_cmd("route_export", {"name": str(name)})
+
+    def define_zone(self, name: str, kind: str = "", x: Optional[float] = None,
+                    y: Optional[float] = None, z: Optional[float] = None,
+                    radius: Optional[float] = None, box: Optional[dict] = None,
+                    protect: Optional[list] = None) -> dict:
+        """声明一个区域：**语义（kind）+ 硬保护（protect）**，硬拦在 Java 侧生效。
+
+        参数名与 Java `ActionExecutor.handleDefineZone` 逐字对齐：`name / kind / x,y,z /
+        radius? / box?{min_x..max_z} / protect[]`（radius = 球；box = 轴对齐长方体，两者都给
+        按 box 判）。缺形状会被 Java 拒（`need_shape`），本地先挡一道。
+        """
+        args: dict[str, Any] = {"name": str(name), "kind": str(kind or "")}
+        for key, value in (("x", x), ("y", y), ("z", z), ("radius", radius)):
+            if value is not None:
+                args[key] = float(value)
+        if isinstance(box, dict):
+            args["box"] = {key: float(box[key]) for key in
+                           ("min_x", "min_y", "min_z", "max_x", "max_y", "max_z")
+                           if key in box}
+        if protect:
+            args["protect"] = [str(item) for item in protect]
+        return self._send_cmd("define_zone", args)
+
+    def clear_zone(self, name: str) -> dict:
+        """删掉一个区域（不存在则 Java 回 `unknown_zone`，如实上报）。"""
+        return self._send_cmd("clear_zone", {"name": str(name)})
+
     # ── 守卫 / HUD 描述词 / 原版命令直通 ────────────────────────
     # 参数名与 Java `ActionExecutor` 逐字对齐（写错不会报错，只会落进 default）：
     #   guard        → x? / y? / z? / radius? / enabled?

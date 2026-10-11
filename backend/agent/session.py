@@ -37,7 +37,9 @@ from .message_db import MessageDB
 from .conversation import ConversationStore, server_key
 from .borrow import BorrowRulesStore, parse_borrow_grant, parse_borrow_revoke
 from .person_memory import PersonMemoryStore
-from .world_memory import WorldMemoryStore, plan_replay
+from .world_memory import WorldMemoryStore, plan_replay, route_args
+from .territory import (TerritoryStore, current_base, home_situation, plan_zone_replay,
+                        point_of)
 from .permissions import CraftPolicy, PermissionsStore, ReplyGate
 from .persona_store import PersonaStore
 from .task_list import TaskList
@@ -209,6 +211,15 @@ class Session:
         # 四层记忆（global / person / server / world）里属于 world 层的两份：
         # 站点、路径（坐标只在同一世界同一维度里有效，见 world_memory）。
         self.places = WorldMemoryStore()
+        # 领地 / 基地 / 容器 / 区域（同样的 world 层分区：坐标只在这里）。
+        self.territories = TerritoryStore()
+        # 回灌时"模组只报点数、后端没几何"的路径 → 记下 route_export 的请求 id，
+        # 等回执（`command_response`）拿到点列再推回去（拿不到就维持 no_geometry）。
+        self._route_exports: dict[str, dict] = {}
+        # 最近被区域硬拦的记录（`blocked_by_zone`）：进 L2 上下文 + 归入任务失败原因。
+        self._zone_blocks: list[dict] = []
+        # "离家多久"的计时（进基地范围就清零；只上报，绝不自己偷跑回去）。
+        self._home_away_since: Optional[float] = None
         # person 层：跨服的"同一个人"稳定事实（uuid 优先，名字兜底 + 降级打标）。
         self.people = PersonMemoryStore()
         # 已回灌/已激活的层标记（`world:<key>` / `server:<key>` / `person:<key>` / global）：
@@ -274,6 +285,8 @@ class Session:
             permissions=self.permissions,
             # 借用规则（对话授权"仓库里的铁可以用"）：计划器只查表，不看 tier 分支。
             borrow_rules=self.borrow_rules,
+            # 领地 / 基地 / 容器 / 区域（world 层分区）：授权判定与回灌都在计划器里。
+            territory=self.territories,
             # 单一指令口 + 私信 + TPA：全部走 session 的方法（规则只在这里实现一次）。
             server_commands=self.run_server_command,
             whisper_sender=self.send_whisper,
@@ -367,6 +380,8 @@ class Session:
                 self._absorb_conversation_namespace(data)
                 # 站点/路径（world 层）：落盘 + 模组侧空了就回灌。
                 self._absorb_places(data)
+                # 领地/基地/容器/区域（同样的 world 层）：区域声明吸收 + 按需回灌。
+                self._absorb_territory(data)
                 # person 层：把在场的人与已认出的 uuid 对上号（只读，不写一次性上下文）。
                 self._absorb_people(data)
                 # 容器内容变了（含归还后的快照）→ 用真实快照核对借用是否真的放回去了。
@@ -384,6 +399,10 @@ class Session:
                 req_id = data.get("id", "?")
                 success = data.get("success", False)
                 self.action_manager.handle_response(req_id, success)
+                # 区域硬拦（`blocked_by_zone`）：如实转达"哪个区域、哪条规则"，并归入任务失败原因。
+                self._note_zone_block(data)
+                # `route_export` 的回执：拿到点列就补存盘并推回去（拿不到维持 no_geometry）。
+                self._absorb_route_export(data)
                 if req_id in self._manual_action_reqs:
                     if success and self._manual_task_kind in {"follow_player", "craft_item", "eat", "collect_blocks", "move_to", "explore", "build"}:
                         self._manual_command_until = max(self._manual_command_until, time.time() + 30.0)
@@ -777,9 +796,205 @@ class Session:
                         key, len(sent_stations), len(sent_routes), len(plan["skipped"]))
         for item in plan["blocked"]:
             logger.info("[Memory] 回灌受阻 %s %s：%s", item["kind"], item["name"], item["reason"])
+        # 只想推、却因为"模组只报了点数（无几何）"推不出去的路径 → **按需**取一次点列
+        # （`route_export {name}`）；拿到就存盘并推回去，拿不到就维持诚实的 no_geometry。
+        self._request_route_exports(plan["blocked"], store)
         self._mark_layer(layer)
         return {"server": key, "replayed": True, "stations": sent_stations,
                 "routes": sent_routes, "skipped": plan["skipped"], "blocked": plan["blocked"]}
+
+    def _request_route_exports(self, blocked: Any, store) -> list[str]:
+        """对"缺几何"的路径发 `route_export`（异步：点列在回执里才拿得到）。
+
+        点列**不进每帧 state** —— 只有这一条按需出口；回执回来后由
+        `_absorb_route_export` 存盘并推 `remember_route`，失败就维持 `no_geometry`。
+        """
+        skills = getattr(self, "skills", None)
+        export = getattr(skills, "route_export", None) if skills is not None else None
+        if not callable(export):
+            return []
+        requested: list[str] = []
+        for item in blocked or []:
+            if not isinstance(item, dict) or item.get("kind") != "route":
+                continue
+            if item.get("reason") != "no_geometry":
+                continue
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            result = export(name) or {}
+            req_id = str(result.get("req_id") or "")
+            if req_id:
+                self._route_exports[req_id] = {"name": name, "namespace": store.namespace}
+                while len(self._route_exports) > 20:
+                    self._route_exports.pop(next(iter(self._route_exports)))
+            requested.append(name)
+        if requested:
+            logger.info("[Memory] 路径缺几何，向模组按需取点列：%s", ", ".join(requested))
+        return requested
+
+    def _absorb_route_export(self, data: dict) -> bool:
+        """`route_export` 的回执：拿到点列就存盘并推回模组，拿不到就维持 no_geometry。"""
+        req_id = str(data.get("id") or "")
+        pending_map = getattr(self, "_route_exports", None)
+        if not pending_map:
+            return False
+        pending = pending_map.pop(req_id, None)
+        if not pending:
+            return False
+        store = getattr(self, "places", None)
+        payload = data.get("data") if isinstance(data.get("data"), dict) else {}
+        name = str(pending.get("name") or payload.get("name") or "")
+        points = payload.get("points")
+        if not bool(data.get("success")) or not isinstance(points, list) or len(points) < 2:
+            reason = str(payload.get("reason") or data.get("error") or "no_geometry")
+            logger.info("[Memory] 路径 '%s' 取不回点列（%s），维持 no_geometry（不编）", name, reason)
+            return False
+        if store is None:
+            return False
+        store.absorb_state({"routes": [{"name": name, "points": points}]})
+        row = store.route(name) or {}
+        args = route_args(row) if isinstance(row, dict) else None
+        if args is None:
+            logger.info("[Memory] 路径 '%s' 的回执点列不完整，没推", name)
+            return False
+        skills = getattr(self, "skills", None)
+        remember = getattr(skills, "remember_route", None) if skills is not None else None
+        if callable(remember):
+            remember(args["name"], args["points"])
+        logger.info("[Memory] 路径 '%s' 取回 %d 个点并灌回模组",
+                    args["name"], len(args["points"]))
+        return True
+
+    # ── 领地 / 基地 / 容器 / 区域（world 层分区）──────────────────
+
+    def _note_zone_block(self, data: dict) -> Optional[dict]:
+        """被区域硬拦（`blocked_by_zone`）→ 记下"哪个区域、哪条规则"，并归入任务失败原因。
+
+        用户口径：「被拦住时**如实上报"哪个区域、哪条保护规则"**」——所以这条要同时
+        进 L2 上下文（下一轮 LLM 事前就不去试）**和**当前任务的 `failure_reason`。
+        """
+        payload = data.get("data") if isinstance(data.get("data"), dict) else {}
+        zone = str(payload.get("blocked_by_zone") or "").strip()
+        if not zone:
+            return None
+        rule = str(payload.get("rule") or "").strip()
+        action = str(payload.get("action") or "").strip()
+        row = {
+            "ts": time.time(),
+            "zone": zone,
+            "rule": rule,
+            "action": action,
+            "reason": f"blocked_by_zone: {zone}(rule={rule}, action={action})",
+            "req_id": str(data.get("id") or ""),
+        }
+        blocks = getattr(self, "_zone_blocks", None)
+        if blocks is None:
+            blocks = self._zone_blocks = []
+        blocks.append(row)
+        del blocks[:-20]
+        self._fail_active_task_for_zone(row)
+        logger.info("[Session] 区域硬拦：区域「%s」规则「%s」（动作 %s）", zone, rule, action)
+        recorder = getattr(self, "_on_security_audit", None)
+        if callable(recorder):
+            try:
+                recorder({"kind": "zone_blocked", "zone": zone, "rule": rule,
+                          "action": action, "req_id": row["req_id"],
+                          "outcome": "blocked"})
+            except Exception as e:  # noqa: BLE001
+                logger.debug("[Session] 区域拦截审计失败: %s", e)
+        return row
+
+    def _fail_active_task_for_zone(self, row: dict) -> None:
+        """把这条拦截归到**当前正在跑的任务**上（失败原因带区域名与规则）。"""
+        tasks = getattr(self, "tasks", None)
+        if tasks is None:
+            return
+        cmd = ""
+        manager = getattr(self, "action_manager", None)
+        current = getattr(manager, "current", None) if manager is not None else None
+        if current is not None:
+            cmd = str(getattr(current, "label", "") or "")
+        if not cmd:
+            cmd = str(getattr(self, "_manual_task_kind", "") or "")
+        target = None
+        for item in tasks.items():
+            if item.status == "active" and (not cmd or item.kind == cmd):
+                target = item
+                break
+        if target is None:
+            for item in tasks.items():
+                if item.status == "active":
+                    target = item
+                    break
+        if target is None:
+            return
+        try:
+            tasks.complete(target.id, success=False, reason=row["reason"])
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[Session] 区域拦截归入任务失败原因失败: %s", e)
+
+    def _absorb_territory(self, data: dict) -> None:
+        """吸收 state 里的 `zones[]`（Java 是硬拦真相）+ 按需把后端存的区域回灌回模组。
+
+        分区与站点/路径完全一致（坐标只在同一世界同一维度有效）：**换服/换世界/换维度
+        各自一份文件，绝不串号**。Java 的 `ZoneGuard` 是内存态、重启即丢，所以后端这份
+        存盘 + 进世界时的幂等回灌才是它不丢的原因。
+        """
+        store = getattr(self, "territories", None)
+        if store is None or not isinstance(data, dict):
+            return None
+        world = data.get("world") if isinstance(data.get("world"), dict) else {}
+        player = data.get("player") if isinstance(data.get("player"), dict) else {}
+        try:
+            store.use_namespace(world.get("server", ""), world.get("world_name", ""),
+                                player.get("dimension", ""))
+            store.absorb_state(data)
+        except Exception as e:
+            logger.warning("[Session] 区域吸收失败: %s", e)
+            return None
+        return self._replay_zones(data, store)
+
+    def _replay_zones(self, data: dict, store) -> dict:
+        """把 world 层的区域声明回灌回模组（同一个 world **只推一次**，幂等）。"""
+        key = store.namespace
+        layer = f"zones:{key}"
+        seen = getattr(self, "_replay_layers", None)
+        if seen is None:
+            seen = self._replay_layers = set()
+        if layer in seen:
+            return {"namespace": key, "replayed": False, "reason": "already_replayed"}
+        saved = store.zones()
+        if not saved:
+            return {"namespace": key, "replayed": False, "reason": "nothing_saved"}
+        if not self.llm_active():
+            return {"namespace": key, "replayed": False, "reason": "not_in_world"}
+        reported = data.get("zones")
+        if not isinstance(reported, list):
+            return {"namespace": key, "replayed": False, "reason": "mod_not_reporting"}
+        report = plan_zone_replay(saved, reported)
+        skills = getattr(self, "skills", None)
+        define = getattr(skills, "define_zone", None) if skills is not None else None
+        sent: list[dict] = []
+        for args in report["zones"]:
+            if callable(define):
+                define(**args)
+                sent.append(args)
+        for row in report["adopted"]:
+            # 只在模组侧存在的区域（Java 是硬拦真相）→ 直接采纳落盘，下次也能回灌。
+            store.set_zone(row.get("zone"), granted_by={"tier": "", "name": ""})
+        if sent:
+            logger.info("[Memory] 回灌区域 %s：%d 条", key, len(sent))
+        for item in report["blocked"]:
+            logger.info("[Memory] 区域回灌受阻 %s：%s", item.get("name"), item.get("reason"))
+        self._mark_layer(layer)
+        return {"namespace": key, "replayed": True, "zones": sent,
+                "skipped": report["skipped"], "blocked": report["blocked"],
+                "adopted": [row["name"] for row in report["adopted"]]}
+
+    def _zone_block_context(self) -> list[dict]:
+        """最近被区域硬拦的记录（进 L2：让 LLM 知道"这里是农场，不能动"）。"""
+        return [dict(row) for row in getattr(self, "_zone_blocks", [])[-5:]]
 
     def _absorb_people(self, data: dict) -> None:
         """把在场玩家与 person 层对上号（**只读**，不写新条目）。
@@ -1859,10 +2074,13 @@ class Session:
             except Exception as e:
                 logger.debug("[Session] 借用欠账读取失败: %s", e)
                 context["borrow_pending"] = ""
-        # 能力位：这一轮是谁在说话（制作/翻箱授权按它查表）；自主轮由 planner 侧改写。
+        # 能力位：这一轮是谁在说话（制作/翻箱/领地授权按它查表）；自主轮由 planner 侧改写。
         actor = getattr(self, "_actor", None) or {}
         context["actor_tier"] = str(actor.get("tier") or "guest")
+        context["actor_name"] = str(actor.get("name") or "")
         context["autonomous"] = False
+        # 领地 / 基地 / 容器 / 区域（world 层）：授权范围 + 当前基地 + 回家事实 + 刚被拦的记录。
+        self._fill_territory_context(context)
 
         # 语境：谁在线、谁刚说过话（以及他说那话时站在哪）、最近的聊天顺序。
         context["players"] = self._players_for_status()
@@ -1890,6 +2108,54 @@ class Session:
                 context["conversation"] = {}
         context["in_world"] = self.llm_active()
         return context
+
+    # ── 领地 / 基地 / 容器 / 区域：进 L2 的动态上下文 ─────────────
+
+    def _fill_territory_context(self, context: dict) -> None:
+        """把领地快照、当前基地、回家事实与刚被拦的记录放进上下文（**只进 L2**）。"""
+        store = getattr(self, "territories", None)
+        if store is None:
+            return
+        try:
+            snapshot = store.snapshot()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[Session] 领地快照读取失败: %s", e)
+            snapshot = {"territories": [], "bases": [], "containers": [], "zones": []}
+        context["territory"] = snapshot
+        player = context.get("player") if isinstance(context.get("player"), dict) else {}
+        position = point_of(player)
+        bases = snapshot.get("bases") or []
+        if position is None or not bases:
+            context["current_base"] = None
+            context["home_status"] = {}
+        else:
+            context["current_base"] = current_base(bases, *position)
+            context["home_status"] = self._home_facts(bases, position)
+        context["zone_blocks"] = self._zone_block_context()
+
+    def _home_facts(self, bases: list, position: tuple) -> dict:
+        """离家多远/多久的**事实**（只上报；回来与否交给 LLM 判断，绝不自己偷跑）。"""
+        inside = current_base(bases, *position)
+        if inside is not None:
+            self._home_away_since = None
+        elif getattr(self, "_home_away_since", None) is None:
+            self._home_away_since = time.time()
+        return home_situation(bases, position[0], position[1], position[2],
+                              away_since=getattr(self, "_home_away_since", None),
+                              now=time.time())
+
+    def _territory_status(self) -> dict:
+        """领地/基地/容器/区域的仪表盘快照（store 在测试替身里可能是空的）。"""
+        store = getattr(self, "territories", None)
+        snapshot: dict = {}
+        if store is not None:
+            try:
+                snapshot = store.snapshot()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("[Session] 领地快照读取失败: %s", e)
+                snapshot = {}
+        snapshot["zone_blocks"] = self._zone_block_context()
+        return snapshot
 
     def _players_count(self) -> int:
         """在线人数（决定窗口口径：单人/私聊 60，多人 40）。"""
@@ -2528,6 +2794,8 @@ class Session:
                 "ledger": self._borrow_ledger_status(),
                 "rule_audit": list(getattr(self, "_borrow_rule_audit", []) or [])[-10:],
             },
+            # 领地 / 基地 / 容器 / 区域（world 层分区）+ 最近的区域硬拦记录。
+            "territory": self._territory_status(),
             # 主动参与：最近注入的事件及结果（含 no_action）。
             "events": {
                 "recent": list(getattr(self, "_event_audit", []) or [])[-10:],

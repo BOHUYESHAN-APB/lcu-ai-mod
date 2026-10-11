@@ -23,6 +23,9 @@ from .craft import (ContainerPick, armor_in_containers, clamp_take, describe_mis
                     evaluate_craft, is_armor, normalize_item, route_containers)
 from .llm_service import prompt_version, render_persona_triple
 from .permissions import CraftPolicy, TIER_GUEST
+from .territory import (POLICY_BORROW_ONLY, POLICY_FREE, POLICY_NO_TOUCH,
+                        bed_attempt, bed_note, current_base,
+                        normalize_grants, normalize_policy, point_of)
 
 logger = logging.getLogger("planner")
 TOOL_CALL_RE = re.compile(r"tool\(\s*([a-zA-Z_]+)\s*,\s*(\{.*?\})\s*\)", re.DOTALL)
@@ -122,6 +125,23 @@ ACTION_GROUPS: dict[str, tuple[tuple[str, str, str], ...]] = {
     "memory": (
         ("remember_poi", "name,category,x,y,z", "记住当前位置"),
     ),
+    "territory": (
+        ("list_territory", "", "列出领地/基地/容器及其授权与保护项"),
+        ("grant_territory", "name,kind,radius,grants",
+         "把这片区域的所有权授予我（master；grants=take,place,break,farm,store）"),
+        ("revoke_territory", "name", "收回领地的所有权"),
+        ("set_base", "name,kind,radius,x,y,z", "设/更新一个基地（省坐标＝脚下）"),
+        ("del_base", "name", "删掉一个基地"),
+        ("remember_container", "name,x,y,z,kind,policy",
+         "记住箱子的确切位置与策略（free随取|borrow_only传递|no_touch不碰）"),
+        ("grant_container", "name,policy", "给箱子设/改访问策略（friend 只能给自己的，且只到传递）"),
+        ("revoke_container", "name", "收回箱子的访问授权（立即生效）"),
+        ("define_zone", "name,kind,x,y,z,radius,protect",
+         "声明区域语义与硬保护（protect=animals,crops,blocks,containers）"),
+        ("clear_zone", "name", "删掉一个区域"),
+        ("set_home", "base", "在基地范围内自己找床；找不到就自己造（缺料/不安全如实报）"),
+        ("go_home", "base", "回基地的床位（没床就回锚点）"),
+    ),
 }
 
 # task_state.kind → 阶段
@@ -136,11 +156,11 @@ _KIND_TO_PHASE = {
 # night / guard / hud / memory 全局注入：睡觉、守点、HUD 描述词与记忆点在任何阶段
 # 都可能有意义（用户说"在这儿守着"时他可能正在看着 AI 挖矿）。
 PHASE_GROUPS: dict[str, tuple[str, ...]] = {
-    "idle": ("move", "locate", "gather", "craft", "container", "guard", "items", "survive", "combat", "hud", "night", "server", "memory"),
-    "travel": ("move", "locate", "combat", "guard", "items", "container", "survive", "hud", "night", "server", "memory"),
-    "gather": ("move", "locate", "gather", "guard", "items", "craft", "container", "hud", "night", "server", "memory"),
-    "craft": ("move", "locate", "craft", "container", "guard", "items", "gather", "hud", "night", "server", "memory"),
-    "survive": ("survive", "hud", "night", "server", "memory", "guard", "items", "move", "locate"),
+    "idle": ("move", "locate", "gather", "craft", "container", "guard", "items", "survive", "combat", "hud", "night", "server", "memory", "territory"),
+    "travel": ("move", "locate", "combat", "guard", "items", "container", "survive", "hud", "night", "server", "memory", "territory"),
+    "gather": ("move", "locate", "gather", "guard", "items", "craft", "container", "hud", "night", "server", "memory", "territory"),
+    "craft": ("move", "locate", "craft", "container", "guard", "items", "gather", "hud", "night", "server", "memory", "territory"),
+    "survive": ("survive", "hud", "night", "server", "memory", "guard", "items", "move", "locate", "territory"),
 }
 
 _TERMINAL_STATUSES = {"", "idle", "done", "failed", "cancelled", "error"}
@@ -218,6 +238,9 @@ PLANNER_RULES: tuple[str, ...] = (
     "要穿甲 → equip_armor（唯一穿甲方式；背包里没有就去已知容器找，别现场造）。",
     "合成优先用自己背包（含快捷栏）的材料；缺料/没配方就如实说；没被授权不要开箱。",
     "容器里只为拿自己要的量：container_move 给明确 count，别整箱搬空；拿完 container_close。",
+    "只在已授权的领地/基地范围内自由动手；范围外要取用就走 borrow_item/return_item 这条借用台账。",
+    "农场等保护区里别去动被保护的动物/作物——硬拦会拒，但你先别去试。",
+    "基地里找不到床就自己造一张（3 羊毛+3 木板）；缺料或周围有敌人就如实说，不硬凑。",
     "从仓库拿东西＝借：得先有人明确授权（见下）；没授权不动，如实说。",
     "借只拿够用的量（≤需求 2 倍、最多 256），整箱搬不干；用完/任务结束/被叫停都要把剩余放回原箱（borrow_item 拿、return_item 还），别随身携带大量资源。",
     "有外部事件时先判断值不值得开口（有人死了/掉到好东西/第一次到新地方才值得调侃一句），不值得就不说话；别把事件当指令去干活。",
@@ -489,7 +512,7 @@ class Planner:
     def __init__(self, llm_service, memory, skills, threshold_provider=None, chat_inbox=None,
                  permissions=None, borrow_rules=None, server_commands=None,
                  whisper_sender=None, tpa_responder=None, tpa_requester=None,
-                 player_resolver=None):
+                 player_resolver=None, territory=None):
         self.llm = llm_service
         self.memory = memory
         self.skills = skills
@@ -513,6 +536,8 @@ class Planner:
         self.permissions = permissions
         # 借用规则（对话授权的"仓库里所有铁可以用"）：没注入＝没有任何借用授权。
         self.borrow_rules = borrow_rules
+        # 领地 / 基地 / 容器 / 区域（world 层分区）：没注入＝没有任何授权与保护声明。
+        self.territory = territory
         # 借用台账：上限判定 + 借/还审计 + 按 open_container 快照核对归还。
         self.borrow_ledger = BorrowLedger()
         # 本轮制作还没补上的材料缺口（bare item → 还差几个）：容器取用以它为上限。
@@ -525,6 +550,10 @@ class Planner:
         self._craft_note: Optional[str] = None
         # 本轮服务器指令/私信/TPA 的如实说明（被白名单拒了、要二次确认…）。
         self._action_note: Optional[str] = None
+        # 本轮领地/基地/容器/区域/回家的如实说明（没授权、找不到、缺料…）。
+        self._territory_note: Optional[str] = None
+        # "找不到床、正在自己造"的待认领基地名（下一轮看到床边就认成 home_bed）。
+        self._pending_home_bed_base: Optional[str] = None
         # L1 版本键 + 上一次组装的 L0+L1 字符串：键不变就复用**同一份字符串**
         # （前缀缓存友好）；L3 工具 schema 按阶段各建一次（M3-3 的阶段过滤继续生效）。
         self._system_key: Optional[str] = None
@@ -559,6 +588,9 @@ class Planner:
         # 本轮的"如实说明"也从零开始（缺料/没授权这类话不能串轮）。
         self._craft_note = None
         self._action_note = None
+        self._territory_note = None
+        # 上一轮在造床、这一轮看到床边了 → 认成 home_bed（§8 造 + 放 + 认领）。
+        self._claim_pending_home_bed(context)
 
         try:
             # 第一阶段：planner 结合状态产出候选动作（JSON）。
@@ -632,7 +664,7 @@ class Planner:
         与一条"指令被拒/要确认"的说明 —— 都不许编，有什么说什么。
         """
         text = self._with_locate_note(reply)
-        for note in (self._craft_note, self._action_note):
+        for note in (self._craft_note, self._action_note, self._territory_note):
             if not note:
                 continue
             text = f"{text}\n{note}" if text else note
@@ -786,6 +818,8 @@ class Planner:
         known_poi_text = (context.get("known_poi") or "").strip() if isinstance(context, dict) else ""
         if not known_poi_text:
             known_poi_text = "暂无"
+
+        territory_text = self._render_territory(context)
 
         # 借用授权（L1，见 `_render_borrow_authorization`）+ 当前欠账（L2：每轮都变）。
         borrow_pending_text = (context.get("borrow_pending") or "").strip() if isinstance(context, dict) else ""
@@ -1007,6 +1041,8 @@ class Planner:
 
 已知箱子（历史记忆，可能不在当前视野内）：
 {known_poi_text}
+
+{territory_text}
 
 时间与睡眠：
 - 现在是{night_text}（sky_darken={sky_darken_text}，{sleepable_text}）；day_time={day_time_text}
@@ -1562,6 +1598,30 @@ class Planner:
             result = self.tpa_requester(str(player))
             self._action_note = self._server_command_note("主动传送请求", result)
             return bool(result.get("ok"))
+        elif tool_name == "list_territory":
+            return self._dispatch_list_territory(context)
+        elif tool_name == "grant_territory":
+            return self._dispatch_grant_territory(payload, context)
+        elif tool_name == "revoke_territory":
+            return self._dispatch_revoke_territory(payload, context)
+        elif tool_name == "set_base":
+            return self._dispatch_set_base(payload, context)
+        elif tool_name == "del_base":
+            return self._dispatch_del_base(payload, context)
+        elif tool_name == "remember_container":
+            return self._dispatch_remember_container(payload, context)
+        elif tool_name == "grant_container":
+            return self._dispatch_grant_container(payload, context)
+        elif tool_name == "revoke_container":
+            return self._dispatch_revoke_container(payload, context)
+        elif tool_name == "define_zone":
+            return self._dispatch_define_zone(payload, context)
+        elif tool_name == "clear_zone":
+            return self._dispatch_clear_zone(payload, context)
+        elif tool_name == "set_home":
+            return self._dispatch_set_home(payload, context)
+        elif tool_name == "go_home":
+            return self._dispatch_go_home(payload, context)
         elif tool_name == "stop":
             self.skills.stop_all()
             return True
@@ -1717,9 +1777,18 @@ class Planner:
         return True
 
     def _dispatch_container_move(self, payload: dict, context: dict) -> bool:
-        """容器取用：必须获授权，且**用多少取多少**（有缺口登记时绝不超、绝不整组搬空）。"""
+        """容器取用：必须获授权，且**用多少取多少**（有缺口登记时绝不超、绝不整组搬空）。
+
+        先看这个箱子登记的策略：`no_touch` 一律不许动；`free`（所有权已交给它）随取、
+        不记欠账；剩下的（`borrow_only` / 没登记）落回借用台账那条保守路径。
+        """
+        cpolicy, crow = self._container_policy(context)
+        if cpolicy == POLICY_NO_TOUCH:
+            self._craft_note = self._container_policy_note(crow)
+            logger.info("[Planner] container_move 被拒：no_touch %s", (crow or {}).get("name"))
+            return False
         policy = self._craft_policy(context)
-        if not policy.may_open_containers:
+        if not policy.may_open_containers and cpolicy != POLICY_FREE:
             self._craft_note = self._auth_note(policy, "翻箱子")
             logger.info("[Planner] container_move 被拒：%s", policy.reason)
             return False
@@ -1762,6 +1831,13 @@ class Planner:
                 logger.info("[Planner] container_move 被拒：%d > 缺口 %d", count, total)
                 return False
         self._record_take(item_id or f"slot:{from_slot}", count or 0, from_slot, to_slot)
+        if cpolicy == POLICY_FREE:
+            # 所有权已经交给它：随取，不记欠账 —— 但**仍记审计**（"这铁怎么没了"要能查）。
+            store = self._territory_store()
+            if store is not None:
+                store.audit("take_free", target=str((crow or {}).get("name") or ""),
+                            details={"item": item_id or f"slot:{from_slot}",
+                                     "count": count, "from_slot": from_slot})
         self.skills.container_move(from_slot, to_slot, count)
         logger.info("[Planner] 容器取用 %s x%s（slot %s → %s）",
                     item_id or "?", count if count else "整组", from_slot, to_slot if to_slot is not None else "快速移动")
@@ -1769,8 +1845,12 @@ class Planner:
 
     def _dispatch_container_click(self, payload: dict, context: dict) -> bool:
         """点容器里的一格（"点容器找盔甲"）：同样是容器操作，没授权不动。"""
+        cpolicy, crow = self._container_policy(context)
+        if cpolicy == POLICY_NO_TOUCH:
+            self._craft_note = self._container_policy_note(crow)
+            return False
         policy = self._craft_policy(context)
-        if not policy.may_open_containers:
+        if not policy.may_open_containers and cpolicy != POLICY_FREE:
             self._craft_note = self._auth_note(policy, "翻箱子")
             logger.info("[Planner] container_click 被拒：%s", policy.reason)
             return False
@@ -1790,6 +1870,34 @@ class Planner:
         ctx = context if isinstance(context, dict) else {}
         container = ctx.get("open_container")
         return container if isinstance(container, dict) else {}
+
+    def _container_policy(self, context: dict) -> tuple[str, Optional[dict]]:
+        """当前这个箱子登记的策略（free / borrow_only / no_touch）。
+
+        用户口径：「范围决定在哪动手，容器策略决定哪个箱子能动」——先按名字（title/name）
+        对，再按坐标对（打开的快照带 x/y/z 时），对不上就是**没登记**（一律落回借用台账那条
+        保守路径）。
+        """
+        store = self._territory_store()
+        if store is None:
+            return "", None
+        container = self._open_container(context)
+        name = str(container.get("title") or container.get("name") or "").strip()
+        row = store.container(name) if name else None
+        if row is None:
+            try:
+                if all(isinstance(container.get(axis), (int, float))
+                       and not isinstance(container.get(axis), bool)
+                       for axis in ("x", "y", "z")):
+                    row = store.container_by_position(container.get("x"), container.get("y"),
+                                                      container.get("z"))
+            except (TypeError, ValueError):
+                row = None
+        return (str((row or {}).get("policy") or ""), row)
+
+    def _container_policy_note(self, row: Optional[dict]) -> str:
+        name = str((row or {}).get("name") or "这个箱子")
+        return f"（「{name}」是 no_touch：什么都不许动）"
 
     def _borrow_grant(self, item: str) -> Optional[dict]:
         """这件物品有没有被口头授权借用（查规则记忆；没权限表来源 → 一律没有）。"""
@@ -1837,7 +1945,12 @@ class Planner:
         台账 —— 用完/任务结束/被叫停时由 `settle_borrows` 自动放回并核对。
         """
         policy = self._craft_policy(context)
-        if not policy.may_open_containers:
+        cpolicy, crow = self._container_policy(context)
+        if cpolicy == POLICY_NO_TOUCH:
+            self._craft_note = self._container_policy_note(crow)
+            logger.info("[Planner] borrow_item 被拒：no_touch %s", (crow or {}).get("name"))
+            return False
+        if not policy.may_open_containers and cpolicy != POLICY_FREE:
             self._craft_note = self._auth_note(policy, "翻箱子")
             logger.info("[Planner] borrow_item 被拒：%s", policy.reason)
             return False
@@ -2057,6 +2170,534 @@ class Planner:
     def borrow_note(self) -> str:
         """借出未还的摘要（prompt 用）。"""
         return self.borrow_ledger.describe()
+
+    # ── 领地 / 基地 / 容器 / 区域 / 回家（world 层；授权全查表） ────
+
+    def _actor_of(self, context: dict) -> tuple[str, str]:
+        """这一轮的动手人（tier + 名字）：优先显式 `actor_*`，退回最近发话者。"""
+        ctx = context if isinstance(context, dict) else {}
+        speaker = ctx.get("last_speaker") if isinstance(ctx.get("last_speaker"), dict) else {}
+        name = str(ctx.get("actor_name") or speaker.get("name") or "").strip()
+        tier = str(ctx.get("actor_tier") or TIER_GUEST).strip().lower() or TIER_GUEST
+        return tier, name
+
+    @staticmethod
+    def _player_pos(context: dict) -> Optional[tuple[float, float, float]]:
+        """玩家当前坐标（缺一个轴就不猜，返回 None）。"""
+        player = (context or {}).get("player") if isinstance(context, dict) else None
+        player = player if isinstance(player, dict) else {}
+        try:
+            if any(not isinstance(player.get(axis), (int, float))
+                   or isinstance(player.get(axis), bool) for axis in ("x", "y", "z")):
+                return None
+            return (float(player["x"]), float(player["y"]), float(player["z"]))
+        except (TypeError, ValueError):
+            return None
+
+    def _may(self, kind: str, context: dict) -> tuple[bool, str]:
+        """查权限表：`kind` = territory | zones。没权限表来源 → 一律不放行。"""
+        tier, _ = self._actor_of(context)
+        store = self.permissions
+        if store is None:
+            return False, "no_permissions"
+        try:
+            allowed = (store.can_authorize_territory(tier) if kind == "territory"
+                       else store.can_define_zones(tier))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[Planner] %s 权限查询失败: %s", kind, exc)
+            return False, "no_permissions"
+        return (True, "granted") if allowed else (False, "tier_not_allowed")
+
+    def _no_authority_note(self, what: str, context: dict) -> str:
+        tier, name = self._actor_of(context)
+        who = f"{name}（{tier}）" if name else tier
+        return f"（{who} 没资格{what}，我没动）"
+
+    def _territory_store(self):
+        return self.territory
+
+    def _base_by_name(self, name: Any, context: dict) -> Optional[dict]:
+        store = self._territory_store()
+        if store is None:
+            return None
+        clean = str(name or "").strip()
+        if clean:
+            return store.base(clean)
+        pos = self._player_pos(context)
+        if pos is not None:
+            inside = current_base(store.bases(), *pos)
+            if inside is not None:
+                return inside
+        bases = store.bases()
+        return bases[0] if len(bases) == 1 else None
+
+    def _dispatch_list_territory(self, context: dict) -> bool:
+        """列出手上的授权与保护项（诚实清单：没有就说没有）。"""
+        store = self._territory_store()
+        if store is None:
+            self._territory_note = "（我这边还没有领地/基地/容器的记录）"
+            return False
+        snapshot = store.snapshot()
+        parts: list[str] = []
+        for base in snapshot["bases"]:
+            anchor = point_of(base.get("anchor")) or (0.0, 0.0, 0.0)
+            bed = point_of(base.get("home_bed"))
+            where = f"({anchor[0]:.0f},{anchor[1]:.0f},{anchor[2]:.0f})"
+            bed_text = f"，床位 ({bed[0]:.0f},{bed[1]:.0f},{bed[2]:.0f})" if bed else "，还没找床"
+            parts.append(f"基地 {base.get('name')}（{base.get('kind')}）{where} 半径"
+                         f"{float(base.get('radius') or 0):.0f}{bed_text}")
+        for row in snapshot["territories"]:
+            parts.append(f"领地 {row.get('name')}：授权 {'/'.join(normalize_grants(row.get('grants')))}")
+        for row in snapshot["containers"]:
+            parts.append(f"容器 {row.get('name')}（{row.get('policy')}）"
+                         f"@({float(row.get('x') or 0):.0f},{float(row.get('y') or 0):.0f},"
+                         f"{float(row.get('z') or 0):.0f})")
+        for row in snapshot["zones"]:
+            protect = "/".join(str(item) for item in (row.get("protect") or [])) or "无保护项"
+            parts.append(f"区域 {row.get('name')}（{row.get('kind')}）：保护 {protect}")
+        if not parts:
+            self._territory_note = "（还没有任何领地、基地、容器或区域）"
+            return True
+        self._territory_note = "（已知：" + "；".join(parts) + "）"
+        return True
+
+    def _dispatch_grant_territory(self, payload: dict, context: dict) -> bool:
+        """把一片区域的所有权授予它（**只有 master**）。"""
+        allowed, reason = self._may("territory", context)
+        if not allowed:
+            self._territory_note = self._no_authority_note("把一片地的所有权交给我", context)
+            return False
+        store = self._territory_store()
+        if store is None:
+            self._territory_note = "（没有领地存储，我记不下来）"
+            return False
+        pos = self._player_pos(context)
+        x = _as_optional_float(payload.get("x"))
+        y = _as_optional_float(payload.get("y"))
+        z = _as_optional_float(payload.get("z"))
+        if x is None or y is None or z is None:
+            if pos is None:
+                self._territory_note = "（不知道这片地在哪，也没给坐标，我没记）"
+                return False
+            x, y, z = pos
+        radius = _as_optional_float(payload.get("radius"))
+        row = store.set_territory(
+            payload.get("name"), kind=str(payload.get("kind") or ""), x=x, y=y, z=z,
+            radius=radius, grants=payload.get("grants"), granted_by=self._granted_by(context))
+        if row is None:
+            self._territory_note = "（领地得有名字和形状（半径），这条没记）"
+            return False
+        grants = "/".join(normalize_grants(row.get("grants"))) or "无"
+        self._territory_note = (f"（记下了领地「{row['name']}」，这一片由我自己使唤，"
+                                f"授权：{grants}）")
+        logger.info("[Planner] 领地授权 %s：%s", row.get("name"), row.get("grants"))
+        return True
+
+    def _dispatch_revoke_territory(self, payload: dict, context: dict) -> bool:
+        allowed, _ = self._may("territory", context)
+        if not allowed:
+            self._territory_note = self._no_authority_note("收回领地授权", context)
+            return False
+        store = self._territory_store()
+        name = str(payload.get("name") or "").strip()
+        if store is None or not name:
+            self._territory_note = "（要收回哪块地得说清名字）"
+            return False
+        removed = store.revoke_territory(name)
+        if removed is None:
+            self._territory_note = f"（没有叫「{name}」的领地）"
+            return False
+        self._territory_note = f"（已收回领地「{name}」，立刻生效）"
+        return True
+
+    def _dispatch_set_base(self, payload: dict, context: dict) -> bool:
+        allowed, _ = self._may("territory", context)
+        if not allowed:
+            self._territory_note = self._no_authority_note("设基地", context)
+            return False
+        store = self._territory_store()
+        name = str(payload.get("name") or "").strip()
+        if store is None or not name:
+            self._territory_note = "（基地得有个名字）"
+            return False
+        pos = self._player_pos(context)
+        x = _as_optional_float(payload.get("x"))
+        y = _as_optional_float(payload.get("y"))
+        z = _as_optional_float(payload.get("z"))
+        if x is None or y is None or z is None:
+            if pos is None:
+                self._territory_note = "（不知道锚点，也没给坐标，基地没设）"
+                return False
+            x, y, z = pos
+        radius = _as_optional_float(payload.get("radius"))
+        row = store.set_base(name, kind=str(payload.get("kind") or "base"),
+                             anchor={"x": x, "y": y, "z": z},
+                             radius=radius if radius is not None else 32.0,
+                             granted_by=self._granted_by(context))
+        if row is None:
+            self._territory_note = "（基地的锚点/半径不合法，没设）"
+            return False
+        self._territory_note = (f"（基地「{row['name']}」设在 ({x:.0f},{y:.0f},{z:.0f})，"
+                                f"半径 {float(row['radius']):.0f}）")
+        return True
+
+    def _dispatch_del_base(self, payload: dict, context: dict) -> bool:
+        allowed, _ = self._may("territory", context)
+        if not allowed:
+            self._territory_note = self._no_authority_note("删基地", context)
+            return False
+        store = self._territory_store()
+        name = str(payload.get("name") or "").strip()
+        if store is None or not name:
+            self._territory_note = "（要删哪个基地得说清名字）"
+            return False
+        removed = store.del_base(name)
+        if removed is None:
+            self._territory_note = f"（没有叫「{name}」的基地）"
+            return False
+        self._territory_note = f"（已删掉基地「{name}」）"
+        return True
+
+    def _granted_by(self, context: dict) -> dict:
+        tier, name = self._actor_of(context)
+        return {"tier": tier, "name": name}
+
+    def _dispatch_remember_container(self, payload: dict, context: dict) -> bool:
+        """**记住某个箱子的确切位置** + 访问策略（friend 只能标自己的，且只到传递权）。"""
+        return self._container_grant(payload, context, require_existing=False)
+
+    def _dispatch_grant_container(self, payload: dict, context: dict) -> bool:
+        return self._container_grant(payload, context, require_existing=True)
+
+    def _container_grant(self, payload: dict, context: dict, *, require_existing: bool) -> bool:
+        store = self._territory_store()
+        tier, actor = self._actor_of(context)
+        name = str(payload.get("name") or "").strip()
+        if store is None or not name:
+            self._territory_note = "（要给哪个箱子设策略得说清名字）"
+            return False
+        existing = store.container(name)
+        if require_existing and existing is None:
+            self._territory_note = f"（还没记住「{name}」在哪，先告诉我它的坐标）"
+            return False
+        owner = str(payload.get("owner") or "").strip()
+        if not owner:
+            owner = str((existing or {}).get("owner") or actor or "")
+        if (existing or {}).get("owner") and tier != "master":
+            # friend 不能借重新登记把别人的箱子划到自己名下。
+            owner = str(existing.get("owner"))
+        policy = normalize_policy(payload.get("policy"), default=POLICY_BORROW_ONLY)
+        permissions = self.permissions
+        if permissions is None:
+            self._territory_note = "（没有权限表，我不能给容器设策略）"
+            return False
+        try:
+            decision = permissions.container_grant_policy(tier, actor=actor, owner=owner,
+                                                          policy=policy)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[Planner] 容器授权查询失败: %s", exc)
+            decision = {"ok": False, "reason": "no_permissions", "policy": "", "clamped": False}
+        if not decision.get("ok"):
+            why = {
+                "tier_not_allowed": f"{actor or tier} 没资格给我设容器的取用策略",
+                "not_owner": "friend 只能标**自己的**箱子，这个不是你的",
+            }.get(str(decision.get("reason")), "这条授权不成立")
+            self._territory_note = f"（{why}，我没记）"
+            logger.info("[Planner] 容器授权被拒：%s（%s）", name, decision.get("reason"))
+            return False
+        final_policy = str(decision.get("policy") or POLICY_BORROW_ONLY)
+        if require_existing:
+            row = store.set_container_policy(name, final_policy,
+                                             granted_by=self._granted_by(context))
+        else:
+            pos = self._player_pos(context)
+            x = _as_optional_float(payload.get("x"))
+            y = _as_optional_float(payload.get("y"))
+            z = _as_optional_float(payload.get("z"))
+            if x is None or y is None or z is None:
+                if pos is None:
+                    self._territory_note = "（得给我这个箱子的确切坐标，我才能记住）"
+                    return False
+                x, y, z = pos
+            row = store.remember_container(
+                name, x=x, y=y, z=z, kind=str(payload.get("kind") or "chest"),
+                policy=final_policy, owner=owner,
+                granted_by=self._granted_by(context))
+        if row is None:
+            self._territory_note = "（这个箱子的信息不完整，我没记）"
+            return False
+        tail = ""
+        if decision.get("clamped"):
+            tail = "；你要的随取权超了 friend 的授权，我按传递权（借了要还）记"
+        policy_text = {"free": "随取（所有权已交给我）",
+                       "borrow_only": "只能借（借多少还多少）",
+                       "no_touch": "不许碰"}.get(row["policy"], row["policy"])
+        self._territory_note = (f"（记住了箱子「{row['name']}」@({row['x']:.0f},{row['y']:.0f},"
+                                f"{row['z']:.0f})，策略：{policy_text}{tail}）")
+        logger.info("[Planner] 容器策略 %s → %s", row["name"], row["policy"])
+        return True
+
+    def _dispatch_revoke_container(self, payload: dict, context: dict) -> bool:
+        """收回箱子的访问授权（**立即生效**）：master 任意，friend 只能收回自己的。"""
+        store = self._territory_store()
+        name = str(payload.get("name") or "").strip()
+        if store is None or not name:
+            self._territory_note = "（要收回哪个箱子得说清名字）"
+            return False
+        tier, actor = self._actor_of(context)
+        existing = store.container(name)
+        if existing is None:
+            self._territory_note = f"（没有叫「{name}」的容器授权）"
+            return False
+        permissions = self.permissions
+        if permissions is None or not permissions.can_authorize_containers(tier):
+            self._territory_note = self._no_authority_note("收回容器授权", context)
+            return False
+        if tier != "master" and str(existing.get("owner") or "").casefold() != actor.casefold():
+            self._territory_note = "（friend 只能收回自己箱子的授权，这个不是你的）"
+            return False
+        removed = store.revoke_container(name)
+        if removed is None:
+            self._territory_note = f"（没有叫「{name}」的容器授权）"
+            return False
+        self._territory_note = f"（已收回箱子「{name}」的访问授权，立刻生效）"
+        return True
+
+    def _dispatch_define_zone(self, payload: dict, context: dict) -> bool:
+        """声明区域：**语义 + 硬保护**（调 Java 硬拦，同时 world 层存盘以便回灌）。"""
+        allowed, _ = self._may("zones", context)
+        if not allowed:
+            self._territory_note = self._no_authority_note("声明区域保护", context)
+            return False
+        store = self._territory_store()
+        position = self._player_pos(context)
+        x = _as_optional_float(payload.get("x"))
+        y = _as_optional_float(payload.get("y"))
+        z = _as_optional_float(payload.get("z"))
+        if x is None or y is None or z is None:
+            if position is None:
+                self._territory_note = "（区域得有中心坐标）"
+                return False
+            x, y, z = position
+        radius = _as_optional_float(payload.get("radius"))
+        box = payload.get("box") if isinstance(payload.get("box"), dict) else None
+        if radius is None and box is None:
+            self._territory_note = "（区域得有形状：给半径或 box）"
+            return False
+        if radius is not None and radius <= 0:
+            self._territory_note = "（半径得是正数）"
+            return False
+        protect = payload.get("protect")
+        row = store.set_zone({
+            "name": str(payload.get("name") or "").strip(),
+            "kind": str(payload.get("kind") or "").strip().lower(),
+            "center": {"x": x, "y": y, "z": z},
+            "radius": radius,
+            "box": box,
+            "protect": protect,
+        }, granted_by=self._granted_by(context)) if store is not None else None
+        if row is None:
+            self._territory_note = "（区域得有名字和形状，这条没记）"
+            return False
+        zone_args = {"name": row["name"], "kind": str(row.get("kind") or "")}
+        zone_args.update({"x": x, "y": y, "z": z})
+        if radius is not None:
+            zone_args["radius"] = radius
+        if box is not None:
+            zone_args["box"] = box
+        if row.get("protect"):
+            zone_args["protect"] = list(row["protect"])
+        skills = getattr(self, "skills", None)
+        define = getattr(skills, "define_zone", None) if skills is not None else None
+        if callable(define):
+            define(**zone_args)
+        protect_text = "/".join(str(item) for item in (row.get("protect") or [])) or "无"
+        self._territory_note = (f"（已声明区域「{row['name']}」（{row.get('kind') or 'protect'}），"
+                                f"保护：{protect_text}；这儿的这些动作会被硬拦）")
+        logger.info("[Planner] 区域声明 %s protect=%s", row["name"], row.get("protect"))
+        return True
+
+    def _dispatch_clear_zone(self, payload: dict, context: dict) -> bool:
+        allowed, _ = self._may("zones", context)
+        if not allowed:
+            self._territory_note = self._no_authority_note("删除区域保护", context)
+            return False
+        store = self._territory_store()
+        name = str(payload.get("name") or "").strip()
+        if store is None or not name:
+            self._territory_note = "（要删哪个区域得说清名字）"
+            return False
+        removed = store.clear_zone(name)
+        skills = getattr(self, "skills", None)
+        clear = getattr(skills, "clear_zone", None) if skills is not None else None
+        if callable(clear):
+            clear(name)
+        if removed is None:
+            self._territory_note = f"（本地没有叫「{name}」的区域，已让模组删除）"
+            return True
+        self._territory_note = f"（已删除区域「{name}」）"
+        return True
+
+    @staticmethod
+    def _bed_in_base(base: dict, beds: Any) -> Optional[tuple[float, float, float]]:
+        """基地半径内的床（按锚点距离筛，取最近的一张）。"""
+        anchor = point_of(base.get("anchor"))
+        radius = base.get("radius")
+        if anchor is None or not isinstance(radius, (int, float)):
+            return None
+        best: Optional[tuple[float, tuple[float, float, float]]] = None
+        for bed in beds or []:
+            if not isinstance(bed, dict):
+                continue
+            x, y, z = bed.get("x"), bed.get("y"), bed.get("z")
+            if any(not isinstance(value, (int, float)) or isinstance(value, bool)
+                   for value in (x, y, z)):
+                continue
+            distance = ((float(x) - anchor[0]) ** 2 + (float(y) - anchor[1]) ** 2
+                        + (float(z) - anchor[2]) ** 2) ** 0.5
+            if distance > float(radius):
+                continue
+            if best is None or distance < best[0]:
+                best = (distance, (float(x), float(y), float(z)))
+        return best[1] if best is not None else None
+
+    def _claim_pending_home_bed(self, context: dict) -> None:
+        """上一轮在造床、这一轮床边出现了 → 认成 `home_bed`（造 + 放 + 认领的最后一步）。"""
+        name = self._pending_home_bed_base
+        store = self._territory_store()
+        if not name or store is None:
+            return
+        base = store.base(name)
+        if base is None:
+            self._pending_home_bed_base = None
+            return
+        bed = self._bed_in_base(base, (context or {}).get("nearby_beds"))
+        if bed is None:
+            return
+        row = store.set_home_bed(name, {"x": bed[0], "y": bed[1], "z": bed[2]})
+        self._pending_home_bed_base = None
+        if row is not None:
+            self._territory_note = (f"（床造好了，认成基地「{name}」的床位 "
+                                    f"({bed[0]:.0f},{bed[1]:.0f},{bed[2]:.0f})，以后回这儿睡）")
+
+    def _dispatch_set_home(self, payload: dict, context: dict) -> bool:
+        """在基地范围内**自己找床**；找不到就**自己造**（缺料/不安全如实报，不硬凑）。"""
+        store = self._territory_store()
+        if store is None:
+            self._territory_note = "（没有基地/领地记录，先给我设一个基地）"
+            return False
+        base = self._base_by_name(payload.get("base"), context)
+        if base is None:
+            self._territory_note = "（不知道是哪个基地：先设一个基地，或说清名字）"
+            return False
+        bed = self._bed_in_base(base, (context or {}).get("nearby_beds"))
+        if bed is not None:
+            store.set_home_bed(base["name"], {"x": bed[0], "y": bed[1], "z": bed[2]})
+            self._territory_note = (f"（在基地「{base['name']}」里找到床 "
+                                    f"({bed[0]:.0f},{bed[1]:.0f},{bed[2]:.0f})，记成床位）")
+            return True
+        decision = bed_attempt((context or {}).get("inventory"), (context or {}).get("entities"))
+        if decision.get("action") == "craft":
+            skills = getattr(self, "skills", None)
+            craft = getattr(skills, "craft_via_recipe", None) if skills is not None else None
+            if callable(craft):
+                craft("white_bed", 1)
+            self._pending_home_bed_base = str(base["name"])
+            self._territory_note = f"（基地「{base['name']}」里没床，材料够，我造一张）"
+            return True
+        self._territory_note = bed_note(decision)
+        logger.info("[Planner] 造床判定：%s", decision)
+        return False
+
+    def _dispatch_go_home(self, payload: dict, context: dict) -> bool:
+        """回基地：有床位就去床位，没床位就去锚点（普通寻路，不是传送）。"""
+        store = self._territory_store()
+        if store is None:
+            self._territory_note = "（没有基地记录，不知道回哪）"
+            return False
+        base = self._base_by_name(payload.get("base"), context)
+        if base is None:
+            self._territory_note = "（不知道是哪个基地：先设一个基地，或说清名字）"
+            return False
+        target = point_of(base.get("home_bed")) or point_of(base.get("anchor"))
+        if target is None:
+            self._territory_note = f"（基地「{base['name']}」没有可用坐标）"
+            return False
+        self.skills.move_to(target[0], target[1], target[2])
+        where = "床位" if base.get("home_bed") else "锚点"
+        self._territory_note = (f"（往基地「{base['name']}」的{where}走："
+                                f"({target[0]:.0f},{target[1]:.0f},{target[2]:.0f})）")
+        return True
+
+    @staticmethod
+    def _container_pos_text(row: dict) -> str:
+        return (f"@({float(row.get('x') or 0):.0f},{float(row.get('y') or 0):.0f},"
+                f"{float(row.get('z') or 0):.0f})")
+
+    def _render_territory(self, context: dict) -> str:
+        """L2 的领地/基地/容器/区域/回家段（**只进 L2**，绝不进 L1 静态前缀）。
+
+        用户口径：「范围决定在哪自由动手，容器策略决定哪个箱子能动」——两道一起给 LLM 看：
+        区域保护是**事前**提醒（Java 硬拦是兜底）；没进任何基地就明说"野外，按最低权限"。
+        """
+        ctx = context if isinstance(context, dict) else {}
+        lines: list[str] = []
+        snapshot = ctx.get("territory") if isinstance(ctx.get("territory"), dict) else {}
+        bases = snapshot.get("bases") if isinstance(snapshot.get("bases"), list) else []
+        base_line = ""
+        current = ctx.get("current_base") if isinstance(ctx.get("current_base"), dict) else None
+        if current is not None:
+            base_line = f"- 当前在基地「{current.get('name')}」（{current.get('kind')}）里"
+        elif bases:
+            base_line = "- 当前**不在任何基地里**（野外：一切按最低权限，别顺手拿别人的东西）"
+        if base_line:
+            lines.append(base_line)
+        for base in bases:
+            anchor = point_of(base.get("anchor")) or (0.0, 0.0, 0.0)
+            bed = point_of(base.get("home_bed"))
+            bed_text = f"床位({bed[0]:.0f},{bed[1]:.0f},{bed[2]:.0f})" if bed else "还没找床"
+            lines.append(f"- 基地「{base.get('name')}」({base.get('kind')}) "
+                         f"@({anchor[0]:.0f},{anchor[1]:.0f},{anchor[2]:.0f}) "
+                         f"半径{float(base.get('radius') or 0):.0f}，{bed_text}")
+        for row in snapshot.get("territories") or []:
+            if not isinstance(row, dict):
+                continue
+            grants = "/".join(normalize_grants(row.get("grants"))) or "无"
+            lines.append(f"- 领地「{row.get('name')}」授权：{grants}（范围外要用就走借用工具）")
+        for row in snapshot.get("containers") or []:
+            if not isinstance(row, dict):
+                continue
+            lines.append(f"- 已知箱子「{row.get('name')}」{self._container_pos_text(row)}"
+                         f" 策略：{row.get('policy')}")
+        for row in snapshot.get("zones") or []:
+            if not isinstance(row, dict):
+                continue
+            protect = "/".join(str(item) for item in (row.get("protect") or [])) or "无保护项"
+            lines.append(f"- 保护区「{row.get('name')}」({row.get('kind')})："
+                         f"{protect} —— 这里这些动作会被硬拦，**别去试**")
+        situation = ctx.get("home_status") if isinstance(ctx.get("home_status"), dict) else None
+        if situation and situation.get("base"):
+            distance = situation.get("distance")
+            if isinstance(distance, (int, float)):
+                if situation.get("away"):
+                    seconds = situation.get("away_seconds")
+                    how_long = (f"，已经离开 {float(seconds) / 60:.0f} 分钟"
+                                if isinstance(seconds, (int, float)) else "")
+                    tail = ("（离家太远太久了 —— **只上报**，要不要回去你自己判断）"
+                            if situation.get("over") else "")
+                    lines.append(f"- 离基地「{situation['base']}」{float(distance):.0f} 格{how_long}{tail}")
+                else:
+                    lines.append(f"- 在基地「{situation['base']}」范围内")
+        blocks = ctx.get("zone_blocks") if isinstance(ctx.get("zone_blocks"), list) else []
+        for row in blocks[-3:]:
+            if not isinstance(row, dict):
+                continue
+            lines.append(f"- 刚才被区域拦下：区域「{row.get('zone')}」的「{row.get('rule')}」规则"
+                         f"（动作 {row.get('action')}）—— 这里不许做这个")
+        if not lines:
+            return ""
+        return "领地 / 基地 / 容器 / 区域（你自己记下的；坐标只在同一世界同一维度有效）：\n" + \
+            "\n".join(lines)
 
     def _dispatch_equip_armor(self, context: dict) -> bool:
         """穿甲：自己背包里有盔甲就直接穿；没有就去**已知容器**里找（"点容器找盔甲"）。

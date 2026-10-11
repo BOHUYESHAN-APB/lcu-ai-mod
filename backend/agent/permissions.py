@@ -93,6 +93,25 @@ CONTAINER_AUTHORITY: dict[str, bool] = {
     TIER_GUEST: False,
 }
 
+# 领地 / 区域声明（用户口径：「master 允许 AI 在一定范围内工作 → 该空间资源由它自行使唤」
+# ＝把所有权交给它）。**只有 master 能授** —— friend 连自己的箱子都只能给"传递权"，
+# 更不能把一片地的所有权交出去；guest 什么都给不了。
+# 同样是数据表：要放开谁就改 `.local/permissions.json` 的 `territory` / `zones`。
+TERRITORY_AUTHORITY: dict[str, bool] = {
+    TIER_MASTER: True,
+    TIER_FRIEND: False,
+    TIER_GUEST: False,
+}
+ZONE_AUTHORITY: dict[str, bool] = {
+    TIER_MASTER: True,
+    TIER_FRIEND: False,
+    TIER_GUEST: False,
+}
+
+# friend 能给容器的最强策略＝传递权（**默认不给任意取用权** ✗）：
+# 他要把自己箱子上的 `free`（随取）降成 `borrow_only`（走借用台账）。
+FRIEND_MAX_CONTAINER_POLICY = "borrow_only"
+
 # 无人指挥（自主 self-prompt / 外部事件）时能不能自造：默认 **false**
 # —— 没人授权就不动手，这是用户口径的默认值（要放开请显式打开 autonomy_craft）。
 DEFAULT_AUTONOMY_CRAFT = False
@@ -126,6 +145,8 @@ def _default_permissions() -> dict[str, Any]:
         # 能力位：谁能让他造 / 谁能授权他翻箱 / 无人指挥时能否自造
         "craft": dict(CRAFT_AUTHORITY),
         "containers": dict(CONTAINER_AUTHORITY),
+        "territory": dict(TERRITORY_AUTHORITY),
+        "zones": dict(ZONE_AUTHORITY),
         "autonomy_craft": DEFAULT_AUTONOMY_CRAFT,
         # TPA 分层策略（用户口径：master 自动接受 / friend 默认询问 / guest 拒绝且不点
         # / 主动发起仅 master）。默认值定义在 `agent/tpa.py`，这里只做挂载。
@@ -288,6 +309,8 @@ def _normalize(raw: Any) -> dict[str, Any]:
     data["ban_patterns"] = _as_patterns(source.get("ban_patterns"))
     data["craft"] = _as_capability_map(source.get("craft"), CRAFT_AUTHORITY)
     data["containers"] = _as_capability_map(source.get("containers"), CONTAINER_AUTHORITY)
+    data["territory"] = _as_capability_map(source.get("territory"), TERRITORY_AUTHORITY)
+    data["zones"] = _as_capability_map(source.get("zones"), ZONE_AUTHORITY)
     data["autonomy_craft"] = _as_bool(source.get("autonomy_craft"), DEFAULT_AUTONOMY_CRAFT)
     data["tpa"] = normalize_tpa_policy(source.get("tpa"))
     data["scope"] = _normalize_scope(source.get("scope"))
@@ -561,6 +584,45 @@ class PermissionsStore:
         tier = _as_tier(tier)
         with self._lock:
             return bool(self._data["containers"].get(tier, False))
+
+    def can_authorize_territory(self, tier: str) -> bool:
+        """该 tier 能否把一片地的所有权交给他 / 收回（查表，只有 master 默认 True）。"""
+        tier = _as_tier(tier)
+        with self._lock:
+            return bool(self._data["territory"].get(tier, False))
+
+    def can_define_zones(self, tier: str) -> bool:
+        """该 tier 能否声明/删除区域（语义 + 硬保护；默认只有 master）。"""
+        tier = _as_tier(tier)
+        with self._lock:
+            return bool(self._data["zones"].get(tier, False))
+
+    def container_grant_policy(self, tier: str, *, actor: str = "", owner: str = "",
+                               policy: str = "") -> dict:
+        """一次"给容器设访问策略"的授权结论（决策链的唯一入口，不看 tier 分支）。
+
+        用户口径：master 可授予/撤销**任意**容器；**friend 只能标自己的**容器为可交互/
+        传递，且**默认只给传递权、不给任意取用权**（要 `free` 会被降级成 `borrow_only`）；
+        guest 什么都给不了。返回 `{ok, policy, reason, clamped}`。
+        """
+        resolved = _as_tier(tier)
+        requested = str(policy or "").strip().lower()
+        if requested not in {"free", "borrow_only", "no_touch"}:
+            requested = FRIEND_MAX_CONTAINER_POLICY
+        with self._lock:
+            allowed = bool(self._data["containers"].get(resolved, False))
+            max_policy = "" if resolved == TIER_MASTER else FRIEND_MAX_CONTAINER_POLICY
+        if not allowed:
+            return {"ok": False, "policy": "", "reason": "tier_not_allowed", "clamped": False}
+        if resolved == TIER_MASTER:
+            return {"ok": True, "policy": requested, "reason": "granted", "clamped": False}
+        if str(owner or "").strip().casefold() != str(actor or "").strip().casefold() \
+                or not str(actor or "").strip():
+            return {"ok": False, "policy": "", "reason": "not_owner", "clamped": False}
+        if requested == "free":
+            return {"ok": True, "policy": max_policy, "reason": "clamped_to_transfer",
+                    "clamped": True}
+        return {"ok": True, "policy": requested, "reason": "granted", "clamped": False}
 
     def craft_policy(self, tier: str = "", *, autonomous: bool = False) -> CraftPolicy:
         """一次制作/取物请求的授权结论（决策链的唯一入口，不看 tier 分支）。

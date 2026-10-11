@@ -382,7 +382,7 @@ class NativeToolCallTests(unittest.TestCase):
 
 
 class StaticSizeTests(unittest.TestCase):
-    """静态前缀（L0+L1）只降不抬；旧口径见 test_planner 的同名断言。"""
+    """静态前缀（L0+L1）只降不抬（实测 1678 / 预算 1700）；旧口径见 test_planner 的同名断言。"""
 
     IDLE_STATIC_BUDGET = 1700
 
