@@ -672,6 +672,12 @@ textarea{width:100%;min-height:68px;resize:vertical;background:var(--ov-bg,#0d11
       </span>
       <input type="checkbox" id="cfgJobOrchestration">
     </label>
+    <label class="toggle-field" for="cfgCompositesEnabled">
+      <span>复合体（声明式能力复合）<code>composites.enabled</code><br>
+        <span class="hint">开（默认）＝注册表里的复合体（<code>make_bed</code> / <code>deposit_all</code>）可以调用：<b>按声明逐步下发已注册工具</b>，每步照样过权限门与资源租约；某步要等下一轮快照时（如刚合成完的床）会<b>挂起</b>，在下一轮里续跑，超时如实报 <code>await_timeout</code>。关＝调用被<b>如实拒绝</b>（一步都不发、连挂起都不发生），但复合体<b>仍留在注册表里</b>（工具清单的唯一事实来源不破坏）。</span>
+      </span>
+      <input type="checkbox" id="cfgCompositesEnabled">
+    </label>
     <label class="toggle-field" for="cfgLogChangesOnly">
       <span>周期性状态日志只打变化 <code>log_changes_only</code><br>
         <span class="hint">开（默认）＝模组周期性状态日志只有内容<b>变了</b>才打一行，相同就压掉并计数（日志短、好看）。关＝每次上报都打一行（排查时用，日志会变长很多）。</span>
@@ -2377,6 +2383,7 @@ function loadRuntimeSwitches() {
     box('cfgGovernorEnabled', gov.enabled);
     box('cfgJobOrchestration', cfg.job_orchestration);
     box('cfgLogChangesOnly', cfg.log_changes_only);
+    box('cfgCompositesEnabled', (cfg && cfg.composites) ? cfg.composites.enabled : undefined);
     const hb = document.getElementById('cfgLogHeartbeat');
     if (hb) hb.value = (cfg.log_heartbeat_seconds != null ? String(cfg.log_heartbeat_seconds) : '0');
     const th = document.getElementById('cfgGovernorThresholds');
@@ -2397,10 +2404,14 @@ function saveRuntimeSwitches() {
     // 否则会把你手改过的阈值抹掉）。
     const gov = Object.assign({}, (cfg && cfg.state_governor) || {});
     gov.enabled = !!document.getElementById('cfgGovernorEnabled').checked;
+    // 复合体同理整段回传：以后这节里再加别的键，也不会被这个开关顺手抹掉。
+    const comp = Object.assign({}, (cfg && cfg.composites) || {});
+    comp.enabled = !!document.getElementById('cfgCompositesEnabled').checked;
     return fetch('/api/config', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
         state_governor: gov,
+        composites: comp,
         job_orchestration: !!document.getElementById('cfgJobOrchestration').checked,
         log_changes_only: !!document.getElementById('cfgLogChangesOnly').checked,
         log_heartbeat_seconds: heartbeat,
@@ -2409,7 +2420,7 @@ function saveRuntimeSwitches() {
   }).then(r => r.json()).then(d => {
     const c = (d && d.config) || {};
     const g = c.state_governor || {};
-    st.textContent = `已保存：状态治理 ${g.enabled ? '开' : '关'} / 编排轮次 ${c.job_orchestration ? '开' : '关'} / 日志只打变化 ${c.log_changes_only ? '开' : '关'} / 心跳 ${c.log_heartbeat_seconds}s`;
+    st.textContent = `已保存：状态治理 ${g.enabled ? '开' : '关'} / 复合体 ${(c.composites || {}).enabled ? '开' : '关'} / 编排轮次 ${c.job_orchestration ? '开' : '关'} / 日志只打变化 ${c.log_changes_only ? '开' : '关'} / 心跳 ${c.log_heartbeat_seconds}s`;
   }).catch(e => { if (st) st.textContent = '保存失败: ' + e; });
 }
 
