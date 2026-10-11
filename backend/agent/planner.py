@@ -51,6 +51,7 @@ from .haul import (HAUL_MAX_ATTEMPTS, HAUL_VERIFY_TIMEOUT, HAUL_WALK_TIMEOUT,
 from .llm_service import prompt_version, render_persona_triple
 from .modes_engine import EatYield
 from .permissions import CraftPolicy, TIER_GUEST
+from .resource_lease import PRIORITY_DEFAULT, ResourceLease, resources_for_tool
 from .territory import (ACTION_FARM, POLICY_BORROW_ONLY, POLICY_FREE, POLICY_NO_TOUCH,
                         bed_attempt, bed_note, current_base, may_act,
                         normalize_grants, normalize_policy, point_of,
@@ -402,7 +403,7 @@ class Planner:
                  permissions=None, borrow_rules=None, server_commands=None,
                  whisper_sender=None, tpa_responder=None, tpa_requester=None,
                  player_resolver=None, territory=None, action_manager=None,
-                 poi=None, places=None):
+                 poi=None, places=None, resource_lease=None, state_governor=None):
         self.llm = llm_service
         self.memory = memory
         self.skills = skills
@@ -472,6 +473,12 @@ class Planner:
         self.control_lease = ControlLease()
         # BackendEatYield：进食的让路/退避/冷却闸门（`eat` 工具下发前都要过它）。
         self.eat_yield = EatYield(action_manager, control_lease=self.control_lease)
+        # 资源租约（按资源分租：同资源互斥、异资源并行、P0 生存反射永远可抢）。
+        # 由 session 注入共享实例；独立构造（测试/单跑）时自建一个。
+        self.resource_lease = resource_lease if resource_lease is not None else ResourceLease()
+        # 状态治理（卡死即摘掉）：由 session 注入；没注入＝不治理（行为照旧）。
+        # 只用于 (a) 派发前查"该目标是否在取消后的退避窗口内"。
+        self.state_governor = state_governor
 
     def _threshold(self) -> float:
         """当前 decider 置信度阈值：读注入的 provider，失败回退默认常量。"""
@@ -1370,11 +1377,73 @@ class Planner:
         payload = payload if isinstance(payload, dict) else {}
         if not self._authorize_tool(spec, payload, context):
             return False
+        # 资源仲裁（同资源互斥、异资源并行、P0 优先）：只**仲裁**，不新增能力。
+        proceed, lease_owner = self._begin_tool_lease(spec, payload, context)
+        if not proceed:
+            return False
         handler = getattr(self, spec.handler, None)
         if handler is None:
             logger.warning("[Planner] 工具 %s 登记的 handler %s 不存在", spec.name, spec.handler)
+            self._end_tool_lease(lease_owner)
             return False
-        return bool(handler(payload, context))
+        try:
+            return bool(handler(payload, context))
+        finally:
+            self._end_tool_lease(lease_owner)
+
+    # ── 资源租约接线（只仲裁；P0 反射走 survival 通道，永远不被本批挡住）────
+
+    def _begin_tool_lease(self, spec: ToolSpec, payload: dict, context: dict) -> tuple[bool, Optional[str]]:
+        """派发前按工具声明的资源请求租约。
+
+        返回 ``(是否放行, 持有的 owner 或 None)``。被挡时把真实原因写进 ``_action_note``
+        （诚实优先，绝不假装做了），并**一帧都不发**。
+        """
+        governor = self.state_governor
+        if governor is not None and not governor.enabled():
+            return True, None              # 总开关关掉 ⇒ 行为回到现在
+        target = spec.name
+        if governor is not None and governor.is_backed_off(target):
+            wait = max(0.0, governor.backoff_until(target) - time.time())
+            self._action_note = f"（{target} 刚被判定卡死，退避中（还剩约 {wait:.0f}s），先不重试）"
+            logger.info("[Planner] %s 在治理退避窗口内，暂不下发", target)
+            return False, None
+        resources = resources_for_tool(spec.name)
+        if not resources:
+            return True, None
+        owner = f"tool:{spec.name}"
+        result = self.resource_lease.request(
+            owner, resources, priority=self._lease_priority(context),
+            reason=f"工具 {spec.name}", kind=spec.name, target=target, actor="planner")
+        if not result.get("granted"):
+            blocked = "、".join(result.get("blocked_by") or []) or "别的状态"
+            self._action_note = f"（{spec.name} 要用的资源正被 {blocked} 占用，本次已排队，暂不下发）"
+            logger.info("[Planner] %s 资源冲突（被 %s 占用）→ 排队", spec.name, blocked)
+            return False, None
+        return True, owner
+
+    def _end_tool_lease(self, owner: Optional[str]) -> None:
+        """一次派发结束（成功或失败）就释放占用——工具是一次性下发，不长期占资源。"""
+        if not owner:
+            return
+        try:
+            self.resource_lease.release(owner, "工具派发结束")
+        except Exception as exc:  # noqa: BLE001 — 释放失败不拖垮主链路
+            logger.warning("[Planner] 释放资源租约失败: %s", exc)
+
+    @staticmethod
+    def _lease_priority(context: dict) -> int:
+        """模型任务的优先级（按 task_list 的归属/优先级；缺省取普通值）。"""
+        context = context if isinstance(context, dict) else {}
+        raw = context.get("task_priority")
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            return max(0, min(1000, int(raw)))
+        task = context.get("task_state")
+        if isinstance(task, dict):
+            raw = task.get("priority")
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                return max(0, min(1000, int(raw)))
+        return PRIORITY_DEFAULT
 
     # ── 统一授权（注册表权限字段驱动）──────────────────────────
     def _authorize_tool(self, spec: ToolSpec, payload: dict, context: dict) -> bool:

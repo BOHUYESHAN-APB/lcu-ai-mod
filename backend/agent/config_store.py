@@ -278,6 +278,17 @@ def _default_config() -> dict[str, Any]:
         #     所以默认必须是 0；需要时再开。
         "log_changes_only": True,
         "log_heartbeat_seconds": 0,
+        # 状态治理（`agent/state_governor.py`）：卡死即摘掉 + 资源分租仲裁。
+        # 默认**开**（用户明确要这个行为）；关掉 ⇒ 行为回到现在（不仲裁、不取消）。
+        "state_governor": {
+            "enabled": True,
+            # N 秒无进展（位置未变 / 同一工具结果重复）⇒ 取消该状态/任务。
+            "no_progress_seconds": 20.0,
+            # 取消后同一目标 T 秒内不许立刻重试（否则又成死循环）。
+            "retry_cooldown_seconds": 30.0,
+            # 同屏治理台账上限（超出淘汰最低优先级的非生存项）。
+            "max_tracked": 50,
+        },
     }
 
 
@@ -426,6 +437,10 @@ class ConfigStore:
                         0.0, float(payload["log_heartbeat_seconds"]))
                 except (TypeError, ValueError):
                     pass
+            if isinstance(payload.get("state_governor"), dict):
+                from .state_governor import GovernorConfig
+                self._data["state_governor"] = GovernorConfig.from_mapping(
+                    payload["state_governor"]).as_dict()
             self.save()
             return self.raw(redact=True)
 
@@ -472,6 +487,20 @@ class ConfigStore:
             return max(0.0, float(raw))
         except (TypeError, ValueError):
             return 0.0
+
+    def get_state_governor_config(self) -> dict[str, Any]:
+        """状态治理开关与阈值（``config.json`` → ``state_governor``，带默认值）。
+
+        键：``enabled``（默认 True）/ ``no_progress_seconds``（默认 20）/
+        ``retry_cooldown_seconds``（默认 30）/ ``max_tracked``（默认 50）。
+        """
+        from .state_governor import GovernorConfig
+        with self._lock:
+            raw = self._data.get("state_governor")
+        merged = dict(GovernorConfig().as_dict())
+        if isinstance(raw, dict):
+            merged.update(raw)
+        return merged
 
     def get_decision_threshold(self) -> float:
         """decider 置信度阈值；非法值回退默认。"""

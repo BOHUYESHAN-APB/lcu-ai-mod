@@ -15,6 +15,8 @@ from contextlib import contextmanager
 from typing import Any, Optional
 
 from .outbound import sanitize_outbound
+from .resource_lease import (OWNER_P0_REFLEX, RESOURCE_ATTACK, RESOURCE_LOOK, RESOURCE_MOVE,
+                             RESOURCE_USE, register_survival_hold)
 
 logger = logging.getLogger("skills")
 
@@ -34,9 +36,19 @@ class Skills:
         self._control = None
         # 出站清洗的审计回调（session 注入）：清洗真的发生时把"原文/清洗后"记下来。
         self._outbound_observer = None
+        # 资源租约（session 注入）：P0 反射走**生存通道**登记控制流占用（只登记、不拦，
+        # 命比调度重要）。没注入＝行为与字节照旧。
+        self._resource_lease = None
+        self._lease_enabled_provider = None
+        self._lease_held = frozenset()
 
     def set_wire(self, wire):
         self.wire = wire
+
+    def set_resource_lease(self, lease, enabled_provider=None):
+        """挂上资源租约（P0 反射控制流占用登记 + 总开关）。"""
+        self._resource_lease = lease
+        self._lease_enabled_provider = enabled_provider
 
     def set_command_observer(self, observer):
         self._command_observer = observer
@@ -81,10 +93,62 @@ class Skills:
                 look_yaw if look_yaw is not None else 0.0,
                 look_pitch if look_pitch is not None else 0.0,
             )
+        # P0 控制流的资源占用：**只登记、不拦**（生存通道，永远可抢）。
+        self._note_survival_hold(forward=forward, back=back, left=left, right=right,
+                                 jump=jump, sneak=sneak, sprint=sprint,
+                                 attack=attack, use=use, look=bool(
+                                     look_dx or look_dy or look_yaw is not None
+                                     or look_pitch is not None))
         return self._control.flush()
+
+    def _note_survival_hold(self, *, forward=False, back=False, left=False, right=False,
+                            jump=False, sneak=False, sprint=False, attack=False,
+                            use=False, look=False) -> None:
+        """把 P0 反射当前占用的控制流资源登记进资源租约（生存优先级）。
+
+        没接线 / 总开关关掉 ⇒ 什么都不做（行为照旧）。**只登记不拦**：P0 永不被本批挡住 ✗。
+        """
+        lease = self._resource_lease
+        if lease is None:
+            return
+        provider = self._lease_enabled_provider
+        if provider is not None:
+            try:
+                if not provider():
+                    return
+            except Exception as exc:  # noqa: BLE001 — 开关读失败按"开"处理（保守：登记）
+                logger.debug("[Skills] 资源租约开关读取失败: %s", exc)
+        resources = set()
+        if any((forward, back, left, right, jump, sneak, sprint)):
+            resources.add(RESOURCE_MOVE)
+        if attack:
+            resources.add(RESOURCE_ATTACK)
+        if use:
+            resources.add(RESOURCE_USE)
+        if look:
+            resources.add(RESOURCE_LOOK)
+        frozen = frozenset(resources)
+        if frozen == self._lease_held:
+            return
+        if self._lease_held:
+            try:
+                lease.release(OWNER_P0_REFLEX, "P0 控制流切换")
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[Skills] P0 资源释放失败: %s", exc)
+            self._lease_held = frozenset()
+        if frozen:
+            register_survival_hold(lease, resources=frozen, reason="P0 反射控制流",
+                                   kind="reflex", target="p0")
+            self._lease_held = frozen
 
     def release_control(self) -> None:
         """松手：清空控制流按键与视角并立刻下发一次。"""
+        if self._resource_lease is not None and self._lease_held:
+            try:
+                self._resource_lease.release(OWNER_P0_REFLEX, "P0 控制流松手")
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[Skills] P0 资源释放失败: %s", exc)
+            self._lease_held = frozenset()
         if self._control is not None:
             self._control.release()
 

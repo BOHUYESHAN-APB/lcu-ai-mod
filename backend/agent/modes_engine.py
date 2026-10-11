@@ -20,6 +20,7 @@ from typing import Any, Optional
 
 from .control_lease import (HOLDER_REFLEX_EAT, REASON_SURVIVAL_EAT, ControlLease,
                             register_reflex_preemption)
+from .resource_lease import MODE_RESOURCES, PRIORITY_DEFAULT, PRIORITY_SURVIVAL
 
 logger = logging.getLogger("modes_engine")
 
@@ -523,16 +524,67 @@ class ModesEngine:
     - interrupts=False modes only run when action manager is idle
     """
 
-    def __init__(self, skills, memory=None, action_manager=None):
+    def __init__(self, skills, memory=None, action_manager=None, resource_lease=None,
+                 enabled_provider=None):
         self.skills = skills
         self.memory = memory
         self.action_manager = action_manager
         # 模式只看见这层退避代理：action_manager 说"本次拒绝"时，退避期内零 wire 帧。
         self._mode_skills = _GatedSkills(skills, action_manager)
+        # 资源租约（按资源分租）：模式**声明**自己占哪些资源；P0 走生存通道（永远可抢）。
+        # 模式是安全层，**只登记不拦**（拿不到也不影响执行，P0 更是绝不被挡）。
+        self._lease = resource_lease
+        self._enabled_provider = enabled_provider
+        self._lease_owner: Optional[str] = None
         self.modes: list[Mode] = []
         self._sorted: list[Mode] = []
         self._active_mode: Optional[Mode] = None
         self._last_action: str = ""
+
+    def _sync_mode_lease(self, mode: Optional[Mode]) -> None:
+        """把"当前模式占哪些资源"同步进资源租约（只登记不拦；P0 生存通道）。"""
+        lease = self._lease
+        if lease is None:
+            self._lease_owner = None
+            return
+        provider = self._enabled_provider
+        if provider is not None:
+            try:
+                if not provider():
+                    self._release_mode_lease()
+                    return
+            except Exception as exc:  # noqa: BLE001 — 开关读失败按"开"处理
+                logger.debug("[Mode] 资源租约开关读取失败: %s", exc)
+        owner = f"mode:{mode.name}" if mode is not None else None
+        if owner == self._lease_owner:
+            return
+        self._release_mode_lease()
+        if mode is None:
+            return
+        resources = MODE_RESOURCES.get(mode.name, frozenset())
+        if not resources:
+            return
+        survival = mode.priority <= 0
+        try:
+            result = lease.request(
+                owner, resources, survival=survival,
+                priority=PRIORITY_SURVIVAL if survival else PRIORITY_DEFAULT,
+                kind="mode", target=mode.name, reason=f"模式 {mode.name}", actor="modes_engine")
+        except Exception as exc:  # noqa: BLE001 — 登记失败绝不影响模式执行
+            logger.warning("[Mode] 资源登记失败（不影响执行）: %s", exc)
+            return
+        if result.get("granted"):
+            self._lease_owner = owner
+
+    def _release_mode_lease(self) -> None:
+        if self._lease is None or self._lease_owner is None:
+            self._lease_owner = None
+            return
+        try:
+            self._lease.release(self._lease_owner, "模式结束")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[Mode] 资源释放失败: %s", exc)
+        self._lease_owner = None
 
     def add_mode(self, mode: Mode):
         self.modes.append(mode)
@@ -572,6 +624,7 @@ class ModesEngine:
             logger.info("[Mode] Deactivated: %s", self._active_mode.name)
             self._active_mode.on_deactivate(self._mode_skills)
             self._active_mode = None
+            self._sync_mode_lease(None)
             self._reset_streak_credit()
 
         # Scan modes in priority order
@@ -585,6 +638,7 @@ class ModesEngine:
                 mode.active = True
                 self._active_mode = mode
                 mode.on_activate()
+                self._sync_mode_lease(mode)
                 logger.info("[Mode] Activated: %s (priority=%d)", mode.name, mode.priority)
                 action = mode.tick(self._mode_skills, state)
                 if action:
@@ -630,6 +684,7 @@ class ModesEngine:
         if self._active_mode:
             self._active_mode.on_deactivate(self._mode_skills)
         self._active_mode = None
+        self._release_mode_lease()
         for mode in self.modes:
             mode.active = False
 

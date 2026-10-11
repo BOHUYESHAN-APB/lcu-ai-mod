@@ -44,6 +44,8 @@ from .territory import (TerritoryStore, current_base, home_situation, plan_zone_
 from .permissions import CraftPolicy, PermissionsStore, ReplyGate
 from .persona_store import PersonaStore
 from .task_list import TaskList
+from .resource_lease import PRIORITY_DEFAULT, ResourceLease
+from .state_governor import StateGovernor
 from .audit_log import AuditLog
 from .command_gate import CommandGate, CommandsStore
 from .contacts import ContactStore, WhisperDetector
@@ -156,8 +158,19 @@ class Session:
 
         # Core subsystems
         self.action_manager = ActionManager()
+        # 资源租约 + 状态治理（卡死即摘掉）：按资源分租（同资源互斥、异资源并行、P0 优先），
+        # 并对已注册的在途动作做进展判定；N 秒无进展 ⇒ 取消（带真实原因）+ 退避。
+        # 总开关默认**开**（`config.json` → `state_governor.enabled`）；关掉 ⇒ 行为回到现在。
+        self.resource_lease = ResourceLease()
+        self.state_governor = StateGovernor(
+            config=get_config_store(DEFAULT_CONFIG_PATH).get_state_governor_config,
+            lease=self.resource_lease,
+            cancel_hook=self._governor_cancel,
+        )
         self.skills = Skills(wire)
         self.skills.set_command_observer(self._on_skill_command)
+        # P0 反射的控制流占用走生存通道登记（只登记、不拦）。
+        self.skills.set_resource_lease(self.resource_lease, self.state_governor.enabled)
         # 高频控制流（P0 反射层 / VLA 出口）；tick 里心跳保持按键。
         self.control = ControlStream(wire)
         self.skills.set_control_stream(self.control)
@@ -166,7 +179,9 @@ class Session:
         self.poi = WorldPoiMemory()
         self.commands = Commands(self.skills, authorizer=self._command_craft_policy)
         self.modes_engine = ModesEngine(self.skills, self.memory,
-                                        action_manager=self.action_manager)
+                                        action_manager=self.action_manager,
+                                        resource_lease=self.resource_lease,
+                                        enabled_provider=self.state_governor.enabled)
         self.llm = LLMService()
 
         # Message database (SQLite persistence)
@@ -301,6 +316,9 @@ class Session:
             player_resolver=self.resolve_player,
             # BackendEatYield 走 action_manager 的退避窗口（进食的让路/退避/冷却在这里收口）。
             action_manager=self.action_manager,
+            # 资源租约 + 状态治理：共享同一实例，planner 只做"派发前的仲裁/退避查询"。
+            resource_lease=self.resource_lease,
+            state_governor=self.state_governor,
         )
 
         # Vision (Python 侧直接抓屏 -> VLM，后台线程低频刷新，不阻塞动作链路)
@@ -2123,6 +2141,8 @@ class Session:
                 context["history_scope"] = projected["scope"]
         context["persona"] = self.runtime.get("persona", {})
         context["task_state"] = self.runtime.get("task_state", {})
+        # 模型任务的资源仲裁优先级：按 task_list 的归属/优先级（没有 active 任务取普通值）。
+        context["task_priority"] = self._active_task_priority()
         context["behavior_state"] = self.runtime.get("behavior_state", {})
         context["control_state"] = self.runtime.get("control_state", {})
         context["player"] = self.runtime.get("player", {})
@@ -2301,6 +2321,19 @@ class Session:
         # Action manager tick (check timeouts, process completions)
         self.action_manager.tick()
 
+        # 状态治理：把"当前在途动作"同步进治理台账 → 进展判定 → 卡死即取消（带真实原因 + 退避）。
+        governor = getattr(self, "state_governor", None)
+        if governor is not None:
+            try:
+                governor.sync(
+                    self.runtime,
+                    current_label=(self.action_manager.current_label
+                                   if self.action_manager.is_busy else None),
+                    priority=self._active_task_priority(),
+                )
+            except Exception as e:  # noqa: BLE001 — 治理失败绝不拖垮主链路
+                logger.warning("[Session] 状态治理同步失败: %s", e)
+
         # Long-task completion: task_state went terminal and stayed terminal
         # through the grace window → the tracked action is really done.
         self._complete_long_task_if_idle()
@@ -2384,6 +2417,13 @@ class Session:
                     action_manager.stop()
             except Exception as e:
                 logger.debug("[Session] 静默模式中止动作失败: %s", e)
+        # 不在世界：治理台账全部注销（释放资源；只释放，不取消）。
+        governor = getattr(self, "state_governor", None)
+        if governor is not None:
+            try:
+                governor.release_all("离场")
+            except Exception as e:
+                logger.debug("[Session] 治理台账注销失败: %s", e)
         self._pending_chat = None
         memory = getattr(self, "memory", None)
         poi = getattr(self, "poi", None)
@@ -2847,7 +2887,68 @@ class Session:
             # person 层的稳定事实 + 本 session 已回灌的层标记。
             "memory_layers": self._memory_layers_status(),
             "llm_usage": self.llm.get_usage(),
+            # 资源租约（按资源分租）+ 状态治理（卡死即摘掉）：全部防御式取值。
+            "resource_lease": (self.resource_lease.snapshot()
+                               if getattr(self, "resource_lease", None) is not None else {}),
+            "state_governor": (self.state_governor.snapshot()
+                               if getattr(self, "state_governor", None) is not None else {}),
         }
+
+    def _active_task_priority(self) -> int:
+        """当前 active 任务的优先级（模型任务按 task_list 的归属/优先级）；没有则普通值。"""
+        tasks = getattr(self, "tasks", None)
+        try:
+            active = tasks.active() if tasks is not None else None
+        except Exception:  # noqa: BLE001
+            active = None
+        return int(active.priority) if active is not None else PRIORITY_DEFAULT
+
+    def _governor_cancel(self, payload: dict) -> None:
+        """状态治理判定"卡死" → **取消**该状态/任务（带真实原因，绝不静默）。
+
+        * 中止在途动作（这就是用户说的"直接打断"）；
+        * 任务列表里对应任务标 failed + 真实原因；
+        * 原因写进现有失败通道（``runtime['task_state']`` 与 ``planner._action_note``），
+          **不新造通道** ✗。P0 反射不会走到这里（治理侧 ``survival=True`` 永不取消）。
+        """
+        payload = payload if isinstance(payload, dict) else {}
+        reason = str(payload.get("reason") or "stuck")
+        label = str(payload.get("kind") or "")
+        target = str(payload.get("target") or "")
+        action_manager = getattr(self, "action_manager", None)
+        if action_manager is not None:
+            try:
+                current = action_manager.current_label
+                if current and (not label or current == label):
+                    action_manager.stop()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("[Session] 治理取消（中止动作）失败: %s", e)
+        tasks = getattr(self, "tasks", None)
+        task_kind = self.TASK_KINDS.get(label) if label else None
+        if tasks is not None and task_kind:
+            try:
+                for item in list(tasks.items()):
+                    if item.kind == task_kind and item.status not in {"done", "failed",
+                                                                      "cancelled"}:
+                        tasks.complete(item.id, success=False, reason=f"stuck: {reason}")
+            except Exception as e:  # noqa: BLE001
+                logger.debug("[Session] 治理取消（任务列表）失败: %s", e)
+        runtime = getattr(self, "runtime", None)
+        if isinstance(runtime, dict):
+            task_state = runtime.get("task_state")
+            task_state = dict(task_state) if isinstance(task_state, dict) else {}
+            if label:
+                task_state.setdefault("kind", task_kind or label)
+            task_state.update({"status": "failed", "detail": reason, "reason": reason,
+                               "source": "state_governor"})
+            runtime["task_state"] = task_state
+        planner = getattr(self, "planner", None)
+        if planner is not None:
+            try:
+                planner._action_note = f"（{target or label or '当前动作'} 卡住已取消：{reason}）"
+            except Exception:  # noqa: BLE001
+                pass
+        logger.warning("[Session] 状态治理取消 %s：%s", target or label or "?", reason)
 
     def _complete_long_task_if_idle(self):
         """Complete a tracked long task once task_state stayed terminal for
