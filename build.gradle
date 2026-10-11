@@ -227,6 +227,7 @@ tasks.named('check').configure {
     dependsOn 'verifyMixin'
     dependsOn 'verifyLang'
     dependsOn 'verifyWalk'
+    dependsOn 'verifyTrade'
 }
 
 tasks.register('verifyWalk', JavaExec) {
@@ -235,6 +236,14 @@ tasks.register('verifyWalk', JavaExec) {
     dependsOn tasks.named('testClasses')
     classpath = sourceSets.test.output + sourceSets.main.output
     mainClass = 'com.lcu.lcumod.action.WalkCheck'
+}
+
+tasks.register('verifyTrade', JavaExec) {
+    group = 'verification'
+    description = '纯逻辑自检（村民交易：挑报价按序号/结果物/第一条有货、挑不中一律给 code；成交判定=结果槽真被拿走；槽位常量 0/1/2；静态扫描 TradePlan 零依赖、走原版选报价三步、全程不开界面、失败 code 真在源码里）'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.output + sourceSets.main.output
+    mainClass = 'com.lcu.lcumod.action.TradeCheck'
 }
 
 tasks.register('verifyMixin', JavaExec) {

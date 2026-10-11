@@ -9,7 +9,11 @@ import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.entity.Entity;
 import net.minecraft.world.inventory.AbstractContainerMenu;
+import net.minecraft.world.phys.EntityHitResult;
+import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.inventory.ContainerInput;
 import net.minecraft.world.inventory.Slot;
 import net.minecraft.world.item.ItemStack;
@@ -141,6 +145,21 @@ public final class ContainerController {
     }
 
     /**
+     * 对**实体**做一次通用右键（村民/流浪商人 ⇒ 由服务端开交易菜单）。
+     *
+     * <p>与方块容器同一口径：**不开任何客户端界面**，只看向 + 发交互包，然后等
+     * {@code player.containerMenu} 自己变成 {@code MerchantMenu}（那一步在 tick 里等）。
+     */
+    public static boolean interactWithEntity(Minecraft mc, Entity entity) {
+        if (mc == null || mc.player == null || mc.gameMode == null || entity == null) {
+            return false;
+        }
+        aimAt(mc, entity.position().add(0.0, entity.getBbHeight() * 0.5, 0.0));
+        mc.gameMode.interact(mc.player, entity, new EntityHitResult(entity), InteractionHand.MAIN_HAND);
+        return true;
+    }
+
+    /**
      * 通用右键打开某个方块（箱子 / 工作台 / 酿酒台…都走这一条，没有按方块 id 分支）：看向方块中心
      * → 按住 use。容器由**服务端**打开，客户端这边只等 {@code player.containerMenu} 变化。
      */
@@ -182,6 +201,11 @@ public final class ContainerController {
      * 例外：界面挂的菜单正好就是 AI 刚发起要开的那个容器（抑制界面失败时的兜底），
      * 那不算"玩家的界面"，命令仍然可用。
      */
+    /** 让路判定的公开只读版本：非 null ⇒ 现在不该下任何点击（交易等入口共用同一条口径 ✓）。 */
+    public static String gateReason(Minecraft mc) {
+        return gate(mc);
+    }
+
     private static String gate(Minecraft mc) {
         boolean containerScreen = false;
         boolean ours = false;

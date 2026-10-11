@@ -18,6 +18,11 @@ import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.inventory.AbstractContainerMenu;
 import net.minecraft.world.inventory.ContainerInput;
+import net.minecraft.world.inventory.MerchantMenu;
+import net.minecraft.network.protocol.game.ServerboundSelectTradePacket;
+import net.minecraft.world.item.trading.Merchant;
+import net.minecraft.world.item.trading.MerchantOffer;
+import net.minecraft.world.item.trading.MerchantOffers;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.BlockItem;
@@ -84,6 +89,22 @@ public class ActionExecutor {
     private static boolean pendingSleep = false;
     private static BlockPos pendingSleepBed = null;
     private static int pendingSleepTicks = 0;
+
+    // trade：三段式（等菜单 → 选报价并等结果槽 → 点结果槽并校验）；全程**不开界面** ✓
+    private static final double TRADE_REACH_SQR = 6.0 * 6.0;
+    private static final int TRADE_PHASE_WAIT_MENU = 0;
+    private static final int TRADE_PHASE_WAIT_RESULT = 1;
+    private static final int TRADE_MENU_TIMEOUT_TICKS = 20 * 3;
+    private static final int TRADE_RESULT_TIMEOUT_TICKS = 20 * 2;
+    private static boolean pendingTrade = false;
+    private static int pendingTradePhase = TRADE_PHASE_WAIT_MENU;
+    private static int pendingTradeTicks = 0;
+    private static String pendingTradeReqId = null;
+    private static String pendingTradeName = "";
+    private static Integer pendingTradeOffer = null;
+    private static String pendingTradeItem = "";
+    private static boolean pendingTradeListOnly = false;
+    private static int pendingTradeSelected = -1;
 
     /** 饥饿反射：阈值取自参考实现（mineflayer-auto-eat 的 minHunger=15 / mindcraft 的 14）。 */
     private static final int HUNGER_REFLEX_FOOD = 14;
@@ -216,6 +237,7 @@ public class ActionExecutor {
 
         // ── 找方块/睡觉的两段式收尾（走过去 → 记忆/点床/诚实失败）──
         tickPendingBlockTasks(mc);
+        tickPendingTrade(mc);
 
         // ── P0 饥饿反射：饿到一定程度自己吃 ──
         tickHungerReflex(mc);
@@ -1419,6 +1441,7 @@ public class ActionExecutor {
     private void handleStopAll(WireServer.WireCommand cmd) {
         var mc = Minecraft.getInstance();
         followTargetName = null;
+        clearPendingTrade();
         pendingCraftItem = null;
         pendingCraftReqId = null;
         pendingCraftTicks = 0;
@@ -1947,14 +1970,79 @@ public class ActionExecutor {
         sendResponse(cmd.id(), true, "Exploring area");
     }
 
+    /**
+     * {@code trade {entity_id?|radius?, offer?, item?, list_only?}} —— 真去跟村民做买卖。
+     *
+     * <p>走与原版同一条路，但**不开任何客户端界面**：看向村民 → 发交互包（菜单由服务端开）→
+     * 等 {@code player.containerMenu} 变成 {@code MerchantMenu} → 按序号/结果物挑报价 →
+     * 做原版会做的那三件事（{@code setSelectionHint} + {@code tryMoveItems} + 发
+     * {@code ServerboundSelectTradePacket}）→ 点结果槽 → **校验结果槽真被拿走** ✓；
+     * 没拿走就如实报 {@code trade_no_effect}，绝不谎报成功 ✗。
+     */
     private void handleTrade(WireServer.WireCommand cmd) {
         var args = cmd.args();
-        if (args == null || !args.has("villager_type")) {
-            sendResponse(cmd.id(), false, "Need villager type");
+        var mc = Minecraft.getInstance();
+        if (mc.player == null || mc.level == null || mc.gameMode == null) {
+            sendResponse(cmd.id(), false, "No player");
             return;
         }
-        // Honest failure: no villager UI automation yet
-        sendResponse(cmd.id(), false, "trade not implemented (villager UI automation pending)");
+        String gate = ContainerController.gateReason(mc);
+        if (gate != null) {
+            sendResponse(cmd.id(), false, gate);
+            return;
+        }
+        Entity merchant = findTradePartner(mc, args);
+        if (merchant == null) {
+            sendResponse(cmd.id(), false, "no_villager: 附近没有可交易的村民/流浪商人");
+            return;
+        }
+        double distance = Math.sqrt(mc.player.distanceToSqr(merchant));
+        if (mc.player.distanceToSqr(merchant) > TRADE_REACH_SQR) {
+            sendResponse(cmd.id(), false, "out_of_range: 先靠近再交易（现在 "
+                    + String.format("%.1f", distance) + " 米）");
+            return;
+        }
+        ContainerController.interactWithEntity(mc, merchant);
+        pendingTrade = true;
+        pendingTradePhase = TRADE_PHASE_WAIT_MENU;
+        pendingTradeTicks = 0;
+        pendingTradeReqId = cmd.id();
+        pendingTradeName = merchant.getName().getString();
+        pendingTradeOffer = args != null && args.has("offer") ? args.get("offer").getAsInt() : null;
+        pendingTradeItem = args != null && args.has("item") ? args.get("item").getAsString() : "";
+        pendingTradeListOnly = args != null && args.has("list_only") && args.get("list_only").getAsBoolean();
+        setTaskState("trade", "opening", pendingTradeName, "interacting with merchant", 0.1);
+        if (LCUMod.WIRE != null) {
+            LCUMod.WIRE.sendProgress(cmd.id(), 0.1, "opening merchant menu");
+        }
+        sendResponse(cmd.id(), true, "Interacting with merchant");
+    }
+
+    /** 找交易对象：给了 {@code entity_id} 就按 id ✓；否则最近的可交易实体（村民/流浪商人 ✓）。 */
+    private static Entity findTradePartner(Minecraft mc, JsonObject args) {
+        if (args != null && args.has("entity_id")) {
+            int wanted = args.get("entity_id").getAsInt();
+            for (Entity entity : mc.level.getEntities(mc.player, mc.player.getBoundingBox().inflate(16.0))) {
+                if (entity.getId() == wanted) {
+                    return entity;
+                }
+            }
+            return null;
+        }
+        double radius = args != null && args.has("radius") ? args.get("radius").getAsDouble() : 8.0;
+        double best = radius * radius;
+        Entity bestEntity = null;
+        for (Entity entity : mc.level.getEntities(mc.player, mc.player.getBoundingBox().inflate(radius))) {
+            if (!(entity instanceof Merchant)) {
+                continue;
+            }
+            double d = mc.player.distanceToSqr(entity);
+            if (d <= best) {
+                best = d;
+                bestEntity = entity;
+            }
+        }
+        return bestEntity;
     }
 
     private void handleSleep(WireServer.WireCommand cmd) {
@@ -2826,6 +2914,155 @@ public class ActionExecutor {
     /** 正在走去睡 / 已在床（HUD 用）。 */
     public static boolean isSleepingPending() {
         return pendingSleep;
+    }
+
+    /**
+     * trade 的 tick 推进：等菜单 → 挑报价并等结果槽 → 点结果槽并**校验**。
+     *
+     * <p>为什么分三段：结果槽是**服务端**填的（等它把付款收走、把产物放上），所以不能菜单一开
+     * 就点 ✗ —— 那会点个空槽然后误报失败 ✗。
+     */
+    private void tickPendingTrade(Minecraft mc) {
+        if (!pendingTrade) {
+            return;
+        }
+        if (mc.player == null || mc.level == null || mc.gameMode == null) {
+            failPendingTrade("no_player", "玩家不在了");
+            return;
+        }
+        pendingTradeTicks++;
+        AbstractContainerMenu menu = mc.player.containerMenu;
+        if (!(menu instanceof MerchantMenu merchantMenu)) {
+            if (pendingTradeTicks > TRADE_MENU_TIMEOUT_TICKS) {
+                failPendingTrade("no_menu", "服务端没有打开交易菜单（村民太远，或它不是商人）");
+            }
+            return;
+        }
+        List<TradePlan.Offer> offers = offersOf(merchantMenu);
+
+        if (pendingTradePhase == TRADE_PHASE_WAIT_MENU) {
+            if (pendingTradeListOnly) {
+                JsonObject data = new JsonObject();
+                data.addProperty("villager", pendingTradeName);
+                JsonArray arr = new JsonArray();
+                for (TradePlan.Offer offer : offers) {
+                    JsonObject item = new JsonObject();
+                    item.addProperty("index", offer.index());
+                    item.addProperty("offer", offer.describe());
+                    item.addProperty("sold_out", offer.soldOut());
+                    arr.add(item);
+                }
+                data.add("offers", arr);
+                data.addProperty("count", offers.size());
+                sendResponse(pendingTradeReqId, true, data);
+                setTaskState("trade", "done", pendingTradeName, "listed " + offers.size() + " offers", 1.0);
+                clearPendingTrade();
+                sendBehaviorSnapshot();
+                return;
+            }
+            TradePlan.Selection selection = TradePlan.select(offers, pendingTradeOffer, pendingTradeItem);
+            if (!selection.ok()) {
+                failPendingTrade(selection.code(), selection.message());
+                return;
+            }
+            pendingTradeSelected = selection.offer().index();
+            // 原版 MerchantScreen 选报价就这三件事（源码实证）；这里照做，但不开界面 ✓
+            merchantMenu.setSelectionHint(pendingTradeSelected);
+            merchantMenu.tryMoveItems(pendingTradeSelected);
+            if (mc.getConnection() != null) {
+                mc.getConnection().getConnection()
+                        .send(new ServerboundSelectTradePacket(pendingTradeSelected));
+            }
+            pendingTradePhase = TRADE_PHASE_WAIT_RESULT;
+            pendingTradeTicks = 0;
+            setTaskState("trade", "selecting", pendingTradeName, selection.offer().describe(), 0.35);
+            if (LCUMod.WIRE != null) {
+                LCUMod.WIRE.sendProgress(pendingTradeReqId, 0.35,
+                        "selected " + selection.offer().describe());
+            }
+            sendBehaviorSnapshot();
+            return;
+        }
+
+        ItemStack result = merchantMenu.getSlot(TradePlan.RESULT_SLOT).getItem();
+        if (result.isEmpty()) {
+            if (pendingTradeTicks > TRADE_RESULT_TIMEOUT_TICKS) {
+                boolean paid = !merchantMenu.getSlot(TradePlan.PAYMENT1_SLOT).getItem().isEmpty();
+                failPendingTrade(paid ? "offer_unavailable" : "not_enough_items",
+                        paid ? "报价没成交（可能刚被别人买走 / 正在补货）" : "背包里没有这次交易要付的东西");
+            }
+            return;
+        }
+        int before = result.getCount();
+        mc.gameMode.handleContainerInput(menu.containerId, TradePlan.RESULT_SLOT, 0,
+                ContainerInput.PICKUP, mc.player);
+        int after = merchantMenu.getSlot(TradePlan.RESULT_SLOT).getItem().getCount();
+        if (!TradePlan.tradeHappened(before, after)) {
+            failPendingTrade("trade_no_effect", "点了结果槽但没成交（服务端没认这次点击）");
+            return;
+        }
+        JsonObject data = new JsonObject();
+        data.addProperty("villager", pendingTradeName);
+        data.addProperty("offer_index", pendingTradeSelected);
+        data.addProperty("traded", true);
+        sendResponse(pendingTradeReqId, true, data);
+        setTaskState("trade", "done", pendingTradeName, "traded offer #" + pendingTradeSelected, 1.0);
+        if (LCUMod.WIRE != null) {
+            LCUMod.WIRE.sendProgress(pendingTradeReqId, 1.0, "traded");
+        }
+        clearPendingTrade();
+        sendBehaviorSnapshot();
+    }
+
+    /** MC 的报价 → 纯数据（{@link TradePlan} 零依赖，好被零依赖自检加载 ✓）。 */
+    private static List<TradePlan.Offer> offersOf(MerchantMenu menu) {
+        List<TradePlan.Offer> out = new java.util.ArrayList<>();
+        MerchantOffers offers = menu.getOffers();
+        if (offers == null) {
+            return out;
+        }
+        for (int i = 0; i < offers.size(); i++) {
+            MerchantOffer offer = offers.get(i);
+            ItemStack a = offer.getCostA();
+            ItemStack b = offer.getCostB();
+            ItemStack r = offer.getResult();
+            out.add(new TradePlan.Offer(i,
+                    itemIdOf(a), a == null ? 0 : a.getCount(),
+                    itemIdOf(b), b == null ? 0 : b.getCount(),
+                    itemIdOf(r), r == null ? 0 : r.getCount(),
+                    offer.getUses(), offer.getMaxUses(), offer.getSpecialPriceDiff()));
+        }
+        return out;
+    }
+
+    private static String itemIdOf(ItemStack stack) {
+        if (stack == null || stack.isEmpty()) {
+            return "";
+        }
+        return BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
+    }
+
+    private void clearPendingTrade() {
+        pendingTrade = false;
+        pendingTradePhase = TRADE_PHASE_WAIT_MENU;
+        pendingTradeTicks = 0;
+        pendingTradeReqId = null;
+        pendingTradeName = "";
+        pendingTradeOffer = null;
+        pendingTradeItem = "";
+        pendingTradeListOnly = false;
+        pendingTradeSelected = -1;
+    }
+
+    /** 失败一律**如实**报：task_state 带 code + 进度 0.0（job 层就是靠这个看到"为什么失败"✓）。 */
+    private void failPendingTrade(String code, String message) {
+        String detail = code + ": " + message;
+        setTaskState("trade", "failed", pendingTradeName, detail, 0.0);
+        if (LCUMod.WIRE != null && pendingTradeReqId != null) {
+            LCUMod.WIRE.sendProgress(pendingTradeReqId, 0.0, detail);
+        }
+        clearPendingTrade();
+        sendBehaviorSnapshot();
     }
 
     /**
