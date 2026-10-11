@@ -401,21 +401,64 @@ public final class ContainerController {
     }
 
     /**
-     * {@code craft_via_recipe {item,count?}}：用原版**配方放置** API
-     * {@code MultiPlayerGameMode.handlePlaceRecipe(containerId, RecipeDisplayId, useMaxItems)}，
-     * 然后 shift 点击结果槽收进背包。**不自己摆动合成格子。**
-     * 拿不到配方表（非单人）/ 配方不匹配 / 缺材料 → 如实失败。
+     * {@code craft_via_recipe {item,count?}}（按产物 id 入口）：跨原版工作站找配方（工作台优先）
+     * → 原版**配方放置** API {@code MultiPlayerGameMode.handlePlaceRecipe(containerId, RecipeDisplayId, useMaxItems)}
+     * → 结果槽 QUICK_MOVE 收进背包。**不自己摆动合成格子。**
+     * 拿不到配方表（非单人）/ 无配方 / 工作站不符 / 缺材料 → 如实失败。
+     * 另一个入口是 {@link #craftViaDisplay(Minecraft, int, int)}（search_recipes 的 display_id）。
      */
     public static Result craftViaRecipe(Minecraft mc, String item, int count) {
         if (mc == null || mc.player == null || mc.gameMode == null) {
             return failSimple("no_player");
         }
+        if (item == null || item.isBlank()) {
+            return failSimple("missing_item");
+        }
+        if (mc.getSingleplayerServer() == null) {
+            // 配方表只在集成服务端可解析（ServerboundPlaceRecipePacket 要的是服务端分配的 display id）
+            return failSimple("recipe_table_unavailable");
+        }
+        // 跨工作站找配方（工作台优先），产物用归一后的 id 记账
+        RecipeHolder<?> recipe = RecipeTools.recipeByOutput(mc, item);
+        if (recipe == null) {
+            return failSimple("no_recipe");
+        }
+        RecipeDisplayId displayId = resolveRecipeDisplayId(recipe);
+        if (displayId == null) {
+            return failSimple("no_recipe_display");
+        }
+        return placeAndCollect(mc, recipe, displayId.index(), RecipeTools.outputIdOf(mc, recipe), count);
+    }
+
+    /** {@code craft_via_recipe {display_id,count?}}：用 search_recipes 给出的精确 display_id 直接放置。 */
+    public static Result craftViaDisplay(Minecraft mc, int displayId, int count) {
+        if (mc == null || mc.player == null || mc.gameMode == null) {
+            return failSimple("no_player");
+        }
+        if (mc.getSingleplayerServer() == null) {
+            return failSimple("recipe_table_unavailable");
+        }
+        RecipeHolder<?> recipe = RecipeTools.recipeByDisplayId(mc, displayId);
+        if (recipe == null) {
+            return failSimple("unknown_display_id");
+        }
+        String output = RecipeTools.outputIdOfDisplay(mc, displayId);
+        if (output == null || output.isBlank()) {
+            output = RecipeTools.outputIdOf(mc, recipe);
+        }
+        return placeAndCollect(mc, recipe, displayId, output, count);
+    }
+
+    /**
+     * 放置 + 收结果（craft_via_recipe 两条入口共用）：让路判定 → 工作站与已开容器匹配
+     * （不匹配如实拒结，绝不盲目发包）→ 材料核对 → 原版 {@code handlePlaceRecipe} →
+     * 结果槽 QUICK_MOVE → 登记诚实 outcome（背包真多出物品才算成功）。
+     */
+    private static Result placeAndCollect(Minecraft mc, RecipeHolder<?> recipe, int displayId,
+                                          String outputItem, int count) {
         String gate = gate(mc);
         if (gate != null) {
             return failSimple(gate);
-        }
-        if (item == null || item.isBlank()) {
-            return failSimple("missing_item");
         }
         AbstractContainerMenu menu = activeMenu(mc);
         if (menu == null) {
@@ -423,47 +466,83 @@ public final class ContainerController {
         }
         int want = count <= 0 ? 1 : count;
 
-        if (mc.getSingleplayerServer() == null) {
-            // 配方表只在集成服务端可解析（ServerboundPlaceRecipePacket 要的是服务端分配的 display id）
-            return failSimple("recipe_table_unavailable");
-        }
-        RecipeHolder<?> recipe = findRecipeByResult(mc, item);
-        if (recipe == null) {
-            return failSimple("no_recipe");
-        }
-        boolean needsTable = needsCraftingTable(recipe);
-        if (needsTable && isInventoryMenu(mc, menu)) {
-            return failSimple("needs_crafting_table");
+        String station = RecipeTools.stationOf(recipe);
+        String stationError = stationGate(mc, menu, station, recipe);
+        if (stationError != null) {
+            JsonObject data = new JsonObject();
+            data.addProperty("station", station);
+            data.addProperty("open_menu", ContainerPlan.classifyMenu(menu.getClass().getSimpleName()));
+            data.addProperty("reason", stationError);
+            return Result.fail(stationError, data);
         }
         if (!hasIngredients(mc, recipe)) {
             return failSimple("missing_ingredients");
         }
-        RecipeDisplayId displayId = resolveRecipeDisplayId(recipe);
-        if (displayId == null) {
-            return failSimple("no_recipe_display");
+        int resultSlot = findResultSlot(menu);
+        if (resultSlot < 0) {
+            return failSimple("no_result_slot");
+        }
+        if (outputItem == null || outputItem.isBlank()) {
+            outputItem = RecipeTools.outputIdOf(mc, recipe);
         }
 
-        int before = ActionExecutor.countInventoryItem(mc, item);
-        mc.gameMode.handlePlaceRecipe(menu.containerId, displayId, want > 1);
-        // 收集产物（原版"合成全部"语义：shift 点击结果槽）
-        mc.gameMode.handleContainerInput(menu.containerId, ContainerPlan.RESULT_SLOT, ContainerPlan.BTN_PRIMARY,
+        int before = ActionExecutor.countInventoryItem(mc, outputItem);
+        mc.gameMode.handlePlaceRecipe(menu.containerId, new RecipeDisplayId(displayId), want > 1);
+        // 收集产物（原版"合成全部"语义：shift 点击结果槽；结果槽按 ResultContainer 动态定位）
+        mc.gameMode.handleContainerInput(menu.containerId, resultSlot, ContainerPlan.BTN_PRIMARY,
                 ContainerInput.QUICK_MOVE, mc.player);
 
-        craftItem = item;
+        craftItem = outputItem;
         craftBaseline = before;
         craftGoal = want;
         craftElapsed = 0;
 
         JsonObject data = new JsonObject();
         data.addProperty("container_id", menu.containerId);
-        data.addProperty("item", item);
+        data.addProperty("item", outputItem);
         data.addProperty("count", want);
+        data.addProperty("station", station);
+        data.addProperty("result_slot", resultSlot);
         data.addProperty("recipe", recipe.id().identifier().toString());
-        data.addProperty("display_index", displayId.index());
+        data.addProperty("display_index", displayId);
         data.addProperty("use_max_items", want > 1);
         data.addProperty("baseline", before);
         data.addProperty("reason", ContainerPlan.OK);
         return Result.ok(data);
+    }
+
+    /**
+     * 工作站匹配（原版先做全：工作台 / 熔炉 / 高炉 / 烟熏炉 / 切石机 / 锻造台）：
+     * 已开容器与配方工作站不符 → 如实拒结，不盲目发包。模组工作站（未归一）→ unsupported_station。
+     */
+    private static String stationGate(Minecraft mc, AbstractContainerMenu menu, String station,
+                                      RecipeHolder<?> recipe) {
+        boolean inventory = isInventoryMenu(mc, menu);
+        String kind = inventory ? "inventory"
+                : ContainerPlan.classifyMenu(menu.getClass().getSimpleName());
+        if (RecipeQuery.S_CRAFTING.equals(station)) {
+            if ("crafting".equals(kind)) {
+                return null;
+            }
+            if (inventory) {
+                return needsCraftingTable(recipe) ? "needs_crafting_table" : null;
+            }
+            return "wrong_station";
+        }
+        if (station == null || station.isBlank() || !RecipeQuery.isSupportedStation(station)) {
+            return "unsupported_station";
+        }
+        return kind.equals(station) ? null : "wrong_station";
+    }
+
+    /** 结果槽定位：合成/熔炉/切石/锻造的结果槽底层都是 {@code ResultContainer}（javap 实证）。 */
+    private static int findResultSlot(AbstractContainerMenu menu) {
+        for (int i = 0; i < menu.slots.size(); i++) {
+            if (menu.slots.get(i).container instanceof net.minecraft.world.inventory.ResultContainer) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     /** 登记 craft_via_recipe 的 outcome 请求 id（由命令层设置，用于诚实回执）。 */

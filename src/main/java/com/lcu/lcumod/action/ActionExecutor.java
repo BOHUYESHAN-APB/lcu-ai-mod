@@ -483,6 +483,10 @@ public class ActionExecutor {
                 case "container_click" -> handleContainerClick(cmd);
                 case "equip_armor" -> handleEquipArmor(cmd);
                 case "craft_via_recipe" -> handleCraftViaRecipe(cmd);
+                // 物品身份对齐（回答"传 id 还是名字"）：id / 中英文名 / #tag → 稳定 id
+                case "resolve_item" -> handleResolveItem(cmd);
+                // 配方搜索（数据源 = 服务端配方显示）：output?/input?/station?/limit?
+                case "search_recipes" -> handleSearchRecipes(cmd);
                 case "look_at_entity" -> handleLookAtEntity(cmd);
                 case "use_on_entity" -> handleUseOnEntity(cmd);
                 case "behavior_enable", "toggle_behavior" -> { 
@@ -1401,22 +1405,183 @@ public class ActionExecutor {
         sendControllerResult(cmd.id(), ContainerController.equipArmor(mc), "equip_armor");
     }
 
-    /** craft_via_recipe {item,count?}：原版配方放置 API + 结果槽 shift 点击。 */
+    /**
+     * craft_via_recipe {item?,display_id?,count?}：原版配方放置 + 结果槽 QUICK_MOVE + 诚实 outcome。
+     * 产物名先经 {@link RecipeQuery#craftTarget} 对齐（**歧义不猜**，回候选），或用
+     * search_recipes 给出的精确 display_id。
+     */
     private void handleCraftViaRecipe(WireServer.WireCommand cmd) {
         var args = cmd.args();
-        if (args == null || !args.has("item")) {
-            sendResponse(cmd.id(), false, "Need item");
+        var mc = Minecraft.getInstance();
+        Integer displayId = args != null && args.has("display_id") && !args.get("display_id").isJsonNull()
+                ? args.get("display_id").getAsInt() : null;
+        String item = args != null && args.has("item") && !args.get("item").isJsonNull()
+                ? args.get("item").getAsString() : null;
+        int count = args != null && args.has("count") ? args.get("count").getAsInt() : 1;
+
+        if (displayId == null && (item == null || item.isBlank())) {
+            sendResponse(cmd.id(), false, "Need item or display_id");
             return;
         }
-        var mc = Minecraft.getInstance();
-        String item = args.get("item").getAsString();
-        int count = args.has("count") ? args.get("count").getAsInt() : 1;
-        var res = ContainerController.craftViaRecipe(mc, item, count);
+
+        if (displayId != null) {
+            var res = ContainerController.craftViaDisplay(mc, displayId, count);
+            if (res.ok()) {
+                ContainerController.trackCraftOutcome(cmd.id());
+            }
+            sendControllerResult(cmd.id(), res, "craft_via_recipe display=" + displayId);
+            return;
+        }
+
+        // 产物对齐：歧义/未知/tag 一律拒结并回候选（不猜）
+        RecipeQuery.CraftTarget target = RecipeTools.craftTarget(mc, item);
+        if (!target.ok()) {
+            JsonObject data = new JsonObject();
+            data.addProperty("query", item);
+            data.addProperty("reason", target.reason());
+            data.add("candidates", candidatesJson(target.candidates()));
+            data.addProperty("message", "craft_via_recipe " + item);
+            if (LCUMod.WIRE != null) {
+                LCUMod.WIRE.sendResponse(cmd.id(), false, data, target.reason());
+            }
+            return;
+        }
+        var res = ContainerController.craftViaRecipe(mc, target.itemId(), count);
         if (res.ok()) {
             // 配方放置包已发出：登记诚实 outcome（背包真的多出物品才算成功，超时恒实失败）
             ContainerController.trackCraftOutcome(cmd.id());
         }
-        sendControllerResult(cmd.id(), res, "craft_via_recipe " + item);
+        sendControllerResult(cmd.id(), res, "craft_via_recipe " + target.itemId());
+    }
+
+    /** resolve_item {query}：把 query 当 minecraft:id / 中文名 / 英文名 / #tag 对齐到真实注册表。 */
+    private void handleResolveItem(WireServer.WireCommand cmd) {
+        var args = cmd.args();
+        String query = strArg(args, "query");
+        if (query == null) {
+            query = strArg(args, "item");
+        }
+        if (query == null) {
+            sendResponse(cmd.id(), false, "Need query");
+            return;
+        }
+        var mc = Minecraft.getInstance();
+        RecipeQuery.Resolution r = RecipeTools.resolveItem(mc, query);
+        JsonObject data = resolutionJson(query, r);
+        if (LCUMod.WIRE == null) {
+            return;
+        }
+        if (r.ok()) {
+            LCUMod.WIRE.sendResponse(cmd.id(), true, data);
+        } else {
+            LCUMod.WIRE.sendResponse(cmd.id(), false, data, r.reason());
+        }
+    }
+
+    /** search_recipes {output?,input?,station?,limit?}：数据源 = 服务端发来的配方显示。 */
+    private void handleSearchRecipes(WireServer.WireCommand cmd) {
+        var args = cmd.args();
+        String output = strArg(args, "output");
+        String input = strArg(args, "input");
+        String station = strArg(args, "station");
+        int limit = args != null && args.has("limit") ? args.get("limit").getAsInt() : 0;
+        var mc = Minecraft.getInstance();
+        RecipeQuery.SearchResult res = RecipeTools.searchRecipes(mc, output, input, station, limit);
+
+        JsonObject data = new JsonObject();
+        data.addProperty("reason", res.reason());
+        data.addProperty("total", res.total());
+        data.addProperty("truncated", res.truncated());
+        data.addProperty("count", res.rows().size());
+        JsonArray recipes = new JsonArray();
+        for (RecipeQuery.RecipeRow row : res.rows()) {
+            recipes.add(recipeRowJson(row));
+        }
+        data.add("recipes", recipes);
+        if (!res.candidates().isEmpty()) {
+            data.add("candidates", candidatesJson(res.candidates()));
+        }
+        if (LCUMod.WIRE == null) {
+            return;
+        }
+        if (res.ok()) {
+            LCUMod.WIRE.sendResponse(cmd.id(), true, data);
+        } else {
+            LCUMod.WIRE.sendResponse(cmd.id(), false, data, res.reason());
+        }
+    }
+
+    private static String strArg(JsonObject args, String name) {
+        if (args == null || !args.has(name) || args.get(name).isJsonNull()) {
+            return null;
+        }
+        String v = args.get(name).getAsString();
+        return v == null || v.isBlank() ? null : v;
+    }
+
+    private static JsonObject resolutionJson(String query, RecipeQuery.Resolution r) {
+        JsonObject data = new JsonObject();
+        data.addProperty("query", query);
+        data.addProperty("ok", r.ok());
+        data.addProperty("reason", r.reason());
+        if (r.match() != null) {
+            JsonObject m = new JsonObject();
+            m.addProperty("item", r.match().item());
+            m.addProperty("name", r.match().name());
+            m.addProperty("count", r.match().count());
+            m.addProperty("tag", r.match().tag());
+            data.add("match", m);
+        }
+        data.add("candidates", candidatesJson(r.candidates()));
+        return data;
+    }
+
+    private static JsonArray candidatesJson(List<RecipeQuery.Candidate> candidates) {
+        JsonArray arr = new JsonArray();
+        if (candidates != null) {
+            for (RecipeQuery.Candidate c : candidates) {
+                JsonObject o = new JsonObject();
+                o.addProperty("item", c.item());
+                o.addProperty("name", c.name());
+                o.addProperty("score", c.score());
+                o.addProperty("reason", c.reason());
+                arr.add(o);
+            }
+        }
+        return arr;
+    }
+
+    private static JsonObject recipeRowJson(RecipeQuery.RecipeRow row) {
+        JsonObject o = new JsonObject();
+        o.addProperty("display_id", row.displayId());
+        o.addProperty("station", row.station());
+        o.addProperty("supported", row.supported());
+        o.addProperty("recipe", row.recipeId());
+        JsonArray inputs = new JsonArray();
+        if (row.inputs() != null) {
+            for (RecipeQuery.Stack s : row.inputs()) {
+                inputs.add(stackJson(s));
+            }
+        }
+        o.add("inputs", inputs);
+        JsonObject out = new JsonObject();
+        out.addProperty("item", row.output().item());
+        out.addProperty("count", row.output().count());
+        out.addProperty("name", nameForStack(row.output().item()));
+        o.add("output", out);
+        return o;
+    }
+
+    private static JsonObject stackJson(RecipeQuery.Stack s) {
+        JsonObject o = new JsonObject();
+        o.addProperty("item", s.item());
+        o.addProperty("count", s.count());
+        o.addProperty("name", nameForStack(s.item()));
+        return o;
+    }
+
+    private static String nameForStack(String itemId) {
+        return itemId != null && itemId.startsWith("#") ? itemId : RecipeTools.displayName(itemId);
     }
 
     /** 把 ContainerController 的结果如实转成 wire 回执（成功/失败都带机器可读 reason）。 */

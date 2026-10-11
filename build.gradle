@@ -213,6 +213,15 @@ tasks.named('check').configure {
     dependsOn 'verifyHold'
     dependsOn 'verifyContainer'
     dependsOn 'verifyRoute'
+    dependsOn 'verifyRecipe'
+}
+
+tasks.register('verifyRecipe', JavaExec) {
+    group = 'verification'
+    description = '纯逻辑自检（物品身份对齐 / 配方搜索：id-名字-tag 优先级与歧义 / 未知名候选 / 工作站归一与不支持拒结 / limit 截断）'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.output + sourceSets.main.output
+    mainClass = 'com.lcu.lcumod.action.RecipeCheck'
 }
 
 tasks.register('verifyRoute', JavaExec) {
