@@ -81,12 +81,18 @@ jobs:
       # No `tests/integration/__init__.py` on purpose: `discover -s tests`
       # skips non-package directories, so the 1103-test unit suite keeps its
       # "zero skips" baseline and this heavier test is run here, explicitly.
-      # Needs no pip install: the test imports only stdlib + protocol.wire_client.
+      # The integration test itself needs no third-party packages (stdlib plus
+      # protocol.wire_client), but this job ALSO runs the unit suite first, and
+      # that one imports httpx/PIL — so installing requirements is mandatory
+      # here too. Without it the job died on 52 ImportErrors (only 165 tests
+      # collected) before the fixture was ever reached.
       #
       # The unit suite runs *first, in this same job* on purpose: if the wire
       # fixture fails, the transcript above it still shows whether the 1103
       # unit tests were green, so "unit green / integration red" is readable
       # instead of being hidden by a broken fixture.
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
       - name: Backend unit suite (baseline, 1103 tests, zero skips)
         shell: bash
         run: python -m unittest discover -s tests
