@@ -184,7 +184,9 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
                             note="同一道授权门；材料优先用自己背包"), job=True),
     ToolSpec("place_block", "放置手中方块", "", ("craft",), "_tool_place_block",
              ToolPermission(area=True, note="就近放置；受区域硬保护约束")),
-    ToolSpec("build", "建造结构", "x,y,z,structure", ("craft",), "_tool_build",
+    ToolSpec("build", "真放一批方块：结构 wall/pen/platform/pillar；**material 必须点名**（本地不做材料启发式）；"
+                      "一次只放伸手够得着的那批，够不着的如实报 remaining 并让你先走过去再叫一次",
+             "x,y,z,structure,material,size,height", ("craft",), "_tool_build",
              ToolPermission(area=True, note="在坐标处建造"), job=True),
     # ── container ──
     ToolSpec("container_move", "容器内移物（省 to_slot＝背包↔快捷栏）",

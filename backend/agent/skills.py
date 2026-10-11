@@ -419,9 +419,21 @@ class Skills:
         """Sort inventory items."""
         return self._send_cmd("sort_inventory", {})
 
-    def build(self, x: float, y: float, z: float, structure: str) -> dict:
-        """Build a structure at position."""
-        return self._send_cmd("build", {"x": x, "y": y, "z": z, "structure": structure})
+    def build(self, x: float, y: float, z: float, structure: str,
+              material: str = "", size: int = 3, height: int = 1) -> dict:
+        """按结构放一批方块（参数与模组侧 `build` 命令**一一对应** ✓）。
+
+        `material` 由**模型点名** ✓（本地不做材料启发式 ✗）；留空 ⇒ 模组侧如实回 `need_material` ✓。
+        一次只放伸手够得着的那批 ✓，够不着的由模组侧如实报 `remaining` ✓。
+        """
+        args: dict = {"x": x, "y": y, "z": z, "structure": structure}
+        if material:
+            args["material"] = material
+        if size:
+            args["size"] = int(size)
+        if height:
+            args["height"] = int(height)
+        return self._send_cmd("build", args)
 
     # ── Locator / POI / Night (Java 侧扫描 + 自动寻路 + 持久记忆) ──
     # block 支持通配：精确 `minecraft:chest` / 后缀 `*_bed` / 前缀 `oak_*` /

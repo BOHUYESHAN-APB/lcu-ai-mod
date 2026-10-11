@@ -1346,8 +1346,11 @@ class Planner:
                     try:
                         x, y, z = float(parts[0]), float(parts[1]), float(parts[2])
                         structure = parts[3].strip()
+                        # 材料现在**必须由模型点名**（本地不做启发式 ✗）⇒ 旧写法没有材料，
+                        # 就让它如实拿到 `need_material`，而不是在这里编一种方块 ✗。
                         self.skills.build(x, y, z, structure)
-                        logger.info("[Planner] 建造 %s 在 (%.0f, %.0f, %.0f)", structure, x, y, z)
+                        logger.info("[Planner] 建造 %s 在 (%.0f, %.0f, %.0f)（材料未点名 ⇒ 会如实要求）",
+                                structure, x, y, z)
                         executed_any_action = True
                     except ValueError:
                         pass
@@ -1912,11 +1915,25 @@ class Planner:
         return True
 
     def _tool_build(self, payload: dict, context: dict) -> bool:
-        if {"x", "y", "z", "structure"}.issubset(payload):
-            self.skills.build(float(payload["x"]), float(payload["y"]),
-                              float(payload["z"]), str(payload["structure"]))
-            return True
-        return False
+        """真建造：参数与模组侧 `build` 命令**一一对应** ✓；**材料由模型点名** ✓。
+
+        不点名材料 ⇒ **如实拒**（`need_material` ✓），**不编**一种方块 ✗ —— 与 `place_block` 同一条口径 ✓。
+        """
+        if not {"x", "y", "z", "structure"}.issubset(payload):
+            return False
+        material = str(payload.get("material") or "")
+        if not material:
+            self._action_note = "build: 得点名 material（用哪种方块）—— 本地不做材料启发式 ✗"
+            return False
+        try:
+            size = int(payload.get("size") or 3)
+            height = int(payload.get("height") or 1)
+        except (TypeError, ValueError):
+            self._action_note = "build: size/height 必须是整数"
+            return False
+        self.skills.build(float(payload["x"]), float(payload["y"]), float(payload["z"]),
+                          str(payload["structure"]), material, size, height)
+        return True
 
     def _tool_container_close(self, payload: dict, context: dict) -> bool:
         self.skills.container_close()
