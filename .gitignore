@@ -2,12 +2,12 @@
 run/
 out/
 *.jar
+!gradle/wrapper/gradle-wrapper.jar
 src/generated/
 
 # Gradle
 .gradle/
 build/
-gradle/wrapper/gradle-wrapper.jar
 
 # IDE
 .idea/
@@ -34,9 +34,18 @@ backend/config.json
 backend/.env
 backend/.api_key
 backend/*.egg-info/
+backend/**/*.egg-info/
 backend/dist/
 backend/.venv/
 backend/venv/
+
+# Local credentials and generated configuration, regardless of working directory
+**/.local/
+**/.api_key
+**/.env
+**/.env.*
+!**/.env.example
+/.api_key
 
 # Token logs
 backend/token_usage.csv
@@ -46,3 +55,6 @@ backend/token_usage.csv
 .trae/
 .trae-cn/
 docs/dev/
+
+# Shallow-cloned upstream references used for local architecture research
+references/

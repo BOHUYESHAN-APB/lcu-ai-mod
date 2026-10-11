@@ -7,8 +7,7 @@ Architecture: Session (集中管理) → Orchestrator → WireClient → Java Mo
 
 import os
 import logging
-import threading
-import time
+import ipaddress
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -28,8 +27,18 @@ if __name__ == "__main__":
     from dotenv import load_dotenv
     load_dotenv()
 
+    host = os.getenv("WEB_HOST", "127.0.0.1")
     port = int(os.getenv("WEB_PORT", "8080"))
-    logger.info("Starting LCUMod backend on port %d...", port)
+    api_token = os.getenv("SDK_API_TOKEN", "").strip()
+
+    try:
+        is_loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        is_loopback = host.lower() == "localhost"
+    if not is_loopback and not api_token:
+        raise RuntimeError("SDK_API_TOKEN is required when WEB_HOST is not loopback")
+
+    logger.info("Starting LCUMod backend on %s:%d...", host, port)
 
     import uvicorn
-    uvicorn.run("server:app", port=port, host="0.0.0.0", reload=False)
+    uvicorn.run("server:app", port=port, host=host, reload=False)

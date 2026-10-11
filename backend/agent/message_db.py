@@ -11,10 +11,12 @@ import sqlite3
 import time
 import json
 import logging
+import hashlib
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
 logger = logging.getLogger("message_db")
+UNVERIFIED_REQUEST_HASH = "legacy-unverified"
 
 
 class MessageDB:
@@ -91,6 +93,21 @@ class MessageDB:
                 metadata TEXT
             )
         """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS player_message_receipts (
+                conversation_id TEXT NOT NULL,
+                client_message_id TEXT NOT NULL,
+                request_hash TEXT,
+                status TEXT NOT NULL,
+                response_text TEXT,
+                error TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (conversation_id, client_message_id)
+            )
+        """)
+        self._migrate_player_message_receipts(cursor)
         
         # Create indexes
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)")
@@ -100,6 +117,75 @@ class MessageDB:
         
         self.conn.commit()
         logger.info("[MessageDB] Database initialized at %s", self.db_path)
+
+    @staticmethod
+    def _migrate_player_message_receipts(cursor: sqlite3.Cursor) -> None:
+        columns = cursor.execute("PRAGMA table_info(player_message_receipts)").fetchall()
+        primary_key = [row["name"] for row in sorted(columns, key=lambda row: row["pk"]) if row["pk"]]
+        names = {row["name"] for row in columns}
+        if primary_key == ["conversation_id", "client_message_id"] and "request_hash" in names:
+            MessageDB._backfill_player_receipt_hashes(cursor)
+            return
+
+        cursor.execute("SAVEPOINT migrate_player_message_receipts")
+        try:
+            cursor.execute("ALTER TABLE player_message_receipts RENAME TO player_message_receipts_legacy")
+            cursor.execute("""
+                CREATE TABLE player_message_receipts (
+                    conversation_id TEXT NOT NULL,
+                    client_message_id TEXT NOT NULL,
+                    request_hash TEXT,
+                    status TEXT NOT NULL,
+                    response_text TEXT,
+                    error TEXT,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (conversation_id, client_message_id)
+                )
+            """)
+            request_hash = "request_hash" if "request_hash" in names else "NULL"
+            cursor.execute(f"""
+                INSERT OR IGNORE INTO player_message_receipts
+                    (conversation_id, client_message_id, request_hash, status, response_text, error,
+                     created_at, updated_at)
+                SELECT conversation_id, client_message_id, {request_hash}, status, response_text, error,
+                       created_at, updated_at
+                FROM player_message_receipts_legacy
+            """)
+            MessageDB._backfill_player_receipt_hashes(cursor)
+            cursor.execute("DROP TABLE player_message_receipts_legacy")
+        except Exception:
+            cursor.execute("ROLLBACK TO SAVEPOINT migrate_player_message_receipts")
+            cursor.execute("RELEASE SAVEPOINT migrate_player_message_receipts")
+            raise
+        cursor.execute("RELEASE SAVEPOINT migrate_player_message_receipts")
+
+    @staticmethod
+    def _backfill_player_receipt_hashes(cursor: sqlite3.Cursor) -> None:
+        receipts = cursor.execute("""
+            SELECT conversation_id, client_message_id FROM player_message_receipts
+            WHERE request_hash IS NULL
+        """).fetchall()
+        for receipt in receipts:
+            request_hash = UNVERIFIED_REQUEST_HASH
+            messages = cursor.execute("""
+                SELECT sender, message, metadata FROM messages
+                WHERE conversation_id = ? ORDER BY id DESC
+            """, (receipt["conversation_id"],)).fetchall()
+            for message in messages:
+                try:
+                    metadata = json.loads(message["metadata"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if metadata.get("client_message_id") == receipt["client_message_id"]:
+                    request_hash = MessageDB.player_message_request_hash(
+                        message["sender"], message["message"],
+                    )
+                    break
+            cursor.execute("""
+                UPDATE player_message_receipts SET request_hash = ?
+                WHERE conversation_id = ? AND client_message_id = ?
+            """, (request_hash, receipt["conversation_id"], receipt["client_message_id"]))
     
     # ── Message Operations ──
     
@@ -118,7 +204,7 @@ class MessageDB:
             1 if is_system else 0,
             1 if is_ai else 0,
             conversation_id,
-            json.dumps(metadata) if metadata else None
+            json.dumps(metadata) if metadata is not None else None
         ))
         self.conn.commit()
         
@@ -153,13 +239,16 @@ class MessageDB:
         return [dict(row) for row in reversed(rows)]
     
     def get_conversation_messages(self, conversation_id: str, limit: int = 100) -> List[Dict]:
-        """Get messages in a conversation thread."""
+        """Get the newest messages in a conversation thread in chronological order."""
         cursor = self.conn.cursor()
         cursor.execute("""
-            SELECT * FROM messages 
-            WHERE conversation_id = ? 
-            ORDER BY timestamp ASC 
-            LIMIT ?
+            SELECT * FROM (
+                SELECT * FROM messages
+                WHERE conversation_id = ?
+                ORDER BY timestamp DESC, id DESC
+                LIMIT ?
+            )
+            ORDER BY timestamp ASC, id ASC
         """, (conversation_id, limit))
         
         rows = cursor.fetchall()
@@ -209,6 +298,87 @@ class MessageDB:
         ))
         self.conn.commit()
         return conv_id
+
+    def get_or_create_direct_conversation(self, contact_id: str, display_name: str) -> str:
+        """Return a stable direct conversation for one verified transport identity."""
+        digest = hashlib.sha256(contact_id.encode("utf-8")).hexdigest()[:24]
+        conversation_id = f"direct_{digest}"
+        now = time.time()
+        participants = json.dumps([contact_id, "companion"], ensure_ascii=False)
+        with self.conn:
+            self.conn.execute("""
+                INSERT OR IGNORE INTO conversations
+                    (id, started_at, last_activity, participants, message_count, topic)
+                VALUES (?, ?, ?, ?, 0, ?)
+            """, (conversation_id, now, now, participants, display_name))
+            self.conn.execute("""
+                UPDATE conversations SET topic = ?, last_activity = MAX(last_activity, ?)
+                WHERE id = ?
+            """, (display_name, now, conversation_id))
+        return conversation_id
+
+    def get_conversation(self, conversation_id: str) -> Optional[Dict]:
+        row = self.conn.execute(
+            "SELECT * FROM conversations WHERE id = ?", (conversation_id,),
+        ).fetchone()
+        return self._decode_conversation(row) if row else None
+
+    def list_conversations(self, limit: int = 100) -> List[Dict]:
+        rows = self.conn.execute("""
+            SELECT * FROM conversations
+            ORDER BY last_activity DESC, id ASC LIMIT ?
+        """, (limit,)).fetchall()
+        return [self._decode_conversation(row) for row in rows]
+
+    def claim_player_message(self, client_message_id: str, conversation_id: str,
+                             request_hash: str) -> tuple[bool, Dict]:
+        now = time.time()
+        with self.conn:
+            cursor = self.conn.execute("""
+                INSERT OR IGNORE INTO player_message_receipts
+                    (conversation_id, client_message_id, request_hash, status, created_at, updated_at)
+                VALUES (?, ?, ?, 'processing', ?, ?)
+            """, (conversation_id, client_message_id, request_hash, now, now))
+            row = self.conn.execute(
+                """SELECT * FROM player_message_receipts
+                   WHERE conversation_id = ? AND client_message_id = ?""",
+                (conversation_id, client_message_id),
+            ).fetchone()
+        return cursor.rowcount == 1, dict(row)
+
+    @staticmethod
+    def player_message_request_hash(player_name: str, message: str) -> str:
+        payload = json.dumps(
+            {"message": message, "player_name": player_name},
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def complete_player_message(self, client_message_id: str, conversation_id: str,
+                                response_text: str) -> None:
+        with self.conn:
+            self.conn.execute("""
+                UPDATE player_message_receipts
+                SET status = 'completed', response_text = ?, error = NULL, updated_at = ?
+                WHERE conversation_id = ? AND client_message_id = ?
+            """, (response_text, time.time(), conversation_id, client_message_id))
+
+    def fail_player_message(self, client_message_id: str, conversation_id: str, error: str) -> None:
+        with self.conn:
+            self.conn.execute("""
+                UPDATE player_message_receipts
+                SET status = 'failed', error = ?, updated_at = ?
+                WHERE conversation_id = ? AND client_message_id = ?
+            """, (error[:1000], time.time(), conversation_id, client_message_id))
+
+    @staticmethod
+    def _decode_conversation(row) -> Dict:
+        result = dict(row)
+        try:
+            result["participants"] = json.loads(result.get("participants") or "[]")
+        except json.JSONDecodeError:
+            result["participants"] = []
+        return result
     
     def _update_conversation(self, conv_id: str, sender: str):
         """Update conversation activity."""
@@ -293,7 +463,7 @@ class MessageDB:
             description,
             player_involved,
             location,
-            json.dumps(metadata) if metadata else None
+            json.dumps(metadata) if metadata is not None else None
         ))
         self.conn.commit()
         return cursor.lastrowid

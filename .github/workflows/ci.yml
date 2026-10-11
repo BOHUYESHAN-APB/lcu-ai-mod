@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  java:
+    name: Java build + tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@v4
+      # `sh gradlew` works on both OS and does not depend on the exec bit
+      # (gradlew is committed as 100644). Runs compileJava + the full JUnit
+      # suite (43+ tests) against the real MC 1.21.1 classes from the
+      # neoform dev runtime — no game client needed.
+      - name: Build + tests
+        shell: bash
+        run: sh gradlew build
+
+  python:
+    name: Python suite (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      # Full suite; the two integration modules self-skip without
+      # LCU_RUN_JAVA_INTEGRATION=1 (covered by the integration job).
+      - name: Run tests
+        shell: bash
+        run: python -m unittest tests.test_agent_state tests.test_audit_log tests.test_body_registry tests.test_commands tests.test_config_store tests.test_decision_scheduler tests.test_identity tests.test_llm_service tests.test_memory tests.test_memory_catalog tests.test_memory_management tests.test_memory_overlay tests.test_message_db tests.test_modes_engine tests.test_orchestrator tests.test_planner tests.test_scoped_knowledge tests.test_sdk tests.test_server tests.test_server_command_policy tests.test_session tests.test_skills tests.test_storage_policy tests.test_task_coordinator tests.test_task_preset_registry tests.test_timing_gate tests.test_wire_client tests.test_world_model tests.integration.test_java_wire_protocol tests.integration.test_wire_client_socket
+
+  integration:
+    # Headless Java<->Python wire simulation: a real WireServer fixture
+    # process (no Minecraft) driven by the Python WireClient + orchestrator.
+    name: Java-Python wire integration (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      LCU_RUN_JAVA_INTEGRATION: '1'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Install dependencies
+        working-directory: backend
+        run: python -m pip install -r requirements.txt
+      # Pre-compile so the fixture launches within the test's 90s READY
+      # deadline even on a cold cache (first run also builds the neoform
+      # minecraft artifacts here).
+      - name: Pre-compile Java fixture
+        shell: bash
+        run: sh gradlew testClasses
+      - name: Run wire integration test
+        working-directory: backend
+        shell: bash
+        run: python -m unittest tests.integration.test_java_wire_protocol -v

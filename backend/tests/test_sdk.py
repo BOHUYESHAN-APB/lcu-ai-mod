@@ -1,0 +1,169 @@
+import unittest
+from typing import Any, cast
+
+import httpx
+
+from sdk import LCUClient
+
+
+class SDKClientTests(unittest.TestCase):
+    def test_client_sends_bearer_token_and_unwraps_gateway_response(self):
+        requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json={"status": "ok", "response": "来了"})
+
+        client = LCUClient(api_token="secret")
+        client._client.close()
+        client._client = cast(Any, httpx.Client(
+            base_url="http://127.0.0.1:8080",
+            transport=httpx.MockTransport(handler),
+            headers={"Authorization": "Bearer secret"},
+        ))
+
+        response = client.send_chat("跟我来", sender="launcher")
+        client.close()
+
+        self.assertEqual(response, "来了")
+        self.assertEqual(requests[0].headers["Authorization"], "Bearer secret")
+        self.assertEqual(requests[0].url.path, "/api/sdk/chat")
+
+    def test_client_raises_for_http_errors(self):
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(401, json={"detail": "denied"})
+
+        client = LCUClient()
+        client._client.close()
+        client._client = cast(Any, httpx.Client(
+            base_url="http://127.0.0.1:8080",
+            transport=httpx.MockTransport(handler),
+        ))
+
+        with self.assertRaises(httpx.HTTPStatusError):
+            client.get_status()
+        client.close()
+
+    def test_identity_response_is_unwrapped(self):
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"identity": {"companion_id": "stable-id", "scope": "global"}})
+
+        client = LCUClient()
+        client._client.close()
+        client._client = cast(Any, httpx.Client(
+            base_url="http://127.0.0.1:8080",
+            transport=httpx.MockTransport(handler),
+        ))
+
+        self.assertEqual(client.get_identity()["companion_id"], "stable-id")
+        client.close()
+
+    def test_body_request_diagnostics_endpoint_is_exposed(self):
+        requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json={"request_id": "req/1", "status": "running"})
+
+        client = LCUClient()
+        client._client.close()
+        client._client = cast(Any, httpx.Client(
+            base_url="http://127.0.0.1:8080",
+            transport=httpx.MockTransport(handler),
+        ))
+
+        result = client.get_body_request("req/1")
+        client.close()
+
+        self.assertEqual(result["status"], "running")
+        self.assertEqual(requests[0].url.raw_path, b"/api/v2/body-requests/req%2F1")
+
+    def test_v2_control_and_skill_run_are_typed(self):
+        requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.url.path.endswith("/leases"):
+                return httpx.Response(200, json={"lease": {
+                    "id": "lease-1", "fencing_token": 7, "mode": "external",
+                }})
+            return httpx.Response(200, json={
+                "run_id": "req-1", "skill_id": "general.craft_item", "status": "accepted",
+            })
+
+        client = LCUClient()
+        client._client.close()
+        client._client = cast(Any, httpx.Client(
+            base_url="http://127.0.0.1:8080",
+            transport=httpx.MockTransport(handler),
+        ))
+
+        lease = client.acquire_control("upstream")
+        run = client.run_skill(
+            "general.craft_item",
+            {"item": "minecraft:torch", "count": 4},
+            lease_id=lease["id"],
+            fencing_token=lease["fencing_token"],
+        )
+        client.close()
+
+        self.assertEqual(run["run_id"], "req-1")
+        self.assertEqual(requests[0].url.path, "/api/v2/control/leases")
+        self.assertEqual(requests[1].url.path, "/api/v2/skills/general.craft_item/runs")
+        self.assertIn(b'"fencing_token":7', requests[1].content)
+
+    def test_player_pairing_endpoint_is_exposed(self):
+        requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json={
+                "player_id": "uuid-alice", "server_id": "example.org", "token": "paired",
+            })
+
+        client = LCUClient()
+        client._client.close()
+        client._client = cast(Any, httpx.Client(
+            base_url="http://127.0.0.1:8080", transport=httpx.MockTransport(handler),
+        ))
+
+        result = client.create_player_pairing("uuid-alice", "example.org")
+        client.close()
+
+        self.assertEqual(result["token"], "paired")
+        self.assertEqual(requests[0].url.path, "/api/v2/player-pairings")
+        self.assertIn(b'"server_id":"example.org"', requests[0].content)
+
+    def test_task_preset_endpoints_are_exposed(self):
+        requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.url.path == "/api/v2/task-presets":
+                return httpx.Response(200, json={"presets": [{"id": "craft.iron_pickaxe"}]})
+            if request.url.path == "/api/v2/task-presets/craft.iron_pickaxe":
+                return httpx.Response(200, json={"id": "craft.iron_pickaxe", "skill_id": "general.craft_item"})
+            return httpx.Response(200, json={"id": "run-1", "skill_id": "general.craft_item", "status": "dispatched"})
+
+        client = LCUClient()
+        client._client.close()
+        client._client = cast(Any, httpx.Client(
+            base_url="http://127.0.0.1:8080",
+            transport=httpx.MockTransport(handler),
+        ))
+
+        presets = client.list_task_presets()
+        preset = client.get_task_preset("craft.iron_pickaxe")
+        run = client.run_task_preset("craft.iron_pickaxe", {})
+        client.close()
+
+        self.assertEqual(presets[0]["id"], "craft.iron_pickaxe")
+        self.assertEqual(preset["skill_id"], "general.craft_item")
+        self.assertEqual(run["status"], "dispatched")
+        self.assertEqual(requests[0].url.path, "/api/v2/task-presets")
+        self.assertEqual(requests[1].url.path, "/api/v2/task-presets/craft.iron_pickaxe")
+        self.assertEqual(requests[2].url.path, "/api/v2/task-presets/craft.iron_pickaxe/runs")
+
+
+if __name__ == "__main__":
+    unittest.main()
