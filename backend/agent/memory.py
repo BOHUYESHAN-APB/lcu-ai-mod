@@ -272,16 +272,20 @@ class Memory:
 
 
 class WorldPoiMemory:
-    """按「服务器 + 世界」命名空间持久化的 POI 记忆（箱子 / 工作站）。
+    """按「服务器 + 世界 + 维度」命名空间持久化的 POI 记忆（箱子 / 工作站）。
 
     Java 的 PoiMemory 只活在内存里，离开视野 5 分钟后过期、重启即丢；这一层把
-    观测到的 POI 落盘，并按服务器与存档分开存，避免跨服跨档串数据。
+    观测到的 POI 落盘，并按服务器/存档/**维度**分开存，避免跨服跨档跨维度串数据。
+
+    维度是必需的一层（缺的层用固定占位，绝不省略）：同一服务器里主世界与下界的
+    xyz 完全不是一回事，少了这一段两个世界就会互相污染。
     """
 
     def __init__(self, root: str = "data/poi"):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self._namespace = ""
+        self._legacy_namespace = ""
         self._entries: dict[str, dict] = {}
         self._dirty = False
 
@@ -295,14 +299,20 @@ class WorldPoiMemory:
     def path(self) -> Path:
         return self.root / f"{self._namespace or 'unscoped'}.json"
 
-    def use_namespace(self, server: str, world: str) -> str:
-        """切换到指定服务器/世界；与当前不同则先落盘旧的，再载入新的。"""
-        key = f"{self._slug(server, 'unknown-server')}__{self._slug(world, 'unknown-world')}"
+    def use_namespace(self, server: str, world: str, dimension: str = "") -> str:
+        """切换到指定「服务器 / 存档 / 维度」；与当前不同则先落盘旧的，再载入新的。"""
+        key = "__".join((
+            self._slug(server, "unknown-server"),
+            self._slug(world, "unknown-world"),
+            self._slug(dimension, "unknown-dimension"),
+        ))
         if key == self._namespace:
             return key
         if self._namespace:
             self.save()
         self._namespace = key
+        # 旧版只有「服务器 + 存档」两段：历史文件还能读回来（下次落盘写成三段式）。
+        self._legacy_namespace = f"{self._slug(server, 'unknown-server')}__{self._slug(world, 'unknown-world')}"
         self._entries = {}
         self._dirty = False
         self._load()
@@ -411,13 +421,22 @@ class WorldPoiMemory:
     # ── 持久化 ──
 
     def _load(self):
-        if not self.path.exists():
+        path = self.path
+        legacy = False
+        if not path.exists() and self._legacy_namespace:
+            # 迁移：旧的两段式（server__world）文件仍然读得到；下次 save 写成三段式。
+            candidate = self.root / f"{self._legacy_namespace}.json"
+            if candidate.exists():
+                path, legacy = candidate, True
+        if not path.exists():
             return
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8"))
             entries = data.get("entries", {})
             self._entries = entries if isinstance(entries, dict) else {}
-            logger.info("[PoiMemory] 载入 %s：%d 个 POI", self._namespace, len(self._entries))
+            self._dirty = legacy
+            logger.info("[PoiMemory] 载入 %s：%d 个 POI%s", self._namespace, len(self._entries),
+                        "（旧两段式文件）" if legacy else "")
         except Exception as e:
             logger.warning("[PoiMemory] 载入失败: %s", e)
 

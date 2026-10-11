@@ -354,6 +354,35 @@ class Skills:
             args["z"] = z
         return self._send_cmd("remember_poi", args)
 
+    def remember_station(self, name: str, kind: Optional[str] = None,
+                         x: Optional[float] = None, y: Optional[float] = None,
+                         z: Optional[float] = None, yaw: Optional[float] = None,
+                         pitch: Optional[float] = None,
+                         radius: Optional[float] = None) -> dict:
+        """记一个站点（显式坐标优先、缺省回退当前位姿；同名覆盖）。
+
+        参数名与 Java `ActionExecutor.handleRememberStation` **逐字对齐**
+        （name / kind? / x? / y? / z? / yaw? / pitch? / radius?）。后端回灌时把
+        持久化的坐标整份传进来 —— 缺了坐标 Java 会回退到当前位姿，那不是回灌。
+        """
+        args: dict[str, Any] = {"name": str(name)}
+        if kind is not None:
+            args["kind"] = str(kind)
+        for key, value in (("x", x), ("y", y), ("z", z),
+                           ("yaw", yaw), ("pitch", pitch), ("radius", radius)):
+            if value is not None:
+                args[key] = float(value)
+        return self._send_cmd("remember_station", args)
+
+    def remember_route(self, name: str, points: list) -> dict:
+        """把整条路径灌回模组（`points:[{x,y,z,yaw?}]`，**不抽稀**）。
+
+        参数名与 Java `ActionExecutor.handleRememberRoute` 逐字对齐；点数 <2 或 >2000
+        会被 Java 整条拒绝（被拒**不覆盖**同名旧条目）。
+        """
+        return self._send_cmd("remember_route",
+                              {"name": str(name), "points": list(points or [])})
+
     # ── 守卫 / HUD 描述词 / 原版命令直通 ────────────────────────
     # 参数名与 Java `ActionExecutor` 逐字对齐（写错不会报错，只会落进 default）：
     #   guard        → x? / y? / z? / radius? / enabled?

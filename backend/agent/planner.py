@@ -15,11 +15,13 @@ import json
 import logging
 import re
 import time
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from .borrow import BorrowLedger
 from .craft import (ContainerPick, armor_in_containers, clamp_take, describe_missing,
                     evaluate_craft, is_armor, normalize_item, route_containers)
+from .llm_service import prompt_version, render_persona_triple
 from .permissions import CraftPolicy, TIER_GUEST
 
 logger = logging.getLogger("planner")
@@ -64,11 +66,11 @@ ACTION_GROUPS: dict[str, tuple[tuple[str, str, str], ...]] = {
     ),
     "locate": (
         ("find_block", "block,radius,limit", "扫附近有无该方块（只查不走）"),
-        ("go_to_block", "block,radius,remember", "找该方块并寻路过去，到达后记住"),
-        ("locate_structure", "name,kind", "用原版 /locate 查结构/群系坐标（kind=structure|biome）"),
+        ("go_to_block", "block,radius,remember", "寻路过去，到达后记住"),
+        ("locate_structure", "name,kind", "/locate 查结构/群系（kind=structure|biome）"),
     ),
     "gather": (
-        ("mine_block", "", "挖面前的方块"),
+        ("mine_block", "", "挖面前方块"),
         ("collect_blocks", "block_type,count", "采集方块"),
         ("drop_item", "item,count", "丢弃物品"),
         ("sort_inventory", "", "整理背包"),
@@ -76,22 +78,22 @@ ACTION_GROUPS: dict[str, tuple[tuple[str, str, str], ...]] = {
     ),
     "craft": (
         ("craft_item", "item,count", "合成物品"),
-        ("craft_via_recipe", "item,count", "用原版配方合成（先看背包材料）"),
+        ("craft_via_recipe", "item,count", "原版配方合成（先看背包材料）"),
         ("place_block", "", "放置手中方块"),
         ("build", "x,y,z,structure", "建造结构"),
     ),
     "container": (
-        ("container_move", "from_slot,to_slot,count", "容器里把某格物品移到另一格（省 to_slot＝背包↔快捷栏）"),
-        ("container_click", "slot,click_type", "点容器里的一格（click_type=pickup|quick_move|swap|throw）"),
-        ("container_close", "", "关掉当前容器界面"),
-        ("borrow_item", "item,count,container", "从仓库借 item×count（须已授权；不给 count＝整箱搬，拒绝）"),
-        ("return_item", "item,count,container", "把借来的 item 放回原容器（省 count＝全部剩余）"),
+        ("container_move", "from_slot,to_slot,count", "容器内移物（省 to_slot＝背包↔快捷栏）"),
+        ("container_click", "slot,click_type", "点容器一格（pickup|quick_move|swap|throw）"),
+        ("container_close", "", "关掉容器界面"),
+        ("borrow_item", "item,count,container", "从仓库借（须授权；不给 count＝整箱搬，拒绝）"),
+        ("return_item", "item,count,container", "放回原容器（省 count＝全部剩余）"),
     ),
     "combat": (
         ("attack", "", "攻击附近敌人"),
     ),
     "items": (
-        ("equip_armor", "", "穿上背包里的盔甲（没有就去容器找）"),
+        ("equip_armor", "", "穿背包里的盔甲（没有就去容器找）"),
         ("equip_weapon", "", "换上热栏里最好的武器"),
         ("select_hotbar", "index", "切到热栏第 index 格（0-8）"),
     ),
@@ -104,7 +106,7 @@ ACTION_GROUPS: dict[str, tuple[tuple[str, str, str], ...]] = {
         ("sleep_in_bed", "", "走到最近的床睡到天亮（只能夜里）"),
     ),
     "guard": (
-        ("guard", "x,y,z,radius", "在水平半径内驻守（默认 32 格；省略坐标＝最近发话者的位置）"),
+        ("guard", "x,y,z,radius", "水平半径内驻守（默认 32；省坐标＝最近发话者位置）"),
         ("guard_off", "", "取消驻守"),
     ),
     "hud": (
@@ -166,6 +168,126 @@ def _render_actions(actions: list[tuple[str, str, str]]) -> str:
         f"- {name}({args}): {desc}" if args else f"- {name}: {desc}"
         for name, args, desc in actions
     )
+
+
+# ── 分层提示词模型（L0/L1/L2/L3）────────────────────────────────────
+# 设计文档：docs/dev/PROMPT_MODEL.md。四层的**注入时机**各不相同：
+#   L0 system 契约 —— 每轮都在，但**逐字节不变**（缓存前缀第一段）；
+#   L1 system 人设/规则/授权 —— 首轮 + **内容变更时**才重组（内容 hash 作版本键）；
+#   L2 动态上下文 —— 每轮都换，**只进当轮 user 消息**；
+#   L3 工具定义 —— 每轮都带，但走 API `tools` 参数（**不内联进提示词**）。
+# 铁律：L0/L1 不得含任何动态值（坐标 / 饥饿 / 时间 / 玩家名 / 欠账）——测试用哨兵值打住。
+
+# L0：官方契约（基础身份由 L1 的人设段给出，这里只写"角色与输出"的公约）。
+L0_PLANNER_CONTRACT = """你是一个正在玩 Minecraft 的玩家角色，和服务器里的其他玩家一起玩。你不是 AI，不要暴露自己是 AI。
+
+工具调用契约：
+- 可用工具在本次请求的 `tools` 参数里（不在本提示词里）；tool 必须精确取自该清单，args 按其中的参数名给。
+- 参数用真实值，禁止"附近""随机位置"这类占位词；拿不到的真实值宁可不下发该动作。
+
+输出格式：只输出合法 JSON（无 markdown、无多余文字），给 1-4 个候选动作并按偏好排序：
+{"reply": "对玩家说的话", "candidates": [{"tool": "工具名", "args": {...}, "why": "简短理由"}]}
+没有合适的动作就给空数组：{"reply": "", "candidates": []}"""
+
+# L0：decider（第二阶段打分选择）的官方契约 —— 同样逐字节不变。
+L0_DECIDER_CONTRACT = """你是行动决策模型：从给定候选动作里选出当前最优的一个，并给出置信度。
+
+输出格式：只输出一行合法 JSON，不要解释、不要 markdown：
+{"choice": <候选编号>, "confidence": <0 到 1 之间的小数>}
+confidence 是你对这个选择的确信程度；没有一个候选明显合适就给低分。"""
+
+# L1：规则（**静态**，不随轮次变化；与人设、授权一起构成系统提示词）。
+PLANNER_RULES: tuple[str, ...] = (
+    "你是真实玩家，不是 AI；说话自然简短，直接做事。",
+    "用户要求停止时优先给 stop；当前任务非 idle 且目标未变时不要重复下发同一任务。",
+    "晚上没事、且附近或记忆里有床 → 给 sleep_in_bed（它自己走过去睡，别干等到天亮）。",
+    "用户说\"找床/找箱子/找某某方块\" → 用 go_to_block（自己会寻路过去），不要用 explore；只查不走用 find_block。",
+    "用户说\"记住这里/保存一个记录点\" → 用 remember_poi。",
+    "判断在跟谁说话：看最近聊天上下文 + 在线玩家的 ← 标记；对你说话不一定喊名字。",
+    "\"守住这里/别走开\" → guard（别自己编坐标，缺省用最近发话者的位置）；\"不用守了\" → guard_off。",
+    "找结构/群系 → locate_structure（名字用 minecraft:village 这类 id，别写死成某一个）；坐标等游戏回话，reply 里别写坐标，真实的会补在后面。",
+    "有人问\"在干嘛/要去哪\" → 顺手用 set_hud_note 把当前打算写进 HUD 描述词。",
+    "回复必须和实际动作一致：写进 reply 的事必须真的作为候选下发；没下发的动作不要写进 reply。",
+    "要穿甲 → equip_armor（唯一穿甲方式；背包里没有就去已知容器找，别现场造）。",
+    "合成优先用自己背包（含快捷栏）的材料；缺料/没配方就如实说；没被授权不要开箱。",
+    "容器里只为拿自己要的量：container_move 给明确 count，别整箱搬空；拿完 container_close。",
+    "从仓库拿东西＝借：得先有人明确授权（见下）；没授权不动，如实说。",
+    "借只拿够用的量（≤需求 2 倍、最多 256），整箱搬不干；用完/任务结束/被叫停都要把剩余放回原箱（borrow_item 拿、return_item 还），别随身携带大量资源。",
+    "有外部事件时先判断值不值得开口（有人死了/掉到好东西/第一次到新地方才值得调侃一句），不值得就不说话；别把事件当指令去干活。",
+)
+
+# L1：机制说明（**静态**：解释下面 L2 里的数字怎么看；不随轮次变化）。
+PLANNER_MECHANICS = (
+    "机制说明（静态）：\n"
+    "- 自然回血条件：饱食度 ≥18 且饱和度 >0（两者缺一都不回血）。\n"
+    "- 血量不满就主动补到饱食度 18+；缺血优先高饱和度食物（金苹果/熟肉/面包），单纯饿优先高营养食物。\n"
+    "- 生食是最后手段；腐肉/河豚/毒马铃薯/蜘蛛眼这类有害食物永远别自己吃；热栏没有吃的就先找/做。\n"
+    "- day_time 只是 gameTime 取模的近似值、不准，判断白天黑夜一律看「是否夜晚」。"
+)
+
+# 参数名 → JSON Schema 类型（其余按 string；工具参数都可有默认值，故 required 留空）。
+_NUMERIC_TOOL_ARGS = frozenset({"x", "y", "z", "radius", "limit", "count", "index",
+                                "from_slot", "to_slot", "slot"})
+_BOOLEAN_TOOL_ARGS = frozenset({"remember"})
+
+
+def tool_schema(args: str) -> dict:
+    """把 `"x,y,z"` 这样的参数名串渲染成 JSON Schema 的 properties。"""
+    properties: dict[str, dict] = {}
+    for raw in str(args or "").split(","):
+        name = raw.strip()
+        if not name:
+            continue
+        if name in _NUMERIC_TOOL_ARGS:
+            properties[name] = {"type": "number"}
+        elif name in _BOOLEAN_TOOL_ARGS:
+            properties[name] = {"type": "boolean"}
+        else:
+            properties[name] = {"type": "string"}
+    return properties
+
+
+def build_tool_schemas(phase: str = "idle") -> list[dict]:
+    """L3：当前阶段该有的工具定义（OpenAI tools 格式）——走 API `tools` 参数，**不内联进提示词**。
+
+    复用 `_actions_for_phase`，把 M3-3 的"只注入当前阶段相关动作"继续落实在真实请求上
+    （idle 是全部动作组的超集）。顺序稳定，按动作名去重。
+    """
+    tools: list[dict] = []
+    for name, args, desc in _actions_for_phase(phase):
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": desc,
+                "parameters": {
+                    "type": "object",
+                    "properties": tool_schema(args),
+                    "required": [],
+                },
+            },
+        })
+    return tools
+
+
+@dataclass
+class PromptLayers:
+    """一次 LLM 调用的分层组装结果：system(L0+L1) / user(L2) / tools(L3)。"""
+    system: str
+    user: str
+    tools: list = field(default_factory=list)
+    l1_version: str = ""
+
+
+def render_planner_rules() -> str:
+    """规则段（静态）：紧凑表，一行一条。"""
+    return "规则：\n" + "\n".join(f"- {rule}" for rule in PLANNER_RULES)
+
+
+def render_tool_table(phase: str) -> str:
+    """工具表的人类可读预览（真正发给模型的是 `tools` 参数里的 schema）。"""
+    return "可用动作（\"tool\" 必须精确用下列名称；括号内是参数名）：\n" + _render_actions(
+        _actions_for_phase(phase))
 
 
 # 中文方块名 → Java 侧可匹配的方块 id / 通配串。
@@ -381,6 +503,11 @@ class Planner:
         self._take_audit: list[dict] = []
         # 本轮如实说明的补充（缺料 / 没授权 / 已经够了），拼在回复后面。
         self._craft_note: Optional[str] = None
+        # L1 版本键 + 上一次组装的 L0+L1 字符串：键不变就复用**同一份字符串**
+        # （前缀缓存友好）；L3 工具 schema 按阶段各建一次（M3-3 的阶段过滤继续生效）。
+        self._system_key: Optional[str] = None
+        self._system_cache: str = ""
+        self._tools_cache: dict[str, list[dict]] = {}
 
     def _threshold(self) -> float:
         """当前 decider 置信度阈值：读注入的 provider，失败回退默认常量。"""
@@ -411,14 +538,25 @@ class Planner:
         self._craft_note = None
 
         try:
-            # 第一阶段：planner 结合状态产出候选动作（JSON）
-            prompt = self._build_planner_prompt(sender, message, context, bot_name)
-            result = self.llm.chat([{"role": "user", "content": prompt}], agent="planner")
+            # 第一阶段：planner 结合状态产出候选动作（JSON）。
+            # L0+L1 走 system（稳定前缀），L2 走当轮 user，工具走 `tools` 参数（L3）。
+            layers = self.build_prompt_layers(sender, message, context, bot_name)
+            result = self.llm.chat(
+                [{"role": "system", "content": layers.system},
+                 {"role": "user", "content": layers.user}],
+                agent="planner",
+                tools=layers.tools,
+            )
             plan_text = result.get("content", "")
-            
-            if not plan_text:
-                logger.warning("[Planner] LLM 返回空内容")
-                return None
+
+            if not str(plan_text).strip():
+                # 模型没回 JSON 正文，而是走**原生** tool_calls（工具从 tools 参数给出去后
+                # 这是完全合法的一手）→ 折算成候选，仍然过一遍 decider 的置信度门。
+                native = self._plan_from_tool_calls(result.get("tool_calls"))
+                if native is None:
+                    logger.warning("[Planner] LLM 返回空内容")
+                    return None
+                return self._with_notes(self._execute_decision(native, context))
             
             logger.info("[Planner] LLM 规划: %s", plan_text[:100])
             
@@ -477,15 +615,81 @@ class Planner:
             return note
         return f"{text}\n{note}"
     
-    def _build_planner_prompt(self, sender: str, message: str, 
+    # ── 分层组装：L0 system 契约 / L1 人设·规则·授权 / L2 当轮动态 / L3 工具 ──
+
+    def _render_persona(self, context: dict, bot_name: str) -> str:
+        """L1 的人设段：三段块（身份/表达习惯/场景规则），没配就退回 legacy 两行。
+
+        **不含** state_block —— 那是会变的动态值，属于 L2。
+        """
+        context = context if isinstance(context, dict) else {}
+        persona = context.get("persona")
+        persona = persona if isinstance(persona, dict) else {}
+        name = persona.get("name") or bot_name
+        triple = render_persona_triple(context)
+        if triple:
+            return (f"你是 {name}。你的人设分三块（各管一件事，别重复、别把状态写进身份）：\n"
+                    f"{triple}")
+        personality = persona.get("personality") or "友好、自然"
+        speaking_style = persona.get("speaking_style") or "口语化、简短"
+        return (f"你是 {name}。现在的设定是：\n"
+                f"- 性格：{personality}\n"
+                f"- 说话风格：{speaking_style}")
+
+    def _render_borrow_authorization(self, context: dict) -> str:
+        """L1 的借用授权段（规则性记忆）：**内容变更才重组**，所以它是 L1 的一部分。"""
+        context = context if isinstance(context, dict) else {}
+        rules_text = str(context.get("borrow_rules") or "").strip()
+        if rules_text:
+            return "借用授权（被人明确授权才可以动仓库里的东西）：\n" + rules_text
+        return "借用授权：还没有人授权我从仓库取用任何东西——要用得先让人明说「可以用仓库里的…」。"
+
+    def _build_l1(self, context: dict, bot_name: str) -> str:
+        """L1：人设三段 + 规则 + 机制说明 + 借用授权 —— 只在**内容变更**时才重组。"""
+        return "\n\n".join((
+            self._render_persona(context, bot_name),
+            render_planner_rules(),
+            PLANNER_MECHANICS,
+            self._render_borrow_authorization(context),
+        ))
+
+    def build_prompt_layers(self, sender: str, message: str,
+                            context: dict, bot_name: str = "AI") -> PromptLayers:
+        """把一次调用拆成四层：system = L0 + L1（稳定前缀），user = L2，tools = L3。
+
+        L0 逐字节不变；L1 用内容 hash 作版本键，键不变就复用上一次的字符串
+        （模型供应商的前缀缓存按前 N 字节命中，见 docs/dev/PROMPT_MODEL.md）。
+        """
+        context = context if isinstance(context, dict) else {}
+        l1 = self._build_l1(context, bot_name)
+        key = prompt_version(L0_PLANNER_CONTRACT, l1)
+        if key != self._system_key:
+            self._system_key = key
+            self._system_cache = f"{L0_PLANNER_CONTRACT}\n\n{l1}"
+        phase = _phase_from_task(context.get("task_state"))
+        if phase not in self._tools_cache:
+            self._tools_cache[phase] = build_tool_schemas(phase)
+        return PromptLayers(
+            system=self._system_cache,
+            user=self._build_l2(sender, message, context, bot_name),
+            tools=self._tools_cache[phase],
+            l1_version=key,
+        )
+
+    def _build_planner_prompt(self, sender: str, message: str,
                                context: dict, bot_name: str) -> str:
-        """构建规划提示。"""
-        # 获取记忆上下文
+        """人类可读的**全量预览**：L0+L1+L2 再拼上工具表（真实请求走 `build_prompt_layers`，
+        工具走 `tools` 参数而不是内联）。诊断/测试用它一眼看全模型到底看到了什么。
+        """
+        context = context if isinstance(context, dict) else {}
+        layers = self.build_prompt_layers(sender, message, context, bot_name)
+        phase = _phase_from_task(context.get("task_state"))
+        return f"{layers.system}\n\n{layers.user}\n\n{render_tool_table(phase)}"
+
+    def _build_l2(self, sender: str, message: str,
+                  context: dict, bot_name: str) -> str:
+        """L2：每轮的动态上下文（状态/聊天/任务/HUD/欠账）——**只进当轮 user 消息**。"""
         memory_context = self.memory.build_context()
-        persona = context.get("persona", {}) if isinstance(context, dict) else {}
-        persona_name = persona.get("name", bot_name)
-        personality = persona.get("personality", "友好、自然")
-        speaking_style = persona.get("speaking_style", "口语化、简短")
         
         # 获取最近对话
         recent = self.memory.get_recent_context(5)
@@ -538,13 +742,11 @@ class Planner:
         if not known_poi_text:
             known_poi_text = "暂无"
 
-        # 借用规则（对话里授权的"仓库里的铁可以用"）+ 当前欠账（拿了还没还的）。
-        borrow_rules_text = (context.get("borrow_rules") or "").strip() if isinstance(context, dict) else ""
+        # 借用授权（L1，见 `_render_borrow_authorization`）+ 当前欠账（L2：每轮都变）。
         borrow_pending_text = (context.get("borrow_pending") or "").strip() if isinstance(context, dict) else ""
         if borrow_pending_text:
             borrow_pending_text = f"\n- 现在还没还：{borrow_pending_text}（用完就放回去，别带着跑）"
-        borrow_rules_line = borrow_rules_text or (
-            "（还没有人授权我从仓库取用任何东西——要用得先让人明说「可以用仓库里的…」）")
+        borrow_debt_text = ("欠账（借了还没还）：" + borrow_pending_text) if borrow_pending_text else ""
 
         # 时间 / 夜晚 / 能否睡觉：state_update 顶层字段（也兼容塞在 world 里）。
         world_ctx = context.get("world", {}) if isinstance(context, dict) else {}
@@ -628,25 +830,16 @@ class Planner:
                 where = f"，说话时站在 ({float(last_speaker['x']):.0f}, {float(last_speaker.get('y') or 0):.0f}, {float(last_speaker['z']):.0f})"
             speaker_line = f"- 最近发话者：{last_speaker['name']}{where}\n"
 
-        # 人设三段 + 与 identity 分离的 state_block：**四个独立块**，禁止混写
-        # （设计文档 §3：人设不得被临时状态污染）。没配置三段时退回 legacy 两行。
+        # L2 的状态块：人设三段已进 L1（system），这里只留**会变**的 state_block，
+        # 绝不与身份混写（"状态不是身份"）。
         persona_blocks = context.get("persona_blocks") if isinstance(context, dict) else None
         persona_blocks = persona_blocks if isinstance(persona_blocks, dict) else {}
-        identity_block = str(persona_blocks.get("identity") or "").strip()
-        reply_style_block = str(persona_blocks.get("reply_style") or "").strip()
-        scene_rules_block = str(persona_blocks.get("scene_rules") or "").strip()
         state_block = str(persona_blocks.get("state_block") or "").strip()
-        if identity_block or reply_style_block or scene_rules_block:
-            persona_section = (
-                "你的人设（下面三块各管一件事，别把状态写进身份、也别在三处重复同一句话）：\n"
-                f"【身份】{identity_block or '（未配置）'}\n"
-                f"【表达习惯】{reply_style_block or '（未配置）'}\n"
-                f"【场景规则】{scene_rules_block or '（未配置）'}\n"
-                f"【此刻状态（会变，不是身份）】{state_block or '（无）'}\n"
-            )
-        else:
-            persona_section = (f"当前人设：\n- 性格：{personality}\n"
-                               f"- 说话风格：{speaking_style}\n")
+        state_block_text = (f"【此刻状态（会变，不是身份）】{state_block}" if state_block else "")
+
+        # HUD 描述词（模组报回来的当前 HUD 文案）：说话/改 HUD 前先知道现在显示什么。
+        hud_note = str(context.get("hud_note") or "").strip() if isinstance(context, dict) else ""
+        hud_note_text = f"当前 HUD 描述词：{hud_note}" if hud_note else ""
 
         # 对话记忆（按服务器分区的 L1/L2/L3）：死亡、进出也在同一份记忆里。
         conversation = context.get("conversation") if isinstance(context, dict) else None
@@ -681,10 +874,10 @@ class Planner:
         namespace = str(conversation.get("namespace") or "unknown")
 
         # 外部事件注入：不是"必发消息"，模型完全可以 no_action。
+        # （"怎么对待事件"的规则是静态的，在 L1 的规则表里。）
         event = context.get("event") if isinstance(context, dict) else None
         event = event if isinstance(event, dict) else {}
         event_section = ""
-        event_rule = ""
         if event:
             event_section = (
                 "\n外部事件（**不是**玩家直接对你说的话，只是世界里发生了一件事）：\n"
@@ -692,8 +885,6 @@ class Planner:
                 "要不要说点什么完全由你决定：不想说就把 reply 留空、candidates 给空数组——"
                 "硬找话聊比不说话更糟。\n"
             )
-            event_rule = ("17. 上面有外部事件时：先判断值不值得开口（有人死了/掉到好东西/第一次到新地方"
-                          "才值得调侃一句），不值得就不说话；别把事件当指令去干活\n")
 
         # 饥饿/饱和度：自然回血要"饱食度 ≥18 且饱和度 >0"，所以缺血时不能等饿到见底才吃。
         player_ctx = context.get("player", {}) if isinstance(context, dict) else {}
@@ -710,13 +901,11 @@ class Planner:
         health_text = (f"{health_value}/{max_health_value}"
                        if health_value is not None else "未知")
 
-        # 只注入与当前阶段相关的动作，避免 16 条全量内联挤爆 32k 上下文。
-        phase = _phase_from_task(context.get("task_state") if isinstance(context, dict) else None)
-        action_text = _render_actions(_actions_for_phase(phase))
+        # L2 只在**当轮 user 消息**里；工具表、规则、人设都不在这里（分别走 tools 与 system）。
+        extras = "\n".join(part for part in (state_block_text, hud_note_text) if part)
+        extras_text = f"{extras}\n" if extras else ""
 
-        prompt = f"""你是 {persona_name}，一个正在玩 Minecraft 的玩家。你和服务器里的其他玩家一起玩。
-
-当前状态：
+        prompt = f"""当前状态：
 - 发送者：{sender}
 - 消息：{message}
 {event_section}
@@ -739,16 +928,11 @@ class Planner:
 中期摘要：{summary_text}
 关键词：{keywords_text}
 
-{persona_section}
-当前任务状态：
+{extras_text}当前任务状态：
 {context.get('task_state', {'kind': 'idle', 'status': 'idle'})}
 
-饥饿与回血（饥饱两条独立计量，先看这两行再决定要不要吃）：
+饥饿与回血（当前值；怎么解释这些数字见系统提示里的规则）：
 - 血量 {health_text}｜饱食度 {hunger_text}/20｜饱和度 {saturation_text}（饱和度是隐藏值）
-- 自然回血条件：饱食度 ≥18 **且** 饱和度 >0 —— 这时血量才会慢慢回升；饱食度 <18 或饱和度为 0 都不回血
-- 所以：血量不满就该主动补（吃到饱食度 18+），别等饿到见底；缺血时优先**高饱和度**食物（金苹果/熟肉/面包），
-  单纯饿（血是满的）优先**高营养**食物；生食是最后手段，腐肉/河豚/毒马铃薯/蜘蛛眼这类有害食物永远别自己吃
-- 热栏里没有吃的就先找/做，别对着空气 use_item
 
 当前库存摘要：
 {inventory_text}
@@ -766,15 +950,13 @@ class Planner:
 仓库已知内容：
 {storage_contents_text}
 
-借用授权（规则性记忆：被人明确授权才可以动仓库里的东西）：
-{borrow_rules_line}{borrow_pending_text}
+{borrow_debt_text}
 
 已知箱子（历史记忆，可能不在当前视野内）：
 {known_poi_text}
 
 时间与睡眠：
-- 现在是{night_text}（sky_darken={sky_darken_text}，{sleepable_text}）
-- day_time={day_time_text} 只是 gameTime 取模的近似值，不准，判断白天黑夜一律看"是否夜晚"
+- 现在是{night_text}（sky_darken={sky_darken_text}，{sleepable_text}）；day_time={day_time_text}
 - 附近的床：{nearby_bed_text}
 
 已知记录点（你自己记住的持久记忆，可能在很远的地方）：
@@ -785,33 +967,6 @@ class Planner:
 
 画面观察（来自截图，可能略有延迟）：
 {vision_text}
-
-可用动作（"tool" 必须精确用下列名称；括号内是参数名）：
-{action_text}
-
-规则：
-1. 你是真实玩家，不是 AI；说话自然简短，直接做事
-2. 参数用真实值，禁止"附近""随机位置"这类占位词
-3. 用户要求停止时优先给 stop；当前任务非 idle 且目标未变时不要重复下发同一任务
-4. 晚上没事、且附近或记忆里有床 → 给 sleep_in_bed（它自己走过去睡，别干等到天亮）
-5. 用户说"找床/找箱子/找某某方块"时，用 go_to_block（自己会寻路过去），不要用 explore
-6. 用户说"记住这里/保存一个记录点"时，用 remember_poi
-7. 判断在跟谁说话：看最近聊天上下文 + 在线玩家的 ← 标记；对你说话不一定喊名字，
-   谁刚在跟你讲、谁离你最近，就用谁的话当指令
-8. "守住这里/别走开" → guard（别自己编坐标，用最近发话者的位置）；"不用守了" → guard_off
-9. 找结构/群系 → locate_structure（名字用 minecraft:village 这类 id，别写死成某一个）；坐标等游戏回话，reply 里**别写坐标**，真实的会补在后面
-10. 有人问"在干嘛/要去哪" → 顺手用 set_hud_note 把当前打算写进 HUD 描述词
-11. 回复必须和实际动作一致：写进 reply 的事必须真的作为候选下发；没下发的动作不要写进 reply
-12. 要穿甲 → equip_armor（唯一穿甲方式；背包里没有就去已知容器找，别现场造）
-13. 合成优先用自己背包（含快捷栏）的材料；缺料/没配方就**如实说**；没被授权不要开箱
-14. 容器里只为拿自己要的量：container_move 给明确 count，别整箱搬空；拿完 container_close
-15. 从仓库拿东西＝**借**：得先有人明确授权（见上）；没授权不动，如实说
-16. 借只拿够用的量（≤需求 2 倍、最多 256），**整箱搬不干**；用完/任务结束/被叫停都要把
-    剩余放回**原箱**（borrow_item 拿、return_item 还），**别随身携带大量资源**
-{event_rule}
-给 1-4 个候选动作（按偏好排序，没有合适的就给空数组），只输出合法 JSON（无 markdown、无多余文字）：
-"过来" → {{"reply":"来了","candidates":[{{"tool":"move_to","args":{{"x":100,"y":64,"z":-200}},"why":"靠近"}}]}}
-"别跟着" → {{"reply":"行","candidates":[{{"tool":"stop","args":{{}},"why":"用户要求停止"}}]}}
 """
 
         return prompt
@@ -872,7 +1027,8 @@ class Planner:
         prompt = self._build_decider_prompt(candidates, context)
         try:
             result = self.llm.chat(
-                [{"role": "user", "content": prompt}],
+                [{"role": "system", "content": L0_DECIDER_CONTRACT},
+                 {"role": "user", "content": prompt}],
                 agent="decider",
                 temperature=DECIDER_TEMPERATURE,
                 max_tokens=DECIDER_MAX_TOKENS,
@@ -893,7 +1049,7 @@ class Planner:
         return verdict
 
     def _build_decider_prompt(self, candidates: list[dict], context: dict) -> str:
-        """构建决策模型的极短提示：状态摘要 + 编号候选 + 单行 JSON 契约。"""
+        """L2：decider 的当轮动态（状态摘要 + 编号候选）；输出契约在 L0 system 里。"""
         player = context.get("player", {}) if isinstance(context, dict) else {}
         task_state = context.get("task_state", {}) if isinstance(context, dict) else {}
         speaker = context.get("last_speaker") if isinstance(context, dict) else None
@@ -904,16 +1060,41 @@ class Planner:
             args = json.dumps(candidate.get("args", {}), ensure_ascii=False)
             lines.append(f"{i}. {candidate.get('tool')}({args}) — {candidate.get('why', '')}")
         options_text = "\n".join(lines)
-        return f"""你是行动决策模型。请从下列候选动作中选出当前最优的一个，并给出置信度。
+        return (f"当前状态：血量 {player.get('health', '?')}/{player.get('max_health', 20)}，"
+                f"饥饿 {player.get('hunger', '?')}/20，饱和度 {player.get('saturation', '?')}，"
+                f"任务 {task_state.get('kind', 'idle')}/{task_state.get('status', 'idle')}{speaker_text}\n\n"
+                f"候选动作：\n{options_text}")
 
-当前状态：血量 {player.get('health', '?')}/{player.get('max_health', 20)}，饥饿 {player.get('hunger', '?')}/20，饱和度 {player.get('saturation', '?')}，任务 {task_state.get('kind', 'idle')}/{task_state.get('status', 'idle')}{speaker_text}
+    @staticmethod
+    def _plan_from_tool_calls(tool_calls: Any) -> Optional[dict]:
+        """把供应商的原生 `tool_calls` 折算成候选动作（L3 走 tools 参数后的合法回法）。
 
-候选动作：
-{options_text}
-
-只输出一行 JSON，不要解释，不要 markdown：
-{{"choice": <候选编号>, "confidence": <0 到 1 之间的小数>}}
-confidence 表示你对这个选择的确信程度；如果没有一个候选明显合适，就给低分。"""
+        参数可能是 JSON 字符串（OpenAI 约定）或已是对象；解析不了一律给空 args ——
+        **绝不猜参数**（猜出来的坐标/数量会直接下发到游戏里）。
+        """
+        candidates = []
+        for call in tool_calls or []:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function")
+            function = function if isinstance(function, dict) else {}
+            name = str(function.get("name") or "").strip()
+            if not name:
+                continue
+            args = function.get("arguments")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+            candidates.append({
+                "tool": name,
+                "args": args if isinstance(args, dict) else {},
+                "why": "模型直接调用",
+            })
+        if not candidates:
+            return None
+        return {"reply": "", "candidates": candidates}
 
     @staticmethod
     def _parse_plan_json(text: str) -> Optional[dict]:

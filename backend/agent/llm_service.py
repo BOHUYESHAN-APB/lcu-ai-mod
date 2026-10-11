@@ -11,6 +11,7 @@ Features:
 """
 
 import base64
+import hashlib
 import json
 import logging
 import time
@@ -19,6 +20,48 @@ from typing import Any, Generator, Optional
 import httpx
 
 logger = logging.getLogger("llm_service")
+
+# ── 分层提示词模型（L0/L1/L2/L3）───────────────────────────────────
+# 设计文档：docs/dev/PROMPT_MODEL.md。
+#
+#   L0 系统契约（官方）：基础身份 + 输出格式。**逐字节不变**，是缓存前缀的第一段。
+#   L1 用户系统提示词（人设三段 / 规则 / 借用授权）：内容 hash 作版本键，
+#      **只有内容变更才重组**；不变就复用完全相同的字符串（前缀缓存友好）。
+#   L2 动态上下文（状态 / 最近聊天 / 任务 / HUD / 欠账）：只进**当轮 user 消息**。
+#   L3 工具定义：走 API `tools` 参数，绝不内联进提示词。
+#
+# 注入时机：L0 每轮都在但字节不变；L1 首轮 + 变更时；L2 每轮；L3 每轮（结构化，不占提示词）。
+# 铁律：L0/L1 不得出现任何动态值（坐标 / 饥饿 / 时间 / 玩家名 / 欠账）——测试用哨兵值打住。
+
+# L0 基础契约：与具体人设无关的"官方"身份与说话纪律（不是 AI）。
+L0_BASE_CONTRACT = (
+    "你是服务器里的一名玩家角色，不是 AI；任何情况下都不要承认自己是 AI 或程序。\n"
+    "说话像真人玩家：自然、简短、口语化，不写长篇大论。"
+)
+
+
+def prompt_version(*parts: Any) -> str:
+    """L1 版本键：对参与组装的各段内容做内容 hash（判定"要不要重组"的唯一依据）。"""
+    joined = "\x1f".join(str(part or "") for part in parts)
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+
+
+def render_persona_triple(context: dict) -> Optional[str]:
+    """人设三段（身份 / 表达习惯 / 场景规则）——**不含** state_block（那是 L2 动态）。
+
+    没配置三段返回 None，由调用方回退 legacy 两行格式。
+    """
+    context = context if isinstance(context, dict) else {}
+    blocks = context.get("persona_blocks")
+    blocks = blocks if isinstance(blocks, dict) else {}
+    identity = str(blocks.get("identity") or "").strip()
+    reply_style = str(blocks.get("reply_style") or "").strip()
+    scene_rules = str(blocks.get("scene_rules") or "").strip()
+    if not (identity or reply_style or scene_rules):
+        return None
+    return (f"【身份】{identity or '（未配置）'}\n"
+            f"【表达习惯】{reply_style or '（未配置）'}\n"
+            f"【场景规则】{scene_rules or '（未配置）'}")
 
 # No default provider - user must configure
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
@@ -40,6 +83,9 @@ class LLMService:
         self._agent_configs: dict[str, dict[str, Any]] = {}
         # 每个角色最近一次调用失败的原因（UI 直接显示，避免"配了却不知道错在哪"）
         self._last_error: dict[str, str] = {}
+        # L1 版本键 + 上一次组装出的 L0+L1 字符串（键不变就原样复用，前缀缓存友好）。
+        self._system_key: Optional[str] = None
+        self._system_cache: str = ""
 
         # Token tracking
         self.total_prompt_tokens = 0
@@ -159,46 +205,59 @@ class LLMService:
     # ── System Prompt ──
 
     def build_system_prompt(self, context: dict, commands_docs: str = "") -> str:
-        """Build a system prompt from context and command docs."""
-        persona = context.get("persona", {}) if isinstance(context, dict) else {}
-        persona_name = persona.get("name", "AI")
-        personality = persona.get("personality", "友好、自然")
-        speaking_style = persona.get("speaking_style", "口语化、简短")
-        external_context = persona.get("external_context", {})
-        blocks = context.get("persona_blocks") if isinstance(context, dict) else None
-        blocks = blocks if isinstance(blocks, dict) else {}
-        parts = [
-            f"你是 {persona_name}，一个正在玩 Minecraft 的玩家，和服务器里的其他人一起玩。",
-        ]
-        if blocks.get("identity") or blocks.get("reply_style") or blocks.get("scene_rules"):
-            # 三段独立块（人设正文以 .local/persona.json 为准）；状态块与身份分开。
-            parts.append(f"【身份】{blocks.get('identity') or personality}")
-            parts.append(f"【表达习惯】{blocks.get('reply_style') or speaking_style}")
-            parts.append(f"【场景规则】{blocks.get('scene_rules') or '（未配置）'}")
-            if blocks.get("state_block"):
-                parts.append(f"【此刻状态（会变，不是身份）】{blocks['state_block']}")
+        """L0 + L1（system）：**只含跨轮不变的内容**。
+
+        L1 = 人设三段 + 上游注入的人设上下文 + 命令文档；用内容 hash 作版本键，
+        不变就直接返回上一次的字符串（**逐字节相同**，前缀缓存命中）。
+
+        动态值（`persona_blocks.state_block` / `action_insights` / `interaction_summary`）
+        **绝不在这里** —— 它们属于 L2，由 `build_dynamic_context` 拼进当轮 user 消息。
+        """
+        context = context if isinstance(context, dict) else {}
+        l1 = self._build_l1(context, commands_docs)
+        key = prompt_version(L0_BASE_CONTRACT, l1)
+        if key != self._system_key:
+            self._system_key = key
+            self._system_cache = f"{L0_BASE_CONTRACT}\n\n{l1}".strip()
+        return self._system_cache
+
+    def _build_l1(self, context: dict, commands_docs: str = "") -> str:
+        """用户系统提示词正文（人设 / 外部上下文 / 命令文档）；不含任何动态值。"""
+        persona = context.get("persona")
+        persona = persona if isinstance(persona, dict) else {}
+        name = persona.get("name") or "AI"
+        parts = [f"你是 {name}，一个正在玩 Minecraft 的玩家，和服务器里的其他玩家一起玩。"]
+        triple = render_persona_triple(context)
+        if triple:
+            # 三段独立块（正文以 .local/persona.json 为准）；状态块与身份分开。
+            parts.append(triple)
         else:
+            personality = persona.get("personality") or "友好、自然"
+            speaking_style = persona.get("speaking_style") or "口语化、简短"
             parts.append(f"你的人设性格是：{personality}。")
             parts.append(f"你的说话风格是：{speaking_style}。")
-        parts.extend([
-            "你不是 AI，不要暴露自己是 AI。说话要自然、随意，像真人玩家一样。",
-            '可以用"哈哈"、"好的"、"来了"、"等下"等口语。回复要简短，不要长篇大论。',
-            "",
-        ])
+        external_context = persona.get("external_context")
         if external_context:
             parts.append(f"上游系统注入的人设上下文：{external_context}")
-            parts.append("")
         if commands_docs:
             parts.append(commands_docs)
-            parts.append("")
+        return "\n".join(parts)
+
+    def build_dynamic_context(self, context: dict, user_text: str = "") -> str:
+        """L2：每轮的动态上下文 —— 只进**当轮 user 消息**，绝不混进 system。"""
+        context = context if isinstance(context, dict) else {}
+        parts = [str(user_text or "").strip()]
+        blocks = context.get("persona_blocks")
+        blocks = blocks if isinstance(blocks, dict) else {}
+        state_block = str(blocks.get("state_block") or "").strip()
+        if state_block:
+            parts.append(f"【此刻状态（会变，不是身份）】{state_block}")
         if context.get("action_insights"):
             parts.append(f"Action history: {context['action_insights']}")
-            parts.append("")
         if context.get("interaction_summary"):
             parts.append("Recent conversation:")
-            parts.append(context["interaction_summary"])
-            parts.append("")
-        return "\n".join(parts).strip()
+            parts.append(str(context["interaction_summary"]))
+        return "\n\n".join(part for part in parts if part)
 
     # ── Internal ──
 
@@ -242,6 +301,12 @@ class LLMService:
             "max_tokens": kwargs.get("max_tokens", resolved.get("max_tokens", 2048)),
             "stream": stream,
         }
+        # L3：工具定义走 API 的 tools 参数（**绝不内联进提示词**）。
+        # 只在调用方真的给了工具时发送，避免给不支持的工具的供应商加字段。
+        if kwargs.get("tools"):
+            payload["tools"] = kwargs["tools"]
+            if kwargs.get("tool_choice"):
+                payload["tool_choice"] = kwargs["tool_choice"]
         # 角色级默认在角色配置里（thinking 缺省=False），调用方可按次覆盖；
         # 透传时调用参数优先，其次取角色配置里的同名键。
         if kwargs.get("thinking", resolved.get("thinking", False)):
@@ -329,10 +394,14 @@ class LLMService:
     def _parse_response(self, response: dict) -> dict:
         try:
             choice = response["choices"][0]
+            message = choice.get("message", {})
             return {
                 "role": choice.get("role", "assistant"),
-                "content": choice.get("message", {}).get("content", ""),
+                "content": message.get("content", ""),
                 "finish_reason": choice.get("finish_reason", ""),
+                # L3 工具走 `tools` 参数后，模型可能改为**原生** tool_calls 而不是 JSON；
+                # 原样透传给调用方，由它折算成候选（绝不丢掉模型选定的动作）。
+                "tool_calls": message.get("tool_calls") or [],
             }
         except (KeyError, IndexError) as e:
             logger.error("[LLM] Unexpected response: %s", response)

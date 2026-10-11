@@ -305,6 +305,11 @@ class BorrowRulesStore:
     def audit_path(self) -> Path:
         return self.root / f"{sanitize_key(self._namespace)}.audit.jsonl"
 
+    @property
+    def ledger_path(self) -> Path:
+        """未归还借出的台账文件（与规则/审计同一目录、同一分区名）。"""
+        return self.root / f"{sanitize_key(self._namespace)}.ledger.json"
+
     # ── 读 ──
 
     def rules(self) -> list[dict]:
@@ -599,7 +604,7 @@ class BorrowLedger:
     def __init__(self, audit_path: str | Path | None = None, clock=time.time,
                  max_count: int = BORROW_MAX_COUNT,
                  need_multiplier: int = BORROW_NEED_MULTIPLIER,
-                 audit_limit: int = 200):
+                 audit_limit: int = 200, ledger_path: str | Path | None = None):
         self._clock = clock
         self.max_count = max(1, int(max_count))
         self.need_multiplier = max(1, int(need_multiplier))
@@ -613,6 +618,10 @@ class BorrowLedger:
                 self._audit_path.parent.mkdir(parents=True, exist_ok=True)
             except OSError as exc:
                 logger.warning("[Borrow] 建审计目录失败 %s: %s", self._audit_path.parent, exc)
+        # 未归还借出的台账文件：给了路径就按盘上的欠账恢复（后端重启不赖账）。
+        self._ledger_path: Optional[Path] = None
+        if ledger_path:
+            self.use_ledger_path(ledger_path)
 
     # ── 审计落盘 ──
 
@@ -623,6 +632,131 @@ class BorrowLedger:
                 self._audit_path.parent.mkdir(parents=True, exist_ok=True)
             except OSError as exc:
                 logger.warning("[Borrow] 建审计目录失败 %s: %s", self._audit_path.parent, exc)
+
+    # ── 台账落盘（未归还的借出记录）──
+    # 只存"还没还清 / 已判失败"的条目（已还清的留在审计里）。重启后按盘恢复欠账，
+    # 条件允许时继续走原来的 settle / auto-return 路径；回不去的照旧报出来。
+
+    def use_ledger_path(self, path: str | Path | None) -> None:
+        """切换台账文件并按盘恢复欠账；同一路径重复调用直接返回（不重读）。
+
+        换服/换世界会换文件：别的分区的欠账不能带过来，本分区的也不会丢
+        （每次变更都已落盘）。
+        """
+        new_path = Path(path) if path else None
+        if new_path is not None and self._ledger_path is not None and new_path == self._ledger_path:
+            return
+        self._ledger_path = new_path
+        if new_path is None:
+            return
+        try:
+            new_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning("[Borrow] 建台账目录失败 %s: %s", new_path.parent, exc)
+        restored = self._load_ledger()
+        with self._lock:
+            self._entries = restored
+        if restored:
+            logger.info("[Borrow] 从 %s 恢复 %d 笔未归还的借用（%s），继续自动归还",
+                        new_path, len(restored), self.describe() or "等待容器")
+
+    def save_ledger(self) -> None:
+        """把未归还的借用写到台账文件（原子替换）。"""
+        path = self._ledger_path
+        if path is None:
+            return
+        with self._lock:
+            rows = [self._entry_state(entry) for entry in self._entries
+                    if entry.state != "returned"]
+        data = {"version": 1, "saved_at": float(self._clock()), "entries": rows}
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        try:
+            temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(path)
+        except Exception as exc:
+            logger.warning("[Borrow] 写台账失败 %s: %s", path, exc)
+
+    def _load_ledger(self) -> list[BorrowEntry]:
+        path = self._ledger_path
+        if path is None or not path.exists():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("[Borrow] 读取台账失败，已回退空账 %s: %s", path, exc)
+            return []
+        rows = data.get("entries") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            return []
+        out: list[BorrowEntry] = []
+        for row in rows:
+            entry = self._entry_from_state(row)
+            if entry is not None:
+                out.append(entry)
+        return out
+
+    @staticmethod
+    def _entry_state(entry: BorrowEntry) -> dict:
+        """BorrowEntry → 盘上的一条（坐标/容器身份/基线都要带上，否则重启后回不去）。"""
+        return {
+            "id": entry.id,
+            "item": entry.item,
+            "count": entry.count,
+            "returned": entry.returned,
+            "reason": entry.reason,
+            "container_id": entry.container_id,
+            "container_title": entry.container_title,
+            "container_pos": list(entry.container_pos) if entry.container_pos else None,
+            "container_block": entry.container_block,
+            "from_slot": entry.from_slot,
+            "baseline": entry.baseline,
+            "ts": entry.ts,
+            "state": entry.state,
+            "attempts": entry.attempts,
+            "failure": entry.failure,
+        }
+
+    def _entry_from_state(self, row: Any) -> Optional[BorrowEntry]:
+        """盘上的一条 → BorrowEntry；重启后"在途动作"不存在，在途标志一律清掉。"""
+        if not isinstance(row, dict):
+            return None
+        entry_id = str(row.get("id") or "")
+        item = normalize_item(row.get("item"))
+        count = _as_int(row.get("count"))
+        if not entry_id or not item or count is None or count <= 0:
+            return None
+        raw_pos = row.get("container_pos")
+        container_pos: Optional[tuple] = None
+        if isinstance(raw_pos, (list, tuple)) and len(raw_pos) >= 3:
+            try:
+                container_pos = tuple(float(value) for value in raw_pos)
+            except (TypeError, ValueError):
+                container_pos = None
+        state = str(row.get("state") or "open")
+        if state == "returning":
+            # 上一次运行下发了归还动作但还没核对就被重启冲掉 → 当作还没还，重新排一遍。
+            state = "open"
+        elif state not in {"open", "failed"}:
+            state = "open"
+        return BorrowEntry(
+            id=entry_id,
+            item=item,
+            count=int(count),
+            reason=str(row.get("reason") or ""),
+            container_id=_as_int(row.get("container_id")),
+            container_title=str(row.get("container_title") or ""),
+            container_pos=container_pos,
+            container_block=str(row.get("container_block") or ""),
+            from_slot=_as_int(row.get("from_slot")),
+            baseline=_as_int(row.get("baseline")),
+            ts=float(row.get("ts") or 0.0),
+            returned=int(_as_int(row.get("returned")) or 0),
+            state=state,
+            attempts=int(_as_int(row.get("attempts")) or 0),
+            awaiting_snapshot=False,
+            trip_sent=False,
+            failure=str(row.get("failure") or ""),
+        )
 
     def _record(self, action: str, *, item: str, count: int, container: str = "",
                 container_slot: Optional[int] = None, player_slot: Optional[int] = None,
@@ -644,6 +778,8 @@ class BorrowLedger:
         self._audit.append(row)
         del self._audit[:-self._audit_limit]
         self._append(row)
+        # 每一次借/还/失败都会经过这里 → 台账跟着落盘，重启不赖账。
+        self.save_ledger()
         return row
 
     def _append(self, row: dict) -> None:

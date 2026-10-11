@@ -368,21 +368,28 @@ class PlannerPromptSlimmingTests(unittest.TestCase):
     def test_static_block_stays_within_prompt_budget(self):
         """静态指令块预算：防止无节制内联把 32k 上下文挤爆。
 
-        历史基线：改动前静态块 1205 字符（16 条动作 + 10 条规则 + JSON 骨架），
-        当时 idle 实测 762。新增 4 个定位/记忆/睡觉工具（20 条动作 + 7 条规则）
-        后 idle 实测 1157；这里留约 15% 余量作为新的预算上限。
-        再新增守卫/HUD/`/locate` 四个工具与 4 条语境规则（22 条动作 + 11 条规则）
-        后 idle 实测 **1861**，同样留约 15% 余量。
-        最后新增借用台账两个工具 + 2 条借用规则（24 条动作 + 13 条规则）
-        后 idle 实测 **2392**，仍留约 15% 余量（旧值 2140 是这一步之前的基线）。
+        历史基线（旧口径：user 提示里"可用动作（"到结尾的那一段 = 动作表 + 规则 + JSON 骨架）：
+        改动前 1205 字符（16 条动作 + 10 条规则 + JSON 骨架），当时 idle 实测 762；新增 4 个
+        定位/记忆/睡觉工具后 1157；再新增守卫/HUD/`/locate` 四个工具与 4 条语境规则后 1861；
+        最后新增借用台账两个工具 + 2 条借用规则后 idle 实测 **2392**，预算一度抬到 2750。
+
+        **现在换成新口径**：静态块 = 真正发出去、要求逐字节不变的 **L0+L1 系统前缀**
+        （契约 + 人设 + 规则 + 机制说明 + 借用授权）。工具表已改走 API `tools` 参数、
+        JSON 骨架已并入 L0，静态块本身**只降不抬**：
+          旧值 IDLE_STATIC_BUDGET = 2750（旧口径实测 2392）
+          新值 IDLE_STATIC_BUDGET = 1700（新口径实测 1535，留约 10% 余量）
         """
-        IDLE_STATIC_BUDGET = 2750
+        IDLE_STATIC_BUDGET = 1700
 
-        # 最坏情况是 idle（注入全部动作组）
-        prompt = self._prompt({"kind": "idle", "status": "idle"})
-        static = prompt[prompt.index("可用动作（"):]
+        # 最坏情况是 idle（`_build_l1` 与阶段无关，这里取的正是发出去的 system 前缀）。
+        planner = Planner(llm_service=None, memory=DummyMemory(), skills=DummySkills())
+        layers = planner.build_prompt_layers(
+            "Steve", "hi", {"task_state": {"kind": "idle", "status": "idle"}}, "AI")
 
-        self.assertLess(len(static), IDLE_STATIC_BUDGET)
+        self.assertLess(len(layers.system), IDLE_STATIC_BUDGET)
+        # 工具表不再内联进提示词（改走 tools 参数）。
+        self.assertNotIn("可用动作（", layers.system + layers.user)
+        self.assertTrue(layers.tools)
 
     def test_phase_filtering_removes_unrelated_actions(self):
         from agent.planner import _actions_for_phase

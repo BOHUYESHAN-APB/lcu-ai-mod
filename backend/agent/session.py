@@ -34,8 +34,10 @@ from .commands import Commands
 from .llm_service import LLMService
 from .self_prompter import SelfPrompter
 from .message_db import MessageDB
-from .conversation import ConversationStore
+from .conversation import ConversationStore, server_key
 from .borrow import BorrowRulesStore, parse_borrow_grant, parse_borrow_revoke
+from .person_memory import PersonMemoryStore
+from .world_memory import WorldMemoryStore, plan_replay
 from .permissions import CraftPolicy, PermissionsStore, ReplyGate
 from .persona_store import PersonaStore
 from .task_list import TaskList
@@ -198,6 +200,18 @@ class Session:
         # 借用规则记忆（按 server 分区）：对话里的"可以用仓库里的铁"落成带条件的规则。
         self.borrow_rules = BorrowRulesStore()
         self._borrow_rule_audit: list[dict] = []
+        # 四层记忆（global / person / server / world）里属于 world 层的两份：
+        # 站点、路径（坐标只在同一世界同一维度里有效，见 world_memory）。
+        self.places = WorldMemoryStore()
+        # person 层：跨服的"同一个人"稳定事实（uuid 优先，名字兜底 + 降级打标）。
+        self.people = PersonMemoryStore()
+        # 已回灌/已激活的层标记（`world:<key>` / `server:<key>` / `person:<key>` / global）：
+        # 同一 session 内同一层只推一次。
+        self._replay_layers: set[str] = set()
+        # 这一 session 里"从聊天认出来的"（名字 → (uuid, 当时的 server_key)）。
+        self._people_seen: dict[str, tuple[str, str]] = {}
+        # 当前在场玩家的 person 稳定事实（名字 → facts），供 prompt 用（只读）。
+        self._present_person_facts: dict[str, dict] = {}
         # 任务列表（多任务 + 归属 + 优先级 + 状态 + 进度）
         self.tasks = TaskList()
         # 当前对话的发起者（供任务归属/权限判定；没有对话时是空）
@@ -311,6 +325,10 @@ class Session:
                 self.runtime.update(data)
                 self._absorb_poi(data)
                 self._absorb_conversation_namespace(data)
+                # 站点/路径（world 层）：落盘 + 模组侧空了就回灌。
+                self._absorb_places(data)
+                # person 层：把在场的人与已认出的 uuid 对上号（只读，不写一次性上下文）。
+                self._absorb_people(data)
                 # 容器内容变了（含归还后的快照）→ 用真实快照核对借用是否真的放回去了。
                 if isinstance(data, dict) and "open_container" in data:
                     self._verify_borrow_returns(data.get("open_container") or {})
@@ -613,6 +631,9 @@ class Session:
         store = getattr(self, "conversation", None)
         if store is None:
             return
+        # global 层是单实例（人设/规则/权限/.local），没有分区也没有回灌动作，
+        # 但"这一层已经就位"要留个痕，status 里才看得出来。
+        self._mark_layer("global", "全局层：人设 / 规则 / 权限（单实例，跨服常驻）")
         world = data.get("world") if isinstance(data, dict) else None
         world = world if isinstance(world, dict) else {}
         try:
@@ -631,8 +652,174 @@ class Session:
             if ledger is not None:
                 try:
                     ledger.use_audit_path(rules.audit_path)
+                    # 欠账台账：与规则/审计同目录同分区；换分区＝按那个分区的盘恢复欠账。
+                    ledger.use_ledger_path(rules.ledger_path)
                 except Exception as e:
-                    logger.warning("[Session] 借用审计路径切换失败: %s", e)
+                    logger.warning("[Session] 借用审计/台账路径切换失败: %s", e)
+            self._mark_layer(f"server:{rules.namespace}", "server 层（对话记忆 / 借用规则）")
+
+    # ── 分层回灌（global / person / server / world）────────────────
+
+    def _mark_layer(self, layer: str, label: str = "") -> bool:
+        """记下某一层这次 session 已经"推过"了；第一次返回 True（幂等标记按层分开）。"""
+        seen = getattr(self, "_replay_layers", None)
+        if seen is None:
+            seen = self._replay_layers = set()
+        if layer in seen:
+            return False
+        seen.add(layer)
+        if label:
+            logger.info("[Memory] 激活 %s（%s）", layer, label)
+        return True
+
+    def _absorb_places(self, data: dict) -> None:
+        """吸收 state 里的站点/路径（原样落盘），并按需把后端存盘的回灌回模组。"""
+        store = getattr(self, "places", None)
+        if store is None or not isinstance(data, dict):
+            return
+        world = data.get("world") if isinstance(data.get("world"), dict) else {}
+        dimension = (data.get("player") or {}).get("dimension", "") if isinstance(data.get("player"), dict) else ""
+        try:
+            store.use_namespace(world.get("server", ""), world.get("world_name", ""), dimension)
+            store.absorb_state(data)
+        except Exception as e:
+            logger.warning("[Session] 站点/路径记忆吸收失败: %s", e)
+            return
+        self._replay_places(data, store)
+
+    def _replay_places(self, data: dict, store) -> dict:
+        """把 world 层的站点/路径回灌回模组（同一个 world **只推一次**）。
+
+        触发：进入某个 world（本 session 第一次见到这个 `world:<key>` 分区）、后端有存盘、
+        模组侧这份记忆是空的（`stations`/`routes` 报了空列表）**或**有同名但内容不同的条目。
+        模组已有同名同内容的条目不推（幂等）；不在世界里不下发（在场门）。
+        """
+        key = store.namespace
+        layer = f"world:{key}"
+        seen = getattr(self, "_replay_layers", None)
+        if seen is None:
+            seen = self._replay_layers = set()
+        if layer in seen:
+            return {"server": key, "replayed": False, "reason": "already_replayed"}
+        saved_stations, saved_routes = store.stations(), store.routes()
+        if not saved_stations and not saved_routes:
+            return {"server": key, "replayed": False, "reason": "nothing_saved"}
+        if not self.llm_active():
+            return {"server": key, "replayed": False, "reason": "not_in_world"}
+        reported_stations = data.get("stations")
+        reported_routes = data.get("routes")
+        if not isinstance(reported_stations, list) and not isinstance(reported_routes, list):
+            # 模组没上报这两类（旧模组）：不能确认"它那边是空的"，就不推。
+            return {"server": key, "replayed": False, "reason": "mod_not_reporting"}
+
+        plan = plan_replay(
+            saved_stations, saved_routes,
+            reported_stations if isinstance(reported_stations, list) else None,
+            reported_routes if isinstance(reported_routes, list) else None)
+
+        sent_stations, sent_routes = [], []
+        skills = getattr(self, "skills", None)
+        remember_station = getattr(skills, "remember_station", None)
+        for args in plan["stations"]:
+            if callable(remember_station):
+                remember_station(**args)
+                sent_stations.append(args)
+        remember_route = getattr(skills, "remember_route", None)
+        for args in plan["routes"]:
+            if callable(remember_route):
+                remember_route(args["name"], args["points"])
+                sent_routes.append(args)
+        if plan["stations"] or plan["routes"]:
+            # 内容不同才推的条目要留痕（"为什么又覆盖了一次"）。
+            logger.info("[Memory] 回灌 %s：站点 %d 条、路径 %d 条（模组已有同名的 %d 条不推）",
+                        key, len(sent_stations), len(sent_routes), len(plan["skipped"]))
+        for item in plan["blocked"]:
+            logger.info("[Memory] 回灌受阻 %s %s：%s", item["kind"], item["name"], item["reason"])
+        self._mark_layer(layer)
+        return {"server": key, "replayed": True, "stations": sent_stations,
+                "routes": sent_routes, "skipped": plan["skipped"], "blocked": plan["blocked"]}
+
+    def _absorb_people(self, data: dict) -> None:
+        """把在场玩家与 person 层对上号（**只读**，不写新条目）。
+
+        真正落 person 记录的时机是"他说了话"（`_note_person`）—— 那里才有 uuid。
+        在场的人里能从聊天认出 uuid 的用 uuid 取件，其余按"名字 + 本服"取降级件。
+        """
+        store = getattr(self, "people", None)
+        if store is None or not isinstance(data, dict):
+            return
+        rows = data.get("players")
+        if not isinstance(rows, list):
+            return
+        server = self._current_server_key()
+        facts: dict[str, dict] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("name") or "").strip()
+            if not name:
+                continue
+            try:
+                person_facts = store.facts(self._person_uuid(name), name, server_key=server)
+            except Exception as e:
+                logger.debug("[Session] person 记忆读取失败 %s: %s", name, e)
+                continue
+            if person_facts:
+                facts[name] = person_facts
+        self._present_person_facts = facts
+
+    def _current_server_key(self) -> str:
+        """当前 server 分区键（供 person 层降级键/现役玩家取件用）。"""
+        rules = getattr(self, "borrow_rules", None)
+        namespace = getattr(rules, "namespace", "") if rules is not None else ""
+        if namespace:
+            return str(namespace)
+        runtime = getattr(self, "runtime", None)
+        world = runtime.get("world") if isinstance(runtime, dict) else None
+        world = world if isinstance(world, dict) else {}
+        return server_key(world.get("server", ""), world.get("world_name", ""))
+
+    def _person_uuid(self, name: str) -> str:
+        """这个名字对应的 uuid：**只有**在本服亲耳听过他说话（聊天带 uuid）才认。"""
+        if not name:
+            return ""
+        seen = getattr(self, "_people_seen", None) or {}
+        row = seen.get(name)
+        if not row:
+            return ""
+        uuid, server = row
+        return uuid if server and server == self._current_server_key() else ""
+
+    def _note_person(self, data: dict) -> None:
+        """一条聊天事件 → person 层：uuid↔名字绑定（稳定事实）。
+
+        **只记身份**：聊天内容、坐标、在哪遇到的这类服务器内的一次性上下文一概不进来
+        （`PersonMemoryStore` 的白名单会把它们挡掉）。
+        """
+        if not isinstance(data, dict):
+            return
+        name = str(data.get("sender") or "").strip()
+        if not name or name == "?":
+            return
+        store = getattr(self, "people", None)
+        if store is None:
+            return
+        uuid = str(data.get("uuid") or "").strip()
+        server = self._current_server_key()
+        try:
+            entry = store.identify(uuid, name, server_key=server)
+        except Exception as e:
+            logger.debug("[Session] person 记忆写入失败: %s", e)
+            return
+        if not isinstance(entry, dict):
+            return
+        if uuid:
+            seen = getattr(self, "_people_seen", None)
+            if seen is None:
+                seen = self._people_seen = {}
+            seen[name] = (uuid, server)
+        self._mark_layer(f"person:{entry.get('key')}",
+                         f"person 层（{name} 的稳定事实）")
 
     def _record_conversation_chat(self, data: dict) -> None:
         """把一条聊天事件写进对话记忆（L1 落盘 + L2 窗口）。
@@ -699,6 +886,9 @@ class Session:
 
         # 对话记忆（L1+L2）与交互库：静默模式 / guest 也要"听见"。
         self._record_conversation_chat(data)
+        # person 层：认人（uuid↔名字）——只记身份，聊天内容留在 server 层。
+        if not is_system:
+            self._note_person(data)
         if not getattr(self, "_chat_tap_registered", False):
             self._note_chat(data)
         try:
@@ -1038,10 +1228,15 @@ class Session:
         return _wake_names_from(persona, self._get_bot_name())
 
     def _absorb_poi(self, data: dict):
-        """吸收一次状态里的 POI 观测，并按当前服务器/世界切换命名空间。"""
+        """吸收一次状态里的 POI 观测，并按当前「服务器/世界/维度」切换命名空间。
+
+        维度是必需的一层：同一服务器里主世界与下界的 xyz 不是一回事。
+        """
         world = data.get("world")
         world = world if isinstance(world, dict) else {}
-        self.poi.use_namespace(world.get("server", ""), world.get("world_name", ""))
+        player = data.get("player") if isinstance(data.get("player"), dict) else {}
+        self.poi.use_namespace(world.get("server", ""), world.get("world_name", ""),
+                               player.get("dimension", ""))
         self.poi.observe_state(data)
 
     def _hud_note(self) -> str:
@@ -1138,6 +1333,8 @@ class Session:
         # 语境：谁在线、谁刚说过话（以及他说那话时站在哪）、最近的聊天顺序。
         context["players"] = self._players_for_status()
         context["last_speaker"] = dict(getattr(self, "last_speaker", {}) or {})
+        # person 层：在场玩家关于自己的**稳定事实**（跨服复用；服务器内的一次性上下文不在这一层）。
+        context["person_facts"] = dict(getattr(self, "_present_person_facts", {}) or {})
         inbox = getattr(self, "chat_inbox", None)
         context["recent_chat"] = inbox.recent(8) if inbox is not None else []
         context["hud_note"] = self._hud_note()
@@ -1611,7 +1808,8 @@ class Session:
         system_prompt = self.llm.build_system_prompt(context, self.commands.get_docs())
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt},
+            # L2：动态上下文只进当轮 user 消息（与 planner 口径一致，绝不允许混进 system）。
+            {"role": "user", "content": self.llm.build_dynamic_context(context, prompt)},
         ]
         # Non-blocking LLM call (runs on background thread)
         try:
@@ -1702,6 +1900,38 @@ class Session:
 
     # ── Status ──
 
+    def _memory_layers_status(self) -> dict:
+        """四层记忆的现状（global / person / server / world）—— 仪表盘与排障用。"""
+        places = getattr(self, "places", None)
+        people = getattr(self, "people", None)
+        stations = routes = 0
+        world_namespace = ""
+        if places is not None:
+            try:
+                stations = len(places.stations())
+                routes = len(places.routes())
+                world_namespace = places.namespace
+            except Exception as e:
+                logger.debug("[Session] world 层状态读取失败: %s", e)
+        known_people: list[dict] = []
+        if people is not None:
+            try:
+                known_people = [{
+                    "key": row.get("key"),
+                    "name": row.get("name"),
+                    "degraded": bool(row.get("degraded")),
+                    "facts": sorted((row.get("facts") or {}).keys()),
+                } for row in people.known()[:20]]
+            except Exception as e:
+                logger.debug("[Session] person 层状态读取失败: %s", e)
+        return {
+            # global 层是单实例（人设/规则/权限文件），没有"分区"也没有回灌动作。
+            "global": {"active": True, "note": "人设/规则/权限单实例，跨服常驻"},
+            "world": {"namespace": world_namespace, "stations": stations, "routes": routes},
+            "person": {"people": known_people},
+            "replayed_layers": sorted(getattr(self, "_replay_layers", set())),
+        }
+
     def get_status(self) -> dict:
         tasks = getattr(self, "tasks", None)
         gate = getattr(self, "reply_gate", None)
@@ -1764,6 +1994,9 @@ class Session:
                 "storage": len(self.poi.find("storage")),
                 "workstation": len(self.poi.find("workstation")),
             },
+            # 分层记忆（global / person / server / world）：world 层的站点/路径 +
+            # person 层的稳定事实 + 本 session 已回灌的层标记。
+            "memory_layers": self._memory_layers_status(),
             "llm_usage": self.llm.get_usage(),
         }
 
