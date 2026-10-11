@@ -216,6 +216,7 @@ tasks.named('check').configure {
     dependsOn 'verifyRecipe'
     dependsOn 'verifyGuard'
     dependsOn 'verifyProto'
+    dependsOn 'verifyMlg'
 }
 
 tasks.register('verifyGuard', JavaExec) {
@@ -232,6 +233,14 @@ tasks.register('verifyProto', JavaExec) {
     dependsOn tasks.named('testClasses')
     classpath = sourceSets.test.output + sourceSets.main.output
     mainClass = 'com.lcu.lcumod.proto.ProtoCheck'
+}
+
+tasks.register('verifyMlg', JavaExec) {
+    group = 'verification'
+    description = '纯逻辑自检（落地水/MLG：FallPlan 决策表 危险/不危险边界、too_late、no_bucket、判据=预计伤害vs生命值；反应窗口 tick 预算；让路 关掉/缓冲/地面未知→none；回执枚举与 phase 稳定）'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.output + sourceSets.main.output
+    mainClass = 'com.lcu.lcumod.action.MlgCheck'
 }
 
 tasks.register('verifyRecipe', JavaExec) {

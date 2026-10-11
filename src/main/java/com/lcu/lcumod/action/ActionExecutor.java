@@ -287,6 +287,11 @@ public class ActionExecutor {
         // 只写 jump 键，不碰 WASD/朝向，因此不会跟寻路/控制流抢横向控制。
         SwimReflex.tick(mc);
 
+        // ── P0 落地水（MLG）反射：真会摔死时在落地前放水、落地后收回 ──
+        // 与岩浆/溺水同级；只在预计落地伤害 ≥ 生命值时动手（保守优先）。放在最后 →
+        // 放水窗口内它是"看向正下方"的最后写入者。
+        MlgReflex.tick(mc);
+
         // ── Auto-respawn ──
         if (mc.player.isDeadOrDying()) {
             if (!wasDead) {
@@ -578,6 +583,17 @@ public class ActionExecutor {
                             + (enable ? " for " + seconds + "s" : ""));
                 }
                 case "eat" -> handleEat(cmd);
+                // 落地水（MLG）反射开关：默认开；{enabled:false} 立刻放弃并停止动手
+                case "mlg" -> {
+                    JsonObject mlgArgs = cmd.args();
+                    boolean mlgEnabled = mlgArgs == null || !mlgArgs.has("enabled")
+                            || mlgArgs.get("enabled").getAsBoolean();
+                    MlgReflex.setEnabled(mlgEnabled);
+                    JsonObject mlgData = new JsonObject();
+                    mlgData.addProperty("enabled", mlgEnabled);
+                    mlgData.add("state", MlgReflex.state());
+                    sendResponse(cmd.id(), true, mlgData, "mlg=" + mlgEnabled);
+                }
                 case "drop_item" -> handleDropItem(cmd);
                 case "sort_inventory" -> handleSortInventory(cmd);
                 case "build" -> handleBuild(cmd);
@@ -1204,7 +1220,7 @@ public class ActionExecutor {
      * <p>注意这只是"搬运同一个物品"，不是"换别的物品"；换不过去就返回 false，由调用方如实失败。
      * 开着别的容器时不动（避免和容器命令抢同一套槽位）。
      */
-    private static boolean swapIntoHotbar(Minecraft mc, int invIndex) {
+    static boolean swapIntoHotbar(Minecraft mc, int invIndex) {
         var player = mc.player;
         if (player == null || mc.gameMode == null) {
             return false;

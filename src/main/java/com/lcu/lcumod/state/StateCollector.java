@@ -239,6 +239,8 @@ public class StateCollector {
         state.addProperty("reflex_combat", com.lcu.lcumod.action.CombatReflex.isEngaged());
         state.addProperty("reflex_swim", com.lcu.lcumod.action.SwimReflex.isActive());
         state.addProperty("reflex_eat", com.lcu.lcumod.action.ActionExecutor.isReflexEating());
+        // 落地水（MLG）反射：armed/phase/reason/receipt（与上面三个反射同口径）
+        state.add("reflex_mlg", com.lcu.lcumod.action.MlgReflex.state());
 
         // Player
         JsonObject player = new JsonObject();
