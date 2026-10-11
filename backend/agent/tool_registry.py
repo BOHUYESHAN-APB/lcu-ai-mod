@@ -63,6 +63,9 @@ class ToolPermission:
                  craft→`PermissionsStore.can_craft`、territory→`can_authorize_territory`、
                  zones→`can_define_zones`、containers→`can_authorize_containers`。
     container  : 派发前统一走容器访问授权（箱子的 free/borrow_only/no_touch 策略 + 借用规则）。
+    read_only  : **只读**变体（`container=True` 时才有意义）：no_touch 一律拒，登记过的
+                 （free/borrow_only）只读放行 —— 只看不拿，不需要翻箱授权；没登记的箱子
+                 仍要翻箱授权（不去开别人没让我看的箱子）。
     command    : 走服务器指令白名单闸门（判定在 handler 内，因为需要白名单内容）。
     borrow     : 走借用台账（借用规则 + 数量上限 + 归还）。
     area       : 动手范围受领地/区域授权约束（handler 用 `may_act` 逐点判定）。
@@ -72,6 +75,7 @@ class ToolPermission:
 
     tier: str = ""
     container: bool = False
+    read_only: bool = False
     command: bool = False
     borrow: bool = False
     area: bool = False
@@ -127,6 +131,13 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
                          "只答位置：不移动、不扫描、不猜坐标，问不到就如实说不知道"
                          "（kind=auto|player|poi|station|container|zone，默认 auto）",
              "target,kind", ("locate",), "_tool_where_is"),
+    ToolSpec("find_entity", "找**附近实体**（只查不走）：按 kind 列出手边快照里的实体候选"
+                            "（牛/羊/村民/僵尸这类，写英文 cow/villager/zombie 或中文「牛」"
+                            "「村民」都行；也能按类别 animal|hostile|item|player|mob），"
+                            "每条带坐标、距离与类别——数据只来自 state 快照（我周围约 16 格），"
+                            "要过去就另外调 move_to/go_to_block/follow（我只答，不移动、不扫描、"
+                            "不编坐标）；快照里没有就如实说没有。kind 留空＝把附近实体都列出来",
+             "kind,limit", ("locate",), "_tool_find_entity"),
     ToolSpec("find_block", "扫附近有无该方块（只查不走）", "block,radius,limit",
              ("locate",), "_tool_find_block"),
     ToolSpec("go_to_block", "寻路过去，到达后记住", "block,radius,remember",
@@ -163,6 +174,16 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
              ToolPermission(container=True, deny_label="翻箱子",
                             note="同容器访问授权；no_touch 不碰")),
     ToolSpec("container_close", "关掉容器界面", "", ("container",), "_tool_container_close"),
+    ToolSpec("view_container", "**只读**看一眼容器里有什么（对照 !viewChest）：列出"
+                               "{items:[{name,count,slot}], empty, truncated}，看完关掉界面，"
+                               "**什么都不拿** —— 这是 haul「取多少 / 搬什么」**之前那一步**"
+                               "（先看清有几件，再决定取多少、搬什么）。要有开着的容器"
+                               "（先 go_to_block 过去 + use_on 右键打开，再叫我一次）；"
+                               "no_touch 的箱子一律不给看，borrow_only 只读可以",
+             "target,limit", ("container",), "_tool_view_container",
+             ToolPermission(container=True, read_only=True, deny_label="翻箱子",
+                            note="只读：no_touch 不碰、borrow_only 只读可以；只列内容不拿东西；"
+                                 "没登记的箱子仍要翻箱授权")),
     ToolSpec("borrow_item", "从仓库借（须授权；不给 count＝整箱搬，拒绝）",
              "item,count,container", ("container",), "_dispatch_borrow_item",
              ToolPermission(container=True, borrow=True, deny_label="翻箱子",
@@ -199,6 +220,12 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("equip_weapon", "换上热栏里最好的武器", "", ("items",), "_tool_equip_weapon"),
     ToolSpec("select_hotbar", "切到热栏第 index 格（0-8）", "index", ("items",),
              "_tool_select_hotbar"),
+    ToolSpec("use_on", "对目标使用**手里**的物品（右键）：点火把、倒水、剪羊毛、挤奶、喂食"
+                       "这类原版交互都走它。target＝实体名/类型（从 state 快照里挑最近的），"
+                       "或配合 x,y,z 对坐标/方块右键；想指定手里该拿哪件就带 item（给的这件"
+                       "不在手上会如实报 wrong_item，我不替你乱换）。够不着（>4 格）报 "
+                       "out_of_range，先 go_to_block/move_to 靠近。占 use 资源",
+             "target,item,x,y,z", ("items",), "_tool_use_on"),
     # ── survive ──
     ToolSpec("eat", "吃东西", "", ("survive",), "_tool_eat", job=True),
     ToolSpec("sleep", "睡觉", "", ("survive",), "_tool_sleep", job=True),

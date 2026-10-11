@@ -141,9 +141,15 @@ class RegistryDrivenDispatchTests(unittest.TestCase):
         """容器工具的权限在注册表里标 container=True；统一校验走同一个 helper。"""
         spec = TOOL_BY_NAME["container_move"]
         self.assertTrue(spec.permission.container)
+        self.assertFalse(spec.permission.read_only)
 
         container_specs = {s.name for s in TOOL_SPECS if s.permission.container}
-        self.assertEqual(container_specs, {"container_move", "container_click", "borrow_item"})
+        self.assertEqual(container_specs,
+                         {"container_move", "container_click", "borrow_item",
+                          "view_container"})
+        # 只读变体只有 `view_container` 一个（no_touch 拒、borrow_only 只读可以）。
+        read_only_specs = {s.name for s in TOOL_SPECS if s.permission.read_only}
+        self.assertEqual(read_only_specs, {"view_container"})
 
 
 class ToolDocTests(unittest.TestCase):

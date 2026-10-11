@@ -21,9 +21,21 @@ from typing import Any, Callable, Optional
 
 from . import where
 from .borrow import BorrowLedger
+from .container_view import describe as container_view_note
+from .container_view import (CODE_BUSY as CONTAINER_VIEW_BUSY, CODE_NO_TOUCH,
+                             CODE_OTHER_CONTAINER, CODE_UNAUTHORIZED)
+from .container_view import is_open as container_is_open
+from .container_view import matches as container_matches
+from .container_view import other_container_note as container_view_other_note
+from .container_view import title_of as container_title
+from .container_view import view as container_view_snapshot
+from .container_view import denied_note as container_view_denied_note
 from .control_lease import ControlLease
 from .craft import (ContainerPick, armor_in_containers, clamp_take, describe_missing,
                     evaluate_craft, is_armor, normalize_item, route_containers)
+from .entities import describe as entity_note
+from .entities import find as find_entities
+from .entities import gather as gather_entities
 from .farm import (ACTION_HARVEST, ACTION_PLANT, ACTION_REPLANT, ACTION_TILL,
                    choose_action, counts_of, crop_of, hold_index, is_hoe, missing_items,
                    normalize_action)
@@ -62,6 +74,9 @@ from .territory import (ACTION_FARM, POLICY_BORROW_ONLY, POLICY_FREE, POLICY_NO_
 from .tool_registry import (ACTION_GROUPS as _ACTION_GROUPS,
                             PHASE_GROUPS as _PHASE_GROUPS, TOOL_BY_NAME, ToolSpec,
                             _actions_for_phase, build_tool_schemas, tool_schema)
+from .use_on import MODE_ENTITY as USE_ON_ENTITY
+from .use_on import describe as use_on_note
+from .use_on import plan as plan_use_on
 
 logger = logging.getLogger("planner")
 TOOL_CALL_RE = re.compile(r"tool\(\s*([a-zA-Z_]+)\s*,\s*(\{.*?\})\s*\)", re.DOTALL)
@@ -1527,7 +1542,8 @@ class Planner:
             logger.info("[Planner] 工具 %s 被拒：%s 权限不足", spec.name, perm.tier)
             return False
         if perm.container:
-            ok, note, _cpolicy, crow = self._container_access(context)
+            access = self._container_read_access if perm.read_only else self._container_access
+            ok, note, _cpolicy, crow = access(context)
             if not ok:
                 self._craft_note = note
                 logger.info("[Planner] 工具 %s 被拒：容器访问未授权 %s",
@@ -1573,6 +1589,29 @@ class Planner:
             return False, self._auth_note(policy, "翻箱子"), cpolicy, crow
         return True, "", cpolicy, crow
 
+    def _container_read_access(self, context: dict) -> tuple[bool, str, str, Optional[dict]]:
+        """**只读**容器访问的判定（`view_container` 用）：no_touch 拒、登记过的只读放行。
+
+        与取用路径（`_container_access`）**只差一条**：只读不改变任何东西，所以
+        `free` / `borrow_only` 都给看；没登记的箱子仍要翻箱授权 —— 只读也不去开
+        别人没让我看的箱子。被拒时给的是**带 code** 的如实说明。
+        """
+        cpolicy, crow = self._container_policy(context)
+        if not container_is_open(self._open_container(context)):
+            # 根本没有开着的容器：没有可读的东西，也没可判的箱子 —— 放行到 handler，
+            # 由它如实说"没开着的容器，我不知道里面有什么"（比报"未授权"更贴事实）。
+            return True, "", cpolicy, crow
+        if cpolicy == POLICY_NO_TOUCH:
+            return (False, container_view_denied_note(CODE_NO_TOUCH, container=crow),
+                    cpolicy, crow)
+        if cpolicy in (POLICY_FREE, POLICY_BORROW_ONLY):
+            return True, "", cpolicy, crow
+        policy = self._craft_policy(context)
+        if not policy.may_open_containers:
+            return (False, container_view_denied_note(CODE_UNAUTHORIZED, tier=policy.tier),
+                    cpolicy, crow)
+        return True, "", cpolicy, crow
+
     # ── handler（注册表登记，指向现有技能函数）────────────────
     def _tool_move_to(self, payload: dict, context: dict) -> bool:
         if {"x", "y", "z"}.issubset(payload):
@@ -1615,6 +1654,22 @@ class Planner:
         self._action_note = str(result.get("note") or where.describe(result))
         logger.info("[Planner] where_is %s（kind=%s）：%d 个候选",
                     target or "(空)", kind, len(result.get("candidates") or []))
+        return True
+
+    def _tool_find_entity(self, payload: dict, context: dict) -> bool:
+        """找附近实体：**只答候选，绝不移动、绝不扫描**（数据只来自 state 快照）。
+
+        快照里没有就如实说没有（并说明它只覆盖周围约 16 格），**绝不编坐标** ——
+        要过去是模型另外调 move_to/go_to_block/follow。
+        """
+        kind = str(payload.get("kind") or payload.get("target")
+                   or payload.get("name") or "").strip()
+        result = find_entities(kind, limit=payload.get("limit"),
+                               player_pos=self._player_pos(context),
+                               entities=gather_entities(context))
+        self._action_note = str(result.get("note") or entity_note(result))
+        logger.info("[Planner] find_entity %s：%d 个候选",
+                    kind or "(全部)", len(result.get("candidates") or []))
         return True
 
     def _tool_find_block(self, payload: dict, context: dict) -> bool:
@@ -1695,6 +1750,59 @@ class Planner:
 
     def _tool_container_close(self, payload: dict, context: dict) -> bool:
         self.skills.container_close()
+        return True
+
+    def _tool_view_container(self, payload: dict, context: dict) -> bool:
+        """**只读**看容器里有什么：列清单 + 关掉界面，**什么都不拿**（授权在注册表那道门）。
+
+        只认**已经开着**的容器（Java state 的 `open_container` 快照）——没开着就如实说
+        不知道里面有什么（并告诉它先 `go_to_block` + `use_on` 打开），**绝不猜内容**。
+        这是 haul「取多少 / 搬什么」之前那一步：先看清有几格、各多少，再决定怎么搬。
+        """
+        if self._haul_job is not None:
+            # 搬运正用着容器界面（对账要快照）—— 不去搅它，如实说忙。
+            self._action_note = container_view_denied_note(CONTAINER_VIEW_BUSY)
+            logger.info("[Planner] view_container 拒绝：haul 正用着容器")
+            return False
+        container = self._open_container(context)
+        target = str(payload.get("target") or payload.get("name") or "").strip()
+        if container_is_open(container) and not container_matches(container, target):
+            self._action_note = container_view_other_note(target, container)
+            logger.info("[Planner] view_container：开着的是别的容器（code=%s)",
+                        CODE_OTHER_CONTAINER)
+            return False
+        result = container_view_snapshot(container, limit=payload.get("limit"))
+        self._action_note = str(result.get("note") or container_view_note(result))
+        if not result.get("known"):
+            logger.info("[Planner] view_container：看不成（code=%s）", result.get("code"))
+            return False
+        self.skills.container_close()
+        logger.info("[Planner] view_container「%s」：%s 格非空（只读，什么都没拿）",
+                    container_title(container) or "容器", result.get("total"))
+        return True
+
+    def _tool_use_on(self, payload: dict, context: dict) -> bool:
+        """对目标使用手里的物品（右键）：判定在 `use_on` 模块，发帧复用**已有原语**。
+
+        实体目标走 `skills.use_on_entity(id)`（Java 侧自带瞄准 + 通用右键）；坐标/方块目标
+        走 `skills.look_at(...)` + `skills.use_on()`。判定不过（没有目标/够不着/手上不对）
+        一律**带 code 如实说**，**一帧都不发**。
+        """
+        result = plan_use_on(payload, context=context)
+        self._action_note = use_on_note(result)
+        if not result.get("ok"):
+            logger.info("[Planner] use_on 拒绝（%s）：%s", result.get("code"),
+                        result.get("reason"))
+            return False
+        target = result.get("target") if isinstance(result.get("target"), dict) else {}
+        entity_id = target.get("id")
+        if (result.get("mode") == USE_ON_ENTITY
+                and isinstance(entity_id, int) and not isinstance(entity_id, bool)):
+            self.skills.use_on_entity(int(entity_id))
+        else:
+            self.skills.look_at(float(target["x"]), float(target["y"]), float(target["z"]))
+            self.skills.use_on()
+        logger.info("[Planner] use_on %s（%s）", target.get("name") or "?", result.get("mode"))
         return True
 
     def _tool_attack(self, payload: dict, context: dict) -> bool:

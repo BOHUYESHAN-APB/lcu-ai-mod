@@ -117,6 +117,7 @@ _TOOL_RESOURCE_OVERRIDES: Mapping[str, frozenset[str]] = {
     "get_inventory": frozenset(),
     "trade": frozenset({RESOURCE_CONTAINER}),              # 村民交易是界面
     "sleep": frozenset({RESOURCE_USE, RESOURCE_CONTAINER}),  # 睡眠走床界面
+    "use_on": frozenset({RESOURCE_USE}),                   # 右键：与反射的 use 同一份资源
     "sleep_in_bed": frozenset({RESOURCE_MOVE, RESOURCE_USE}),
     "run_server_command": frozenset({RESOURCE_CHAT}),
     "send_whisper": frozenset({RESOURCE_CHAT}),
