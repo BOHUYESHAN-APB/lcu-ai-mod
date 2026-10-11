@@ -12,6 +12,14 @@
 """
 
 from .adapter import to_legacy_context
+from .bridge import (
+    MemoryStore,
+    entries_from_turns,
+    project_history,
+    project_turns,
+    server_scope,
+    world_scope_key,
+)
 from .context_builder import (
     ContextBuilder,
     active_branch,
@@ -109,4 +117,11 @@ __all__ = [
     "replay",
     # adapter
     "to_legacy_context",
+    # read-side bridge (wiring)
+    "MemoryStore",
+    "entries_from_turns",
+    "project_history",
+    "project_turns",
+    "server_scope",
+    "world_scope_key",
 ]

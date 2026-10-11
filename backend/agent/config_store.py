@@ -265,6 +265,11 @@ def _default_config() -> dict[str, Any]:
             # 关闭后直接进入 planner（省一次小调用，但会更容易"什么话都接"）。
             "semantic_gate": True,
         },
+        # 会话树读取开关（新地基 `agent/session_core/`，见 docs/dev/AGENT_ARCH.md §1）。
+        # 关闭（默认）→ 「对话历史的读取」走既有链路，路径与字节完全照旧；
+        # 打开 → 「对话历史的读取」改走 session_core 纯投影 + 只读适配（写侧仍归旧链路）。
+        # 默认关闭是刻意的：新链路未逐项验收前不许默认生效。
+        "session_tree": False,
     }
 
 
@@ -399,6 +404,10 @@ class ConfigStore:
                     parsed_gate = _parse_bool(decision["semantic_gate"])
                     if parsed_gate is not None:
                         self._data.setdefault("decision", {})["semantic_gate"] = parsed_gate
+            if "session_tree" in payload:
+                parsed_tree = _parse_bool(payload["session_tree"])
+                if parsed_tree is not None:
+                    self._data["session_tree"] = parsed_tree
             self.save()
             return self.raw(redact=True)
 
@@ -413,6 +422,16 @@ class ConfigStore:
         with self._lock:
             raw = self._data.get("decision", {}).get("semantic_gate", True)
         return _as_bool(raw, True)
+
+    def get_session_tree(self) -> bool:
+        """会话树读取开关（config.json → session_tree，**默认关**）。
+
+        关闭（默认）→ 「对话历史的读取」走既有链路（路径与字节完全照旧）；
+        打开 → 改走 `agent/session_core/` 的纯投影 + 只读适配。
+        """
+        with self._lock:
+            raw = self._data.get("session_tree", False)
+        return _as_bool(raw, False)
 
     def get_decision_threshold(self) -> float:
         """decider 置信度阈值；非法值回退默认。"""

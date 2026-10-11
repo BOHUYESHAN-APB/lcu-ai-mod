@@ -2059,9 +2059,53 @@ class Session:
             "progress": float(task.get("progress") or 0.0),
         }
 
+    # ── 会话树读取（新地基，默认关；见 docs/dev/AGENT_ARCH.md §1） ──
+
+    def _session_tree_enabled(self) -> bool:
+        """会话树读取开关（config.json → session_tree，**默认关**）。
+
+        关闭时走既有链路、字节完全照旧；打开时「对话历史的读取」改走 session_core 投影。
+        """
+        try:
+            return bool(get_config_store(DEFAULT_CONFIG_PATH).get_session_tree())
+        except Exception as e:  # noqa: BLE001 —— 开关读不到就当关（保守）
+            logger.debug("[Session] session_tree 开关读取失败: %s", e)
+            return False
+
+    def _history_scope(self) -> str:
+        """对话历史的分区键（复用现有 key 口径；server 层，进 world/换服都不串层）。"""
+        from .session_core import server_scope
+
+        world = self.runtime.get("world") if isinstance(self.runtime, dict) else None
+        world = world if isinstance(world, dict) else {}
+        return server_scope(world.get("server"), world.get("world_name"))
+
+    def _projected_history(self) -> Optional[dict]:
+        """只读地把「对话历史」投影成 context 片段（新链路；**不写任何真相**）。
+
+        读取源仍是现有真相（``Memory.recent_messages``）；失败一律返回 None 让调用方回退旧读取
+        —— 读取链路绝不因为一次投影异常就报错。
+        """
+        try:
+            from .session_core import project_history
+
+            turns = self.memory.get_recent_context(50)
+            return project_history(turns, scope=self._history_scope())
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[Session] session_tree 投影失败，回退旧读取: %s", e)
+            return None
+
     def _runtime_context(self) -> dict:
         """把 runtime 快照整理成 LLM 上下文（聊天与自我提示两条路共用，避免字段漂移）。"""
         context = self.memory.build_context()
+        # 对话历史的读取：开关打开时改走 session_core 纯投影（只读）；关闭时**一行不动**
+        # （字节完全照旧）。写侧仍归 `_absorb_*` / `conversation.py`：单写单读、新链路只读。
+        if self._session_tree_enabled():
+            projected = self._projected_history()
+            if projected is not None:
+                context["interaction_summary"] = projected["interaction_summary"]
+                context["chat_pairs"] = projected["chat_pairs"]
+                context["history_scope"] = projected["scope"]
         context["persona"] = self.runtime.get("persona", {})
         context["task_state"] = self.runtime.get("task_state", {})
         context["behavior_state"] = self.runtime.get("behavior_state", {})

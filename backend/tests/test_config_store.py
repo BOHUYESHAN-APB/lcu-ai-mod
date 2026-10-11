@@ -109,6 +109,18 @@ class ConfigStoreTests(unittest.TestCase):
             store.set_app_config({"capability_level": "abc"})
             self.assertEqual(store.get_capability_level(), 1, "非法值回退 L1")
 
+    def test_session_tree_flag_defaults_off_and_roundtrips(self):
+        """会话树读取开关默认关；显式打开要落盘。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            store = ConfigStore(path)
+            self.assertFalse(store.get_session_tree(), "默认关：新链路未验收前不许默认生效")
+            store.set_app_config({"session_tree": True})
+            self.assertTrue(store.get_session_tree())
+            self.assertTrue(ConfigStore(path).get_session_tree(), "要落盘")
+            store.set_app_config({"session_tree": "false"})
+            self.assertFalse(store.get_session_tree(), "字符串也能识别")
+
     def test_night_auto_sleep_flag_is_gone(self):
         """自主开关已删除：写入不落盘、读取 API 也不存在。"""
         with tempfile.TemporaryDirectory() as tmp:
