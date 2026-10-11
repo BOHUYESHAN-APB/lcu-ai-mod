@@ -103,6 +103,7 @@ _GROUP_RESOURCES: Mapping[str, frozenset[str]] = {
     "hud": frozenset(),
     "server": frozenset({RESOURCE_CHAT}),
     "memory": frozenset(),
+    "goal": frozenset(),                                  # 立/结束长期目标：只是账本，不占资源
     "territory": frozenset(),
 }
 

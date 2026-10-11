@@ -289,6 +289,11 @@ def _default_config() -> dict[str, Any]:
             # 同屏治理台账上限（超出淘汰最低优先级的非生存项）。
             "max_tracked": 50,
         },
+        # 编排轮次（`agent/job_registry.py`，AGENT_ARCH §10.2 #3）：当且仅当 `task_list` 里有
+        # **模型自己创建的活跃任务**时，在**事件**发生（进度变化 / 出结果 / 卡住 / 玩家说话）时
+        # 把模型请回来做下一步。**不是定时器**、**不是后台自主引擎**。
+        # 默认**开**（用户明确要这个）；关掉 ⇒ 行为回到现在（不再有编排轮）。
+        "job_orchestration": True,
     }
 
 
@@ -441,6 +446,10 @@ class ConfigStore:
                 from .state_governor import GovernorConfig
                 self._data["state_governor"] = GovernorConfig.from_mapping(
                     payload["state_governor"]).as_dict()
+            if "job_orchestration" in payload:
+                parsed_orch = _parse_bool(payload["job_orchestration"])
+                if parsed_orch is not None:
+                    self._data["job_orchestration"] = parsed_orch
             self.save()
             return self.raw(redact=True)
 
@@ -501,6 +510,16 @@ class ConfigStore:
         if isinstance(raw, dict):
             merged.update(raw)
         return merged
+
+    def get_job_orchestration(self) -> bool:
+        """编排轮次开关（``config.json`` → ``job_orchestration``，**默认开**）。
+
+        开 → 当 `task_list` 里有模型自己创建的活跃任务、且有事件发生时，把模型请回来做下一步；
+        关 → 行为回到现在（不再有编排轮；模型只由对话/事件注入那条既有路径触发）。
+        """
+        with self._lock:
+            raw = self._data.get("job_orchestration", True)
+        return _as_bool(raw, True)
 
     def get_decision_threshold(self) -> float:
         """decider 置信度阈值；非法值回退默认。"""

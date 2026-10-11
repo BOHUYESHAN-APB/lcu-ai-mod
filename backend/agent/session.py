@@ -44,6 +44,9 @@ from .territory import (TerritoryStore, current_base, home_situation, plan_zone_
 from .permissions import CraftPolicy, PermissionsStore, ReplyGate
 from .persona_store import PersonaStore
 from .task_list import TaskList
+from .job_registry import (ORCH_EVENT_OUTCOME, ORCH_EVENT_PLAYER, ORCH_EVENT_PROGRESS,
+                           ORCH_EVENT_STUCK, JobRegistry, OrchestrationTurns,
+                           has_model_created_active_task)
 from .resource_lease import PRIORITY_DEFAULT, ResourceLease
 from .state_governor import StateGovernor
 from .audit_log import AuditLog
@@ -250,6 +253,20 @@ class Session:
         # 任务列表（多任务 + 归属 + 优先级 + 状态 + 进度）
         self.tasks = TaskList()
 
+        # ── job 句柄 + 编排轮次（AGENT_ARCH §10.2 #2/#3）──
+        # job 台账：长任务统一成 `{id, tool, status, progress, started_at, result}`，
+        # 供模型查看/取消；**卡死判定复用同一个 state_governor**（不另造）。
+        # 来源只能是"模型已请求的调用"（planner 派发长任务时登记），后台绝不自己发起。
+        self.jobs = JobRegistry(governor=self.state_governor)
+        # 编排轮次：事件驱动（进度变化 / 出结果 / 卡住 / 玩家说话），**只在 task_list 里有
+        # 模型自己创建的活跃任务时**才把模型请回来；**不是定时器**（安静时零额外调用）。
+        # 总开关 `config.json → job_orchestration`（默认**开**；关掉 ⇒ 行为回到现在）。
+        self.orchestration = OrchestrationTurns(
+            enabled_provider=get_config_store(DEFAULT_CONFIG_PATH).get_job_orchestration)
+        # 活跃任务签名：用来判定"进度变化 / 出结果"（变了才记一个编排事件）。
+        # `None` ＝ 还没观测过（首次观测只当基线，不算事件 —— 刚建的目标不该再触发一轮）。
+        self._orch_task_signature: Optional[tuple] = None
+
         # ── 出站/指令安全（这一批新增）──
         # 统一安全审计：出站清洗 / 指令闸门 / TPA 都写到这里（内存环形 + 落盘）。
         self._security_audit: list[dict] = []
@@ -319,6 +336,10 @@ class Session:
             # 资源租约 + 状态治理：共享同一实例，planner 只做"派发前的仲裁/退避查询"。
             resource_lease=self.resource_lease,
             state_governor=self.state_governor,
+            # job 句柄：planner 派发长任务时登记（四样门槛齐备才许登记）；卡死走同一个治理器。
+            job_registry=self.jobs,
+            # 长期目标（set_goal/end_goal）写进**同一份** task_list（不另建第二套存储）。
+            task_list=self.tasks,
         )
 
         # Vision (Python 侧直接抓屏 -> VLM，后台线程低频刷新，不阻塞动作链路)
@@ -390,6 +411,10 @@ class Session:
         }
         logger.debug("[Session] 最近发话者: %s @(%s,%s,%s)", sender,
                      entry.get("sender_x"), entry.get("sender_y"), entry.get("sender_z"))
+        # 编排事件：玩家说话（只对**模型自己创建的活跃任务**有意义；由 tick 统一判定）。
+        orchestration = getattr(self, "orchestration", None)
+        if orchestration is not None:
+            orchestration.note_event(ORCH_EVENT_PLAYER, {"sender": sender})
 
     def handle_event(self, event_type: str, data: dict):
         """Route an event from the mod."""
@@ -549,6 +574,13 @@ class Session:
                 logger.warning("[Session] 中止在途动作失败: %s", e)
         self._task_idle_since = None
         self._pending_chat = None
+        # job 句柄：世界都没了 → 全部取消（走各自的取消路径），不留"没人管"的活跃 job。
+        jobs = getattr(self, "jobs", None)
+        if jobs is not None:
+            try:
+                jobs.cancel_all("离场")
+            except Exception as e:
+                logger.warning("[Session] 离场取消 job 失败: %s", e)
         # 离开世界的这段时间攒下的事件不再补说（回来再调侃几分钟前的死亡很怪）。
         self._pending_death = None
         self._last_task_event = {}
@@ -1792,6 +1824,11 @@ class Session:
 
         `whisper_to` 非空表示这一轮是**私信**：回复也要走私信（不能当着全服说）。
         """
+        # 这一轮已经"把模型请回来"处理了这次发言 → 消费掉编排里的"玩家说话"事件，
+        # 免得 tick 再为同一条发言多跑一次编排轮（同一事件只触发一次模型调用）。
+        orchestration = getattr(self, "orchestration", None)
+        if orchestration is not None:
+            orchestration.consume_kind(ORCH_EVENT_PLAYER)
         self._reply_whisper_to = str(whisper_to or "")
         self._whisper_sent_this_turn = set()
         verdict = self._semantic_gate(sender, message)
@@ -2272,18 +2309,22 @@ class Session:
         return len(players) if isinstance(players, list) else 1
 
     def handle_chat(self, sender: str, message: str, command_context: str = "chat",
-                    event: Optional[dict] = None) -> Optional[str]:
+                    event: Optional[dict] = None,
+                    extra_context: Optional[dict] = None) -> Optional[str]:
         """
         Process a chat message through the LLM.
         Uses Planner for intelligent action planning.
 
         在场门：不在世界里一律不动 LLM（返回 None）。`event` 非空表示这是外部事件注入，
         会以"自行决定是否回复"的形式交给同一个 planner（不是"必发消息"）。
+        `extra_context` 是**当轮专属**的补充上下文（如编排轮的紧凑进展摘要），只进 L2。
         """
         if not self.llm_active():
             logger.info("[Session] 不在世界（界面 %s）→ 跳过 LLM 规划", self.ui_screen or "?")
             return None
         context = self._runtime_context()
+        if isinstance(extra_context, dict):
+            context.update(extra_context)
         whisper_from = str(getattr(self, "_reply_whisper_to", "") or "")
         if whisper_from:
             context["whisper_from"] = whisper_from
@@ -2333,6 +2374,14 @@ class Session:
                 )
             except Exception as e:  # noqa: BLE001 — 治理失败绝不拖垮主链路
                 logger.warning("[Session] 状态治理同步失败: %s", e)
+
+        # job 句柄：按各 job 自带的**进度来源 / 终止条件**更新一次（不新造判定通道）。
+        jobs = getattr(self, "jobs", None)
+        if jobs is not None:
+            try:
+                jobs.refresh()
+            except Exception as e:  # noqa: BLE001 — 台账刷新失败绝不拖垮主链路
+                logger.debug("[Session] job 台账刷新失败: %s", e)
 
         # Long-task completion: task_state went terminal and stayed terminal
         # through the grace window → the tracked action is really done.
@@ -2392,6 +2441,10 @@ class Session:
 
         # 主动参与：外部事件注入（death/被围攻/稀有掉落/新群系/任务完成或失败）。
         self._tick_events()
+
+        # 编排轮次（§10.2 #3）：**只在有事件 + 模型自己有活跃任务时**把模型请回来做下一步。
+        # 安静（没有事件）⇒ 这里一次模型调用都不产生 ✓。
+        self._tick_orchestration()
 
         # 对话记忆 L3：窗口裁切过就生成一条中期摘要（落盘，重启靠它 + 原始事件回灌）。
         self._tick_memory_summary()
@@ -2586,6 +2639,85 @@ class Session:
 
         return out
 
+    # ── 编排轮次（AGENT_ARCH §10.2 #3；事件驱动，不是定时器）──
+
+    def _job_orchestration_enabled(self) -> bool:
+        """编排轮次总开关（config.json → job_orchestration，**默认开**）。"""
+        try:
+            return bool(get_config_store(DEFAULT_CONFIG_PATH).get_job_orchestration())
+        except Exception as e:  # noqa: BLE001 — 开关读不到就用默认（开）
+            logger.debug("[Session] job_orchestration 开关读取失败: %s", e)
+            return True
+
+    def _has_model_created_active_task(self) -> bool:
+        """`task_list` 里有没有**模型自己创建的活跃任务**（编排轮次的唯一触发条件）。"""
+        return has_model_created_active_task(getattr(self, "tasks", None))
+
+    def _note_task_signature(self) -> None:
+        """活跃任务签名变了 → 记一个"进度变化 / 出结果"编排事件（没变就不记）。"""
+        orchestration = getattr(self, "orchestration", None)
+        tasks = getattr(self, "tasks", None)
+        if orchestration is None or tasks is None:
+            return
+        try:
+            items = tasks.items()
+        except Exception:  # noqa: BLE001
+            return
+        signature = tuple((i.id, i.status, round(float(i.progress or 0.0), 3))
+                          for i in items if i.status not in {"done", "failed", "cancelled"})
+        if self._orch_task_signature is None:
+            # 首次观测＝基线，**不算事件**（刚建的目标不该再触发一轮编排）。
+            self._orch_task_signature = signature
+            return
+        if signature == self._orch_task_signature:
+            return
+        self._orch_task_signature = signature
+        if signature:
+            orchestration.note_event(ORCH_EVENT_PROGRESS, {"tasks": len(signature)})
+
+    def _tick_orchestration(self) -> Optional[str]:
+        """事件驱动地把模型请回来做下一步；**安静时零额外模型调用** ✓。"""
+        orchestration = getattr(self, "orchestration", None)
+        if orchestration is None:
+            return None
+        # 活跃任务签名变化也算一种事件（进度变化 / 出结果）。
+        self._note_task_signature()
+        if not orchestration.should_run(self._has_model_created_active_task()):
+            return None
+        events = orchestration.pending()
+        digest = orchestration.build_digest(
+            tasks=getattr(self, "tasks", None), jobs=getattr(self, "jobs", None), events=events)
+        orchestration.consume()
+        return self._run_orchestration_turn(digest, events)
+
+    def _run_orchestration_turn(self, digest: str, events: Optional[list[dict]] = None) -> Optional[str]:
+        """一次编排轮：只喂**紧凑进展摘要**（走 L2）；不产生任何新能力，只把"现在该怎么办"交回模型。"""
+        if not self.llm_active():
+            return None
+        # 编排不是任何人的指令：层级归零（没有人授权 → 默认什么能力都不给）。
+        self._actor = {"name": "", "tier": "guest"}
+        try:
+            response = self.handle_chat("(编排)", digest, command_context="orchestration",
+                                        extra_context={"orchestration": digest})
+        except Exception as e:  # noqa: BLE001 — 编排轮失败绝不拖垮主链路
+            logger.warning("[Session] 编排轮规划失败: %s", e)
+            return None
+        self._audit_event({"kind": "orchestration", "intent": digest[:200],
+                           "verdict": "continue", "spoke": bool(response),
+                           "reason": "event_driven",
+                           "events": [str(e.get("kind")) for e in (events or [])]})
+        if not response:
+            return None
+        try:
+            with self.skills.command_context("chat_reply"):
+                self.skills.send_chat(response)
+            store = getattr(self, "conversation", None)
+            if store is not None:
+                store.record_chat(self._get_bot_name(), response)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[Session] 编排轮回复下发失败: %s", e)
+        return response
+
     # ── 对话记忆摘要（L3）──
 
     # 摘要是最贵的一步（要过 LLM），所以限频：窗口裁切后最多每 60 秒合并一次。
@@ -2682,6 +2814,7 @@ class Session:
                 break
         terminal = {"done": "done", "failed": "failed", "error": "failed",
                     "cancelled": "cancelled"}.get(status)
+        orchestration = getattr(self, "orchestration", None)
         try:
             if terminal:
                 if target is None:
@@ -2691,14 +2824,26 @@ class Session:
                              progress=1.0 if terminal == "done" else progress_value,
                              failure_reason=reason if terminal == "failed" else "")
                 self._last_task_event = {"kind": kind, "status": terminal, "reason": reason}
+                # 编排事件：出结果（终态 outcome）。
+                if orchestration is not None:
+                    orchestration.note_event(ORCH_EVENT_OUTCOME,
+                                             {"kind": kind, "status": terminal, "reason": reason})
                 return
             if target is not None:
                 fields: dict = {"status": "active"}
+                changed = False
                 if progress_value is not None:
                     fields["progress"] = progress_value
+                    changed = changed or abs(float(progress_value) - float(target.progress or 0.0)) >= 1e-9
                 if detail:
                     fields["detail"] = detail
+                    changed = changed or detail != str(target.detail or "")
                 tasks.update(target.id, **fields)
+                # 编排事件：**真的变了**才算"进度变化"（同一个值反复上报不刷事件）。
+                if changed and orchestration is not None:
+                    orchestration.note_event(ORCH_EVENT_PROGRESS,
+                                             {"kind": kind, "progress": progress_value,
+                                              "detail": detail})
             else:
                 # 玩家没直接下过令（自主/反射/控制台）→ 无主任务、最低权重；
                 # 硬套"最近发话者"会把别人的任务列表弄脏。
@@ -2892,6 +3037,14 @@ class Session:
                                if getattr(self, "resource_lease", None) is not None else {}),
             "state_governor": (self.state_governor.snapshot()
                                if getattr(self, "state_governor", None) is not None else {}),
+            # job 句柄（长任务）+ 编排轮次（事件驱动，不是定时器）：全部防御式取值。
+            "jobs": (self.jobs.snapshot() if getattr(self, "jobs", None) is not None else {}),
+            "orchestration": ({
+                "enabled": self._job_orchestration_enabled(),
+                "pending_events": (self.orchestration.pending()
+                                   if getattr(self, "orchestration", None) is not None else []),
+                "model_created_active": self._has_model_created_active_task(),
+            } if getattr(self, "orchestration", None) is not None else {}),
         }
 
     def _active_task_priority(self) -> int:
@@ -2948,6 +3101,11 @@ class Session:
                 planner._action_note = f"（{target or label or '当前动作'} 卡住已取消：{reason}）"
             except Exception:  # noqa: BLE001
                 pass
+        # 编排事件：卡住（治理器取消 → 让模型看到"为什么失败 + 卡在哪一步"）。
+        orchestration = getattr(self, "orchestration", None)
+        if orchestration is not None:
+            orchestration.note_event(ORCH_EVENT_STUCK,
+                                     {"target": target or label, "reason": reason})
         logger.warning("[Session] 状态治理取消 %s：%s", target or label or "?", reason)
 
     def _complete_long_task_if_idle(self):

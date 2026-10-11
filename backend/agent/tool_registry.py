@@ -92,6 +92,9 @@ class ToolSpec:
     groups: tuple[str, ...]                    # 属于哪些动作组（用于阶段过滤）
     handler: str                               # Planner 上的派发方法名
     permission: ToolPermission = _NO_PERM
+    # 是不是"要跑一段时间"的调用（长任务）——是的话派发时登记成 **job 句柄**
+    # （`agent/job_registry.py`，四样门槛齐备才许登记），供查看/取消/卡死治理。
+    job: bool = False
 
     def parameters(self) -> dict[str, Any]:
         """OpenAI `tools` 形状里的 parameters 对象。"""
@@ -113,9 +116,9 @@ class ToolSpec:
 # 保证阶段过滤后的工具序列（进而 `build_tool_schemas` 的输出）与旧行为逐字节一致。
 TOOL_SPECS: tuple[ToolSpec, ...] = (
     # ── move ──
-    ToolSpec("move_to", "移动到坐标", "x,y,z", ("move",), "_tool_move_to"),
-    ToolSpec("follow", "跟随玩家", "player", ("move",), "_tool_follow"),
-    ToolSpec("explore", "探索半径", "radius", ("move",), "_tool_explore"),
+    ToolSpec("move_to", "移动到坐标", "x,y,z", ("move",), "_tool_move_to", job=True),
+    ToolSpec("follow", "跟随玩家", "player", ("move",), "_tool_follow", job=True),
+    ToolSpec("explore", "探索半径", "radius", ("move",), "_tool_explore", job=True),
     ToolSpec("stop", "停止动作", "", ("move",), "_tool_stop"),
     # ── locate ──
     ToolSpec("where_is", "问「某东西在哪」：先调 where_is 拿候选清单（在线玩家/记忆点/站点/"
@@ -127,29 +130,29 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("find_block", "扫附近有无该方块（只查不走）", "block,radius,limit",
              ("locate",), "_tool_find_block"),
     ToolSpec("go_to_block", "寻路过去，到达后记住", "block,radius,remember",
-             ("locate",), "_tool_go_to_block"),
+             ("locate",), "_tool_go_to_block", job=True),
     ToolSpec("locate_structure", "/locate 查结构/群系（kind=structure|biome）", "name,kind",
              ("locate",), "_tool_locate_structure"),
     # ── gather ──
     ToolSpec("mine_block", "挖面前方块", "", ("gather",), "_tool_mine_block",
-             ToolPermission(area=True, note="就近动手；受区域硬保护约束")),
+             ToolPermission(area=True, note="就近动手；受区域硬保护约束"), job=True),
     ToolSpec("collect_blocks", "采集方块", "block_type,count", ("gather",),
-             "_tool_collect_blocks", ToolPermission(area=True, note="就近采集")),
+             "_tool_collect_blocks", ToolPermission(area=True, note="就近采集"), job=True),
     ToolSpec("drop_item", "丢弃物品", "item,count", ("gather",), "_tool_drop_item"),
     ToolSpec("sort_inventory", "整理背包", "", ("gather",), "_tool_sort_inventory"),
     ToolSpec("get_inventory", "查看背包", "", ("gather",), "_tool_get_inventory"),
     # ── craft ──
     ToolSpec("craft_item", "合成物品", "item,count", ("craft",), "_tool_craft_item",
              ToolPermission(tier="craft", deny_label="造东西",
-                            note="须被授权（craft 能力表）；缺料先只用背包，未授权不开箱")),
+                            note="须被授权（craft 能力表）；缺料先只用背包，未授权不开箱"), job=True),
     ToolSpec("craft_via_recipe", "原版配方合成（先看背包材料）", "item,count", ("craft",),
              "_tool_craft_via_recipe",
              ToolPermission(tier="craft", deny_label="造东西",
-                            note="同一道授权门；材料优先用自己背包")),
+                            note="同一道授权门；材料优先用自己背包"), job=True),
     ToolSpec("place_block", "放置手中方块", "", ("craft",), "_tool_place_block",
              ToolPermission(area=True, note="就近放置；受区域硬保护约束")),
     ToolSpec("build", "建造结构", "x,y,z,structure", ("craft",), "_tool_build",
-             ToolPermission(area=True, note="在坐标处建造")),
+             ToolPermission(area=True, note="在坐标处建造"), job=True),
     # ── container ──
     ToolSpec("container_move", "容器内移物（省 to_slot＝背包↔快捷栏）",
              "from_slot,to_slot,count", ("container",), "_dispatch_container_move",
@@ -197,15 +200,15 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("select_hotbar", "切到热栏第 index 格（0-8）", "index", ("items",),
              "_tool_select_hotbar"),
     # ── survive ──
-    ToolSpec("eat", "吃东西", "", ("survive",), "_tool_eat"),
-    ToolSpec("sleep", "睡觉", "", ("survive",), "_tool_sleep"),
-    ToolSpec("trade", "与村民交易", "villager_type", ("survive",), "_tool_trade"),
+    ToolSpec("eat", "吃东西", "", ("survive",), "_tool_eat", job=True),
+    ToolSpec("sleep", "睡觉", "", ("survive",), "_tool_sleep", job=True),
+    ToolSpec("trade", "与村民交易", "villager_type", ("survive",), "_tool_trade", job=True),
     # ── night ──
     ToolSpec("sleep_in_bed", "走到最近的床睡到天亮（只能夜里）", "", ("night",),
-             "_tool_sleep_in_bed"),
+             "_tool_sleep_in_bed", job=True),
     # ── guard ──
     ToolSpec("guard", "水平半径内驻守（默认 32；省坐标＝最近发话者位置）",
-             "x,y,z,radius", ("guard",), "_dispatch_guard"),
+             "x,y,z,radius", ("guard",), "_dispatch_guard", job=True),
     ToolSpec("guard_off", "取消驻守", "", ("guard",), "_tool_guard_off"),
     # ── hud ──
     ToolSpec("set_hud_note", "把当前打算写进 HUD 描述词", "text", ("hud",),
@@ -224,6 +227,15 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     # ── memory ──
     ToolSpec("remember_poi", "记住当前位置", "name,category,x,y,z", ("memory",),
              "_tool_remember_poi"),
+    # ── goal（模型的长期目标：写进任务列表，要显式结束）──
+    ToolSpec("set_goal", "给自己立一个**长期目标**（会写进任务列表、一直占着，直到你用 "
+                         "end_goal 显式结束它）：玩家交代一件要跨很多轮才做得完的事（"
+                         "\"把这片林子砍完\"\"把仓库填满木板\"）时用它把目标记下来，之后按"
+                         "事件推进；不要用它记一次性小动作",
+             "text,priority", ("goal",), "_tool_set_goal"),
+    ToolSpec("end_goal", "结束一个**长期目标**（省 id ＝结束当前那条）；**目标不显式结束就会"
+                         "一直占着**，所以做完/放弃时一定要调它",
+             "id,reason", ("goal",), "_tool_end_goal"),
     # ── territory ──
     ToolSpec("list_territory", "列出领地/基地/容器及其授权与保护项", "", ("territory",),
              "_tool_list_territory"),
@@ -266,15 +278,15 @@ TOOL_BY_NAME: dict[str, ToolSpec] = {spec.name: spec for spec in TOOL_SPECS}
 # 都可能有意义（用户说"在这儿守着"时他可能正在看着 AI 挖矿）。
 PHASE_GROUPS: dict[str, tuple[str, ...]] = {
     "idle": ("move", "locate", "gather", "craft", "container", "farm", "guard", "items",
-             "survive", "combat", "hud", "night", "server", "memory", "territory"),
+             "survive", "combat", "hud", "night", "server", "memory", "goal", "territory"),
     "travel": ("move", "locate", "combat", "guard", "items", "container", "farm", "survive",
-               "hud", "night", "server", "memory", "territory"),
+               "hud", "night", "server", "memory", "goal", "territory"),
     "gather": ("move", "locate", "gather", "guard", "items", "craft", "container", "farm",
-               "hud", "night", "server", "memory", "territory"),
+               "hud", "night", "server", "memory", "goal", "territory"),
     "craft": ("move", "locate", "craft", "container", "farm", "guard", "items", "gather",
-              "hud", "night", "server", "memory", "territory"),
-    "survive": ("survive", "hud", "night", "server", "memory", "guard", "farm", "items",
-                "move", "locate", "territory"),
+              "hud", "night", "server", "memory", "goal", "territory"),
+    "survive": ("survive", "hud", "night", "server", "memory", "goal", "guard", "farm",
+                "items", "move", "locate", "territory"),
 }
 
 

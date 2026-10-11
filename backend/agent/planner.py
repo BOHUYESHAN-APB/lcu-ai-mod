@@ -38,6 +38,7 @@ from .farm import feed_food as farm_feed_food
 from .farm import land_owner as farm_land_owner
 from .farm import others_note as farm_others_note
 from .farm import others_verdict as farm_others_verdict
+from .job_registry import JOB_DONE, JOB_FAILED, JobRejected
 from .haul import (HAUL_MAX_ATTEMPTS, HAUL_VERIFY_TIMEOUT, HAUL_WALK_TIMEOUT,
                    MODE_INSIDE, MODE_ITEM, MODE_WHOLE,
                    SIDE_CONTAINER, SIDE_PLAYER, STEP_DONE, STEP_OPEN_SOURCE,
@@ -403,7 +404,8 @@ class Planner:
                  permissions=None, borrow_rules=None, server_commands=None,
                  whisper_sender=None, tpa_responder=None, tpa_requester=None,
                  player_resolver=None, territory=None, action_manager=None,
-                 poi=None, places=None, resource_lease=None, state_governor=None):
+                 poi=None, places=None, resource_lease=None, state_governor=None,
+                 job_registry=None, task_list=None):
         self.llm = llm_service
         self.memory = memory
         self.skills = skills
@@ -473,12 +475,20 @@ class Planner:
         self.control_lease = ControlLease()
         # BackendEatYield：进食的让路/退避/冷却闸门（`eat` 工具下发前都要过它）。
         self.eat_yield = EatYield(action_manager, control_lease=self.control_lease)
+        # 在途动作跟踪器：job 句柄的进度来源/终止条件/取消路径都读它（不新造通道）。
+        self.action_manager = action_manager
         # 资源租约（按资源分租：同资源互斥、异资源并行、P0 生存反射永远可抢）。
         # 由 session 注入共享实例；独立构造（测试/单跑）时自建一个。
         self.resource_lease = resource_lease if resource_lease is not None else ResourceLease()
         # 状态治理（卡死即摘掉）：由 session 注入；没注入＝不治理（行为照旧）。
         # 只用于 (a) 派发前查"该目标是否在取消后的退避窗口内"。
         self.state_governor = state_governor
+        # job 句柄台账（长任务统一成 job：查看/await/取消）：由 session 注入；
+        # 没注入＝不登记 job（行为照旧）。**只登记"模型已请求的调用"**，后台绝不自己发起。
+        self.job_registry = job_registry
+        # 模型的长期目标（`set_goal`/`end_goal`）**写进现有 task_list**（不另建第二套存储）：
+        # 由 session 注入同一个实例（仪表盘/编排轮次看到的都是同一份）。
+        self.task_list = task_list
 
     def _threshold(self) -> float:
         """当前 decider 置信度阈值：读注入的 provider，失败回退默认常量。"""
@@ -925,6 +935,10 @@ class Planner:
         extras = "\n".join(part for part in (state_block_text, hud_note_text, whisper_text) if part)
         extras_text = f"{extras}\n" if extras else ""
 
+        # 编排轮次的**紧凑进展摘要**（§10.2 #3）：只在编排轮出现，**只进 L2**（绝不进 L0/L1）。
+        orchestration_text = (context.get("orchestration") or "").strip() if isinstance(context, dict) else ""
+        orchestration_section = f"\n{orchestration_text}\n" if orchestration_text else ""
+
         prompt = f"""当前状态：
 - 发送者：{sender}
 - 消息：{message}
@@ -950,7 +964,7 @@ class Planner:
 
 {extras_text}当前任务状态：
 {context.get('task_state', {'kind': 'idle', 'status': 'idle'})}
-
+{orchestration_section}
 饥饿与回血（当前值；怎么解释这些数字见系统提示里的规则）：
 - 血量 {health_text}｜饱食度 {hunger_text}/20｜饱和度 {saturation_text}（饱和度是隐藏值）
 
@@ -1386,10 +1400,61 @@ class Planner:
             logger.warning("[Planner] 工具 %s 登记的 handler %s 不存在", spec.name, spec.handler)
             self._end_tool_lease(lease_owner)
             return False
+        before_label = self.action_manager.current_label if self.action_manager is not None else None
         try:
-            return bool(handler(payload, context))
+            handled = bool(handler(payload, context))
         finally:
             self._end_tool_lease(lease_owner)
+        if handled:
+            self._maybe_register_job(spec, payload, context, before_label)
+        return handled
+
+    # ── job 句柄接线（只登记"模型已请求的调用"；卡死判定交给 state_governor）──
+
+    def _maybe_register_job(self, spec: ToolSpec, payload: dict, context: dict,
+                            before_label: Optional[str]) -> None:
+        """长任务调用 → 登记成 job（四样门槛齐备；缺一即不登记，绝不半成品）。
+
+        进度来源 / 终止条件都读**现成**的 action_manager（不新造通道）：
+        终止条件到点就把真实结果（含失败 code）落进 job；取消路径就是 ``action_manager.stop``。
+        """
+        registry = self.job_registry
+        action_manager = self.action_manager
+        if registry is None or action_manager is None or not spec.job:
+            return
+        label = action_manager.current_label
+        if not label or label == before_label or not action_manager.is_busy:
+            return
+        started = time.time()
+        _tier, actor = self._actor_of(context)
+
+        def _progress(_label: str = label) -> Optional[float]:
+            current = action_manager.current
+            if current is not None and current.label == _label:
+                return current.progress
+            return None
+
+        def _terminal(_label: str = label, _started: float = started) -> Optional[dict]:
+            record = action_manager.outcome_since(_label, _started)
+            if record is None:
+                return None
+            if record.get("success"):
+                return {"status": JOB_DONE, "result": {"detail": "ok"}}
+            return {"status": JOB_FAILED, "code": "tool_failed",
+                    "result": {"error": str(record.get("error") or "tool failed")}}
+
+        def _cancel(_reason: str = "") -> None:
+            action_manager.stop()
+
+        try:
+            registry.register(
+                spec.name, progress=_progress, terminal=_terminal,
+                failure="tool_failed", cancel=_cancel,
+                resources=resources_for_tool(spec.name),
+                priority=self._lease_priority(context), actor=actor,
+                detail=f"{spec.name} {json.dumps(payload, ensure_ascii=False)}"[:200])
+        except JobRejected as exc:
+            logger.info("[Planner] %s 未登记为 job：%s", spec.name, exc.reason)
 
     # ── 资源租约接线（只仲裁；P0 反射走 survival 通道，永远不被本批挡住）────
 
@@ -1744,6 +1809,58 @@ class Planner:
 
     def _tool_list_territory(self, payload: dict, context: dict) -> bool:
         return self._dispatch_list_territory(context)
+
+    # ── 长期目标（模型的入口；写进现有 task_list，不另建第二套存储）──
+
+    def _tool_set_goal(self, payload: dict, context: dict) -> bool:
+        """立一个长期目标：写进 `task_list`（归属/优先级/审计沿用现有字段）。
+
+        标 `model_created=True` —— 这是**编排轮次**（§10.2 #3）的唯一触发条件：
+        只有模型自己创建的目标才会在事件发生时把模型请回来。
+        """
+        tasks = self.task_list
+        text = str(payload.get("text") or payload.get("goal")
+                   or payload.get("detail") or "").strip()
+        if tasks is None or not text:
+            return False
+        tier, actor = self._actor_of(context)
+        try:
+            priority = None if payload.get("priority") is None else int(payload.get("priority"))
+        except (TypeError, ValueError):
+            priority = None
+        try:
+            goal = tasks.add("goal", owner=actor, owner_tier=tier, detail=text,
+                             status="active", model_created=True, priority=priority)
+            # 已有同名活跃目标时 `add` 会去重返回旧条目：把文字/优先级更新成这一次的。
+            if str(goal.detail or "") != text or not goal.model_created:
+                tasks.update(goal.id, detail=text, status="active", model_created=True,
+                             priority=priority)
+        except Exception as exc:  # noqa: BLE001 — 登记失败如实返回 False
+            logger.warning("[Planner] set_goal 失败: %s", exc)
+            return False
+        return True
+
+    def _tool_end_goal(self, payload: dict, context: dict) -> bool:
+        """显式结束长期目标（省 id ＝结束当前那条活跃目标）。
+
+        目标**不显式结束就会一直占着**（会一直触发编排轮次），所以做完/放弃时必须调它。
+        """
+        tasks = self.task_list
+        if tasks is None:
+            return False
+        goal_id = str(payload.get("id") or payload.get("goal") or "").strip()
+        item = tasks.get(goal_id) if goal_id else None
+        if item is None:
+            item = next((i for i in tasks.items()
+                         if i.kind == "goal" and i.status not in {"done", "failed", "cancelled"}),
+                        None)
+        if item is None:
+            return False
+        reason = str(payload.get("reason") or "").strip()
+        if reason:
+            tasks.update(item.id, failure_reason=reason)
+        tasks.complete(item.id, success=True)
+        return True
 
     @staticmethod
     def _server_command_note(what: str, result: Any) -> Optional[str]:

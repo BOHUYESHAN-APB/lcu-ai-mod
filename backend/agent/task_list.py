@@ -67,6 +67,9 @@ class TaskItem:
     created_at: float = 0.0
     updated_at: float = 0.0
     failure_reason: str = ""
+    # **模型自己创建的**任务（`set_goal` 立的目标）——编排轮次的唯一触发条件：
+    # 后台/自主/反射行为建的任务不带这个标（`docs/dev/AGENT_ARCH.md` §10.2 #3）。
+    model_created: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -81,6 +84,7 @@ class TaskItem:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "failure_reason": self.failure_reason,
+            "model_created": self.model_created,
         }
 
 
@@ -144,6 +148,8 @@ class TaskList:
             item.detail = str(fields["detail"])
         if "failure_reason" in fields and fields["failure_reason"] is not None:
             item.failure_reason = str(fields["failure_reason"])
+        if "model_created" in fields and fields["model_created"] is not None:
+            item.model_created = bool(fields["model_created"])
         if item.status in TERMINAL_STATUSES:
             if item.status == STATUS_DONE:
                 item.progress = 1.0
@@ -154,7 +160,8 @@ class TaskList:
 
     def add(self, kind: str, *, owner: str = "", owner_tier: str = "guest",
             priority: Optional[int] = None, detail: str = "",
-            status: str = STATUS_PENDING, progress: float = 0.0) -> TaskItem:
+            status: str = STATUS_PENDING, progress: float = 0.0,
+            model_created: bool = False) -> TaskItem:
         """入队。返回新条目；若同 (kind, owner) 已有活跃任务，直接返回那一条（不重复入队）。"""
         with self._lock:
             existing = self._find_active(kind, owner)
@@ -176,6 +183,7 @@ class TaskList:
                 detail=detail,
                 created_at=now,
                 updated_at=now,
+                model_created=bool(model_created),
             )
             if item.status in TERMINAL_STATUSES and item.status == STATUS_DONE:
                 item.progress = 1.0
