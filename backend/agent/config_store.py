@@ -251,8 +251,8 @@ def _default_config() -> dict[str, Any]:
             "allowed_origins": ["http://127.0.0.1", "http://localhost"],
             "updated_at": None,
         },
-        "whitelist": [],
-        "listen_public": True,
+        # 注意：旧的 whitelist / listen_public 已由 `.local/permissions.json` 的
+        # master / friends / server_mode / public_reply_guests 取代（M3-19 的分层权限模型）。
         "patrol_radius": 8,
         # 夜晚自动睡觉（默认开）：自主模式下天黑且能睡时，自己走到床上睡到天亮。
         "night_auto_sleep": True,
@@ -263,6 +263,9 @@ def _default_config() -> dict[str, Any]:
         "capability_level": 1,
         "decision": {
             "confidence_threshold": DECISION_DEFAULT_CONFIDENCE,
+            # 回复语义门（L4）：每条消息是否值得接话的廉价一次判断。
+            # 关闭后直接进入 planner（省一次小调用，但会更容易"什么话都接"）。
+            "semantic_gate": True,
         },
     }
 
@@ -382,7 +385,7 @@ class ConfigStore:
 
     def set_app_config(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
-            for key in ("whitelist", "listen_public", "patrol_radius"):
+            for key in ("patrol_radius",):
                 if key in payload:
                     self._data[key] = payload[key]
             if "capability_level" in payload:
@@ -392,11 +395,16 @@ class ConfigStore:
                 if parsed_flag is not None:
                     self._data["night_auto_sleep"] = parsed_flag
             if isinstance(payload.get("decision"), dict):
-                threshold = payload["decision"].get("confidence_threshold")
+                decision = payload["decision"]
+                threshold = decision.get("confidence_threshold")
                 if threshold is not None:
                     self._data.setdefault("decision", {})[
                         "confidence_threshold"
                     ] = _clamp_confidence(threshold)
+                if "semantic_gate" in decision:
+                    parsed_gate = _parse_bool(decision["semantic_gate"])
+                    if parsed_gate is not None:
+                        self._data.setdefault("decision", {})["semantic_gate"] = parsed_gate
             self.save()
             return self.raw(redact=True)
 
@@ -410,6 +418,12 @@ class ConfigStore:
         """夜晚自动睡觉开关（默认开）。"""
         with self._lock:
             raw = self._data.get("night_auto_sleep", True)
+        return _as_bool(raw, True)
+
+    def get_semantic_gate(self) -> bool:
+        """回复语义门开关（config.json → decision.semantic_gate，默认开）。"""
+        with self._lock:
+            raw = self._data.get("decision", {}).get("semantic_gate", True)
         return _as_bool(raw, True)
 
     def get_decision_threshold(self) -> float:

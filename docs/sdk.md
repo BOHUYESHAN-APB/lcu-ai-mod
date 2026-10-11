@@ -48,7 +48,8 @@ await client.pushExternalContext({ source: 'launcher-ui', profileId: 'maid-alpha
 
 - `default`
 - `planner`
-- `timing_gate`
+- `gate`（回复语义门：continue / wait / no_action）
+- `summarizer`（对话记忆 L3 中期摘要）
 - `self_prompter`
 - `conversation`
 

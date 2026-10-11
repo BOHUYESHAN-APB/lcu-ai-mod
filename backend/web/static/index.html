@@ -86,6 +86,11 @@ body{font-family:'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;backgroun
 .task-card .progress-bar{height:100%;background:#1f6feb;border-radius:3px;transition:width .3s}
 .task-card .progress-text{font-size:11px;color:#8b949e;margin-top:4px}
 .task-card .task-detail{font-size:11px;color:#8b949e;margin-top:4px}
+/* 任务归属徽标：主人/朋友/路人的颜色区分（master 可插队/取消任意任务） */
+.owner-badge{display:inline-block;margin-left:8px;padding:1px 6px;border-radius:8px;font-size:10px;border:1px solid #30363d}
+.owner-badge.master{color:#f0b72f;border-color:#f0b72f}
+.owner-badge.friend{color:#58a6ff;border-color:#58a6ff}
+.owner-badge.guest{color:#8b949e;border-color:#8b949e}
 
 /* HUD 描述词 */
 .hud-note{color:#d29922}
@@ -142,6 +147,7 @@ body{font-family:'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;backgroun
         </div>
       </div>
       <div id="statusLine" class="hint" style="margin-top:10px">状态：-</div>
+      <div id="presenceLine" class="hint" style="margin-top:4px">在场：-</div>
       <div id="stateHint" class="hint" style="margin-top:4px">正在检查与游戏端的同步…</div>
       <div style="margin-top:12px">
         <button class="btn primary" onclick="toggleAutonomy()">切换自主模式</button>
@@ -158,6 +164,13 @@ body{font-family:'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;backgroun
   <div class="card">
     <h3>📋 任务队列</h3>
     <div id="taskQueue">暂无任务</div>
+    <h3 style="margin-top:14px">🗂️ 任务列表（归属 / 优先级 / 进度）</h3>
+    <div id="taskListPanel">暂无任务</div>
+  </div>
+
+  <div class="card">
+    <h3>🚪 对话门（他为什么理 / 不理）</h3>
+    <div id="gatePanel" class="hint">等待数据…</div>
   </div>
 </div>
 
@@ -227,17 +240,34 @@ body{font-family:'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;backgroun
     </div>
     
     <div class="card">
-      <h3>🛡️ 权限配置</h3>
+      <h3>🛡️ 权限与对话门</h3>
+      <div class="hint">tier 只决定三件事：能否下指令 / 任务权重 / 记忆可见性。
+        私人服人人都能跟他说话；公开服只有主人和朋友的指令有效，路人默认静默（消息仍进记忆，零 token）。</div>
       <div class="form-row">
-        <label>白名单</label>
-        <input type="text" id="whitelist" placeholder="玩家1,玩家2">
+        <label>服务器模式</label>
+        <select id="serverMode">
+          <option value="private">私人服（人人都能聊）</option>
+          <option value="public">公开服（仅主人/朋友能下指令）</option>
+        </select>
       </div>
       <div class="form-row">
-        <label>监听公聊</label>
-        <select id="listenPublic">
-          <option value="true">是</option>
-          <option value="false">否</option>
+        <label>主人 master</label>
+        <input type="text" id="masterList" placeholder="玩家1,玩家2">
+      </div>
+      <div class="form-row">
+        <label>朋友 friends</label>
+        <input type="text" id="friendsList" placeholder="玩家3,玩家4">
+      </div>
+      <div class="form-row">
+        <label>公开服回复路人</label>
+        <select id="publicReplyGuests">
+          <option value="false">否（静默：只记录不回）</option>
+          <option value="true">是（按降频回）</option>
         </select>
+      </div>
+      <div class="form-row">
+        <label>频率系数</label>
+        <input type="number" id="sessionAdjust" value="1" min="0" max="4" step="0.1">
       </div>
       <div class="form-row">
         <label>巡逻半径</label>
@@ -262,27 +292,49 @@ body{font-family:'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;backgroun
         <label>决策置信度阈值</label>
         <input type="number" id="confidenceThreshold" value="0.6" min="0" max="1" step="0.05">
       </div>
+      <div class="form-row">
+        <label>回复语义门</label>
+        <select id="semanticGate">
+          <option value="true">开（先判断该不该接话）</option>
+          <option value="false">关（省一次调用，但更容易什么都接）</option>
+        </select>
+      </div>
       <button class="btn primary" onclick="savePermissionConfig()">保存权限配置</button>
     </div>
   </div>
   
   <div class="card">
-    <h3>🧠 人设配置</h3>
+    <h3>🧠 人设（三段分开写）</h3>
+    <div class="hint">三段各管一件事，别互相重复：身份 = 他是谁（第二人称，80–220 字）；
+      表达习惯 = 怎么说话（描述性的，不要写死固定句式）；场景规则 = 私聊 / 公开服 / 被点名分别怎么说。
+      生命/饥饿/任务这类临时状态是独立的第四块，不要写进身份里。</div>
     <div class="form-row">
       <label>AI 名字</label>
       <input type="text" id="aiName" placeholder="AI">
     </div>
     <div class="form-row">
-      <label>性格</label>
-      <input type="text" id="personality" placeholder="友好、自然">
-    </div>
-    <div class="form-row">
       <label>唤醒名</label>
       <input type="text" id="wakeNames" placeholder="AI,小A">
     </div>
+    <div class="form-row" style="align-items:flex-start">
+      <label>身份 identity</label>
+      <textarea id="personaIdentity" rows="4" placeholder="你是……" style="flex:1;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px"></textarea>
+    </div>
+    <div class="form-row" style="align-items:flex-start">
+      <label>表达习惯 reply_style</label>
+      <textarea id="personaReplyStyle" rows="3" placeholder="句子短，多用口语……" style="flex:1;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px"></textarea>
+    </div>
+    <div class="form-row" style="align-items:flex-start">
+      <label>备用风格（每行一条，可选）</label>
+      <textarea id="personaMultiple" rows="2" placeholder="偶尔损一点&#10;偶尔很正经" style="flex:1;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px"></textarea>
+    </div>
     <div class="form-row">
-      <label>说话风格</label>
-      <input type="text" id="speakingStyle" placeholder="口语化、简短，不暴露 AI 身份">
+      <label>备用风格概率</label>
+      <input type="number" id="personaMultipleProbability" value="0" min="0" max="1" step="0.05">
+    </div>
+    <div class="form-row" style="align-items:flex-start">
+      <label>场景规则 scene_rules</label>
+      <textarea id="personaSceneRules" rows="3" placeholder="- 私聊：……&#10;- 公开服：……&#10;- 被点名：……" style="flex:1;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px"></textarea>
     </div>
     <button class="btn primary" onclick="savePersonaConfig()">保存人设</button>
     <div id="personaStatus" style="margin-top:8px;font-size:11px;color:#8b949e">等待加载</div>
@@ -445,6 +497,98 @@ function updateDashboard(data) {
   const task = data.task || data.task_state || {};
   renderTask(task);
   renderStatusLine(task, data.hud_note);
+  // M3-19：多任务列表 / 对话门 / 在场门。
+  renderTaskList(data.task_list);
+  renderGate(data.gate, data.chat_decisions, data.in_world);
+  renderPresence(data);
+}
+
+// 在场门：不在世界里就别再显示假的动作状态（模组此时只发 ui_screen）。
+function renderPresence(data) {
+  const el = document.getElementById('presenceLine');
+  if (!el) return;
+  const presence = data.presence || {};
+  const inWorld = (data.in_world !== undefined) ? !!data.in_world : (presence.in_world !== false);
+  if (inWorld) {
+    el.textContent = '在场：' + (presence.label || '在世界里（LLM 与下发正常）');
+    el.style.color = '#3fb950';
+  } else {
+    const screen = data.ui_screen || presence.ui_screen || '?';
+    el.textContent = '在场：' + (presence.label
+      ? `${presence.label}`
+      : `未在游戏中（界面 ${screen}）`)
+      + ' — 已停 LLM / 停下发，事件仍进对话记忆';
+    el.style.color = '#d29922';
+  }
+}
+
+// 任务列表：多条任务 + owner 徽标 + 进度条 + 失败原因；master 可插队/取消。
+function renderTaskList(taskList) {
+  const el = document.getElementById('taskListPanel');
+  if (!el) return;
+  const items = (taskList && Array.isArray(taskList.items)) ? taskList.items : [];
+  if (!items.length) { el.innerHTML = '暂无任务'; return; }
+  el.innerHTML = items.map(item => {
+    const pct = Math.max(0, Math.min(1, Number(item.progress) || 0)) * 100;
+    const tier = String(item.owner_tier || 'guest');
+    const owner = String(item.owner || '—');
+    const status = String(item.status || '');
+    const failed = status === 'failed';
+    const reason = item.failure_reason
+      ? `<div class="task-detail" style="color:#f85149">失败原因：${escapeHtml(String(item.failure_reason))}</div>` : '';
+    const detail = item.detail
+      ? `<div class="task-detail">${escapeHtml(String(item.detail))}</div>` : '';
+    return `<div class="task-card" style="margin-bottom:8px">
+      <div class="task-head">
+        <span class="task-kind">${escapeHtml(String(item.kind || '?'))}</span>
+        <span class="owner-badge ${tier}">${escapeHtml(owner)} · ${escapeHtml(tier)}</span>
+        <span class="task-status">${escapeHtml(status)} · P${escapeHtml(String(item.priority))} · ${escapeHtml(String(item.id))}</span>
+      </div>
+      <div class="progress"><div class="progress-bar" style="width:${pct.toFixed(0)}%;${failed ? 'background:#f85149' : ''}"></div></div>
+      <div class="progress-text">${pct.toFixed(0)}%</div>
+      ${detail}${reason}
+      <div style="margin-top:6px;display:flex;gap:6px">
+        <button class="btn" onclick="taskAction('activate','${escapeHtml(String(item.id))}')">插队</button>
+        <button class="btn" onclick="taskAction('cancel','${escapeHtml(String(item.id))}')">取消</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function taskAction(action, id) {
+  fetch(`/api/tasks/${action}`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({id: id})
+  }).then(r => r.json()).then(d => {
+    if (d.status !== 'ok') dbgLog(`任务 ${action} 被拒：${d.reason || ''}（master 可管任意任务，friend 只能管自己的）`);
+    else dbgLog(`任务 ${action} 成功`);
+  }).catch(e => dbgLog('任务操作失败: ' + e));
+}
+
+// 对话门：effective/threshold/最近一轮决策（"他为什么不理我"不用猜）。
+function renderGate(gate, decisions, inWorld) {
+  const el = document.getElementById('gatePanel');
+  if (!el) return;
+  gate = gate || {};
+  const eff = gate.effective || {};
+  const thr = gate.threshold || {};
+  const mode = gate.server_mode || '?';
+  const effText = ['master', 'friend', 'guest']
+    .map(t => `${t} ${(eff[t] !== undefined ? Number(eff[t]).toFixed(2) : '?')}/阈${thr[t] !== undefined ? thr[t] : '?'}`)
+    .join('　');
+  const last = Array.isArray(decisions) ? decisions.slice(-3).reverse() : [];
+  const rows = last.map(d => {
+    const who = d.sender ? `${escapeHtml(String(d.sender))} ` : '';
+    return `<div>· ${who}<b>${escapeHtml(String(d.decision || ''))}</b> (${escapeHtml(String(d.reason || ''))})`
+      + ` eff=${(d.effective !== undefined ? Number(d.effective).toFixed(2) : '?')}`
+      + ` 阈=${d.threshold !== undefined ? d.threshold : '?'}</div>`;
+  }).join('') || '<div>· 还没有对话决策</div>';
+  el.innerHTML = `<div>模式 <b>${escapeHtml(mode)}</b>　频率系数 ${gate.session_adjust !== undefined ? gate.session_adjust : '?'}`
+    + `　pending ${gate.pending !== undefined ? gate.pending : 0}`
+    + `　冷却 ${gate.cooldown_remaining !== undefined ? Number(gate.cooldown_remaining).toFixed(1) + 's' : '-'}</div>`
+    + `<div style="margin-top:4px">${effText}</div>`
+    + `<div style="margin-top:6px">最近决策：</div>${rows}`
+    + (inWorld === false ? '<div style="margin-top:4px;color:#d29922">未在游戏中 → 一律静默（零 token），但消息仍进记忆</div>' : '');
 }
 
 // last_speaker 既可能是字符串（模组的 last_speaker），也可能是后端记的字典。
@@ -645,49 +789,67 @@ function fetchModels() {
 }
 
 function savePermissionConfig() {
-  const whitelist = document.getElementById('whitelist').value.split(',').map(s=>s.trim()).filter(s=>s);
+  const split = id => document.getElementById(id).value.split(',').map(s=>s.trim()).filter(Boolean);
   const thresholdRaw = parseFloat(document.getElementById('confidenceThreshold').value);
   const config = {
-    whitelist: whitelist,
-    listen_public: document.getElementById('listenPublic').value === 'true',
     patrol_radius: parseInt(document.getElementById('patrolRadius').value) || 8,
     capability_level: parseInt(document.getElementById('capabilityLevel').value) || 1,
     night_auto_sleep: document.getElementById('nightAutoSleep').value === 'true',
-    decision: { confidence_threshold: isNaN(thresholdRaw) ? 0.6 : thresholdRaw }
+    decision: {
+      confidence_threshold: isNaN(thresholdRaw) ? 0.6 : thresholdRaw,
+      semantic_gate: document.getElementById('semanticGate').value === 'true'
+    }
   };
-  fetch('/api/config', {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify(config)
-  }).then(()=>dbgLog('权限/决策配置已保存（阈值即时生效）'));
+  const permissions = {
+    master: split('masterList'),
+    friends: split('friendsList'),
+    server_mode: document.getElementById('serverMode').value,
+    public_reply_guests: document.getElementById('publicReplyGuests').value === 'true',
+    session_adjust: parseFloat(document.getElementById('sessionAdjust').value)
+  };
+  if (isNaN(permissions.session_adjust)) permissions.session_adjust = 1.0;
+  Promise.all([
+    fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(config)}),
+    fetch('/api/permissions', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(permissions)})
+  ]).then(() => dbgLog('权限/对话门配置已保存（即时生效）'));
 }
 
 function savePersonaConfig() {
   const payload = {
     name: document.getElementById('aiName').value || 'AI',
     wake_names: document.getElementById('wakeNames').value.split(',').map(s=>s.trim()).filter(Boolean),
-    personality: document.getElementById('personality').value || '',
-    speaking_style: document.getElementById('speakingStyle').value || ''
+    identity: document.getElementById('personaIdentity').value || '',
+    reply_style: document.getElementById('personaReplyStyle').value || '',
+    multiple_reply_style: document.getElementById('personaMultiple').value.split('\n').map(s=>s.trim()).filter(Boolean),
+    multiple_probability: parseFloat(document.getElementById('personaMultipleProbability').value) || 0,
+    scene_rules: document.getElementById('personaSceneRules').value || ''
   };
   fetch('/api/persona', {
     method:'POST',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify(payload)
   }).then(r=>r.json()).then(d=>{
-    document.getElementById('personaStatus').textContent = `🟢 已保存：${d.persona?.name || payload.name}`;
-    dbgLog('人设配置已保存');
+    document.getElementById('personaStatus').textContent = `🟢 已保存：${d.persona?.name || payload.name}（三段分开存 .local/persona.json）`;
+    dbgLog('人设已保存');
   });
 }
 
 function loadPermissionConfig() {
   fetch('/api/config').then(r=>r.json()).then(cfg=>{
-    document.getElementById('whitelist').value = (cfg.whitelist || []).join(',');
-    document.getElementById('listenPublic').value = String(cfg.listen_public !== false);
     document.getElementById('patrolRadius').value = cfg.patrol_radius || 8;
     document.getElementById('capabilityLevel').value = String(cfg.capability_level || 1);
     document.getElementById('nightAutoSleep').value = String(cfg.night_auto_sleep !== false);
-    const threshold = (cfg.decision || {}).confidence_threshold;
+    const decision = cfg.decision || {};
+    const threshold = decision.confidence_threshold;
     document.getElementById('confidenceThreshold').value = threshold !== undefined ? threshold : 0.6;
+    document.getElementById('semanticGate').value = String(decision.semantic_gate !== false);
+  }).catch(()=>{});
+  fetch('/api/permissions').then(r=>r.json()).then(p=>{
+    document.getElementById('serverMode').value = p.server_mode || 'private';
+    document.getElementById('masterList').value = (p.master || []).join(',');
+    document.getElementById('friendsList').value = (p.friends || []).join(',');
+    document.getElementById('publicReplyGuests').value = String(!!p.public_reply_guests);
+    document.getElementById('sessionAdjust').value = (p.session_adjust !== undefined ? p.session_adjust : 1);
   }).catch(()=>{});
 }
 
@@ -695,9 +857,14 @@ function loadPersonaConfig() {
   fetch('/api/persona').then(r=>r.json()).then(p=>{
     document.getElementById('aiName').value = p.name || 'AI';
     document.getElementById('wakeNames').value = (p.wake_names || []).join(',');
-    document.getElementById('personality').value = p.personality || '';
-    document.getElementById('speakingStyle').value = p.speaking_style || '';
-    document.getElementById('personaStatus').textContent = `🟢 已加载：${p.name || 'AI'}`;
+    document.getElementById('personaIdentity').value = p.identity || '';
+    document.getElementById('personaReplyStyle').value = p.reply_style || '';
+    document.getElementById('personaMultiple').value = (p.multiple_reply_style || []).join('\n');
+    document.getElementById('personaMultipleProbability').value = (p.multiple_probability !== undefined ? p.multiple_probability : 0);
+    document.getElementById('personaSceneRules').value = p.scene_rules || '';
+    const chars = p.sections && p.sections.identity_chars;
+    document.getElementById('personaStatus').textContent =
+      `🟢 已加载：${p.name || 'AI'}（身份 ${chars !== undefined ? chars : '?'} 字）`;
   }).catch(()=>{});
 }
 

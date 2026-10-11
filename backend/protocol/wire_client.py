@@ -249,6 +249,18 @@ class ControlStream:
         self._yaw = self._pitch = None
         self.flush(force=True)
 
+    def clear(self):
+        """本地清空按键与视角，**不发任何帧**。
+
+        不在世界（暂停菜单/连接界面）时用它：既不能让按键卡在"按住"状态，
+        也不允许往世界里发指令（在场门要求"零下发"）。回到世界后按键保持全松。
+        """
+        for key in self._keys:
+            self._keys[key] = False
+        self._look_dx = self._look_dy = 0.0
+        self._yaw = self._pitch = None
+        self._dirty = False
+
     def flush(self, force: bool = False) -> bool:
         """下发当前状态；返回是否真的发送了。
 

@@ -566,6 +566,73 @@ class Planner:
                 where = f"，说话时站在 ({float(last_speaker['x']):.0f}, {float(last_speaker.get('y') or 0):.0f}, {float(last_speaker['z']):.0f})"
             speaker_line = f"- 最近发话者：{last_speaker['name']}{where}\n"
 
+        # 人设三段 + 与 identity 分离的 state_block：**四个独立块**，禁止混写
+        # （设计文档 §3：人设不得被临时状态污染）。没配置三段时退回 legacy 两行。
+        persona_blocks = context.get("persona_blocks") if isinstance(context, dict) else None
+        persona_blocks = persona_blocks if isinstance(persona_blocks, dict) else {}
+        identity_block = str(persona_blocks.get("identity") or "").strip()
+        reply_style_block = str(persona_blocks.get("reply_style") or "").strip()
+        scene_rules_block = str(persona_blocks.get("scene_rules") or "").strip()
+        state_block = str(persona_blocks.get("state_block") or "").strip()
+        if identity_block or reply_style_block or scene_rules_block:
+            persona_section = (
+                "你的人设（下面三块各管一件事，别把状态写进身份、也别在三处重复同一句话）：\n"
+                f"【身份】{identity_block or '（未配置）'}\n"
+                f"【表达习惯】{reply_style_block or '（未配置）'}\n"
+                f"【场景规则】{scene_rules_block or '（未配置）'}\n"
+                f"【此刻状态（会变，不是身份）】{state_block or '（无）'}\n"
+            )
+        else:
+            persona_section = (f"当前人设：\n- 性格：{personality}\n"
+                               f"- 说话风格：{speaking_style}\n")
+
+        # 对话记忆（按服务器分区的 L1/L2/L3）：死亡、进出也在同一份记忆里。
+        conversation = context.get("conversation") if isinstance(context, dict) else None
+        conversation = conversation if isinstance(conversation, dict) else {}
+
+        def _ago_ts(entry: dict) -> str:
+            stamp = entry.get("ts") if isinstance(entry, dict) else None
+            if not isinstance(stamp, (int, float)):
+                return "?"
+            delta = max(0.0, now - float(stamp))
+            if delta < 3:
+                return "刚刚"
+            if delta < 60:
+                return f"{delta:.0f}秒前"
+            return f"{delta / 60:.0f}分钟前"
+
+        memory_lines = []
+        for entry in (conversation.get("recent") or [])[-12:]:
+            if not isinstance(entry, dict):
+                continue
+            kind = str(entry.get("type") or "chat")
+            who = str(entry.get("sender") or "?")
+            text = str(entry.get("message") or "")
+            if kind == "chat":
+                memory_lines.append(f"({_ago_ts(entry)}) {who}: {text}")
+            else:
+                memory_lines.append(f"({_ago_ts(entry)}) [{'我' if entry.get('is_self') else kind}] {who} {text}".strip())
+        memory_text = "\n".join(memory_lines) or "（本服务器还没有对话记录）"
+        keywords = conversation.get("keywords") or []
+        keywords_text = ", ".join(str(k) for k in keywords[:12]) or "无"
+        summary_text = str(conversation.get("summary") or "").strip() or "（还没到需要摘要的量）"
+        namespace = str(conversation.get("namespace") or "unknown")
+
+        # 外部事件注入：不是"必发消息"，模型完全可以 no_action。
+        event = context.get("event") if isinstance(context, dict) else None
+        event = event if isinstance(event, dict) else {}
+        event_section = ""
+        event_rule = ""
+        if event:
+            event_section = (
+                "\n外部事件（**不是**玩家直接对你说的话，只是世界里发生了一件事）：\n"
+                f"{json.dumps(event, ensure_ascii=False)}\n"
+                "要不要说点什么完全由你决定：不想说就把 reply 留空、candidates 给空数组——"
+                "硬找话聊比不说话更糟。\n"
+            )
+            event_rule = ("12. 上面有外部事件时：先判断值不值得开口（有人死了/掉到好东西/第一次到新地方"
+                          "才值得调侃一句），不值得就不说话；别把事件当指令去干活\n")
+
         # 饥饿/饱和度：自然回血要"饱食度 ≥18 且饱和度 >0"，所以缺血时不能等饿到见底才吃。
         player_ctx = context.get("player", {}) if isinstance(context, dict) else {}
         if not isinstance(player_ctx, dict):
@@ -590,7 +657,7 @@ class Planner:
 当前状态：
 - 发送者：{sender}
 - 消息：{message}
-
+{event_section}
 在线玩家（按距离，标记出最近跟你说话的那个人）：
 {players_text}
 {speaker_line}
@@ -604,10 +671,13 @@ class Planner:
 记忆上下文：
 {memory_context.get('interaction_summary', '无')}
 
-当前人设：
-- 性格：{personality}
-- 说话风格：{speaking_style}
+对话记忆（服务器 {namespace}；L2 窗口 + L3 中期摘要 + 关键词。
+判断"他之前说过什么/这个服务器上发生过什么"看这里）：
+{memory_text}
+中期摘要：{summary_text}
+关键词：{keywords_text}
 
+{persona_section}
 当前任务状态：
 {context.get('task_state', {'kind': 'idle', 'status': 'idle'})}
 
@@ -669,7 +739,7 @@ class Planner:
    坐标要等游戏回话才知道，所以 reply 里**别写坐标**，只说"去查一下"，真实坐标后端会补在你话后面
 10. 有人问"在干嘛/要去哪" → 顺手用 set_hud_note 把当前打算写进 HUD 描述词
 11. 回复必须和实际动作一致：写进 reply 的事必须真的作为候选下发；没下发的动作不要写进 reply
-
+{event_rule}
 给 1-4 个候选动作（按偏好排序，没有合适的就给空数组），只输出合法 JSON（无 markdown、无多余文字）：
 "过来" → {{"reply":"来了","candidates":[{{"tool":"move_to","args":{{"x":100,"y":64,"z":-200}},"why":"靠近"}}]}}
 "别跟着" → {{"reply":"行","candidates":[{{"tool":"stop","args":{{}},"why":"用户要求停止"}}]}}

@@ -165,14 +165,26 @@ class LLMService:
         personality = persona.get("personality", "友好、自然")
         speaking_style = persona.get("speaking_style", "口语化、简短")
         external_context = persona.get("external_context", {})
+        blocks = context.get("persona_blocks") if isinstance(context, dict) else None
+        blocks = blocks if isinstance(blocks, dict) else {}
         parts = [
             f"你是 {persona_name}，一个正在玩 Minecraft 的玩家，和服务器里的其他人一起玩。",
-            f"你的人设性格是：{personality}。",
-            f"你的说话风格是：{speaking_style}。",
+        ]
+        if blocks.get("identity") or blocks.get("reply_style") or blocks.get("scene_rules"):
+            # 三段独立块（人设正文以 .local/persona.json 为准）；状态块与身份分开。
+            parts.append(f"【身份】{blocks.get('identity') or personality}")
+            parts.append(f"【表达习惯】{blocks.get('reply_style') or speaking_style}")
+            parts.append(f"【场景规则】{blocks.get('scene_rules') or '（未配置）'}")
+            if blocks.get("state_block"):
+                parts.append(f"【此刻状态（会变，不是身份）】{blocks['state_block']}")
+        else:
+            parts.append(f"你的人设性格是：{personality}。")
+            parts.append(f"你的说话风格是：{speaking_style}。")
+        parts.extend([
             "你不是 AI，不要暴露自己是 AI。说话要自然、随意，像真人玩家一样。",
             '可以用"哈哈"、"好的"、"来了"、"等下"等口语。回复要简短，不要长篇大论。',
             "",
-        ]
+        ])
         if external_context:
             parts.append(f"上游系统注入的人设上下文：{external_context}")
             parts.append("")

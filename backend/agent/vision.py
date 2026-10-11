@@ -173,23 +173,40 @@ class ScreenCapture:
 
 
 class VisionInterpreter:
-    """低频把画面转成场景描述；tick 循环只读 `latest()`，永不阻塞。"""
+    """低频把画面转成场景描述；tick 循环只读 `latest()`，永不阻塞。
+
+    `activity_provider` 是在场门的挂钩：它返回 False（例如"不在世界里"）时，
+    后台线程照常活着但**不抓屏、不调 VLM**（零 token），回到世界自动恢复。
+    """
 
     def __init__(self, llm_service, capture: Optional[ScreenCapture] = None,
                  interval: float = DEFAULT_INTERVAL_SECONDS, agent: str = "vision",
-                 prompt: str = VISION_PROMPT, max_tokens: int = 160):
+                 prompt: str = VISION_PROMPT, max_tokens: int = 160,
+                 activity_provider: Optional[Callable[[], bool]] = None):
         self.llm = llm_service
         self.capture = capture or ScreenCapture()
         self.interval = interval
         self.agent = agent
         self.prompt = prompt
         self.max_tokens = max_tokens
+        self.activity_provider = activity_provider
         self._lock = threading.Lock()
         self._description = ""
         self._last_at = 0.0
         self._last_error = ""
+        self._skipped = 0
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+
+    def allowed(self) -> bool:
+        """在场门：不在世界/未开启时不抓屏不调模型。"""
+        provider = self.activity_provider
+        if provider is None:
+            return True
+        try:
+            return bool(provider())
+        except Exception:
+            return True
 
     @property
     def available(self) -> bool:
@@ -221,7 +238,14 @@ class VisionInterpreter:
             self._stop.wait(self.interval)
 
     def refresh(self) -> Optional[str]:
-        """抓一帧并调用 VLM。成功返回描述，失败返回 None 并保留上一次结果。"""
+        """抓一帧并调用 VLM。成功返回描述，失败返回 None 并保留上一次结果。
+
+        不在场（`activity_provider` 为假）时直接跳过：不抓屏、不花 token。
+        """
+        if not self.allowed():
+            with self._lock:
+                self._skipped += 1
+            return None
         jpeg = self.capture.grab_jpeg()
         if not jpeg:
             return None
@@ -253,4 +277,7 @@ class VisionInterpreter:
                 "last_at": self._last_at,
                 "description": self._description,
                 "error": self._last_error,
+                # 在场门跳过的次数（不在世界里视觉不该花任何 token）。
+                "skipped": self._skipped,
+                "allowed": self.allowed(),
             }

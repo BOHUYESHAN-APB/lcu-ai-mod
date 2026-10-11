@@ -19,6 +19,8 @@ from fastapi.staticfiles import StaticFiles
 from agent import LLMService
 from agent.config_store import get_config_store, DEFAULT_CONFIG_PATH
 from agent.orchestrator import Orchestrator
+from agent.permissions import PermissionsStore
+from agent.persona_store import KNOWN_KEYS as PERSONA_KEYS, PersonaStore
 from protocol import WireClient
 
 app = FastAPI(title="LCUMod Backend")
@@ -27,6 +29,24 @@ CONFIG_PATH = DEFAULT_CONFIG_PATH
 # 共享实例：Session/Planner 拿到的必须是同一个（否则 UI 改阈值不生效）
 config_store = get_config_store(CONFIG_PATH)
 app_config = config_store.raw(redact=True)
+
+# 权限 / 人设：运行期一律用 session 里那一份（单一实例），
+# 进程还没起来（模组未连接）时退回模块级实例，保证 REST 依然可用。
+_permissions_fallback = PermissionsStore()
+_persona_fallback = PersonaStore()
+
+
+def _permissions_store() -> PermissionsStore:
+    session = orchestrator.session if orchestrator else None
+    store = getattr(session, "permissions", None)
+    return store if isinstance(store, PermissionsStore) else _permissions_fallback
+
+
+def _persona_store() -> PersonaStore:
+    session = orchestrator.session if orchestrator else None
+    store = getattr(session, "persona", None)
+    return store if isinstance(store, PersonaStore) else _persona_fallback
+
 
 # Global state
 wire: WireClient | None = None
@@ -55,12 +75,34 @@ def _apply_config_to_llm_services():
 def _apply_persona_to_session():
     if not orchestrator or not orchestrator.session:
         return
-    persona = config_store.get_persona()
+    # 合并视图：legacy（config.json 的 personality/speaking_style）打底，
+    # `.local/persona.json` 的三段正文覆盖 —— 空值不覆盖（UI 清空某个可选字段时不至于把人设抹掉）。
+    persona = dict(config_store.get_persona())
+    for key, value in _persona_store().get().items():
+        if value not in (None, "", [], {}):
+            persona[key] = value
     orchestrator.session.runtime["persona"] = persona
 
 # Static files
 STATIC_DIR = Path(__file__).parent / "web" / "static"
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _seed_local_stores() -> None:
+    """首次启动时把默认的人设/权限落成文件，方便操作者直接手改。
+
+    这两份配置本来就支持"文件不存在 → 用内置默认值"，这里只是让文件露出来、可被编辑。
+    """
+    for store, label in ((_persona_store(), "persona"), (_permissions_store(), "permissions")):
+        path = getattr(store, "path", None)
+        if path is None:
+            continue
+        try:
+            if not Path(path).exists():
+                store.set(store.get())
+                print(f"[Backend] 已写入默认 {label} 配置: {path}")
+        except Exception as e:
+            print(f"[Backend] 初始化 {label} 配置失败({path}): {e}")
 
 
 @app.on_event("startup")
@@ -75,6 +117,7 @@ async def startup():
     orchestrator = Orchestrator(wire)
     _apply_config_to_llm_services()
     _apply_persona_to_session()
+    _seed_local_stores()
 
     # Store event loop for background thread scheduling
     loop = asyncio.get_event_loop()
@@ -157,17 +200,22 @@ async def websocket_endpoint(ws: WebSocket):
                 sender = msg.get("sender", "web")
                 response = ""
                 error = ""
+                session = getattr(orchestrator, "session", None) if orchestrator else None
                 if orchestrator:
-                    try:
-                        response = orchestrator.handle_chat(sender, message) or ""
-                    except Exception as e:
-                        error = f"{type(e).__name__}: {e}"
-                    if not response and not error:
-                        session = getattr(orchestrator, "session", None)
-                        if session is not None:
-                            error = session.llm.get_last_error("planner")
-                            if not error and not session.llm.api_key:
-                                error = "LLM 未配置 API Key（见设置页「运行中实际生效」）"
+                    if session is not None and not session.llm_active():
+                        # 在场门：不在世界里一律不调 LLM（省 token），但如实告诉操作者为什么。
+                        error = (f"未在游戏中（界面：{session.ui_screen or '?'}），已暂停回复；"
+                                 "这条消息仍记进了对话记忆")
+                    else:
+                        try:
+                            response = orchestrator.handle_chat(sender, message) or ""
+                        except Exception as e:
+                            error = f"{type(e).__name__}: {e}"
+                        if not response and not error:
+                            if session is not None:
+                                error = session.llm.get_last_error("planner")
+                                if not error and not session.llm.api_key:
+                                    error = "LLM 未配置 API Key（见设置页「运行中实际生效」）"
                 else:
                     error = "后端会话未启动（模组尚未连接）"
 
@@ -356,14 +404,97 @@ async def fetch_llm_models(data: dict):
 
 @app.get("/api/persona")
 async def get_persona():
-    return config_store.get_persona()
+    """人设：`.local/persona.json`（三段自由文本 + 备用风格）与 legacy 字段的合并视图。"""
+    persona = dict(config_store.get_persona())
+    persona.update(_persona_store().get())
+    persona["sections"] = _persona_store().status()
+    return persona
 
 
 @app.post("/api/persona")
 async def set_persona(data: dict):
-    persona = config_store.set_persona(data)
+    """写人设。三段（identity/reply_style/scene_rules + 备用风格）落 `.local/persona.json`
+    —— 它是人设的**唯一权威来源**；只有 `external_context`（上游注入）仍存 config.json。"""
+    sections = {key: value for key, value in (data or {}).items() if key in PERSONA_KEYS}
+    external = {key: value for key, value in (data or {}).items() if key == "external_context"}
+    if sections:
+        _persona_store().set(sections)
+    if external:
+        config_store.set_persona(external)
     _apply_persona_to_session()
-    return {"status": "ok", "persona": persona}
+    merged = dict(config_store.get_persona())
+    merged.update(_persona_store().get())
+    return {"status": "ok", "persona": merged}
+
+
+@app.get("/api/permissions")
+async def get_permissions():
+    """权限配置（`.local/permissions.json`）：master/friends/server_mode/频率参数。"""
+    return _permissions_store().get()
+
+
+@app.post("/api/permissions")
+async def set_permissions(data: dict):
+    """改权限配置；改完立刻生效（ReplyGate 实时读盘）。"""
+    saved = _permissions_store().set(data or {})
+    session = orchestrator.session if orchestrator else None
+    store = getattr(session, "permissions", None)
+    if isinstance(store, PermissionsStore) and hasattr(store, "reload"):
+        try:
+            store.reload()
+        except Exception:
+            pass
+    return {"status": "ok", "permissions": saved}
+
+
+def _operator_actor(requested: str) -> tuple[str, Optional[str]]:
+    """仪表盘上的任务操作算谁做的。
+
+    传了 `actor` 就按那个人查权限（tier 由 permissions.json 决定）；
+    没传就是本地控制台在操作 —— 用配置里的第一位主人；连主人名单都空，则明确按 master 席位执行
+    （这台机器上的仪表盘本来就是操作台，和直接发 wire 指令等价）。
+    """
+    actor = str(requested or "").strip()
+    if actor:
+        return actor, None
+    masters = _permissions_store().get().get("master") or []
+    if masters:
+        return str(masters[0]), None
+    return "", "master"
+
+
+@app.get("/api/tasks")
+async def get_tasks():
+    """任务列表（多任务 + 归属 + 优先级 + 状态 + 进度）。"""
+    session = orchestrator.session if orchestrator else None
+    tasks = getattr(session, "tasks", None)
+    if tasks is None:
+        return {"items": [], "active": None, "count": 0}
+    return tasks.status()
+
+
+@app.post("/api/tasks/cancel")
+async def cancel_task(data: dict):
+    """取消任务：master 可取消任意；friend 只管自己的（权限由 tier 规则判定）。"""
+    session = orchestrator.session if orchestrator else None
+    if session is None:
+        raise HTTPException(status_code=409, detail="会话未启动（模组未连接）")
+    actor, tier = _operator_actor((data or {}).get("actor"))
+    ok, reason = session.cancel_task(str((data or {}).get("id") or ""), actor=actor, tier=tier)
+    return {"status": "ok" if ok else "denied", "reason": reason,
+            "task_list": session.tasks.status()}
+
+
+@app.post("/api/tasks/activate")
+async def activate_task(data: dict):
+    """插队：把某个任务提到最前（master 任意 / friend 仅自己的）。"""
+    session = orchestrator.session if orchestrator else None
+    if session is None:
+        raise HTTPException(status_code=409, detail="会话未启动（模组未连接）")
+    actor, tier = _operator_actor((data or {}).get("actor"))
+    ok, reason = session.activate_task(str((data or {}).get("id") or ""), actor=actor, tier=tier)
+    return {"status": "ok" if ok else "denied", "reason": reason,
+            "task_list": session.tasks.status()}
 
 
 @app.post("/api/sdk/context")

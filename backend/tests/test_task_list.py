@@ -122,7 +122,7 @@ class ActivateTests(unittest.TestCase):
     def test_activate_jumps_queue_and_demotes_others(self):
         tl = TaskList(clock=Clock())
         a = tl.add("a", owner="o", priority=30, status=STATUS_ACTIVE)
-        b = tl.add("b", owner="o2", priority=90, status=STATUS_ACTIVE)
+        b = tl.add("b", owner="o2", priority=100, status=STATUS_ACTIVE)
         target = tl.add("urgent", owner="steve", owner_tier="friend", priority=5)
         ok, why = tl.activate(target.id, actor_tier="friend", actor="steve")
         self.assertTrue(ok)
