@@ -169,9 +169,16 @@ class Skills:
         """Right-click whatever is targeted (block or entity)."""
         return self._send_cmd("use_on", {})
 
-    def use_item(self) -> dict:
-        """Use held item (eat, drink, activate)."""
-        return self._send_cmd("use_item", {})
+    def use_item(self, ticks: Optional[int] = None) -> dict:
+        """Use held item (eat, drink, activate).
+
+        `ticks` 可选：Java 侧是"按住右键 N tick（默认 4）再松开"的通用语义
+        （锄地/播种靠它，不需要任何专门的农活命令）；不给就沿用 Java 的默认值。
+        """
+        args: dict[str, Any] = {}
+        if ticks is not None:
+            args["ticks"] = int(ticks)
+        return self._send_cmd("use_item", args)
 
     # ── Entity Interaction (mineflayer) ─────────────────────────
 

@@ -67,6 +67,9 @@ ACTION_RULES: dict[str, tuple[str, ...]] = {
     ACTION_ATTACK: ("animals",),
     ACTION_MINE: ("crops", "blocks"),
     ACTION_PLACE: ("blocks",),
+    # 农活会碰到作物与土方块：挨着 `protect` 里的 crops/blocks 就**先别动手**
+    # （自家农田声明 `protect:[]` → 命中不了任何规则，照常干活）。
+    ACTION_FARM: ("crops", "blocks"),
 }
 # 动手类动作 → 需要的领地授权项
 ACTION_GRANT: dict[str, str] = {

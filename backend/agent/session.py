@@ -386,7 +386,10 @@ class Session:
                 self._absorb_people(data)
                 # 容器内容变了（含归还后的快照）→ 用真实快照核对借用是否真的放回去了。
                 if isinstance(data, dict) and "open_container" in data:
-                    self._verify_borrow_returns(data.get("open_container") or {})
+                    snapshot = data.get("open_container") or {}
+                    self._verify_borrow_returns(snapshot)
+                    # 搬运的**两侧对账**也在这条路上：搬前/搬后 items 对比，不符就如实报。
+                    self._verify_haul(snapshot)
             case "player_chat":
                 self._handle_player_chat(data)
             case "player_death":
@@ -618,6 +621,8 @@ class Session:
         except Exception as e:
             logger.debug("[Session] 借用结算读容器清单失败: %s", e)
         context["nearby_storage"] = runtime.get("nearby_storage", [])
+        # 玩家位置：搬运算"到没到箱子跟前"要看它（借用那条路不看，多给一份无副作用）。
+        context["player"] = runtime.get("player", {})
         context["actor_tier"] = str((getattr(self, "_actor", {}) or {}).get("tier") or "guest")
         return context
 
@@ -657,6 +662,29 @@ class Session:
             return False
         finally:
             self._borrow_settling = False
+
+    def _haul_step(self) -> bool:
+        """空闲时把还没搬完的搬运推进一步（走到箱边/开箱/取/放；对账走事件那条路）。"""
+        planner = getattr(self, "planner", None)
+        if planner is None:
+            return False
+        try:
+            return bool(planner.haul_step(self._borrow_context()))
+        except Exception as e:
+            logger.warning("[Session] 搬运推进一步失败: %s", e)
+            return False
+
+    def _verify_haul(self, snapshot: dict) -> None:
+        """新容器快照到了 → 给当前搬运做两侧对账（真的对上才算数）。"""
+        planner = getattr(self, "planner", None)
+        verify = getattr(planner, "verify_haul", None)
+        if not callable(verify):
+            return
+        try:
+            player = self.runtime.get("player") if isinstance(self.runtime, dict) else None
+            verify(snapshot, point_of(player))
+        except Exception as e:
+            logger.warning("[Session] 搬运对账失败: %s", e)
 
     def _borrow_ledger_status(self) -> dict:
         """借用台账快照（planner 可能是测试替身，缺方法时给空值）。"""
@@ -2244,6 +2272,8 @@ class Session:
         # 有借出未还、手头又闲着 → 自己推进一步归还（走到箱边开箱、把剩余放回）。
         if is_idle and autonomy_enabled and not manual_override_active:
             self._auto_return_step()
+            # 还没搬完的搬运：走到箱边/开箱/取/放各推进一步（对账走 state_update 那条路）。
+            self._haul_step()
         mode_action = None
         if autonomy_enabled and not manual_override_active:
             with self.skills.command_context("mode"):

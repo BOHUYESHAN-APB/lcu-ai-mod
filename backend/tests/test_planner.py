@@ -377,7 +377,8 @@ class PlannerPromptSlimmingTests(unittest.TestCase):
         （契约 + 人设 + 规则 + 机制说明 + 借用授权）。工具表已改走 API `tools` 参数、
         JSON 骨架已并入 L0，静态块本身**只降不抬**：
           旧值 IDLE_STATIC_BUDGET = 2750（旧口径实测 2392）
-          新值 IDLE_STATIC_BUDGET = 1700（新口径实测：上线时 1535，领地/区域/造床三条规则后 1678）
+          新值 IDLE_STATIC_BUDGET = 1700（新口径实测：上线时 1535，领地/区域/造床三条规则后 1678，
+          搬运/种田两条 + 合并压缩后 1690）
         """
         IDLE_STATIC_BUDGET = 1700
 

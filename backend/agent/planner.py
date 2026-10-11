@@ -11,6 +11,7 @@ Planner — 规划器。
 支持可中断规划：新消息到达时可以中断当前规划。
 """
 
+import copy
 import json
 import logging
 import re
@@ -21,10 +22,21 @@ from typing import Any, Callable, Optional
 from .borrow import BorrowLedger
 from .craft import (ContainerPick, armor_in_containers, clamp_take, describe_missing,
                     evaluate_craft, is_armor, normalize_item, route_containers)
+from .farm import (ACTION_HARVEST, ACTION_PLANT, ACTION_REPLANT, ACTION_TILL,
+                   choose_action, counts_of, crop_of, hold_index, is_hoe, missing_items,
+                   normalize_action)
+from .farm import nearest as farm_nearest
+from .farm import note as farm_note
+from .haul import (HAUL_MAX_ATTEMPTS, HAUL_VERIFY_TIMEOUT, HAUL_WALK_TIMEOUT,
+                   SIDE_CONTAINER, SIDE_PLAYER, STEP_DONE, STEP_OPEN_SOURCE,
+                   STEP_OPEN_TARGET, STEP_PUT, STEP_TAKE, STEP_VERIFY, STEP_WALK_SOURCE,
+                   STEP_WALK_TARGET, HaulJob, failure_receipt, has_layout, plan_haul,
+                   plan_put_moves, plan_take_moves, reconcile_sides, side_free_space,
+                   side_items, success_receipt)
 from .llm_service import prompt_version, render_persona_triple
 from .permissions import CraftPolicy, TIER_GUEST
-from .territory import (POLICY_BORROW_ONLY, POLICY_FREE, POLICY_NO_TOUCH,
-                        bed_attempt, bed_note, current_base,
+from .territory import (ACTION_FARM, POLICY_BORROW_ONLY, POLICY_FREE, POLICY_NO_TOUCH,
+                        bed_attempt, bed_note, current_base, may_act,
                         normalize_grants, normalize_policy, point_of)
 
 logger = logging.getLogger("planner")
@@ -92,6 +104,14 @@ ACTION_GROUPS: dict[str, tuple[tuple[str, str, str], ...]] = {
         ("borrow_item", "item,count,container", "从仓库借（须授权；不给 count＝整箱搬，拒绝）"),
         ("return_item", "item,count,container", "放回原容器（省 count＝全部剩余）"),
     ),
+    "farm": (
+        ("haul", "from,to,item,count",
+         "在容器之间搬运（from/to＝已记住的容器名或 self；省 item＝搬全部可搬的；"
+         "单趟≤256、源箱留底不搬空、两侧对账，卡住就报在哪一步）"),
+        ("farm", "plot,action",
+         "在授权农田里干活（action=till锄地|plant播种|harvest收割|replant补种；"
+         "全走右键/挖，缺种子或锄头如实报）"),
+    ),
     "combat": (
         ("attack", "", "攻击附近敌人"),
     ),
@@ -156,11 +176,11 @@ _KIND_TO_PHASE = {
 # night / guard / hud / memory 全局注入：睡觉、守点、HUD 描述词与记忆点在任何阶段
 # 都可能有意义（用户说"在这儿守着"时他可能正在看着 AI 挖矿）。
 PHASE_GROUPS: dict[str, tuple[str, ...]] = {
-    "idle": ("move", "locate", "gather", "craft", "container", "guard", "items", "survive", "combat", "hud", "night", "server", "memory", "territory"),
-    "travel": ("move", "locate", "combat", "guard", "items", "container", "survive", "hud", "night", "server", "memory", "territory"),
-    "gather": ("move", "locate", "gather", "guard", "items", "craft", "container", "hud", "night", "server", "memory", "territory"),
-    "craft": ("move", "locate", "craft", "container", "guard", "items", "gather", "hud", "night", "server", "memory", "territory"),
-    "survive": ("survive", "hud", "night", "server", "memory", "guard", "items", "move", "locate", "territory"),
+    "idle": ("move", "locate", "gather", "craft", "container", "farm", "guard", "items", "survive", "combat", "hud", "night", "server", "memory", "territory"),
+    "travel": ("move", "locate", "combat", "guard", "items", "container", "farm", "survive", "hud", "night", "server", "memory", "territory"),
+    "gather": ("move", "locate", "gather", "guard", "items", "craft", "container", "farm", "hud", "night", "server", "memory", "territory"),
+    "craft": ("move", "locate", "craft", "container", "farm", "guard", "items", "gather", "hud", "night", "server", "memory", "territory"),
+    "survive": ("survive", "hud", "night", "server", "memory", "guard", "farm", "items", "move", "locate", "territory"),
 }
 
 _TERMINAL_STATUSES = {"", "idle", "done", "failed", "cancelled", "error"}
@@ -226,24 +246,25 @@ confidence 是你对这个选择的确信程度；没有一个候选明显合适
 # L1：规则（**静态**，不随轮次变化；与人设、授权一起构成系统提示词）。
 PLANNER_RULES: tuple[str, ...] = (
     "你是真实玩家，不是 AI；说话自然简短，直接做事。",
-    "用户要求停止时优先给 stop；当前任务非 idle 且目标未变时不要重复下发同一任务。",
+    "要求停止优先给 stop；任务非 idle 且目标未变别重复下发同一任务。",
     "晚上没事、且附近或记忆里有床 → 给 sleep_in_bed（它自己走过去睡，别干等到天亮）。",
-    "用户说\"找床/找箱子/找某某方块\" → 用 go_to_block（自己会寻路过去），不要用 explore；只查不走用 find_block。",
-    "用户说\"记住这里/保存一个记录点\" → 用 remember_poi。",
-    "判断在跟谁说话：看最近聊天上下文 + 在线玩家的 ← 标记；对你说话不一定喊名字。",
+    "找床/箱子/方块 → 用 go_to_block（自己寻路），不要用 explore；只查不走用 find_block。",
+    "\"记住这里/存个点\" → 用 remember_poi。",
+    "判断在跟谁说话：看最近聊天 + 在线玩家的 ← 标记；对你说话不一定喊名字。",
     "\"守住这里/别走开\" → guard（别自己编坐标，缺省用最近发话者的位置）；\"不用守了\" → guard_off。",
-    "找结构/群系 → locate_structure（名字用 minecraft:village 这类 id，别写死成某一个）；坐标等游戏回话，reply 里别写坐标，真实的会补在后面。",
-    "有人问\"在干嘛/要去哪\" → 顺手用 set_hud_note 把当前打算写进 HUD 描述词。",
-    "回复必须和实际动作一致：写进 reply 的事必须真的作为候选下发；没下发的动作不要写进 reply。",
+    "找结构/群系 → locate_structure（名字用 minecraft:village 这类 id，别写死成某一个）；坐标等回话，reply 别写。",
+    "有人问\"在干嘛/要去哪\" → 用 set_hud_note 把打算写进 HUD 描述词。",
+    "回复必须和实际动作一致：写进 reply 的必须真下发，没下发的别写。",
     "要穿甲 → equip_armor（唯一穿甲方式；背包里没有就去已知容器找，别现场造）。",
     "合成优先用自己背包（含快捷栏）的材料；缺料/没配方就如实说；没被授权不要开箱。",
     "容器里只为拿自己要的量：container_move 给明确 count，别整箱搬空；拿完 container_close。",
-    "只在已授权的领地/基地范围内自由动手；范围外要取用就走 borrow_item/return_item 这条借用台账。",
-    "农场等保护区里别去动被保护的动物/作物——硬拦会拒，但你先别去试。",
+    "只在已授权的领地/基地范围内自由动手，保护区里的动物/作物不碰（被硬拦就报区域与规则）；范围外取用走 borrow_item/return_item。",
+    "搬运 haul（from/to＝容器名或 self）：单趟≤256、源箱留底、两侧对账；no_touch 不碰、borrow_only 只借不搬，卡住报哪一步。",
+    "种田用 farm：只在授权农田干（锄/播走右键、收割走挖）；缺种子/锄头如实说，被保护拦住就报区域。",
     "基地里找不到床就自己造一张（3 羊毛+3 木板）；缺料或周围有敌人就如实说，不硬凑。",
     "从仓库拿东西＝借：得先有人明确授权（见下）；没授权不动，如实说。",
-    "借只拿够用的量（≤需求 2 倍、最多 256），整箱搬不干；用完/任务结束/被叫停都要把剩余放回原箱（borrow_item 拿、return_item 还），别随身携带大量资源。",
-    "有外部事件时先判断值不值得开口（有人死了/掉到好东西/第一次到新地方才值得调侃一句），不值得就不说话；别把事件当指令去干活。",
+    "借只拿够用的量（≤需求 2 倍、最多 256）；用完/结束/被叫停把剩余放回原箱（borrow_item 拿、return_item 还）。",
+    "有外部事件先判断值不值得开口（有人死了/掉好东西才调侃），不值得就不说；别当指令。",
 )
 
 # L1：机制说明（**静态**：解释下面 L2 里的数字怎么看；不随轮次变化）。
@@ -554,6 +575,16 @@ class Planner:
         self._territory_note: Optional[str] = None
         # "找不到床、正在自己造"的待认领基地名（下一轮看到床边就认成 home_bed）。
         self._pending_home_bed_base: Optional[str] = None
+        # 本轮搬运 / 农活的如实说明（没授权、卡在哪一步、缺料…）。
+        self._haul_note: Optional[str] = None
+        self._farm_note: Optional[str] = None
+        # 搬运任务（跨轮推进：走到 A → 开箱 → 取 → 走到 B → 开箱 → 放 → 两侧对账）。
+        self._haul_job: Optional[HaulJob] = None
+        self._haul_rows: dict = {}
+        self._haul_last: Optional[dict] = None      # 最近一次搬运的**回执**（如实）
+        self._haul_audit: list[dict] = []           # 搬运台账（发起/完成/失败，字段固定）
+        # "收割了、正要补种同一作物"的待补种目标（下一轮看到耕地就播种）。
+        self._farm_pending: Optional[dict] = None
         # L1 版本键 + 上一次组装的 L0+L1 字符串：键不变就复用**同一份字符串**
         # （前缀缓存友好）；L3 工具 schema 按阶段各建一次（M3-3 的阶段过滤继续生效）。
         self._system_key: Optional[str] = None
@@ -589,8 +620,18 @@ class Planner:
         self._craft_note = None
         self._action_note = None
         self._territory_note = None
+        self._haul_note = None
+        self._farm_note = None
         # 上一轮在造床、这一轮看到床边了 → 认成 home_bed（§8 造 + 放 + 认领）。
         self._claim_pending_home_bed(context)
+        # 上一轮收完了、这一轮看到耕地了 → 补种同一作物（同一套"看到才认"的机制）。
+        self._claim_pending_replant(context)
+        # 还没搬完的搬运任务：容器开了/走到了就接着推进一步（不重复开新的）。
+        if self._haul_job is not None and not self._haul_job.done:
+            try:
+                self.haul_step(context)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[Planner] 搬运续跑失败: %s", exc)
 
         try:
             # 第一阶段：planner 结合状态产出候选动作（JSON）。
@@ -664,7 +705,8 @@ class Planner:
         与一条"指令被拒/要确认"的说明 —— 都不许编，有什么说什么。
         """
         text = self._with_locate_note(reply)
-        for note in (self._craft_note, self._action_note, self._territory_note):
+        for note in (self._craft_note, self._action_note, self._territory_note,
+                     self._haul_note, self._farm_note):
             if not note:
                 continue
             text = f"{text}\n{note}" if text else note
@@ -1622,6 +1664,10 @@ class Planner:
             return self._dispatch_set_home(payload, context)
         elif tool_name == "go_home":
             return self._dispatch_go_home(payload, context)
+        elif tool_name == "haul":
+            return self._dispatch_haul(payload, context)
+        elif tool_name == "farm":
+            return self._dispatch_farm(payload, context)
         elif tool_name == "stop":
             self.skills.stop_all()
             return True
@@ -2629,6 +2675,627 @@ class Planner:
                                 f"({target[0]:.0f},{target[1]:.0f},{target[2]:.0f})）")
         return True
 
+    # ── 搬运 haul（§4）：算量 → 取 → 送 → 两侧对账（跨轮推进）────────
+
+    SELF_NAMES = ("self", "me", "inventory", "backpack", "自己", "背包")
+
+    @classmethod
+    def _is_self_side(cls, name: Any) -> bool:
+        """这一侧是不是"我自己背包"（`from/to` 里的 `self`）。"""
+        return str(name or "").strip().lower() in cls.SELF_NAMES
+
+    @staticmethod
+    def _container_block(row: Optional[dict]) -> str:
+        """记住的容器 → 走过去用的方块 id（kind 认不出就按箱子）。"""
+        kind = str((row or {}).get("kind") or "").strip() or "chest"
+        return kind if ":" in kind else f"minecraft:{kind}"
+
+    def _haul_moved_text(self, moved: Any) -> str:
+        rows = {str(item): int(count) for item, count in (moved or {}).items()
+                if int(count or 0) > 0}
+        return "、".join(f"{item} x{count}" for item, count in rows.items()) or "0 件"
+
+    def _haul_want_text(self, job: HaulJob) -> str:
+        if job.item:
+            return f"{job.item} x{job.want}" if job.want else f"{job.item}（能搬多少算多少）"
+        return "全部可搬的"
+
+    def _haul_container_in_reach(self, name: str, row: Optional[dict], context: Any) -> bool:
+        """这个容器就在跟前吗（用 nearby_storage / known_containers 的距离与坐标判，绝不猜）。"""
+        ctx = context if isinstance(context, dict) else {}
+        rows: list[dict] = []
+        for key in ("nearby_storage", "known_containers"):
+            value = ctx.get(key)
+            if isinstance(value, (list, tuple)):
+                rows.extend(item for item in value if isinstance(item, dict))
+        pos = point_of(row) if row else None
+        for item in rows:
+            title = str(item.get("title") or item.get("name") or "")
+            if name and title and title != name:
+                continue
+            distance = item.get("distance")
+            if (isinstance(distance, (int, float)) and not isinstance(distance, bool)
+                    and distance <= 4.0):
+                return True
+            if pos is None:
+                continue
+            try:
+                dx = float(item.get("x")) - pos[0]
+                dy = float(item.get("y")) - pos[1]
+                dz = float(item.get("z")) - pos[2]
+            except (TypeError, ValueError):
+                continue
+            if abs(dx) <= 4 and abs(dy) <= 4 and abs(dz) <= 4:
+                return True
+        return False
+
+    def _haul_open_matches(self, open_container: Any, name: str, row: Optional[dict],
+                           player_pos: Any = None) -> bool:
+        """现在开着的就是这个名字的容器吗：标题对得上，或人已经站在它记录的位置上。
+
+        Java 的 `open_container` 只报 `title`（界面标题），所以默认名箱子（"Chest"）
+        对不上我们记的名字 —— 这时用"人就在它记录的坐标上"判，**不猜**别的容器。
+        """
+        if not isinstance(open_container, dict) or open_container.get("id") is None:
+            return False
+        title = str(open_container.get("title") or open_container.get("name") or "").strip()
+        if title and name and title.casefold() == str(name).strip().casefold():
+            return True
+        pos = point_of(row) if row else None
+        if pos is None or player_pos is None:
+            return False
+        return (abs(player_pos[0] - pos[0]) <= 3 and abs(player_pos[1] - pos[1]) <= 3
+                and abs(player_pos[2] - pos[2]) <= 3)
+
+    def _dispatch_haul(self, payload: dict, context: dict) -> bool:
+        """`haul {from,to,item?,count?}`：算量 → 取 → 走到 B → 放 → **两侧对账**（§4）。
+
+        硬约束（**入口先挡，绝不"试一下"**）：`no_touch` 一律不碰；`borrow_only` 作为
+        **源**必须走借用台账（haul 不许绕过借还）；没被授权翻箱就不动手。
+        """
+        store = self._territory_store()
+        src_name = str(payload.get("from") or payload.get("source") or "").strip()
+        dst_name = str(payload.get("to") or payload.get("target") or "").strip()
+        src_self = self._is_self_side(src_name)
+        dst_self = self._is_self_side(dst_name)
+        if not src_name or not dst_name:
+            return self._haul_refuse("", "", STEP_OPEN_SOURCE, "need_endpoints",
+                                     "（搬运要说清 from/to：容器名或 self）")
+        if src_self and dst_self:
+            return self._haul_refuse(src_name, dst_name, STEP_OPEN_SOURCE, "self_to_self",
+                                     "（from/to 都是我自己：那就等于没搬）")
+        if src_name.casefold() == dst_name.casefold():
+            return self._haul_refuse(src_name, dst_name, STEP_OPEN_SOURCE, "same_container",
+                                     "（from/to 是同一个容器：没得搬）")
+        src_row = None if src_self else (store.container(src_name) if store is not None else None)
+        dst_row = None if dst_self else (store.container(dst_name) if store is not None else None)
+        if not src_self and src_row is None:
+            return self._haul_refuse(src_name, dst_name, STEP_OPEN_SOURCE, "unknown_container",
+                                     f"（没记住「{src_name}」在哪：先让我记住这个箱子）")
+        if not dst_self and dst_row is None:
+            return self._haul_refuse(src_name, dst_name, STEP_OPEN_TARGET, "unknown_container",
+                                     f"（没记住「{dst_name}」在哪：先让我记住这个箱子）")
+        for row, step in ((src_row, STEP_OPEN_SOURCE), (dst_row, STEP_OPEN_TARGET)):
+            if row is not None and normalize_policy(row.get("policy")) == POLICY_NO_TOUCH:
+                return self._haul_refuse(src_name, dst_name, step, "no_touch",
+                                         self._container_policy_note(row))
+        if src_row is not None and normalize_policy(src_row.get("policy")) == POLICY_BORROW_ONLY:
+            return self._haul_refuse(
+                src_name, dst_name, STEP_TAKE, "borrow_only_use_borrow_item",
+                f"（「{src_name}」是 borrow_only：取东西只能走 borrow_item/return_item 借还，"
+                f"haul 不许绕过它）")
+        policy = self._craft_policy(context)
+        if not policy.may_open_containers:
+            for row in (src_row, dst_row):
+                if row is not None and normalize_policy(row.get("policy")) != POLICY_FREE:
+                    return self._haul_refuse(src_name, dst_name, STEP_OPEN_SOURCE,
+                                             "container_not_authorized",
+                                             self._auth_note(policy, "翻箱子"))
+        count = payload.get("count")
+        want = _as_optional_int(count)
+        if count is not None and str(count).strip() not in ("", "None") and want is None:
+            return self._haul_refuse(src_name, dst_name, STEP_TAKE, "bad_count",
+                                     "（count 得是个数；要么别给，要么给个正整数）")
+        raw_item = str(payload.get("item") or "").strip()
+        job = HaulJob(src=src_name, dst=dst_name,
+                      item=normalize_item(raw_item) if raw_item else "",
+                      want=max(0, want or 0),
+                      src_side=SIDE_PLAYER if src_self else SIDE_CONTAINER,
+                      dst_side=SIDE_PLAYER if dst_self else SIDE_CONTAINER)
+        if src_self:
+            job.wanted, job.phase, job.step = "dst", "put", STEP_WALK_TARGET
+        elif dst_self:
+            job.wanted, job.phase, job.step = "src", "take", STEP_WALK_SOURCE
+        else:
+            # 两边都是箱子：先**探**一眼目标箱（算量要受"目标箱剩余空间"约束）。
+            job.wanted, job.phase, job.step = "dst", "probe", STEP_WALK_TARGET
+        self._haul_job = job
+        self._haul_rows = {"src": src_row, "dst": dst_row}
+        self._haul_audit.append({"ts": time.time(), "from": job.src, "to": job.dst,
+                                 "item": job.item or "*", "want": int(job.want),
+                                 "moved": {}, "result": "started", "reason": ""})
+        del self._haul_audit[:-50]
+        logger.info("[Planner] haul 开始：%s → %s（%s）", job.src, job.dst,
+                    self._haul_want_text(job))
+        return self.haul_step(context)
+
+    def _haul_refuse(self, src: Any, dst: Any, step: str, reason: str, note: str) -> bool:
+        """入口就挡下的一次搬运：回执照契约记，人话照实说（一帧都不发）。"""
+        self._haul_last = failure_receipt(step, src=src, dst=dst, moved=None, reason=reason)
+        self._haul_note = note
+        self._haul_audit.append({"ts": time.time(), "from": str(src or ""), "to": str(dst or ""),
+                                 "item": "", "want": 0, "moved": {},
+                                 "result": f"refused:{reason}", "reason": reason})
+        del self._haul_audit[:-50]
+        logger.info("[Planner] haul 被拒（%s）：%s → %s", reason, src, dst)
+        return False
+
+    def _haul_fail(self, job: HaulJob, step: str, reason: str, note: str) -> bool:
+        """如实报失败（卡在哪一步 + 手头还剩什么没放好），绝不假装搬完。"""
+        short = job.shortfall()
+        tail = f"（{self._haul_moved_text(short)} 还留在我背包里）" if short else ""
+        job.awaiting = ""
+        job.receipt = failure_receipt(step, src=job.src, dst=job.dst, moved=job.moved,
+                                      reason=reason)
+        job.step = step
+        self._haul_last = job.receipt
+        self._haul_note = f"{note}{tail}"
+        self._haul_audit.append({"ts": time.time(), "from": job.src, "to": job.dst,
+                                 "item": job.item or "*", "want": int(job.want),
+                                 "moved": dict(job.moved), "result": f"failed:{reason}",
+                                 "reason": reason})
+        del self._haul_audit[:-50]
+        logger.info("[Planner] haul 失败（%s，step=%s）：%s → %s", reason, step, job.src, job.dst)
+        self._haul_job = None
+        return False
+
+    def _haul_finish(self, job: HaulJob) -> bool:
+        """对账通过才算搬完：记回执 + 台账（源箱留底、没搬空）。"""
+        job.receipt = success_receipt(job.src, job.dst, job.moved)
+        job.step = STEP_DONE
+        job.awaiting = ""
+        self._haul_last = job.receipt
+        self._haul_note = (f"（搬好了：从「{job.src}」到「{job.dst}」共 "
+                           f"{self._haul_moved_text(job.moved)}；两侧已对账，源箱照旧留底没搬空）")
+        self._haul_audit.append({"ts": time.time(), "from": job.src, "to": job.dst,
+                                 "item": job.item or "*", "want": int(job.want),
+                                 "moved": dict(job.moved), "result": "done", "reason": ""})
+        del self._haul_audit[:-50]
+        logger.info("[Planner] haul 完成：%s → %s %s", job.src, job.dst, job.moved)
+        self._haul_job = None
+        return True
+
+    def _haul_plan_note(self, job: HaulJob, plan: dict) -> str:
+        reason = str(plan.get("reason") or "")
+        what = self._haul_want_text(job)
+        src = "我背包" if job.src_side == SIDE_PLAYER else f"「{job.src}」"
+        if reason == "source_empty":
+            return f"（{src}里没有可搬的东西）"
+        if reason == "item_absent":
+            return f"（{src}里没有 {job.item}）"
+        if reason == "source_floor":
+            return f"（{src}的 {what} 只剩底了：要留底，我不搬空）"
+        if reason == "target_full":
+            return f"（「{job.dst}」放不下 {what}）"
+        return "（这一趟没有可搬的量）"
+
+    def _haul_capacity_for_take(self, job: HaulJob, oc: Any) -> Optional[dict]:
+        """算量用的**目标侧剩余空间**：目标是自己背包就按背包侧算，是箱子就用探测到的快照。
+
+        探测不到（目标箱还没开过）→ None（只按需求/上限节流，放不放得下在 put 那一步
+        用**真实快照**再卡一次）。
+        """
+        kinds = [job.item] if job.item else sorted(side_items(oc, job.src_side))
+        if not kinds:
+            return {}
+        if job.dst_side == SIDE_PLAYER:
+            return {item: side_free_space(oc, item, SIDE_PLAYER) for item in kinds}
+        if isinstance(job.dst_before, dict):
+            return {item: side_free_space(job.dst_before, item, SIDE_CONTAINER)
+                    for item in kinds}
+        return None
+
+    def haul_step(self, context: dict) -> bool:
+        """把当前搬运推进一步（空闲时 session 也会调它；等对账时不重复下发）。"""
+        job = self._haul_job
+        if job is None or job.done:
+            return False
+        if job.awaiting:
+            # 已下发取/放，等一份**新**快照来对账（Java 侧内容一变就立刻上报）。
+            if time.time() - float(job.awaiting_since or 0.0) > HAUL_VERIFY_TIMEOUT:
+                return self._haul_fail(job, STEP_VERIFY, "verify_no_snapshot",
+                                       "（搬前搬后的快照没等到，对账做不了 —— 我不假装搬完了）")
+            return False
+        oc = self._open_container(context)
+        rows = self._haul_rows if isinstance(self._haul_rows, dict) else {}
+        key = job.wanted
+        row = rows.get(key)
+        name = job.src if key == "src" else job.dst
+        if row is None:
+            # 这一侧是"我自己"（背包）：从一个开着的菜单里读它的背包侧就够了。
+            return self._haul_on_open(job, oc, context)
+        if self._haul_open_matches(oc, name, row, self._player_pos(context)):
+            return self._haul_on_open(job, oc, context)
+        return self._haul_approach(job, key, context)
+
+    def _haul_approach(self, job: HaulJob, key: str, context: dict) -> bool:
+        """走到容器跟前并右键打开（只用 go_to_block / look_at / open_container 三个原语）。"""
+        rows = self._haul_rows if isinstance(self._haul_rows, dict) else {}
+        row = rows.get(key)
+        name = job.src if key == "src" else job.dst
+        if row is None:
+            self._haul_note = f"（「{name}」不是记过的箱子，我不知道它在哪）"
+            return False
+        step = STEP_OPEN_SOURCE if key == "src" else STEP_OPEN_TARGET
+        if key not in job.walked:
+            job.walked.add(key)
+            job.walked_since = time.time()
+            self.skills.go_to_block(self._container_block(row), 32, True)
+            self._haul_note = f"（走去找「{name}」）"
+            return True
+        if (self._haul_container_in_reach(name, row, context)
+                and time.time() - float(job.walked_since or 0.0) <= HAUL_WALK_TIMEOUT):
+            pos = point_of(row)
+            if pos is not None:
+                self.skills.look_at(pos[0], pos[1], pos[2])
+            self.skills.open_container()
+            job.attempts += 1
+            if job.attempts > HAUL_MAX_ATTEMPTS:
+                return self._haul_fail(job, step, f"cannot_open_{key}",
+                                       f"（走到「{name}」边上了，但它一直没打开）")
+            self._haul_note = f"（到「{name}」跟前了，右键打开）"
+            return True
+        if not job.walked_since or time.time() - float(job.walked_since) > HAUL_WALK_TIMEOUT:
+            return self._haul_fail(
+                job, STEP_WALK_SOURCE if key == "src" else STEP_WALK_TARGET, "no_path",
+                f"（走不到「{name}」：寻路失败或卡住了 —— 我不搭方块硬凑）")
+        self._haul_note = f"（还没走到「{name}」）"
+        return False
+
+    def _haul_on_open(self, job: HaulJob, oc: Any, context: dict) -> bool:
+        """容器开着（或这一侧就是背包）时该干的事：探测 / 取 / 放 / 对账。"""
+        if job.phase == "probe":
+            if not has_layout(oc):
+                return self._haul_fail(job, STEP_OPEN_TARGET, "no_layout",
+                                       f"（「{job.dst}」的快照没给出槽位布局，算不出剩余空间）")
+            job.dst_before = copy.deepcopy(oc)
+            self.skills.container_close()
+            job.walked.clear()
+            job.attempts = 0
+            job.phase, job.wanted, job.step = "take", "src", STEP_WALK_SOURCE
+            self._haul_note = f"（先看清楚「{job.dst}」还剩多少空间，再去「{job.src}」取）"
+            return True
+        if job.phase == "take":
+            return self._haul_take(job, oc, context)
+        if job.phase == "put":
+            return self._haul_put(job, oc, context)
+        return False
+
+    def _haul_take(self, job: HaulJob, oc: Any, context: dict) -> bool:
+        """算量并取出（受目标侧剩余空间 + 本次需求 + 单趟上限约束，源箱留底）。"""
+        if not has_layout(oc):
+            return self._haul_fail(job, STEP_TAKE, "no_layout",
+                                   "（源箱快照没给出槽位布局，算不出取多少）")
+        job.src_before = copy.deepcopy(oc)
+        plan = plan_haul(oc, src_side=job.src_side, item=job.item, want=job.want,
+                         capacity=self._haul_capacity_for_take(job, oc))
+        if plan.get("reason"):
+            return self._haul_fail(job, STEP_TAKE, str(plan["reason"]),
+                                   self._haul_plan_note(job, plan))
+        moved: dict[str, int] = {}
+        for item_id, take in plan["items"].items():
+            item_moves = plan_take_moves(oc, item_id, take)
+            if not item_moves:
+                continue
+            for move in item_moves:
+                self.skills.container_move(move["from_slot"], move["to_slot"], move["count"])
+            moved[item_id] = sum(int(move["count"]) for move in item_moves)
+        if not moved:
+            return self._haul_fail(job, STEP_TAKE, "no_carry_space",
+                                   "（这些量一件都没挪出来：背包放不下，或者箱子侧没料）")
+        job.carried = moved
+        job.awaiting = "take"
+        job.awaiting_since = time.time()
+        job.attempts = 0
+        job.step = STEP_VERIFY
+        if job.dst_side == SIDE_PLAYER:
+            job.phase, job.wanted = "verify", "src"
+        else:
+            job.phase, job.wanted = "put", "dst"
+        self._haul_note = (f"（已从「{job.src}」取出 {self._haul_moved_text(moved)}，"
+                           f"对账后送去「{job.dst}」）")
+        logger.info("[Planner] haul 取出 %s（%s 条移动）", moved, len(moved))
+        return True
+
+    def _haul_capacity_for_put(self, job: HaulJob, oc: Any) -> Optional[dict]:
+        """放进目标箱时，算量用的**目标箱剩余空间**（就是眼下这份快照的真实值）。"""
+        kinds = [job.item] if job.item else sorted(side_items(oc, job.src_side))
+        if not kinds:
+            return {}
+        return {item: side_free_space(oc, item, SIDE_CONTAINER) for item in kinds}
+
+    def _haul_put(self, job: HaulJob, oc: Any, context: dict) -> bool:
+        """把要送的量放进目标箱（放不下的**留在背包里**并如实报，绝不假装放进去了）。"""
+        if not has_layout(oc):
+            return self._haul_fail(job, STEP_PUT, "no_layout",
+                                   "（目标箱快照没给出槽位布局，放不进去）")
+        if job.dst_before is None:
+            job.dst_before = copy.deepcopy(oc)
+        if job.src_side == SIDE_PLAYER and not job.carried:
+            # 源就是我自己背包：要送多少得从**背包侧**算（受目标箱剩余空间 + 需求 + 上限）。
+            # 「源箱留底」是防**搬空别人的箱子**；从自己背包往外搬不受这条限制。
+            plan = plan_haul(oc, src_side=SIDE_PLAYER, item=job.item, want=job.want,
+                             capacity=self._haul_capacity_for_put(job, oc),
+                             source_floor=0)
+            if plan.get("reason"):
+                return self._haul_fail(job, STEP_PUT, str(plan["reason"]),
+                                       self._haul_plan_note(job, plan))
+            job.carried = dict(plan["items"])
+        short = job.shortfall()
+        if not short:
+            job.put_expected = {}
+            job.awaiting = "put"
+            job.awaiting_since = time.time()
+            job.step = STEP_VERIFY
+            return False
+        moves: list[dict] = []
+        planned: dict[str, int] = {}
+        for item_id, count in short.items():
+            item_moves = plan_put_moves(oc, item_id, count)
+            if not item_moves:
+                continue
+            moves.extend(item_moves)
+            planned[item_id] = sum(int(move["count"]) for move in item_moves)
+        if not moves:
+            return self._haul_fail(job, STEP_PUT, "target_full",
+                                   f"（「{job.dst}」已经放不下了）")
+        for move in moves:
+            self.skills.container_move(move["from_slot"], move["to_slot"], move["count"])
+        job.put_expected = planned
+        job.awaiting = "put"
+        job.awaiting_since = time.time()
+        job.attempts = 0
+        job.step = STEP_VERIFY
+        self._haul_note = f"（往「{job.dst}」放进 {self._haul_moved_text(planned)}，等对账）"
+        return True
+
+    def verify_haul(self, open_container: Any, player_pos: Any = None) -> Optional[dict]:
+        """一份**新**的容器快照到了 → 给当前搬运做两侧对账（真的对上才算数）。
+
+        由 session 的 `state_update` 钩子调用（和借用归还核对同一个位置）。
+        """
+        job = self._haul_job
+        if job is None or job.done or not job.awaiting:
+            return None
+        rows = self._haul_rows if isinstance(self._haul_rows, dict) else {}
+        key = "src" if job.awaiting == "take" else "dst"
+        name = job.src if key == "src" else job.dst
+        if not self._haul_open_matches(open_container, name, rows.get(key), player_pos):
+            return None
+        job.attempts = 0
+        if job.awaiting == "take":
+            return self._haul_after_take(job, open_container)
+        return self._haul_after_put(job, open_container)
+
+    def _haul_after_take(self, job: HaulJob, oc: Any) -> bool:
+        dst_side = job.dst_side if job.dst_side == SIDE_PLAYER else None
+        result = reconcile_sides(job.src_before, oc, job.carried,
+                                 src_side=job.src_side, dst_side=dst_side)
+        if not result.get("ok"):
+            return self._haul_fail(job, STEP_VERIFY, str(result.get("reason") or "verify_failed"),
+                                   f"（取的时候对账不符：{result.get('detail') or ''}）")
+        job.awaiting = ""
+        self.skills.container_close()
+        if job.dst_side == SIDE_PLAYER:
+            job.moved = dict(job.carried)
+            return self._haul_finish(job)
+        job.walked.discard("dst")
+        job.attempts = 0
+        job.phase, job.wanted, job.step = "put", "dst", STEP_WALK_TARGET
+        self._haul_note = (f"（源箱「{job.src}」已对账：取出 {self._haul_moved_text(job.carried)}，"
+                           f"这就送到「{job.dst}」）")
+        return True
+
+    def _haul_after_put(self, job: HaulJob, oc: Any) -> bool:
+        planned = dict(job.put_expected or {})
+        src_side = SIDE_PLAYER if job.src_side == SIDE_PLAYER else None
+        result = reconcile_sides(job.dst_before, oc, planned,
+                                 src_side=src_side, dst_side=job.dst_side)
+        if not result.get("ok"):
+            return self._haul_fail(job, STEP_PUT, str(result.get("reason") or "verify_failed"),
+                                   f"（放进目标箱时对账不符：{result.get('detail') or ''}）")
+        job.awaiting = ""
+        for item, count in planned.items():
+            job.moved[item] = int(job.moved.get(item, 0)) + int(count)
+        self.skills.container_close()
+        short = job.shortfall()
+        if short:
+            return self._haul_fail(job, STEP_PUT, "put_short",
+                                   f"（「{job.dst}」只放下了 "
+                                   f"{self._haul_moved_text(planned)}，放不下的还在我背包里）")
+        return self._haul_finish(job)
+
+    def haul_last(self) -> Optional[dict]:
+        """最近一次搬运的回执（`{ok, step, from, to, moved:{item,count}, reason}`）。"""
+        return dict(self._haul_last) if self._haul_last else None
+
+    def haul_status(self) -> dict:
+        """当前搬运的进度（没在搬就是 `{}`）—— 面板/排查用，不含坐标。"""
+        return self._haul_job.status() if self._haul_job is not None else {}
+
+    def haul_audit(self, n: int = 10) -> list[dict]:
+        """最近 n 条搬运台账（发起/完成/失败都记账）。"""
+        rows = self._haul_audit[-int(n):] if n and int(n) > 0 else list(self._haul_audit)
+        return [dict(row) for row in rows]
+
+    # ── 种田 farm（§5、§11）：只在**授权农田**里，全走右键与挖 ──────
+
+    def _farm_plot(self, name: str, store: Any) -> Optional[tuple]:
+        """给名字就找那块地（区域或领地）的中心；认不出返回 None。"""
+        if not name or store is None:
+            return None
+        zone = store.zone(name)
+        if zone is not None:
+            return point_of(zone)
+        territory = store.territory(name)
+        if territory is not None:
+            return point_of(territory)
+        return None
+
+    def _dispatch_farm(self, payload: dict, context: dict) -> bool:
+        """`farm {plot?,action?}`：只在**授权地块**里锄地/播种/收割/补种（§5、§11）。
+
+        * 没有任何授权地块 → 如实拒绝（**不换地方偷干**）；
+        * 命中区域保护 → 如实回报"区域名 + 规则"，**绝不绕过**（Java 侧也会硬拦）；
+        * 缺种子/锄头 → 如实报缺什么（种子在背包里还是借来的都算）；
+        * 动手**全走通用右键**（`use_item`）与 `mine_block` —— 没有特殊交互分支。
+        """
+        ctx = context if isinstance(context, dict) else {}
+        store = self._territory_store()
+        territories = store.territories() if store is not None else []
+        zones = store.zones() if store is not None else []
+        plot_name = str(payload.get("plot") or "").strip()
+        position = self._player_pos(ctx)
+        if plot_name:
+            spot = self._farm_plot(plot_name, store)
+            if spot is None:
+                self._farm_note = f"（没有叫「{plot_name}」的农田/领地记录）"
+                return False
+        else:
+            if position is None:
+                self._farm_note = "（不知道我在哪，农活没法干）"
+                return False
+            spot = position
+        verdict = may_act(territories, zones, spot[0], spot[1], spot[2], ACTION_FARM)
+        if not verdict.get("allowed"):
+            return self._farm_refuse(plot_name, verdict, "no_grant")
+        plot_label = str(verdict.get("territory") or plot_name or "")
+        counts = counts_of(ctx.get("inventory"))
+        blocks = ctx.get("nearby_blocks")
+        requested = str(payload.get("action") or "").strip()
+        chosen = choose_action(requested, blocks, counts)
+        action = str(chosen.get("action") or "")
+        if not action:
+            self._farm_note = farm_note(requested, plot_label, None,
+                                        reason=str(chosen.get("reason") or "nothing_to_do"),
+                                        missing=missing_items(normalize_action(requested),
+                                                              "", counts))
+            logger.info("[Planner] farm 没活干：%s", chosen.get("reason"))
+            return False
+        target = chosen.get("target")
+        tverdict = may_act(territories, zones, target["x"], target["y"], target["z"], ACTION_FARM)
+        if not tverdict.get("allowed"):
+            # 最近的作物可能落在**别人**的保护区里 → 那就不碰（不换地方偷干）。
+            return self._farm_refuse(plot_label, tverdict, "no_grant")
+        seed = str(chosen.get("seed") or "")
+        missing = missing_items(action, seed, counts)
+        if missing:
+            self._farm_note = farm_note(action, plot_label, target,
+                                        reason="missing_hoe" if action == ACTION_TILL
+                                        else "missing_seeds", missing=missing)
+            logger.info("[Planner] farm 缺料：%s", missing)
+            return False
+        return self._farm_act(action, target, seed, plot_label, ctx)
+
+    def _farm_refuse(self, plot: str, verdict: dict, reason: str) -> bool:
+        if verdict.get("reason") == "zone_protection":
+            blocked = {"zone": verdict.get("zone"), "rule": verdict.get("rule")}
+            self._farm_note = farm_note("", plot, None, blocked=blocked)
+            logger.info("[Planner] farm 被区域硬拦：%s(%s) —— 不绕过",
+                        verdict.get("zone"), verdict.get("rule"))
+        else:
+            self._farm_note = farm_note("", plot, None, reason=reason)
+        return False
+
+    def _farm_act(self, action: str, target: Any, seed: str, plot: str, ctx: dict) -> bool:
+        """真正动手：收割走 `mine_block`，锄地/播种走**通用右键**（`use_item`）。"""
+        x, y, z = float(target["x"]), float(target["y"]), float(target["z"])
+        inventory = ctx.get("inventory")
+        if action in (ACTION_HARVEST, ACTION_REPLANT):
+            if action == ACTION_REPLANT:
+                # 补种要**同一作物**：种子现在就缺的话，宁可先不收（收了就补不上）。
+                missing = missing_items(ACTION_REPLANT, seed, counts_of(inventory))
+                if missing:
+                    self._farm_note = farm_note(action, plot, target, reason="missing_seeds",
+                                                missing=missing)
+                    return False
+            self.skills.look_at(x, y, z)
+            self.skills.mine_block()
+            if action == ACTION_REPLANT:
+                self._farm_pending = {"action": ACTION_PLANT, "seed": seed, "crop": crop_of(
+                    target.get("block_id")), "plot": plot, "tries": 0}
+            self._farm_note = farm_note(action, plot, target,
+                                        seed=seed if action == ACTION_REPLANT else "")
+            logger.info("[Planner] farm %s @(%.0f,%.0f,%.0f)", action, x, y, z)
+            return True
+        item = self._farm_hold_item(inventory, action, seed)
+        if not item:
+            self._farm_note = farm_note(action, plot, target,
+                                        reason="missing_hoe" if action == ACTION_TILL
+                                        else "missing_seeds",
+                                        missing=missing_items(action, seed, counts_of(inventory)))
+            return False
+        index = hold_index(inventory, item)
+        if index is None:
+            self._farm_note = (f"（{item} 不在快捷栏（热栏 0-8）里，我拿不到手上 —— "
+                               f"先把 {item} 放到快捷栏）")
+            return False
+        self.skills.select_hotbar(int(index))
+        self.skills.look_at(x, y, z)
+        self.skills.use_item()
+        self._farm_note = farm_note(action, plot, target, seed=seed)
+        logger.info("[Planner] farm %s 手持 %s @(%.0f,%.0f,%.0f)", action, item, x, y, z)
+        return True
+
+    @staticmethod
+    def _farm_hold_item(inventory: Any, action: str, seed: str) -> str:
+        """这个动作该手持什么：锄地＝锄头（背包里第一把），播种/补种＝种子。"""
+        if action == ACTION_TILL:
+            for entry in inventory or []:
+                if isinstance(entry, dict):
+                    item = normalize_item(entry.get("name") or entry.get("item_id")
+                                          or entry.get("item"))
+                    if is_hoe(item):
+                        return item
+            return ""
+        return normalize_item(seed)
+
+    def _claim_pending_replant(self, context: dict) -> None:
+        """上一轮收完了、这一轮看到耕地了 → 补种**同一作物**（看到才认，绝不凭空种）。"""
+        pending = self._farm_pending
+        if not pending:
+            return
+        ctx = context if isinstance(context, dict) else {}
+        store = self._territory_store()
+        territories = store.territories() if store is not None else []
+        zones = store.zones() if store is not None else []
+        counts = counts_of(ctx.get("inventory"))
+        seed = str(pending.get("seed") or "")
+        if not seed or counts.get(seed, 0) <= 0:
+            self._farm_note = farm_note("plant", pending.get("plot") or "", None,
+                                        reason="missing_seeds",
+                                        missing=[f"种子（{seed or '同一作物的种子'}）"])
+            self._farm_pending = None
+            return
+        farmland = farm_nearest(ctx.get("nearby_blocks"),
+                                lambda row: str(row.get("block_id") or "").endswith("farmland")
+                                or str(row.get("block_id") or "") == "minecraft:farmland")
+        if farmland is None:
+            pending["tries"] = int(pending.get("tries") or 0) + 1
+            if pending["tries"] >= 3:
+                self._farm_note = farm_note("plant", pending.get("plot") or "", None,
+                                            reason="no_farmland")
+                self._farm_pending = None
+            return
+        verdict = may_act(territories, zones, farmland["x"], farmland["y"], farmland["z"],
+                          ACTION_FARM)
+        if not verdict.get("allowed"):
+            self._farm_pending = None
+            self._farm_refuse(str(pending.get("plot") or ""), verdict, "no_grant")
+            return
+        self._farm_pending = None
+        self._farm_act(ACTION_PLANT, farmland, seed, str(pending.get("plot") or ""), ctx)
+
     @staticmethod
     def _container_pos_text(row: dict) -> str:
         return (f"@({float(row.get('x') or 0):.0f},{float(row.get('y') or 0):.0f},"
@@ -2880,4 +3547,10 @@ class Planner:
             # 还没补上的材料缺口 + 容器取用审计（"用多少取多少"要能事后查）。
             "craft_need": dict(self._craft_need),
             "take_audit": self.take_audit(10),
+            # 搬运：当前进度 + 最近一次回执 + 台账（"搬没搬完、卡在哪一步"要能事后查）。
+            "haul": self.haul_status(),
+            "haul_last": self.haul_last() or {},
+            "haul_audit": self.haul_audit(5),
+            # 农田：还没补上的那一次补种（有就说明收割完了在等耕地）。
+            "farm_pending": dict(self._farm_pending) if self._farm_pending else {},
         }
