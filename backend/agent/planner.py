@@ -1285,10 +1285,11 @@ class Planner:
         
         # 交易
         if "trade(" in plan_lower:
-            villager_type = self._extract_between(plan_text, "trade(", ")")
-            if villager_type:
-                self.skills.trade(villager_type.strip())
-                logger.info("[Planner] 交易 %s", villager_type.strip())
+            trade_arg = self._extract_between(plan_text, "trade(", ")")
+            if trade_arg:
+                # 旧写法 `trade(名称)`：现在按**结果物**理解（模组侧参数就是 item ✓）。
+                self.skills.trade(item=trade_arg.strip())
+                logger.info("[Planner] 交易（按结果物）%s", trade_arg.strip())
                 executed_any_action = True
         
         # 睡觉
@@ -1839,11 +1840,25 @@ class Planner:
         return True
 
     def _tool_trade(self, payload: dict, context: dict) -> bool:
-        villager = payload.get("villager_type") or payload.get("type")
-        if villager:
-            self.skills.trade(str(villager))
-            return True
-        return False
+        """村民交易：参数与模组侧 `trade` 命令一一对应（序号 / 结果物 / 只看报价 ✓）。
+
+        什么都不给 ⇒ 跟最近的可交易村民交易（模组侧默认 `radius=8` ✓）—— 不编"村民类型"这种东西 ✗。
+        """
+        offer = payload.get("offer")
+        item = str(payload.get("item") or "")
+        list_only = bool(payload.get("list_only"))
+        radius = payload.get("radius")
+        entity_id = payload.get("entity_id")
+        try:
+            offer = int(offer) if offer is not None else None
+            radius = float(radius) if radius is not None else None
+            entity_id = int(entity_id) if entity_id is not None else None
+        except (TypeError, ValueError):
+            self._action_note = "trade: offer/radius/entity_id 必须是数字"
+            return False
+        self.skills.trade(offer=offer, item=item, list_only=list_only,
+                          radius=radius, entity_id=entity_id)
+        return True
 
     def _tool_sleep_in_bed(self, payload: dict, context: dict) -> bool:
         self.skills.sleep_in_bed()

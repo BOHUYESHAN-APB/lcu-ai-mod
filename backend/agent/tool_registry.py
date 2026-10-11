@@ -229,7 +229,9 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     # ── survive ──
     ToolSpec("eat", "吃东西", "", ("survive",), "_tool_eat", job=True),
     ToolSpec("sleep", "睡觉", "", ("survive",), "_tool_sleep", job=True),
-    ToolSpec("trade", "与村民交易", "villager_type", ("survive",), "_tool_trade", job=True),
+    ToolSpec("trade", "与村民交易：list_only 先看报价清单，再按 offer（序号）或 item（结果物）挑一条成交；"
+                      "全程不开界面，失败带 code（no_villager/out_of_range/no_menu/not_enough_items/offer_unavailable/trade_no_effect）",
+             "entity_id,radius,offer,item,list_only", ("survive",), "_tool_trade", job=True),
     # ── night ──
     ToolSpec("sleep_in_bed", "走到最近的床睡到天亮（只能夜里）", "", ("night",),
              "_tool_sleep_in_bed", job=True),

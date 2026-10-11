@@ -384,9 +384,24 @@ class Skills:
         """Explore the area within radius."""
         return self._send_cmd("explore", {"radius": radius})
 
-    def trade(self, villager_type: str) -> dict:
-        """Trade with a villager of specified type."""
-        return self._send_cmd("trade", {"villager_type": villager_type})
+    def trade(self, offer: int | None = None, item: str = "", list_only: bool = False,
+              radius: float | None = None, entity_id: int | None = None) -> dict:
+        """跟村民做买卖：`list_only` 先看报价；否则按 `offer`（序号）或 `item`（结果物）挑一条。
+
+        参数名与模组侧 `trade` 命令**一一对应** ✓（那边实证过：`entity_id|radius, offer, item, list_only`）。
+        """
+        args: dict = {}
+        if entity_id is not None:
+            args["entity_id"] = int(entity_id)
+        if radius is not None:
+            args["radius"] = float(radius)
+        if offer is not None:
+            args["offer"] = int(offer)
+        if item:
+            args["item"] = str(item)
+        if list_only:
+            args["list_only"] = True
+        return self._send_cmd("trade", args)
 
     def sleep(self) -> dict:
         """Sleep in a bed."""
