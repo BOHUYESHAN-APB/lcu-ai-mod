@@ -17,6 +17,7 @@ import re
 import time
 from typing import Any, Callable, Optional
 
+from .borrow import BorrowLedger
 from .craft import (ContainerPick, armor_in_containers, clamp_take, describe_missing,
                     evaluate_craft, is_armor, normalize_item, route_containers)
 from .permissions import CraftPolicy, TIER_GUEST
@@ -83,6 +84,8 @@ ACTION_GROUPS: dict[str, tuple[tuple[str, str, str], ...]] = {
         ("container_move", "from_slot,to_slot,count", "容器里把某格物品移到另一格（省 to_slot＝背包↔快捷栏）"),
         ("container_click", "slot,click_type", "点容器里的一格（click_type=pickup|quick_move|swap|throw）"),
         ("container_close", "", "关掉当前容器界面"),
+        ("borrow_item", "item,count,container", "从仓库借 item×count（须已授权；不给 count＝整箱搬，拒绝）"),
+        ("return_item", "item,count,container", "把借来的 item 放回原容器（省 count＝全部剩余）"),
     ),
     "combat": (
         ("attack", "", "攻击附近敌人"),
@@ -351,7 +354,7 @@ class Planner:
     """
     
     def __init__(self, llm_service, memory, skills, threshold_provider=None, chat_inbox=None,
-                 permissions=None):
+                 permissions=None, borrow_rules=None):
         self.llm = llm_service
         self.memory = memory
         self.skills = skills
@@ -366,6 +369,10 @@ class Planner:
         self._last_locate_result: Optional[dict] = None
         # 能力位来源（craft / containers / autonomy_craft）。没注入＝一律不放行（默认拒绝）。
         self.permissions = permissions
+        # 借用规则（对话授权的"仓库里所有铁可以用"）：没注入＝没有任何借用授权。
+        self.borrow_rules = borrow_rules
+        # 借用台账：上限判定 + 借/还审计 + 按 open_container 快照核对归还。
+        self.borrow_ledger = BorrowLedger()
         # 本轮制作还没补上的材料缺口（bare item → 还差几个）：容器取用以它为上限。
         self._craft_need: dict[str, int] = {}
         # 本次制作涉及过的材料（含已补齐的）：用来把"已经够了"和"根本没登记"区分开。
@@ -531,6 +538,14 @@ class Planner:
         if not known_poi_text:
             known_poi_text = "暂无"
 
+        # 借用规则（对话里授权的"仓库里的铁可以用"）+ 当前欠账（拿了还没还的）。
+        borrow_rules_text = (context.get("borrow_rules") or "").strip() if isinstance(context, dict) else ""
+        borrow_pending_text = (context.get("borrow_pending") or "").strip() if isinstance(context, dict) else ""
+        if borrow_pending_text:
+            borrow_pending_text = f"\n- 现在还没还：{borrow_pending_text}（用完就放回去，别带着跑）"
+        borrow_rules_line = borrow_rules_text or (
+            "（还没有人授权我从仓库取用任何东西——要用得先让人明说「可以用仓库里的…」）")
+
         # 时间 / 夜晚 / 能否睡觉：state_update 顶层字段（也兼容塞在 world 里）。
         world_ctx = context.get("world", {}) if isinstance(context, dict) else {}
         if not isinstance(world_ctx, dict):
@@ -677,7 +692,7 @@ class Planner:
                 "要不要说点什么完全由你决定：不想说就把 reply 留空、candidates 给空数组——"
                 "硬找话聊比不说话更糟。\n"
             )
-            event_rule = ("15. 上面有外部事件时：先判断值不值得开口（有人死了/掉到好东西/第一次到新地方"
+            event_rule = ("17. 上面有外部事件时：先判断值不值得开口（有人死了/掉到好东西/第一次到新地方"
                           "才值得调侃一句），不值得就不说话；别把事件当指令去干活\n")
 
         # 饥饿/饱和度：自然回血要"饱食度 ≥18 且饱和度 >0"，所以缺血时不能等饿到见底才吃。
@@ -751,6 +766,9 @@ class Planner:
 仓库已知内容：
 {storage_contents_text}
 
+借用授权（规则性记忆：被人明确授权才可以动仓库里的东西）：
+{borrow_rules_line}{borrow_pending_text}
+
 已知箱子（历史记忆，可能不在当前视野内）：
 {known_poi_text}
 
@@ -787,6 +805,9 @@ class Planner:
 12. 要穿甲 → equip_armor（唯一穿甲方式；背包里没有就去已知容器找，别现场造）
 13. 合成优先用自己背包（含快捷栏）的材料；缺料/没配方就**如实说**；没被授权不要开箱
 14. 容器里只为拿自己要的量：container_move 给明确 count，别整箱搬空；拿完 container_close
+15. 从仓库拿东西＝**借**：得先有人明确授权（见上）；没授权不动，如实说
+16. 借只拿够用的量（≤需求 2 倍、最多 256），**整箱搬不干**；用完/任务结束/被叫停都要把
+    剩余放回**原箱**（borrow_item 拿、return_item 还），**别随身携带大量资源**
 {event_rule}
 给 1-4 个候选动作（按偏好排序，没有合适的就给空数组），只输出合法 JSON（无 markdown、无多余文字）：
 "过来" → {{"reply":"来了","candidates":[{{"tool":"move_to","args":{{"x":100,"y":64,"z":-200}},"why":"靠近"}}]}}
@@ -1259,6 +1280,10 @@ confidence 表示你对这个选择的确信程度；如果没有一个候选明
         elif tool_name == "container_close":
             self.skills.container_close()
             return True
+        elif tool_name == "borrow_item":
+            return self._dispatch_borrow_item(payload, context)
+        elif tool_name == "return_item":
+            return self._dispatch_return_item(payload, context)
         elif tool_name == "select_hotbar":
             index = payload.get("index")
             if index is not None:
@@ -1456,6 +1481,282 @@ confidence 表示你对这个选择的确信程度；如果没有一个候选明
         button = _as_optional_int(payload.get("button"))
         self.skills.container_click(slot, button if button is not None else 0, click_type)
         return True
+
+    # ── 借用台账：从仓库拿东西＝借（授权 → 上限 → 归还 → 校验 → 审计）──
+
+    @staticmethod
+    def _open_container(context: dict) -> dict:
+        """当前打开的容器快照（没有／不是 dict → 空 dict）。"""
+        ctx = context if isinstance(context, dict) else {}
+        container = ctx.get("open_container")
+        return container if isinstance(container, dict) else {}
+
+    def _borrow_grant(self, item: str) -> Optional[dict]:
+        """这件物品有没有被口头授权借用（查规则记忆；没权限表来源 → 一律没有）。"""
+        store = self.borrow_rules
+        if store is None:
+            return None
+        try:
+            return store.match(item)
+        except Exception as exc:
+            logger.warning("[Planner] 借用规则读取失败: %s", exc)
+            return None
+
+    def _borrow_need(self, item: str) -> Optional[int]:
+        """这次制作这件物品还缺多少（没有登记就返回 None＝不限需求，只按 256 上限）。"""
+        if item in self._craft_tracked:
+            return self._craft_need.get(item)
+        return None
+
+    def _borrow_refusal_note(self, item: str, reason: str, cap: int) -> str:
+        if reason == "whole_container_forbidden":
+            return "（不给数量的取用＝整箱搬，不允许；说清要借多少）"
+        if reason == "invalid_count":
+            return "（借的数量得是正整数）"
+        if reason == "over_limit":
+            return f"（{item} 一次最多借 {cap} 个，不能整箱搬）"
+        return f"（这次借不成：{reason}）"
+
+    def _borrow_go_to_container(self, item: str, raw: str, count: int, context: dict) -> bool:
+        """容器没开（或里面没有这件东西）：去**已知容器**拿，而不是凭空冒出来。"""
+        containers = context.get("known_containers") if isinstance(context, dict) else None
+        picks = route_containers({item: count}, containers)
+        if not picks:
+            self._craft_note = (f"（{raw or item} 这里没有：箱子里没找着，也没有打开的容器可以拿）")
+            logger.info("[Planner] borrow_item：找不到 %s", item)
+            return False
+        pick = picks[0]
+        self._craft_note = (f"（我记得 {self._pick_label(pick)} 里有 {raw or item}，"
+                            f"过去拿 {count} 个，拿完就放回去）")
+        return self._dispatch_container_trip(pick, context)
+
+    def _dispatch_borrow_item(self, payload: dict, context: dict) -> bool:
+        """从仓库**借**物品：先过翻箱授权，再过借用规则，最后卡上限。
+
+        整箱搬（不给 count）一律拒绝；一次最多 `min(256, 需求×2)`。借出去的东西会被记进
+        台账 —— 用完/任务结束/被叫停时由 `settle_borrows` 自动放回并核对。
+        """
+        policy = self._craft_policy(context)
+        if not policy.may_open_containers:
+            self._craft_note = self._auth_note(policy, "翻箱子")
+            logger.info("[Planner] borrow_item 被拒：%s", policy.reason)
+            return False
+        raw = str(payload.get("item") or payload.get("name") or "").strip()
+        item = normalize_item(raw)
+        if not item:
+            self._craft_note = "（要借什么得说清楚）"
+            return False
+        if self._borrow_grant(item) is None:
+            self._craft_note = f"（没人授权我取用 {raw or item}；要用得先明说「可以用仓库里的……」）"
+            logger.info("[Planner] borrow_item 被拒：无授权 %s", item)
+            return False
+        need = self._borrow_need(item)
+        count = _as_optional_int(payload.get("count"))
+        allowed, reason, cap = self.borrow_ledger.check(item, count, need=need)
+        if not allowed:
+            self._craft_note = self._borrow_refusal_note(item, reason, cap)
+            logger.info("[Planner] borrow_item 被拒：%s %s", item, reason)
+            return False
+        container = self._open_container(context)
+        plans = self.borrow_ledger.plan_moves_out(container, item, count) if container else []
+        if not plans:
+            return self._borrow_go_to_container(item, raw, count, context)
+        reason_text = str(payload.get("reason") or payload.get("why")
+                          or ("制作" if need is not None else "任务"))
+        taken = 0
+        for plan in plans:
+            self.skills.container_move(plan["from_slot"], plan["to_slot"], plan["count"])
+            taken += plan["count"]
+        first = plans[0]
+        hint = payload.get("container") if isinstance(payload.get("container"), dict) else {}
+        self.borrow_ledger.record_borrow(
+            item, taken, container=container,
+            from_slot=first["from_slot"], to_slot=first["to_slot"], reason=reason_text,
+            container_pos=self._container_pos(payload, context),
+            container_block=str(hint.get("block_id") or hint.get("name") or ""))
+        where = str(container.get("title") or "容器")
+        short = "" if taken >= count else f"（箱里只有 {taken} 个，先拿这些）"
+        self._craft_note = (f"（从「{where}」借了 {item} x{taken}{short}；"
+                            f"用完/任务结束会放回去）")
+        logger.info("[Planner] 借出 %s x%s（%s 条移动）", item, taken, len(plans))
+        return True
+
+    @staticmethod
+    def _container_pos(payload: dict, context: dict) -> Optional[tuple]:
+        """借出时记下容器坐标（payload 给了就用；没有就不编）。"""
+        source = payload.get("container") if isinstance(payload, dict) else None
+        source = source if isinstance(source, dict) else payload if isinstance(payload, dict) else {}
+        try:
+            if all(isinstance(source.get(axis), (int, float)) and not isinstance(source.get(axis), bool)
+                   for axis in ("x", "y", "z")):
+                return (float(source["x"]), float(source["y"]), float(source["z"]))
+        except (TypeError, ValueError):
+            return None
+        return None
+
+    def _send_return_trip(self, entry) -> bool:
+        """回原容器的路上：走 `go_to_block`（Java 负责寻路 + 到达后记 POI）。"""
+        if entry.trip_sent:
+            return False
+        entry.trip_sent = True
+        self.skills.go_to_block(entry.container_block or "minecraft:chest", 16, True)
+        return True
+
+    def _container_in_reach(self, entry, context: dict) -> bool:
+        """容器就在跟前？用 nearby_storage / known_containers 的距离与坐标判断（绝不猜）。"""
+        ctx = context if isinstance(context, dict) else {}
+        rows = []
+        for key in ("nearby_storage", "known_containers"):
+            value = ctx.get(key)
+            if isinstance(value, (list, tuple)):
+                rows.extend(row for row in value if isinstance(row, dict))
+        for row in rows:
+            title = str(row.get("title") or row.get("name") or "")
+            if entry.container_title and title and title != entry.container_title:
+                continue
+            distance = row.get("distance")
+            if isinstance(distance, (int, float)) and not isinstance(distance, bool) and distance <= 4.0:
+                return True
+            if entry.container_pos:
+                try:
+                    dx = float(row.get("x")) - entry.container_pos[0]
+                    dy = float(row.get("y")) - entry.container_pos[1]
+                    dz = float(row.get("z")) - entry.container_pos[2]
+                except (TypeError, ValueError):
+                    continue
+                if abs(dx) <= 4 and abs(dy) <= 4 and abs(dz) <= 4:
+                    return True
+        return False
+
+    def _return_entries(self, entries: list, context: dict, *, reason: str,
+                        count: Optional[int] = None, final: bool = False) -> dict:
+        """把一批借用放回原容器；返回 `{sent, pending, failed}`（都是 BorrowEntry）。
+
+        - 容器开着且是原容器 → `container_move` 放回，等快照核对；
+        - 容器没开但有坐标 → 走一趟 `go_to_block`，等到了再放；
+        - 真的回不去（`final=True`）→ 记账为失败并**报出来**。
+
+        **不查翻箱授权表**：把东西还回去是保守方向，也是用户口径里"必须做"的那一半；
+        借出去那一步已经卡过授权了。显式的 `return_item` 工具才走授权门。
+        """
+        container = self._open_container(context)
+        out: dict = {"sent": [], "pending": [], "failed": []}
+        for entry in entries:
+            if entry.awaiting_snapshot:
+                out["pending"].append(entry)
+                continue
+            want = min(int(count), entry.remaining) if count else entry.remaining
+            if want <= 0:
+                continue
+            if container and self.borrow_ledger.same_container(entry, container):
+                plan = self.borrow_ledger.plan_move_back(container, entry.item, want)
+                if plan:
+                    self.skills.container_move(plan["from_slot"], plan["to_slot"], plan["count"])
+                    self.borrow_ledger.begin_return(entry.id, count=plan["count"],
+                                                    from_slot=plan["from_slot"],
+                                                    to_slot=plan["to_slot"], reason=reason)
+                    out["sent"].append(entry)
+                    continue
+                if final and self.borrow_ledger.holds(container, entry.item):
+                    # 东西还在手上，可原容器塞不回去了（格子满了）→ 报出来。
+                    self.borrow_ledger.mark_unreturnable(entry.id, f"{reason}:container_full")
+                    out["failed"].append(entry)
+                    continue
+            if entry.container_pos and self._send_return_trip(entry):
+                out["pending"].append(entry)
+                continue
+            if self._container_in_reach(entry, context):
+                self.skills.open_container()
+                out["pending"].append(entry)
+                continue
+            if final:
+                self.borrow_ledger.mark_unreturnable(entry.id, f"{reason}:no_container")
+                out["failed"].append(entry)
+            else:
+                out["pending"].append(entry)
+        return out
+
+    def _dispatch_return_item(self, payload: dict, context: dict) -> bool:
+        """显式归还（工具 `return_item`）：放回原容器，数量缺省＝这笔借用的全部剩余。"""
+        policy = self._craft_policy(context)
+        if not policy.may_open_containers:
+            self._craft_note = self._auth_note(policy, "翻箱子")
+            return False
+        item = normalize_item(payload.get("item") or payload.get("name"))
+        targets = [e for e in self.borrow_ledger.outstanding() if not item or e.item == item]
+        if not targets:
+            self._craft_note = "（没有借了还没还的东西）"
+            return False
+        result = self._return_entries(targets, context, reason="tool",
+                                      count=_as_optional_int(payload.get("count")), final=True)
+        self._craft_note = self._return_note(result)
+        return bool(result["sent"] or result["pending"] or result["failed"])
+
+    @staticmethod
+    def _return_note(result: dict) -> str:
+        sent = ", ".join(f"{e.item} x{e.count - e.returned}" for e in result.get("sent", []))
+        pending = ", ".join(f"{e.item} x{e.remaining}" for e in result.get("pending", []))
+        failed = ", ".join(f"{e.item} x{e.remaining}（{e.failure or '回不去'}）"
+                          for e in result.get("failed", []))
+        parts = []
+        if sent:
+            parts.append(f"已放回原箱：{sent}")
+        if pending:
+            parts.append(f"正在放回/路上：{pending}")
+        if failed:
+            parts.append(f"**没能放回去**：{failed}")
+        return "（" + "；".join(parts) + "）" if parts else "（没有要还的）"
+
+    def settle_borrows(self, reason: str, context: Optional[dict] = None) -> dict:
+        """任务结束/失败/取消/被中断/玩家接管时结算借用：归还剩余并报出回不去的。
+
+        `final=True`：这一步是真结算，回不去的一律记账为失败并放进 `failed`（要报出来）。
+        """
+        if context is None:
+            context = {}
+        entries = self.borrow_ledger.outstanding()
+        if not entries:
+            return {"reason": reason, "sent": [], "pending": [], "failed": [], "note": ""}
+        result = self._return_entries(entries, context, reason=reason, final=True)
+        note = self._return_note(result)
+        result["reason"] = reason
+        result["note"] = note
+        logger.info("[Planner] 借用结算（%s）：%s", reason, note)
+        return result
+
+    def auto_return_step(self, context: Optional[dict] = None) -> bool:
+        """空闲时推进一步归还（开箱/放回）——不设 final，绝不误判失败。"""
+        if context is None:
+            context = {}
+        entries = self.borrow_ledger.outstanding()
+        if not entries:
+            return False
+        result = self._return_entries(entries, context, reason="auto", final=False)
+        if result["sent"] or result["pending"]:
+            self._craft_note = self._return_note(result)
+            return True
+        return False
+
+    def verify_borrow_returns(self, open_container: Any) -> list[dict]:
+        """用一份新的 `open_container` 快照核对归还（真的回去了才算数）。"""
+        try:
+            rows = self.borrow_ledger.verify(open_container)
+        except Exception as exc:
+            logger.warning("[Planner] 归还核对失败: %s", exc)
+            return []
+        for row in rows:
+            if row.get("result") == "failed":
+                self._craft_note = (f"（{row['item']} x{row.get('count')} **没能放回原箱**："
+                                    f"{row.get('detail') or row.get('reason')}）")
+        return rows
+
+    def borrow_status(self) -> dict:
+        """借用总览（欠账 + 审计尾部），供 /api/status 与 prompt。"""
+        return self.borrow_ledger.status()
+
+    def borrow_note(self) -> str:
+        """借出未还的摘要（prompt 用）。"""
+        return self.borrow_ledger.describe()
 
     def _dispatch_equip_armor(self, context: dict) -> bool:
         """穿甲：自己背包里有盔甲就直接穿；没有就去**已知容器**里找（"点容器找盔甲"）。

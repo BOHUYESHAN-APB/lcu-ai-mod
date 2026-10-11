@@ -373,8 +373,10 @@ class PlannerPromptSlimmingTests(unittest.TestCase):
         后 idle 实测 1157；这里留约 15% 余量作为新的预算上限。
         再新增守卫/HUD/`/locate` 四个工具与 4 条语境规则（22 条动作 + 11 条规则）
         后 idle 实测 **1861**，同样留约 15% 余量。
+        最后新增借用台账两个工具 + 2 条借用规则（24 条动作 + 13 条规则）
+        后 idle 实测 **2392**，仍留约 15% 余量（旧值 2140 是这一步之前的基线）。
         """
-        IDLE_STATIC_BUDGET = 2140
+        IDLE_STATIC_BUDGET = 2750
 
         # 最坏情况是 idle（注入全部动作组）
         prompt = self._prompt({"kind": "idle", "status": "idle"})

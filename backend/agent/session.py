@@ -35,6 +35,7 @@ from .llm_service import LLMService
 from .self_prompter import SelfPrompter
 from .message_db import MessageDB
 from .conversation import ConversationStore
+from .borrow import BorrowRulesStore, parse_borrow_grant, parse_borrow_revoke
 from .permissions import CraftPolicy, PermissionsStore, ReplyGate
 from .persona_store import PersonaStore
 from .task_list import TaskList
@@ -194,6 +195,9 @@ class Session:
         # 权限 + 回复决策门（tier 只决定"能否下指令/任务权重/记忆可见性"，不写进决策链）
         self.permissions = PermissionsStore()
         self.reply_gate = ReplyGate(self.permissions)
+        # 借用规则记忆（按 server 分区）：对话里的"可以用仓库里的铁"落成带条件的规则。
+        self.borrow_rules = BorrowRulesStore()
+        self._borrow_rule_audit: list[dict] = []
         # 任务列表（多任务 + 归属 + 优先级 + 状态 + 进度）
         self.tasks = TaskList()
         # 当前对话的发起者（供任务归属/权限判定；没有对话时是空）
@@ -220,6 +224,8 @@ class Session:
             chat_inbox=self.chat_inbox,
             # 能力位（craft / containers / autonomy_craft）：合成与翻箱都要先过这张表。
             permissions=self.permissions,
+            # 借用规则（对话授权"仓库里的铁可以用"）：计划器只查表，不看 tier 分支。
+            borrow_rules=self.borrow_rules,
         )
 
         # Vision (Python 侧直接抓屏 -> VLM，后台线程低频刷新，不阻塞动作链路)
@@ -305,6 +311,9 @@ class Session:
                 self.runtime.update(data)
                 self._absorb_poi(data)
                 self._absorb_conversation_namespace(data)
+                # 容器内容变了（含归还后的快照）→ 用真实快照核对借用是否真的放回去了。
+                if isinstance(data, dict) and "open_container" in data:
+                    self._verify_borrow_returns(data.get("open_container") or {})
             case "player_chat":
                 self._handle_player_chat(data)
             case "player_death":
@@ -351,6 +360,10 @@ class Session:
                         self._task_idle_since = time.time()
                 else:
                     self._task_idle_since = None
+                # 任务真的结束/失败/被取消 → 借用的东西该还了（"不要随身携带"）。
+                # idle 不算：Java 在 craft/collect 各步之间也会报 idle。
+                if status in {"done", "failed", "cancelled", "error"}:
+                    self._settle_borrows(f"task_{status}")
                 if self._manual_behavior_active():
                     self._manual_command_until = max(self._manual_command_until, time.time() + 8.0)
             case "control_state":
@@ -457,7 +470,140 @@ class Session:
         self._audit_chat({"sender": "", "tier": "", "effective": 0.0, "threshold": 0,
                           "pending": 0, "decision": "resumed", "reason": "entered_world"})
 
-    # ── 对话记忆（按服务器分区）──
+    # ── 借用：规则性记忆 / 结算 / 核对 ─────────────────────────────
+
+    def _absorb_borrow_speech(self, sender: str, message: str) -> None:
+        """把一句口头**授权/收回**落成规则（按 server 分区持久化）。
+
+        "你可以使用仓库里所有铁，因为我们有刷铁机" → 授权物品＝铁类；
+        条件＝用完归还 / 不随身携带（规则里写死，prompt 与台账都按它执行）。
+        "别用仓库里的铁了" → 收回那条授权（只认能授权翻箱的人说的话，查能力表）。
+        """
+        store = getattr(self, "borrow_rules", None)
+        if store is None:
+            return
+        change = parse_borrow_revoke(message)
+        action = "revoked"
+        if change is None:
+            change = parse_borrow_grant(message)
+            action = "granted"
+        if change is None:
+            return
+        tier = self._tier_of(sender)
+        permissions = getattr(self, "permissions", None)
+        allowed = False
+        if permissions is not None:
+            try:
+                allowed = permissions.can_authorize_containers(tier)
+            except Exception as e:
+                logger.warning("[Borrow] 授权人能力位查询失败: %s", e)
+        if not allowed:
+            logger.info("[Borrow] %s(%s) 说了仓库%s，但没有翻箱授权，不落规则",
+                        sender, tier, "收回" if action == "revoked" else "授权")
+            self._borrow_rule_audit.append({
+                "ts": time.time(), "sender": sender, "tier": tier,
+                "family": change.get("family"), "result": "denied",
+                "reason": "no_container_authority", "source": change.get("source", ""),
+            })
+            del self._borrow_rule_audit[:-20]
+            return
+        try:
+            if action == "revoked":
+                rule = store.revoke(change)
+                if rule is None:
+                    return  # 本来就没这条授权，不用记一条空动作
+            else:
+                rule = store.grant(change, granted_by=sender, granted_tier=tier,
+                                   source=change.get("source", ""))
+        except Exception as e:
+            logger.warning("[Borrow] 落规则失败(%s): %s", action, e)
+            return
+        self._borrow_rule_audit.append({
+            "ts": time.time(), "sender": sender, "tier": tier,
+            "family": rule.get("family"), "result": action,
+            "rule_id": rule.get("id"), "source": change.get("source", ""),
+        })
+        del self._borrow_rule_audit[:-20]
+        logger.info("[Borrow] %s(%s) %s 借用规则 %s", sender, tier, action, rule.get("id"))
+
+    def _borrow_context(self) -> dict:
+        """结算/核对用的小上下文（只带台账与归还需要的字段，不惊动 LLM）。"""
+        runtime = getattr(self, "runtime", {}) or {}
+        context = {
+            "open_container": runtime.get("open_container") or {},
+            "inventory": runtime.get("inventory", []),
+            "known_containers": [],
+        }
+        try:
+            context["known_containers"] = self.poi.find("storage")
+        except Exception as e:
+            logger.debug("[Session] 借用结算读容器清单失败: %s", e)
+        context["nearby_storage"] = runtime.get("nearby_storage", [])
+        context["actor_tier"] = str((getattr(self, "_actor", {}) or {}).get("tier") or "guest")
+        return context
+
+    def _settle_borrows(self, reason: str) -> dict:
+        """任务结束/失败/取消/被中断/玩家接管 → 自动归还剩余并报出回不去的。"""
+        if getattr(self, "_borrow_settling", False):
+            # 结算里下发 container_move 会再回到命令观察者，防重入。
+            return {}
+        planner = getattr(self, "planner", None)
+        if planner is None:
+            return {}
+        self._borrow_settling = True
+        try:
+            result = planner.settle_borrows(reason, self._borrow_context())
+        except Exception as e:
+            logger.warning("[Session] 借用结算失败(%s): %s", reason, e)
+            return {}
+        finally:
+            self._borrow_settling = False
+        alive = [row for row in ("sent", "pending", "failed") if result.get(row)]
+        if alive:
+            logger.info("[Session] 借用结算(%s)：%s", reason, result.get("note"))
+        return result
+
+    def _auto_return_step(self) -> bool:
+        """空闲时替未还清的借用推进一步（没打开容器就过去/开箱，开着就放回）。"""
+        planner = getattr(self, "planner", None)
+        if planner is None or getattr(self, "_borrow_settling", False):
+            return False
+        try:
+            if not planner.borrow_ledger.outstanding():
+                return False
+            self._borrow_settling = True
+            return bool(planner.auto_return_step(self._borrow_context()))
+        except Exception as e:
+            logger.warning("[Session] 自动归还推进一步失败: %s", e)
+            return False
+        finally:
+            self._borrow_settling = False
+
+    def _borrow_ledger_status(self) -> dict:
+        """借用台账快照（planner 可能是测试替身，缺方法时给空值）。"""
+        planner = getattr(self, "planner", None)
+        getter = getattr(planner, "borrow_status", None)
+        if not callable(getter):
+            return {"outstanding": [], "total_outstanding": 0, "audit": []}
+        try:
+            return getter()
+        except Exception as e:
+            logger.debug("[Session] 借用台账状态读取失败: %s", e)
+            return {"outstanding": [], "total_outstanding": 0, "audit": []}
+
+    def _verify_borrow_returns(self, snapshot: dict) -> None:
+        """新容器快照到了 → 核对归还（真的回去了才算数）。"""
+        planner = getattr(self, "planner", None)
+        if planner is None:
+            return
+        try:
+            rows = planner.verify_borrow_returns(snapshot)
+        except Exception as e:
+            logger.warning("[Session] 归还核对失败: %s", e)
+            return
+        for row in rows:
+            logger.info("[Borrow] 归还核对 %s: %s %s", row.get("item"),
+                        row.get("result"), row.get("detail", ""))
 
     def _absorb_conversation_namespace(self, data: dict) -> None:
         """按 `world.server`（ip）→ `world.world_name`（单人）→ unknown 切换记忆分区。
@@ -473,6 +619,20 @@ class Session:
             store.use_namespace(world.get("server", ""), world.get("world_name", ""))
         except Exception as e:
             logger.warning("[Session] 对话记忆分区切换失败: %s", e)
+        # 借用规则与审计也按同一个 server 分区（换服换文件，重启不丢授权）。
+        rules = getattr(self, "borrow_rules", None)
+        if rules is not None:
+            try:
+                rules.use_namespace(world.get("server", ""), world.get("world_name", ""))
+            except Exception as e:
+                logger.warning("[Session] 借用规则分区切换失败: %s", e)
+            planner = getattr(self, "planner", None)
+            ledger = getattr(planner, "borrow_ledger", None) if planner is not None else None
+            if ledger is not None:
+                try:
+                    ledger.use_audit_path(rules.audit_path)
+                except Exception as e:
+                    logger.warning("[Session] 借用审计路径切换失败: %s", e)
 
     def _record_conversation_chat(self, data: dict) -> None:
         """把一条聊天事件写进对话记忆（L1 落盘 + L2 窗口）。
@@ -553,6 +713,10 @@ class Session:
         # 系统消息（死亡/进出/命令回话）只进记忆：它们不是"人在跟 AI 说话"。
         if is_system:
             return
+
+        # 规则性记忆：这句人话里如果有仓库授权（"可以用仓库里所有铁"），落成带条件的规则。
+        # 只有**能授权翻箱**的 tier 说的话才算数（查能力表，不写 tier 分支）。
+        self._absorb_borrow_speech(sender, message)
 
         # 在场门：不在世界 → 只记录、零 token（设计文档 §1 的静默模式）。
         if not self.llm_active():
@@ -951,6 +1115,21 @@ class Session:
             context["known_containers"] = []
         # 当前打开的容器（Java state 上报的 open_container；含槽位内容时供取用定位）。
         context["open_container"] = self.runtime.get("open_container") or {}
+        # 借用规则（对话里授权的"仓库里的铁可以用"）+ 当前欠账（借了还没还的）。
+        rules = getattr(self, "borrow_rules", None)
+        if rules is not None:
+            try:
+                context["borrow_rules"] = rules.describe()
+            except Exception as e:
+                logger.debug("[Session] 借用规则读取失败: %s", e)
+                context["borrow_rules"] = ""
+        planner = getattr(self, "planner", None)
+        if planner is not None:
+            try:
+                context["borrow_pending"] = planner.borrow_note()
+            except Exception as e:
+                logger.debug("[Session] 借用欠账读取失败: %s", e)
+                context["borrow_pending"] = ""
         # 能力位：这一轮是谁在说话（制作/翻箱授权按它查表）；自主轮由 planner 侧改写。
         actor = getattr(self, "_actor", None) or {}
         context["actor_tier"] = str(actor.get("tier") or "guest")
@@ -1062,6 +1241,9 @@ class Session:
         control_state = self.runtime.get("control_state", {}) if isinstance(self.runtime.get("control_state"), dict) else {}
         autonomy_enabled = control_state.get("ai_controlled", True) and behavior_state.get("behaviors_enabled", True)
         manual_override_active = time.time() < self._manual_command_until or self._manual_behavior_active()
+        # 有借出未还、手头又闲着 → 自己推进一步归还（走到箱边开箱、把剩余放回）。
+        if is_idle and autonomy_enabled and not manual_override_active:
+            self._auto_return_step()
         mode_action = None
         if autonomy_enabled and not manual_override_active:
             with self.skills.command_context("mode"):
@@ -1525,6 +1707,7 @@ class Session:
         gate = getattr(self, "reply_gate", None)
         store = getattr(self, "conversation", None)
         persona = getattr(self, "persona", None)
+        rules = getattr(self, "borrow_rules", None)
         in_world = bool(getattr(self, "in_world", True))
         return {
             "id": self.id,
@@ -1563,6 +1746,12 @@ class Session:
             "chat_decisions": list(getattr(self, "_chat_audit", []) or [])[-10:],
             # 对话记忆分区与窗口（L1/L2/L3）。
             "conversation": store.status() if store is not None else {},
+            # 借用：授权规则（按 server 分区落盘）+ 欠账 + 借/还审计。
+            "borrow": {
+                **({"rules": rules.status()} if rules is not None else {}),
+                "ledger": self._borrow_ledger_status(),
+                "rule_audit": list(getattr(self, "_borrow_rule_audit", []) or [])[-10:],
+            },
             # 主动参与：最近注入的事件及结果（含 no_action）。
             "events": {
                 "recent": list(getattr(self, "_event_audit", []) or [])[-10:],
@@ -1603,6 +1792,8 @@ class Session:
             # Stopping frees whatever long action is in flight
             self.action_manager.stop()
             self._task_idle_since = None
+            # 玩家接管/叫停 → 借来的东西立刻归位（"不要随身携带"）。
+            self._settle_borrows("player_takeover")
         if cmd in self.LONG_TASK_CMDS and self.action_manager.is_busy:
             # A long task is running; don't let a second one orphan its tracking
             logger.warning("[Session] Ignoring %s while %s in flight", cmd, self.action_manager.current_label)
