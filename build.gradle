@@ -212,6 +212,15 @@ tasks.named('check').configure {
     dependsOn 'verifyGate'
     dependsOn 'verifyHold'
     dependsOn 'verifyContainer'
+    dependsOn 'verifyRoute'
+}
+
+tasks.register('verifyRoute', JavaExec) {
+    group = 'verification'
+    description = '纯逻辑自检（站点记忆/驻守与路径压缩重放：抽稀策略 / 链式推进 / 中断 / 漂移滞回 / 同名覆盖 / 持久字段）'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.output + sourceSets.main.output
+    mainClass = 'com.lcu.lcumod.action.RouteCheck'
 }
 
 tasks.register('verifyContainer', JavaExec) {

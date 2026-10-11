@@ -470,6 +470,13 @@ public class StateCollector {
         }
         state.add("remembered_pois", remembered);
 
+        // 站点 / 路径记忆与驻守状态（用户："记住精准 xyz 去挂机"、"记录路径"）
+        // afk: {station, since_ticks, at_target, drift}；route: {name, index, total, active}
+        state.add("afk", com.lcu.lcumod.action.ActionExecutor.describeAfk());
+        state.add("route", com.lcu.lcumod.action.ActionExecutor.describeRoute());
+        state.add("stations", com.lcu.lcumod.action.ActionExecutor.describeStations());
+        state.add("routes", com.lcu.lcumod.action.ActionExecutor.describeRoutes());
+
         LCUMod.WIRE.sendEvent("state_update", state);
     }
 }

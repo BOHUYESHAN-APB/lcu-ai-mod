@@ -70,7 +70,9 @@ public class ActionExecutor {
     /** 收到这些命令视为"新任务"，先取消 Java 侧持久跟随（否则会"嘴上说不跟、身体还在跟"）。 */
     private static final java.util.Set<String> NEW_TASK_COMMANDS = java.util.Set.of(
             "move_to", "follow_player", "explore", "go_to_block", "collect_blocks",
-            "craft_item", "build", "trade", "mine_block", "dig_block", "place_block", "sleep", "guard");
+            "craft_item", "build", "trade", "mine_block", "dig_block", "place_block", "sleep", "guard",
+            // 站点驻守与路径重放同样是"占住身体"的任务，必须参与新任务让路
+            "go_afk", "route_follow");
 
     // go_to_block：两段式（先寻路过去，到达后再记忆/收尾）
     private static BlockPos pendingGoTarget = null;
@@ -98,6 +100,26 @@ public class ActionExecutor {
     private static BlockPos guardPoint = null;
     private static int guardRadius = 32;
     private static int guardCheckCooldown = 0;
+
+    // ── 站点驻守（go_afk / afk_stop）：到站点后在半径内"钉住"，被撞出去自己走回 ──
+    private static final AfkController AFK = new AfkController();
+    /** 走回站点的重试节流与尝试计数（连不上就诚实失败，不假装还在驻守）。 */
+    private static int afkReturnCooldown = 0;
+    private static int afkReturnAttempts = 0;
+    private static final int AFK_MAX_RETURN_ATTEMPTS = 3;
+
+    // ── 路径记忆与重放（route_record_start/stop、route_follow）──
+    /** 现场压缩器；非 null 即"正在记录实际走过的路"。 */
+    private static RouteMemory.Recorder routeRecorder = null;
+    private static String routeRecordName = "";
+    private static final RouteFollower ROUTE = new RouteFollower();
+    /** 段内"该动却没动"的看门狗（与 tickStuckWatchdog 同思路，但对 route 独立计时，互不打架）。 */
+    private static double routeStuckLastX = Double.NaN;
+    private static double routeStuckLastZ = Double.NaN;
+    private static int routeStuckTicks = 0;
+    /** 段与段之间的到点判定容差（见 RouteMemory 抽稀步长 8 → 每段都很短）。 */
+    private static final double ROUTE_REACH_XZ = 1.5;
+    private static final double ROUTE_REACH_Y = 2.0;
     private static String pendingCraftItem = null;
     private static String pendingCraftReqId = null;
     private static int pendingCraftTicks = 0;
@@ -201,6 +223,15 @@ public class ActionExecutor {
         // ── 守卫：出了半径自己走回去（用户"在这儿守着"）──
         tickGuard(mc);
 
+        // ── 站点驻守：到了站点就钉在半径内；被撞出去自己走回；keepalive 只动头不动脚 ──
+        tickAfk(mc);
+
+        // ── 路径重放：逐点走（每段都在原版寻路射程内），诚实上报"卡在第几个点" ──
+        tickRoute(mc);
+
+        // ── 路径记录：每 tick 采样真实位姿，由 Recorder 按抽稀规则决定是否记点 ──
+        tickRouteRecording(mc);
+
         // ── 卡住看门狗：该动却不动 → 停寻路 + 诚实上报（后端据此重规划）──
         tickStuckWatchdog(mc);
 
@@ -222,17 +253,23 @@ public class ActionExecutor {
         boolean runtimeBusy = Pathfinder.isNavigating()
                 || MovementSystem.isMoving()
                 || JavaAutonomousBehavior.getState() != JavaAutonomousBehavior.BehaviorState.IDLE
+                || AFK.isActive()
+                || ROUTE.isActive()
                 || !WireServer.commandQueue.isEmpty();
 
         // ── Human-like idle behavior (head tracking) ──
+        // 驻守时**不**随机张望：站点的朝向有语义（对着刷怪点），必须由 tickAfk 独占朝向写入。
         if (InputIsolation.isAiControlled()
                 && JavaAutonomousBehavior.getState() == JavaAutonomousBehavior.BehaviorState.IDLE
                 && !MovementSystem.isMoving()
-                && !Pathfinder.isNavigating()) {
+                && !Pathfinder.isNavigating()
+                && !AFK.isActive()) {
             HumanLikeBehavior.tick(mc);
         }
 
         // ── Anti-AFK subtle activity pulses ──
+        // 驻守/重放期间交给本层自己的节奏（驻守的 keepalive 只动头不动脚，
+        // 这里的脉冲会真的横移/潜行，属于"移动"，会破坏用户要的站位）。
         ActivitySignalController.tick(mc, runtimeBusy);
 
         // ── High-frequency control stream ──
@@ -324,6 +361,9 @@ public class ActionExecutor {
             MovementSystem.stop();
             Pathfinder.stop();
             followTargetName = null;
+            // 玩家接管：驻守与重放立刻让路（"嘴里说停、身体还在走"是明确禁止的）
+            afkStopQuiet("ai_off");
+            routeStopQuiet("ai_off");
         } else {
             InputIsolation.clearUserControls();
         }
@@ -391,6 +431,14 @@ public class ActionExecutor {
                 releaseActiveHolds(HoldController.Release.NEW_TASK);
                 abortEat("new_task");
                 abortPendingPlace();
+                // 站点驻守 / 路径重放同样"占住身体"：**除非自己就是那个新任务**，一律让路，
+                // 否则会出现"嘴上接了新活、身体还钉在刷怪塔上"。
+                if (!"go_afk".equals(cmd.cmd())) {
+                    afkStopQuiet("new_task");
+                }
+                if (!"route_follow".equals(cmd.cmd())) {
+                    routeStopQuiet("new_task");
+                }
             }
             switch (cmd.cmd()) {
                 case "move_to" -> handleMoveTo(cmd);
@@ -468,6 +516,15 @@ public class ActionExecutor {
                 case "find_block" -> handleFindBlock(cmd);
                 case "go_to_block" -> handleGoToBlock(cmd);
                 case "remember_poi" -> handleRememberPoi(cmd);
+                // 站点记忆：精准 xyz + 朝向 + 水平容差（"让 AI 去刷怪塔挂机"）
+                case "remember_station" -> handleRememberStation(cmd);
+                // 挂机：寻路到站点 → 驻守半径内；被撞出去自己走回；keepalive 只动头不动脚
+                case "go_afk" -> handleGoAfk(cmd);
+                case "afk_stop" -> handleAfkStop(cmd);
+                // 路径记忆与重放（洞穴超出原版寻路距离时的"线"）
+                case "route_record_start" -> handleRouteRecordStart(cmd);
+                case "route_record_stop" -> handleRouteRecordStop(cmd);
+                case "route_follow" -> handleRouteFollow(cmd);
                 case "equip_weapon" -> {
                     String weapon = equipBestWeapon(mc);
                     sendResponse(cmd.id(), weapon != null,
@@ -687,6 +744,11 @@ public class ActionExecutor {
 
         // Movement status
         state.addProperty("moving", MovementSystem.isMoving());
+        // 与 state_update 同口径的驻守/路径状态（后端 on-demand 查询也要看得到）
+        state.add("afk", describeAfk());
+        state.add("route", describeRoute());
+        state.add("stations", describeStations());
+        state.add("routes", describeRoutes());
         var moveTgt = MovementSystem.getTarget();
         if (moveTgt != null) {
             JsonObject target = new JsonObject();
@@ -1193,6 +1255,14 @@ public class ActionExecutor {
         releaseAllInputs();
         releaseActiveHolds(HoldController.Release.MANUAL);
         abortPendingPlace();
+        // 驻守 / 重放 / 记录：stop_all 一视同仁全部停下（记录直接丢弃，不留下半条线）
+        AFK.stop();
+        afkReturnAttempts = 0;
+        afkReturnCooldown = 0;
+        ROUTE.reset();
+        resetRouteStall();
+        routeRecorder = null;
+        routeRecordName = "";
         if (mc.player != null) {
             if (mc.gameMode != null) stopDigging();
             if (mc.player.isUsingItem()) {
@@ -1736,6 +1806,470 @@ public class ActionExecutor {
         sendResponse(cmd.id(), true, data);
     }
 
+    // ── 站点记忆 / 挂机 / 路径记忆与重放 ────────────────────────────────────────
+    // 用户原话："让 AI 去某些点位去挂机（刷怪塔/小黑塔）……它得记住精准的 xyz"；
+    // "还要记录路径（玩家挖的洞穴可能超出原版最大寻路距离）"。
+
+    /** 记一个站点：用**当前位姿**（精准 xyz + 朝向）+ 水平容差；同名覆盖。 */
+    private void handleRememberStation(WireServer.WireCommand cmd) {
+        var mc = Minecraft.getInstance();
+        if (mc.player == null || mc.level == null) {
+            sendResponse(cmd.id(), false, "No player");
+            return;
+        }
+        JsonObject args = cmd.args();
+        String name = args != null && args.has("name") ? args.get("name").getAsString().strip() : "";
+        if (name.isEmpty()) {
+            sendResponse(cmd.id(), false, "Need name");
+            return;
+        }
+        String kind = args != null && args.has("kind") ? args.get("kind").getAsString() : StationMemory.DEFAULT_KIND;
+        double radius = args != null && args.has("radius")
+                ? args.get("radius").getAsDouble() : StationMemory.DEFAULT_RADIUS;
+        boolean existed = StationMemory.has(name);
+        StationMemory.Station station = StationMemory.remember(name, kind,
+                mc.player.getX(), mc.player.getY(), mc.player.getZ(),
+                mc.player.getYRot(), mc.player.getXRot(), radius, tickCount);
+        StateCollector.requestRefresh();
+
+        JsonObject data = stationJson(station);
+        data.addProperty("saved", true);
+        data.addProperty("overwritten", existed);
+        sendResponse(cmd.id(), true, data);
+    }
+
+    /** 挂机：寻路到站点 → 到点后驻守（停止寻路、待在半径内，被撞出去自己走回）。 */
+    private void handleGoAfk(WireServer.WireCommand cmd) {
+        var mc = Minecraft.getInstance();
+        if (mc.player == null || mc.level == null) {
+            sendResponse(cmd.id(), false, "No player");
+            return;
+        }
+        JsonObject args = cmd.args();
+        String name = args != null && args.has("name") ? args.get("name").getAsString().strip() : "";
+        if (name.isEmpty()) {
+            sendResponse(cmd.id(), false, "Need name");
+            return;
+        }
+        StationMemory.Station station = StationMemory.get(name);
+        if (station == null) {
+            sendResponse(cmd.id(), false, "Unknown station: " + name);
+            return;
+        }
+        boolean keepalive = args != null && args.has("keepalive") && args.get("keepalive").getAsBoolean();
+
+        followTargetName = null;
+        MovementSystem.stop();
+        // guard 也是"占住身体"的驻守：go_afk 接管后旧守卫点必须让位，否则两个驻守会互相抢控制
+        guardPoint = null;
+        AFK.begin(station, keepalive);
+        afkReturnCooldown = 0;
+        afkReturnAttempts = 0;
+        double distance = station.distanceTo(mc.player.getX(), mc.player.getY(), mc.player.getZ());
+        Pathfinder.navigateTo(cmd.id(), station.x(), station.y(), station.z());
+        setTaskState("afk", "running", name,
+                keepalive ? "heading to station (keepalive)" : "heading to station", 0.1);
+        StateCollector.requestRefresh();
+
+        JsonObject data = stationJson(station);
+        data.addProperty("going", true);
+        data.addProperty("keepalive", keepalive);
+        data.addProperty("distance", round1(distance));
+        sendResponse(cmd.id(), true, data);
+    }
+
+    /** 结束驻守（用户"别挂了/回来吧"）。 */
+    private void handleAfkStop(WireServer.WireCommand cmd) {
+        boolean wasActive = AFK.isActive();
+        String name = AFK.stationName();
+        if (wasActive) {
+            AFK.stop();
+            afkReturnAttempts = 0;
+            afkReturnCooldown = 0;
+            Pathfinder.stop();
+            setTaskState("afk", "cancelled", name, "afk stopped", 0.0);
+            StateCollector.requestRefresh();
+        }
+        JsonObject data = new JsonObject();
+        data.addProperty("stopped", true);
+        data.addProperty("was_active", wasActive);
+        data.addProperty("station", name);
+        sendResponse(cmd.id(), true, data);
+    }
+
+    /** 开始记录**实际走过的路**（抽稀：每 N 格或方向变化超阈值才记一点）。 */
+    private void handleRouteRecordStart(WireServer.WireCommand cmd) {
+        var mc = Minecraft.getInstance();
+        if (mc.player == null) {
+            sendResponse(cmd.id(), false, "No player");
+            return;
+        }
+        JsonObject args = cmd.args();
+        String name = args != null && args.has("name") ? args.get("name").getAsString().strip() : "";
+        if (name.isEmpty()) {
+            sendResponse(cmd.id(), false, "Need name");
+            return;
+        }
+        double minStep = args != null && args.has("min_step")
+                ? args.get("min_step").getAsDouble() : RouteMemory.DEFAULT_MIN_STEP;
+        double turnDeg = args != null && args.has("turn_degrees")
+                ? args.get("turn_degrees").getAsDouble() : RouteMemory.MIN_TURN_DEGREES;
+
+        routeRecorder = new RouteMemory.Recorder(minStep, turnDeg, RouteMemory.MIN_MOVE);
+        routeRecordName = name;
+        routeRecorder.offer(mc.player.getX(), mc.player.getY(), mc.player.getZ(), mc.player.getYRot());
+        setTaskState("route_record", "running", name, "recording", 0.0);
+        StateCollector.requestRefresh();
+
+        JsonObject data = new JsonObject();
+        data.addProperty("recording", true);
+        data.addProperty("name", name);
+        data.addProperty("min_step", minStep);
+        data.addProperty("turn_degrees", turnDeg);
+        sendResponse(cmd.id(), true, data);
+    }
+
+    /** 结束记录并落库（终点强制精准补点）；同名覆盖。 */
+    private void handleRouteRecordStop(WireServer.WireCommand cmd) {
+        var mc = Minecraft.getInstance();
+        if (mc.player == null) {
+            sendResponse(cmd.id(), false, "No player");
+            return;
+        }
+        if (routeRecorder == null) {
+            sendResponse(cmd.id(), false, "Not recording");
+            return;
+        }
+        routeRecorder.offer(mc.player.getX(), mc.player.getY(), mc.player.getZ(), mc.player.getYRot());
+        List<RouteMemory.RoutePoint> points = routeRecorder.points();
+        RouteMemory.RoutePoint tail = new RouteMemory.RoutePoint(
+                mc.player.getX(), mc.player.getY(), mc.player.getZ(), mc.player.getYRot());
+        if (points.isEmpty() || points.get(points.size() - 1).horizontalDistanceTo(tail) > 0.05) {
+            points.add(tail);
+        }
+        String name = routeRecordName;
+        routeRecorder = null;
+        routeRecordName = "";
+        RouteMemory.Route route = RouteMemory.save(name, points, tickCount);
+        setTaskState("route_record", route == null ? "failed" : "done", name,
+                route == null ? "no points recorded" : points.size() + " points",
+                route == null ? 0.0 : 1.0);
+        StateCollector.requestRefresh();
+
+        JsonObject data = new JsonObject();
+        data.addProperty("saved", route != null);
+        data.addProperty("name", name);
+        data.addProperty("points", points.size());
+        sendResponse(cmd.id(), route != null, data);
+    }
+
+    /** 逐点重放一条路径：每段都单独走一次原版寻路，因此洞穴再长也能一段段爬出去。 */
+    private void handleRouteFollow(WireServer.WireCommand cmd) {
+        var mc = Minecraft.getInstance();
+        if (mc.player == null || mc.level == null) {
+            sendResponse(cmd.id(), false, "No player");
+            return;
+        }
+        JsonObject args = cmd.args();
+        String name = args != null && args.has("name") ? args.get("name").getAsString().strip() : "";
+        if (name.isEmpty()) {
+            sendResponse(cmd.id(), false, "Need name");
+            return;
+        }
+        RouteMemory.Route route = RouteMemory.get(name);
+        if (route == null) {
+            sendResponse(cmd.id(), false, "Unknown route: " + name);
+            return;
+        }
+        double speed = args != null && args.has("speed") ? args.get("speed").getAsDouble() : RouteFollower.DEFAULT_SPEED;
+
+        followTargetName = null;
+        afkStopQuiet("route_follow");
+        guardPoint = null;
+        MovementSystem.stop();
+        if (!ROUTE.begin(name, route.points(), speed)) {
+            sendResponse(cmd.id(), false, "Route has no points: " + name);
+            return;
+        }
+        RouteMemory.RoutePoint first = ROUTE.current();
+        resetRouteStall();
+        ROUTE.beginLeg();
+        Pathfinder.navigateTo(cmd.id(), first.x(), first.y(), first.z());
+        setTaskState("route", "running", name, "point 1/" + ROUTE.total(), ROUTE.progress());
+        StateCollector.requestRefresh();
+
+        JsonObject data = new JsonObject();
+        data.addProperty("following", true);
+        data.addProperty("name", name);
+        data.addProperty("total", ROUTE.total());
+        data.addProperty("index", 0);
+        data.addProperty("speed", ROUTE.speed());
+        sendResponse(cmd.id(), true, data);
+    }
+
+    /**
+     * 驻守 tick：到站点后停下并钉在半径内；被撞出去走回；keepalive 只动头不动脚。
+     *
+     * <p>注意与 {@code tickStuckWatchdog} 的分工：**驻守期间"不动"是意图，不是卡住**，
+     * 因此看门狗对驻守/重放整体让路，由本方法与 {@link #tickRoute} 各自做带上下文的判定。
+     */
+    private void tickAfk(Minecraft mc) {
+        if (!AFK.isActive()) {
+            return;
+        }
+        if (!InputIsolation.isAiControlled()) {
+            setTaskState("afk", "cancelled", AFK.stationName(), "player takeover", 0.0);
+            afkStopQuiet("player takeover");
+            return;
+        }
+        StationMemory.Station station = AFK.station();
+        if (station == null) {
+            AFK.stop();
+            return;
+        }
+        boolean returning = AFK.tick(mc.player.getX(), mc.player.getZ()) == AfkController.Action.RETURN;
+
+        if (returning) {
+            if (Pathfinder.isNavigating()) {
+                afkReturnAttempts = 0; // 正在走回，别打断
+                return;
+            }
+            if (afkReturnCooldown-- > 0) {
+                return;
+            }
+            afkReturnCooldown = 20;
+            afkReturnAttempts++;
+            if (afkReturnAttempts > AFK_MAX_RETURN_ATTEMPTS) {
+                String why = Pathfinder.getLastFailureReason();
+                setTaskState("afk", "failed", station.name(),
+                        "cannot return to station: " + (why == null || why.isBlank() ? "no path" : why), 0.0);
+                Pathfinder.stop();
+                AFK.stop();
+                StateCollector.requestRefresh();
+                LCUMod.LOGGER.warn("[AFK] 回不去站点 {}，已诚实停止驻守", station.name());
+                return;
+            }
+            Pathfinder.navigateTo("go_afk", station.x(), station.y(), station.z());
+            setTaskState("afk", "running", station.name(),
+                    "returning to station (drift " + round1(AFK.drift()) + "m)", 0.5);
+            StateCollector.requestRefresh();
+            return;
+        }
+
+        // 站定：第一次到达时停寻路；然后保持站点朝向 + 按需 keepalive（绝不写移动键）
+        if (Pathfinder.isNavigating()) {
+            Pathfinder.stop();
+            afkReturnAttempts = 0;
+            setTaskState("afk", "running", station.name(),
+                    "holding station r=" + round1(station.radius()), 1.0);
+            StateCollector.requestRefresh();
+        }
+        faceStation(mc, station);
+        if (AFK.keepaliveDue()) {
+            AFK.markPulse();
+            mc.player.setYRot(mc.player.getYRot() + AFK.keepaliveYawDelta());
+            mc.player.setXRot(Math.max(-90.0f,
+                    Math.min(90.0f, mc.player.getXRot() + AFK.keepalivePitchDelta())));
+            mc.player.swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, true);
+        }
+    }
+
+    /** 路径重放 tick：逐点推进；段内卡住/无路 → 重试，仍失败则诚实报"卡在第几个点"。 */
+    private void tickRoute(Minecraft mc) {
+        if (!ROUTE.isActive()) {
+            return;
+        }
+        if (!InputIsolation.isAiControlled()) {
+            setTaskState("route", "cancelled", ROUTE.name(), "player takeover", ROUTE.progress());
+            routeStopQuiet("player takeover");
+            return;
+        }
+        double px = mc.player.getX();
+        double py = mc.player.getY();
+        double pz = mc.player.getZ();
+
+        if (ROUTE.advanceIfReached(px, py, pz, ROUTE_REACH_XZ, ROUTE_REACH_Y)) {
+            resetRouteStall();
+            if (ROUTE.isDone()) {
+                Pathfinder.stop();
+                setTaskState("route", "done", ROUTE.name(),
+                        "reached end (" + ROUTE.total() + " points)", 1.0);
+                StateCollector.requestRefresh();
+                return;
+            }
+            RouteMemory.RoutePoint next = ROUTE.current();
+            ROUTE.beginLeg();
+            Pathfinder.navigateTo("route_follow", next.x(), next.y(), next.z());
+            setTaskState("route", "running", ROUTE.name(),
+                    "point " + (ROUTE.index() + 1) + "/" + ROUTE.total(), ROUTE.progress());
+            StateCollector.requestRefresh();
+            return;
+        }
+
+        ROUTE.tickLeg();
+
+        // 段内无进展：与 tickStuckWatchdog 同口径（3 秒 / 0.6 格，按 speed 缩放），但独立计时
+        if (Double.isNaN(routeStuckLastX)) {
+            routeStuckLastX = px;
+            routeStuckLastZ = pz;
+            routeStuckTicks = 0;
+        } else if (Math.hypot(px - routeStuckLastX, pz - routeStuckLastZ) > 0.6) {
+            routeStuckLastX = px;
+            routeStuckLastZ = pz;
+            routeStuckTicks = 0;
+        } else {
+            routeStuckTicks++;
+        }
+        if (routeStuckTicks >= ROUTE.stallWindowTicks()) {
+            routeLegFailed("no progress");
+            return;
+        }
+        if (ROUTE.legTimedOut()) {
+            routeLegFailed("leg timeout");
+            return;
+        }
+        if (!Pathfinder.isNavigating() && ROUTE.legTicks() > 20) {
+            routeLegFailed(Pathfinder.getLastFailureReason());
+        }
+    }
+
+    /** 一段失败：可重试就重试同一点，否则钉住索引并诚实上报。 */
+    private void routeLegFailed(String reason) {
+        RouteMemory.RoutePoint target = ROUTE.current();
+        if (ROUTE.canRetry()) {
+            ROUTE.retryLeg();
+            resetRouteStall();
+            if (target != null) {
+                Pathfinder.navigateTo("route_follow", target.x(), target.y(), target.z());
+            }
+            LCUMod.LOGGER.info("[Route] 第 {} 点重试 {}/{}：{}",
+                    ROUTE.index() + 1, ROUTE.legAttempts(), ROUTE.maxLegAttempts(), reason);
+            return;
+        }
+        Pathfinder.stop();
+        ROUTE.fail(reason == null || reason.isBlank() ? "no progress" : reason);
+        setTaskState("route", "failed", ROUTE.name(),
+                "stuck at point " + (ROUTE.failIndex() + 1) + "/" + ROUTE.total()
+                        + ": " + ROUTE.failureReason(), ROUTE.progress());
+        StateCollector.requestRefresh();
+        LCUMod.LOGGER.warn("[Route] 卡在第 {} 个点（共 {}）：{}",
+                ROUTE.failIndex() + 1, ROUTE.total(), ROUTE.failureReason());
+    }
+
+    /** 让路：停驻守（不覆盖任务状态，供新任务/stop_all 复用）。 */
+    private static void afkStopQuiet(String reason) {
+        if (!AFK.isActive()) {
+            return;
+        }
+        String name = AFK.stationName();
+        AFK.stop();
+        afkReturnAttempts = 0;
+        afkReturnCooldown = 0;
+        LCUMod.LOGGER.info("[AFK] 停止驻守 {}（{}）", name, reason);
+    }
+
+    /** 让路：停路径重放（中断 ≠ 失败，原因保留在状态里）。 */
+    private static void routeStopQuiet(String reason) {
+        if (!ROUTE.isActive()) {
+            return;
+        }
+        String name = ROUTE.name();
+        ROUTE.abort(reason);
+        resetRouteStall();
+        LCUMod.LOGGER.info("[Route] 中断重放 {}（{}）", name, reason);
+    }
+
+    private static void resetRouteStall() {
+        routeStuckLastX = Double.NaN;
+        routeStuckLastZ = Double.NaN;
+        routeStuckTicks = 0;
+    }
+
+    /** 把视角平滑地对准站点记录的朝向（限速 ±10°/±6° per tick，与原版寻路同口径）。 */
+    private void faceStation(Minecraft mc, StationMemory.Station station) {
+        float yawDiff = wrapDegrees(station.yaw() - mc.player.getYRot());
+        float pitchDiff = station.pitch() - mc.player.getXRot();
+        mc.player.setYRot(mc.player.getYRot() + Math.max(-10.0f, Math.min(10.0f, yawDiff)));
+        mc.player.setXRot(Math.max(-90.0f,
+                Math.min(90.0f, mc.player.getXRot() + Math.max(-6.0f, Math.min(6.0f, pitchDiff)))));
+    }
+
+    private static float wrapDegrees(float deg) {
+        float d = deg % 360.0f;
+        if (d > 180.0f) d -= 360.0f;
+        if (d < -180.0f) d += 360.0f;
+        return d;
+    }
+
+    private static JsonObject stationJson(StationMemory.Station s) {
+        JsonObject o = new JsonObject();
+        o.addProperty("name", s.name());
+        o.addProperty("kind", s.kind());
+        o.addProperty("x", s.x());
+        o.addProperty("y", s.y());
+        o.addProperty("z", s.z());
+        o.addProperty("yaw", s.yaw());
+        o.addProperty("pitch", s.pitch());
+        o.addProperty("radius", s.radius());
+        return o;
+    }
+
+    /** 驻守状态（state_update.afk）：station / since_ticks / at_target / drift。 */
+    public static JsonObject describeAfk() {
+        JsonObject o = new JsonObject();
+        o.addProperty("active", AFK.isActive());
+        o.addProperty("station", AFK.stationName());
+        o.addProperty("since_ticks", AFK.sinceTicks());
+        o.addProperty("at_target", AFK.atTarget());
+        o.addProperty("drift", round1(AFK.drift()));
+        o.addProperty("returning", AFK.returning());
+        o.addProperty("keepalive", AFK.keepaliveEnabled());
+        return o;
+    }
+
+    /** 路径状态（state_update.route）：name / index / total / active（+ 记录与失败信息）。 */
+    public static JsonObject describeRoute() {
+        JsonObject o = new JsonObject();
+        o.addProperty("active", ROUTE.isActive());
+        o.addProperty("name", ROUTE.name());
+        o.addProperty("index", ROUTE.index());
+        o.addProperty("total", ROUTE.total());
+        o.addProperty("status", ROUTE.status().name().toLowerCase(java.util.Locale.ROOT));
+        o.addProperty("failed_index", ROUTE.failIndex());
+        o.addProperty("failure", ROUTE.failureReason());
+        o.addProperty("recording", routeRecorder != null);
+        o.addProperty("recorded_points", routeRecorder == null ? 0 : routeRecorder.size());
+        return o;
+    }
+
+    /** 已记忆的站点（后端"有哪些挂机点"）。 */
+    public static JsonArray describeStations() {
+        JsonArray arr = new JsonArray();
+        for (StationMemory.Station s : StationMemory.all()) {
+            JsonObject o = stationJson(s);
+            o.addProperty("saved_at_tick", s.savedAtTick());
+            arr.add(o);
+        }
+        return arr;
+    }
+
+    /** 已记忆的路径（后端"有哪些线可以重放"）。 */
+    public static JsonArray describeRoutes() {
+        JsonArray arr = new JsonArray();
+        for (RouteMemory.Route r : RouteMemory.all()) {
+            JsonObject o = new JsonObject();
+            o.addProperty("name", r.name());
+            o.addProperty("points", r.points().size());
+            o.addProperty("saved_at_tick", r.savedAtTick());
+            arr.add(o);
+        }
+        return arr;
+    }
+
+    private static double round1(double v) {
+        return Math.round(v * 10.0) / 10.0;
+    }
+
     /** 两段式收尾：go_to_block 到达 → 记忆/收尾；sleep 到达 → 自动点床。 */
     private void tickPendingBlockTasks(Minecraft mc) {
         if (mc.player == null || mc.level == null) {
@@ -1955,14 +2489,30 @@ public class ActionExecutor {
         setTaskState("guard", "running", posKey(guardPoint), "returning to post", 0.5);
     }
 
+    /** 路径记录采样：每 tick 喂一次真实位姿（是否记点由 {@link RouteMemory.Recorder} 内部抽稀决定）。 */
+    private void tickRouteRecording(Minecraft mc) {
+        if (routeRecorder == null || mc.player == null) {
+            return;
+        }
+        routeRecorder.offer(mc.player.getX(), mc.player.getY(), mc.player.getZ(), mc.player.getYRot());
+    }
+
     /**
      * 卡住看门狗（用户实机："追进水里就站住不动"、"有些情况下莫名其妙站在原地不动"）。
      *
      * 这是**通用**机制、不是特判：只要"当前有该走完全程的任务"，3 秒内水平位移 <0.6 格，
      * 就停止寻路、把任务诚实标成 failed 并附上 `Pathfinder` 的失败原因，随后由后端（LLM）
      * 重新规划——本地层不硬撑、也不假装还在推进。
+     *
+     * <p>与驻守/重放的边界：驻守期间"不动"是**意图**（用户要的就是站桩挂机），重放有自己的
+     * 段级判定（带"卡在第几个点"的上下文）—— 因此这两者在此整体让路，绝不互相打架。
      */
     private void tickStuckWatchdog(Minecraft mc) {
+        if (AFK.isActive() || ROUTE.isActive()) {
+            stuckTicks = 0;
+            stuckLastX = Double.NaN;
+            return;
+        }
         boolean shouldMove = Pathfinder.isNavigating() || guardPoint != null
                 || pendingGoTarget != null || pendingSleep;
         if (!shouldMove) {
