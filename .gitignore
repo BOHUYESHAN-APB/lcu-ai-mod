@@ -40,3 +40,9 @@ backend/venv/
 
 # Token logs
 backend/token_usage.csv
+
+# ── 本地开发文档 / agent 工作区（不进版本库）─────────────────
+# 开发文档、路线图、交接记录都放在 docs/dev/ 下，只留在本地。
+.trae/
+.trae-cn/
+docs/dev/

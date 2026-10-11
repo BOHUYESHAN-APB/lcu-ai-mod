@@ -3,9 +3,11 @@ package com.lcu.lcumod.network;
 import com.google.gson.Gson;
 import com.google.gson.JsonObject;
 import com.lcu.lcumod.LCUMod;
+import com.lcu.lcumod.action.ControlStream;
 import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -23,6 +25,11 @@ public class WireServer {
 
     public static final PriorityCommandQueue commandQueue = new PriorityCommandQueue();
 
+    /** 最近一次 bind 失败的原因；null = 正常监听。
+     *  两个游戏窗口抢同一个端口时，本窗口会 bind 失败——此时聊天与状态**全部静默丢弃**，
+     *  必须在游戏里把原因显示出来，否则用户只看到"发消息没反应"。 */
+    public static volatile String LISTEN_ERROR = null;
+
     public WireServer(int port) {
         this.port = port;
     }
@@ -36,7 +43,7 @@ public class WireServer {
         sendThread = new Thread(this::sendLoop, "LCU-WireSend");
         sendThread.setDaemon(true);
         sendThread.start();
-        LCUMod.LOGGER.info("[WireServer] Started on port {}", port);
+        LCUMod.LOGGER.info("[WireServer] Starting on port {} (bind on LCU-WireServer thread)", port);
     }
 
     public void stop() {
@@ -48,6 +55,13 @@ public class WireServer {
 
     public boolean isConnected() {
         return activeConnection != null && activeConnection.isOpen();
+    }
+
+    /** True when at least one backend TCP client is connected.
+     *  Used as the single-writer autonomy gate: while a backend owns behavior,
+     *  the Java-side autonomous behavior must not run in parallel. */
+    public boolean hasClients() {
+        return isConnected();
     }
 
     /** Async send — queues message, returns immediately. NEVER blocks the calling thread. */
@@ -110,24 +124,40 @@ public class WireServer {
     }
 
     private void runServer() {
-        try (ServerSocket ss = new ServerSocket(port)) {
-            while (running.get()) {
-                try {
-                    Socket sock = ss.accept();
-                    LCUMod.LOGGER.info("[WireServer] Backend connected from {}", sock.getRemoteSocketAddress());
-                    Connection conn = new Connection(sock);
-                    Connection old = activeConnection;
-                    if (old != null) old.close();
-                    activeConnection = conn;
-                    conn.startReader();
-                } catch (IOException e) {
-                    if (running.get()) {
-                        LCUMod.LOGGER.error("[WireServer] Accept error: {}", e.getMessage());
+        // 端口被占用时**不要一次失败就永久残废**：每 5s 重绑一次。
+        // 典型场景：用户之前那个游戏窗口没退干净；关掉它以后本窗口应自动恢复，不必重启游戏。
+        while (running.get()) {
+            try (ServerSocket ss = new ServerSocket(port)) {
+                LISTEN_ERROR = null;
+                LCUMod.LOGGER.info("[WireServer] Listening on port {}", port);
+                while (running.get()) {
+                    try {
+                        Socket sock = ss.accept();
+                        LCUMod.LOGGER.info("[WireServer] Backend connected from {}", sock.getRemoteSocketAddress());
+                        Connection conn = new Connection(sock);
+                        Connection old = activeConnection;
+                        if (old != null) old.close();
+                        activeConnection = conn;
+                        conn.startReader();
+                    } catch (IOException e) {
+                        if (running.get()) {
+                            LCUMod.LOGGER.error("[WireServer] Accept error: {}", e.getMessage());
+                        }
                     }
                 }
+            } catch (IOException e) {
+                if (!running.get()) return;
+                LISTEN_ERROR = "端口 " + port + " 被占用，本窗口收不到后端指令（" + e.getMessage() + "）"
+                        + "——请只开一个装了本模组的游戏窗口（会自动重试）";
+                LCUMod.LOGGER.error("[WireServer] PORT BUSY on {}: {} — 是不是开了第二个游戏窗口/有残留进程？"
+                        + "5s 后重试。", port, e.getMessage());
+                try {
+                    Thread.sleep(5000L);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
             }
-        } catch (IOException e) {
-            LCUMod.LOGGER.error("[WireServer] Failed to start on port {}: {}", port, e.getMessage());
         }
     }
 
@@ -139,8 +169,11 @@ public class WireServer {
 
         Connection(Socket socket) throws IOException {
             this.socket = socket;
-            this.reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-            this.writer = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream()));
+            // 必须显式指定 UTF-8：用平台默认编码的话，中文 Windows 上是 GBK，
+            // 而 Python 侧按 UTF-8 解 → 只要消息里带中文（物品名/聊天/POI）整条就被丢掉、
+            // 连接还会重连，表现就是"仪表盘连上了却什么数据都没有"。
+            this.reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+            this.writer = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8));
         }
 
         boolean isOpen() { return open.get(); }
@@ -167,7 +200,10 @@ public class WireServer {
                         if (line.isBlank()) continue;
                         try {
                             JsonObject msg = gson.fromJson(line, JsonObject.class);
-                            if (msg != null && "command".equals(msg.get("type") != null ? msg.get("type").getAsString() : null)) {
+                            if (msg == null) continue;
+                            String type = msg.get("type") != null && !msg.get("type").isJsonNull()
+                                    ? msg.get("type").getAsString() : null;
+                            if ("command".equals(type)) {
                                 WireCommand cmd = new WireCommand(
                                         msg.get("id") != null ? msg.get("id").getAsString() : null,
                                         msg.get("cmd") != null ? msg.get("cmd").getAsString() : null,
@@ -177,6 +213,9 @@ public class WireServer {
                                     LCUMod.LOGGER.info("[WireServer] Received command: {} id={}", cmd.cmd(), cmd.id());
                                     commandQueue.submitBackend(cmd);
                                 }
+                            } else if ("control".equals(type)) {
+                                // 高频控制流：无回执、latest-wins，只写字段，不碰游戏对象
+                                ControlStream.apply(msg);
                             }
                         } catch (Exception e) {
                             LCUMod.LOGGER.warn("[WireServer] Invalid JSON: {}", e.getMessage());
@@ -198,6 +237,8 @@ public class WireServer {
             if (!open.getAndSet(false)) return;
             try { socket.close(); } catch (IOException ignored) {}
             LCUMod.LOGGER.info("[WireServer] Connection closed");
+            // 后端断线必须立刻松手，否则控制流最后一次按键会永久卡住
+            ControlStream.requestRelease();
             if (activeConnection == this) {
                 activeConnection = null;
             }

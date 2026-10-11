@@ -1,0 +1,187 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  LCU 直播叠层 · 顶图（TOP）—— 透明覆盖层：两台电视机外壳
+  1920×1080，带 alpha 通道。渲染后 alpha 会被 overlay/render.py 二值化（>=128→255, <128→0），
+  所以本文件**不画任何低透明度的阴影 / 发光**：只有"实心(255)"与"开孔(0)"两种状态。
+
+  z 序（用户要求）：
+    · 右下 POV 外壳 (1100,575) 808×493 = **完整的长方框**，四条边都在，画在**最上层**，不越出画布；
+    · 左上大电视外壳 (12,40) 1384×810 被小框压住 → 大框画在**下层**，交叠区里大框的笔画全部由
+      小框（不透明）盖掉，视觉上大框右下角是"断"的；
+    · 但两个内屏开孔必须 alpha 严格 0：
+        AI 内屏 (48,76) 1312×738、POV 内屏 (1144,619) 720×405
+      → 两组外壳各自套一层 <g mask>，把"两个内屏矩形"整块挖掉（小框恰好横跨大屏开孔的那一小段会被切掉，
+        其余四边完整；render.py 会取四边中点断言 alpha=255）。
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080">
+  <defs>
+    <linearGradient id="metal" x1="0" y1="0" x2=".45" y2="1">
+      <stop offset="0" stop-color="#5b6b7e"/>
+      <stop offset=".12" stop-color="#3d4a59"/>
+      <stop offset=".36" stop-color="#232c37"/>
+      <stop offset=".6" stop-color="#2d3744"/>
+      <stop offset=".84" stop-color="#1a2029"/>
+      <stop offset="1" stop-color="#101419"/>
+    </linearGradient>
+    <linearGradient id="metal2" x1="0" y1="0" x2=".4" y2="1">
+      <stop offset="0" stop-color="#586676"/>
+      <stop offset=".16" stop-color="#3a4552"/>
+      <stop offset=".44" stop-color="#212831"/>
+      <stop offset=".72" stop-color="#2c3541"/>
+      <stop offset="1" stop-color="#0f1319"/>
+    </linearGradient>
+    <linearGradient id="bevel" x1="0" y1="0" x2=".45" y2="1">
+      <stop offset="0" stop-color="#d6e6f7" stop-opacity=".55"/>
+      <stop offset=".22" stop-color="#8ea2b8" stop-opacity=".26"/>
+      <stop offset=".55" stop-color="#0b0f14" stop-opacity=".40"/>
+      <stop offset=".82" stop-color="#000000" stop-opacity=".55"/>
+      <stop offset="1" stop-color="#9fb4c9" stop-opacity=".18"/>
+    </linearGradient>
+    <linearGradient id="lip" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#000000" stop-opacity=".78"/>
+      <stop offset=".42" stop-color="#04070b" stop-opacity=".62"/>
+      <stop offset=".8" stop-color="#1d2733" stop-opacity=".42"/>
+      <stop offset="1" stop-color="#9fb4c9" stop-opacity=".20"/>
+    </linearGradient>
+    <pattern id="brush" width="4" height="3" patternUnits="userSpaceOnUse">
+      <rect width="4" height="1" fill="#ffffff" fill-opacity=".035"/>
+      <rect y="1" width="4" height="1" fill="#000000" fill-opacity=".055"/>
+    </pattern>
+    <pattern id="glass" width="6" height="4" patternUnits="userSpaceOnUse">
+      <rect width="6" height="1" fill="#d6ecff" fill-opacity=".13"/>
+      <rect y="2" width="6" height="1" fill="#000000" fill-opacity=".22"/>
+    </pattern>
+    <radialGradient id="screwG" cx=".34" cy=".28" r=".8">
+      <stop offset="0" stop-color="#d3e1ee"/>
+      <stop offset=".45" stop-color="#77848f"/>
+      <stop offset="1" stop-color="#1d232b"/>
+    </radialGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#4fa3ff" stop-opacity="0"/>
+      <stop offset=".2" stop-color="#4fa3ff" stop-opacity=".9"/>
+      <stop offset=".6" stop-color="#37d67a" stop-opacity=".85"/>
+      <stop offset="1" stop-color="#9ae66e" stop-opacity="0"/>
+    </linearGradient>
+
+    <!-- ===== 组级裁剪：把"两个内屏矩形"从整组里彻底挖掉 ===== -->
+    <mask id="mBigClip" maskUnits="userSpaceOnUse" x="0" y="0" width="1920" height="1080">
+      <rect x="0" y="0" width="1920" height="1080" fill="#fff"/>
+      <rect x="48" y="76" width="1312" height="738" rx="0" fill="#000"/>
+      <rect x="1144" y="619" width="720" height="405" rx="0" fill="#000"/>
+    </mask>
+    <!-- POV 组：只挖自己的内屏；小框是"完整长方框"，压在 AI 画面上属正常覆盖 -->
+    <mask id="mSmClip" maskUnits="userSpaceOnUse" x="0" y="0" width="1920" height="1080">
+      <rect x="0" y="0" width="1920" height="1080" fill="#fff"/>
+      <rect x="1144" y="619" width="720" height="405" rx="0" fill="#000"/>
+    </mask>
+
+    <!-- ===== 大电视（下层）：外壳 (12,40) 1384×810，内屏外 36px ===== -->
+    <mask id="mBigShell" maskUnits="userSpaceOnUse" x="0" y="0" width="1920" height="1080">
+      <rect x="12" y="40" width="1384" height="810" rx="34" fill="#fff"/>
+      <rect x="48" y="76" width="1312" height="738" rx="0" fill="#000"/>
+    </mask>
+    <mask id="mBigBevel" maskUnits="userSpaceOnUse" x="0" y="0" width="1920" height="1080">
+      <rect x="12" y="40" width="1384" height="810" rx="34" fill="#fff"/>
+      <rect x="16" y="44" width="1376" height="802" rx="32" fill="#000"/>
+    </mask>
+    <mask id="mGlassBig" maskUnits="userSpaceOnUse" x="0" y="0" width="1920" height="1080">
+      <rect x="16" y="44" width="1376" height="802" rx="32" fill="#fff"/>
+      <rect x="48" y="76" width="1312" height="738" rx="0" fill="#000"/>
+    </mask>
+    <mask id="mLipBig" maskUnits="userSpaceOnUse" x="0" y="0" width="1920" height="1080">
+      <rect x="24" y="52" width="1360" height="786" rx="30" fill="#fff"/>
+      <rect x="48" y="76" width="1312" height="738" rx="0" fill="#000"/>
+    </mask>
+
+    <!-- ===== 小电视 POV（上层）：外壳 (1100,575) 808×493，内屏外 44px ===== -->
+    <mask id="mSmShell" maskUnits="userSpaceOnUse" x="0" y="0" width="1920" height="1080">
+      <rect x="1100" y="575" width="808" height="493" rx="28" fill="#fff"/>
+      <rect x="1144" y="619" width="720" height="405" rx="0" fill="#000"/>
+    </mask>
+    <mask id="mSmBevel" maskUnits="userSpaceOnUse" x="0" y="0" width="1920" height="1080">
+      <rect x="1100" y="575" width="808" height="493" rx="28" fill="#fff"/>
+      <rect x="1140" y="615" width="728" height="413" rx="24" fill="#000"/>
+    </mask>
+    <mask id="mGlassSm" maskUnits="userSpaceOnUse" x="0" y="0" width="1920" height="1080">
+      <rect x="1110" y="585" width="788" height="473" rx="22" fill="#fff"/>
+      <rect x="1144" y="619" width="720" height="405" rx="0" fill="#000"/>
+    </mask>
+    <mask id="mLipSm" maskUnits="userSpaceOnUse" x="0" y="0" width="1920" height="1080">
+      <rect x="1120" y="595" width="768" height="453" rx="16" fill="#fff"/>
+      <rect x="1144" y="619" width="720" height="405" rx="0" fill="#000"/>
+    </mask>
+
+    <g id="screw">
+      <circle r="5.4" fill="#0a0e13" fill-opacity=".8"/>
+      <circle r="4.5" fill="url(#screwG)"/>
+      <circle r="4.5" fill="none" stroke="#0b1016" stroke-opacity=".55" stroke-width="1"/>
+      <path d="M-2.6 -1H2.6" stroke="#141a21" stroke-opacity=".8" stroke-width="1.4" stroke-linecap="round"/>
+    </g>
+    <style>
+      .chip { font-family:"Microsoft YaHei","Noto Sans SC",system-ui,sans-serif; font-size:14px; font-weight:700; }
+      .mono { font-family:"Cascadia Mono",Consolas,"Courier New",monospace; }
+    </style>
+  </defs>
+
+  <!-- ==================== 大电视（AI 视角 · 下层，交叠区会被小框盖掉） ==================== -->
+  <g mask="url(#mBigClip)">
+    <rect x="12" y="40" width="1384" height="810" rx="34" fill="url(#metal)" mask="url(#mBigShell)"/>
+    <rect x="12" y="40" width="1384" height="810" rx="34" fill="url(#brush)" mask="url(#mBigShell)"/>
+    <rect x="12" y="40" width="1384" height="810" rx="34" fill="none" stroke="#05080c" stroke-opacity=".85" stroke-width="2"/>
+    <rect x="14.5" y="42.5" width="1379" height="805" rx="32" fill="none" stroke="#9db2c7" stroke-opacity=".22"/>
+    <rect x="12" y="40" width="1384" height="810" rx="34" fill="url(#bevel)" mask="url(#mBigBevel)"/>
+    <rect x="16" y="44" width="1376" height="802" rx="32" fill="url(#glass)" mask="url(#mGlassBig)"/>
+    <rect x="24" y="52" width="1360" height="786" rx="30" fill="url(#lip)" mask="url(#mLipBig)"/>
+
+    <use href="#screw" x="400" y="48"/>
+    <use href="#screw" x="1000" y="48"/>
+    <use href="#screw" x="400" y="842"/>
+    <use href="#screw" x="1000" y="842"/>
+    <use href="#screw" x="20" y="445"/>
+    <use href="#screw" x="1388" y="445"/>
+
+    <!-- 上内唇：视角标 / 品牌 / REC / LIVE -->
+    <text x="56" y="70" class="chip" fill="#c8e3ff">AI 视角</text>
+    <text x="124" y="69" class="mono" font-size="11" fill="#7fa6d0" letter-spacing="1.5">AGENT VIEW · HDMI-1</text>
+    <text x="700" y="70" class="mono" font-size="13" fill="#a8bccf" letter-spacing="4" text-anchor="middle">LCU-VISION</text>
+    <circle cx="1232" cy="64" r="5" fill="#ff4d4d"/>
+    <text x="1243" y="69" class="chip" fill="#ff9a9a" letter-spacing="1">REC</text>
+    <rect x="1296" y="56" width="54" height="18" rx="4" fill="#e0332f"/>
+    <text x="1305" y="69" class="chip" fill="#ffffff" font-size="12" letter-spacing="1">LIVE</text>
+
+    <!-- 下内唇：型号 / 信号 / 分辨率（右端留到 x≤1130，不进入 POV 内屏） -->
+    <text x="56" y="832" class="mono" font-size="12" fill="#7d93ab">MODEL LCU-AI-01 · 4K60</text>
+    <text x="640" y="832" class="mono" font-size="12" fill="#f5c168" text-anchor="middle" letter-spacing="1">SIGNAL · WAITING FOR AGENT</text>
+    <text x="1130" y="832" class="mono" font-size="12" fill="#7d93ab" text-anchor="end">1920×1080 · 16:9</text>
+    <rect x="300" y="841" width="830" height="3" rx="1.5" fill="url(#accent)"/>
+
+    <!-- 左内唇竖排铭牌 / 右内唇状态灯 -->
+    <text x="36" y="445" class="mono" font-size="11" fill="#8ea6bf" fill-opacity=".78"
+          text-anchor="middle" transform="rotate(-90 36 445)" letter-spacing="1">DISPLAY-01 · LCU-VISION · 4K60</text>
+    <circle cx="1372" cy="420" r="4" fill="#37d67a"/>
+    <circle cx="1372" cy="440" r="4" fill="#f5c168"/>
+    <circle cx="1372" cy="460" r="4" fill="#4fa3ff"/>
+  </g>
+
+  <!-- ==================== 小电视 POV（上层 · 完整长方框，压住大框右下角） ==================== -->
+  <g mask="url(#mSmClip)">
+    <rect x="1100" y="575" width="808" height="493" rx="28" fill="url(#metal2)" mask="url(#mSmShell)"/>
+    <rect x="1100" y="575" width="808" height="493" rx="28" fill="url(#brush)" mask="url(#mSmShell)"/>
+    <rect x="1101" y="576" width="806" height="491" rx="27" fill="none" stroke="#05080c" stroke-opacity=".85" stroke-width="2"/>
+    <rect x="1102.5" y="577.5" width="803" height="488" rx="25" fill="none" stroke="#9db2c7" stroke-opacity=".22"/>
+    <rect x="1100" y="575" width="808" height="493" rx="28" fill="url(#bevel)" mask="url(#mSmBevel)"/>
+    <rect x="1110" y="585" width="788" height="473" rx="22" fill="url(#glass)" mask="url(#mGlassSm)"/>
+    <rect x="1120" y="595" width="768" height="453" rx="16" fill="url(#lip)" mask="url(#mLipSm)"/>
+
+    <!-- 上内唇标签（小框完整，可压在 AI 画面上） -->
+    <rect x="1252" y="597" width="152" height="20" rx="5" fill="#37d67a" fill-opacity=".16" stroke="#37d67a" stroke-opacity=".6"/>
+    <text x="1263" y="612" class="chip" fill="#9fe6bd" font-size="13">用户视角 POV</text>
+    <text x="1536" y="611" class="mono" font-size="11" fill="#7d93ab">720×405 · 60 fps</text>
+    <circle cx="1836" cy="607" r="5" fill="#ff4d4d"/>
+    <text x="1846" y="612" class="chip" fill="#ff9a9a" font-size="13" letter-spacing="1">REC</text>
+
+    <circle cx="1132" cy="980" r="4" fill="#37d67a"/>
+    <circle cx="1132" cy="1000" r="4" fill="#f5c168"/>
+    <circle cx="1132" cy="1020" r="4" fill="#4fa3ff"/>
+  </g>
+</svg>

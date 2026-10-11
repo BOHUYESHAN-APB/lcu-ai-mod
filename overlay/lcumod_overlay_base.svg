@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  LCU 直播叠层 · 底图（BASE）—— 不透明整屏 UI
+  1920×1080，带 alpha 通道；**整屏不透明（alpha=255）**，
+  唯一透明处 = 「用户视角 POV」矩形 (1240,690) 640×360（用户自己的游戏画面从这里透出）。
+  实现：全部内容包在一个 mask 组里，mask = 全白 - POV 矩形 → POV 内 alpha 严格 0。
+  面板一律"纯色块"，不烘焙任何文案（文字由用户在 OBS 里自己叠，见 overlay/OVERLAY_LAYOUT.md）。
+  几何（与 overlay/render.py 的 GEOM 常量一致）：
+    · 品牌条     (0,0)      1920×56
+    · AI 占位屏  (48,76)    1312×738   （AI 画面源会盖住它）
+    · 右侧蓝列   (1400,76)  500×584
+    · 底边蓝条   (48,1024)  1168×40
+    · 用户 POV   (1240,690) 640×360    ← 底图在此挖空
+  图层顺序（OBS 自下而上）：BASE → AI 画面 → 用户 POV 画面 → TOP（电视外壳）
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2=".6" y2="1">
+      <stop offset="0" stop-color="#0d1727"/>
+      <stop offset=".45" stop-color="#080d17"/>
+      <stop offset="1" stop-color="#0b1424"/>
+    </linearGradient>
+    <radialGradient id="vig" cx=".45" cy=".4" r=".9">
+      <stop offset=".4" stop-color="#000000" stop-opacity="0"/>
+      <stop offset="1" stop-color="#000000" stop-opacity=".55"/>
+    </radialGradient>
+    <pattern id="grid" width="48" height="48" patternUnits="userSpaceOnUse">
+      <path d="M48 0H0v48" fill="none" stroke="#3f6ea8" stroke-opacity=".14" stroke-width="1"/>
+    </pattern>
+    <linearGradient id="headFade" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#16283f"/>
+      <stop offset="1" stop-color="#0a1424"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#4fa3ff" stop-opacity=".15"/>
+      <stop offset=".5" stop-color="#4fa3ff"/>
+      <stop offset="1" stop-color="#37d67a" stop-opacity=".25"/>
+    </linearGradient>
+    <radialGradient id="dotG" cx=".5" cy=".5" r=".5">
+      <stop offset="0" stop-color="#7ef0b0" stop-opacity=".6"/>
+      <stop offset="1" stop-color="#37d67a" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="dotR" cx=".5" cy=".5" r=".5">
+      <stop offset="0" stop-color="#ff6b6b" stop-opacity=".6"/>
+      <stop offset="1" stop-color="#ff3b3b" stop-opacity="0"/>
+    </radialGradient>
+    <!-- 唯一透明区：POV 矩形 -->
+    <mask id="mPov" maskUnits="userSpaceOnUse" x="0" y="0" width="1920" height="1080">
+      <rect x="0" y="0" width="1920" height="1080" fill="#fff"/>
+      <rect x="1144" y="619" width="720" height="405" fill="#000"/>
+    </mask>
+    <style>
+      .brand { font-family:"Microsoft YaHei","Noto Sans SC",system-ui,sans-serif; font-size:19px; font-weight:700; fill:#e8f2fd; }
+      .mono  { font-family:"Cascadia Mono",Consolas,"Courier New",monospace; }
+    </style>
+  </defs>
+
+  <g mask="url(#mPov)">
+    <!-- ========== 不透明底板（深色 UI 质感） ========== -->
+    <rect x="0" y="0" width="1920" height="1080" fill="url(#bg)"/>
+    <rect x="0" y="0" width="1920" height="1080" fill="url(#grid)"/>
+    <rect x="0" y="0" width="1920" height="1080" fill="url(#vig)"/>
+
+    <!-- ========== 品牌条 (0,0) 1920×56（装饰：圆点 + 短标题 + LIVE 角标） ========== -->
+    <g>
+      <rect x="0" y="0" width="1920" height="56" fill="url(#headFade)"/>
+      <circle cx="30" cy="24" r="12" fill="url(#dotG)"/>
+      <circle cx="30" cy="24" r="6" fill="#37d67a"/>
+      <text x="50" y="31" class="brand">LCU MOD</text>
+      <text x="152" y="30" class="mono" font-size="13" fill="#7fa6d0" letter-spacing="2">OVERLAY</text>
+
+      <circle cx="1786" cy="28" r="10" fill="url(#dotR)"/>
+      <circle cx="1786" cy="28" r="5" fill="#ff5d5d"/>
+      <rect x="1804" y="14" width="86" height="28" rx="6" fill="#e0332f" fill-opacity=".9"/>
+      <text x="1822" y="33" class="mono" font-size="15" fill="#ffffff" letter-spacing="2">LIVE</text>
+
+      <rect x="0" y="34" width="1920" height="2" fill="url(#accent)"/>
+    </g>
+
+    <!-- ========== AI 占位屏 (48,76) 1312×738 —— 纯色块（会被 AI 画面源盖住） ========== -->
+    <g>
+      <rect x="48" y="76" width="1312" height="738" fill="#0e1a2c"/>
+      <rect x="49.5" y="77.5" width="1309" height="735" fill="none" stroke="#4fa3ff" stroke-opacity=".3" stroke-width="1.5"/>
+      <rect x="48" y="76" width="1312" height="4" fill="#4fa3ff" fill-opacity=".25"/>
+      <rect x="48" y="810" width="1312" height="4" fill="#4fa3ff" fill-opacity=".18"/>
+    </g>
+
+    <!-- ========== 右侧蓝列 (1400,76) 500×470 —— 纯色块（不烘焙文字；下沿 546 避开 POV 外壳） ========== -->
+    <g>
+      <rect x="1400" y="76" width="500" height="470" rx="14" fill="#14305a"/>
+      <rect x="1400" y="76" width="500" height="470" rx="14" fill="none" stroke="#4a86d8" stroke-opacity=".85" stroke-width="1.5"/>
+      <rect x="1400" y="94" width="5" height="434" rx="2.5" fill="#6fb6ff"/>
+      <rect x="1400" y="76" width="500" height="3" fill="#7fc0ff" fill-opacity=".7"/>
+    </g>
+
+    <!-- ========== 底边蓝条 (48,1024) 1040×40 —— 纯色块（不烘焙文字；右端 1088 避开 POV 外壳） ========== -->
+    <g>
+      <rect x="48" y="1024" width="1040" height="40" rx="8" fill="#14305a"/>
+      <rect x="48" y="1024" width="1040" height="40" rx="8" fill="none" stroke="#4a86d8" stroke-opacity=".85" stroke-width="1.5"/>
+      <rect x="48" y="1024" width="5" height="40" rx="2.5" fill="#6fb6ff"/>
+      <rect x="48" y="1024" width="1040" height="3" fill="#7fc0ff" fill-opacity=".7"/>
+    </g>
+
+    <!-- 画布描边 -->
+    <rect x="0" y="0" width="1920" height="1080" fill="none" stroke="#4fa3ff" stroke-opacity=".3" stroke-width="2"/>
+  </g>
+</svg>

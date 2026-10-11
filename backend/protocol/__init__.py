@@ -1,1 +1,1 @@
-from .wire_client import WireClient, WireMessage
+from .wire_client import WireClient, WireMessage, ControlStream

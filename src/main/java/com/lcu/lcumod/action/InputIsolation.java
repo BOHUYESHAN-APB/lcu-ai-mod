@@ -6,12 +6,19 @@ import net.minecraft.client.Options;
 
 /**
  * Input isolation system — prevents AI and user from fighting over controls.
- * 
+ *
  * KEY DESIGN:
- * 1. AI control: releaseMouse() — cursor visible, no camera control
- * 2. User control: grabMouse() — cursor hidden, camera control
- * 3. Switching requires F12 key press
- * 4. Auto-return to AI after 10 seconds of user inactivity
+ * 1. The cursor follows one rule: while AI control is active the pointer is RELEASED, so the human
+ *    can use the desktop / other windows while the AI plays. Switching to user control (F12) grabs
+ *    it back, exactly like clicking into the window in vanilla. The release side is re-asserted each
+ *    tick (so entering a world hands the pointer over), the grab side happens ONLY on an explicit
+ *    switch — this class never grabs the pointer out from under the human.
+ * 2. While AI control is active, AI key states are written into the client key bindings — but only
+ *    while the AI actually holds a key, plus one release when it lets go. An idle AI never writes
+ *    "all keys up", which would clobber a human playing on the same client instance.
+ * 3. Switching is manual (F12 / command) — the AI never takes control on its own.
+ * 4. The auto-return-to-AI-after-inactivity path exists but is OFF by default
+ *    (see setAutoReturnEnabled), so a human is never hijacked mid-play.
  */
 public class InputIsolation {
 
@@ -23,18 +30,19 @@ public class InputIsolation {
     private static boolean aiJump = false;
     private static boolean aiSneak = false;
     private static boolean aiSprint = false;
+    /** True while AI key states are written down and not yet released. */
+    private static boolean aiKeysDirty = false;
 
     // Control mode
     private static boolean aiControlled = true;
     private static long lastUserActivity = 0;
     private static final long USER_TIMEOUT_MS = 10000;  // 10 seconds
-    private static boolean autoReturnEnabled = true;
+    private static boolean autoReturnEnabled = false;  // OFF by default: never hijack control back
 
-    // Mouse control
+    // Look target (applied by writing yaw/pitch — the cursor is never grabbed)
     private static float aiYaw = 0;
     private static float aiPitch = 0;
     private static boolean aiHasTarget = false;
-    private static Boolean appliedMouseState = null;
 
     // ── Public API ──
 
@@ -48,30 +56,26 @@ public class InputIsolation {
      */
     public static void toggleControl() {
         Minecraft mc = Minecraft.getInstance();
-        
+
         if (aiControlled) {
-            // Switch to USER control
+            // → USER control: grab the cursor so the human can look around, exactly like
+            // clicking into the window does in vanilla.
             aiControlled = false;
             lastUserActivity = System.currentTimeMillis();
             clearAiControls();
-            
-            // Grab mouse — user gets camera control
             if (mc.mouseHandler != null) {
                 mc.mouseHandler.grabMouse();
-                appliedMouseState = Boolean.FALSE;
             }
-            LCUMod.LOGGER.info("[Input] Switched to USER control (mouse grabbed)");
+            LCUMod.LOGGER.info("[Input] Switched to USER control (cursor grabbed)");
         } else {
-            // Switch to AI control
+            // → AI control: hand the pointer back to the human so they can use the desktop while
+            // the AI plays. This is the whole point of pressing F12.
             aiControlled = true;
             clearUserControls();
-            
-            // Release mouse — AI controls camera, cursor visible
             if (mc.mouseHandler != null) {
                 mc.mouseHandler.releaseMouse();
-                appliedMouseState = Boolean.TRUE;
             }
-            LCUMod.LOGGER.info("[Input] Switched to AI control (mouse released)");
+            LCUMod.LOGGER.info("[Input] Switched to AI control (cursor released)");
         }
     }
 
@@ -116,6 +120,7 @@ public class InputIsolation {
             options.keyShift.setDown(false);
             options.keySprint.setDown(false);
         }
+        aiKeysDirty = false;
     }
 
     /**
@@ -152,17 +157,6 @@ public class InputIsolation {
         }
     }
 
-    public static void ensureControlModeApplied(Minecraft mc) {
-        if (mc.mouseHandler == null) return;
-        if (aiControlled && !Boolean.TRUE.equals(appliedMouseState)) {
-            mc.mouseHandler.releaseMouse();
-            appliedMouseState = Boolean.TRUE;
-        } else if (!aiControlled && !Boolean.FALSE.equals(appliedMouseState)) {
-            mc.mouseHandler.grabMouse();
-            appliedMouseState = Boolean.FALSE;
-        }
-    }
-
     /**
      * Check if user has timed out (for auto-return to AI).
      */
@@ -186,7 +180,14 @@ public class InputIsolation {
     public static void tick(Minecraft mc) {
         if (mc.player == null) return;
 
-        ensureControlModeApplied(mc);
+        // AI control owns the keyboard, but the human keeps the pointer: while the AI plays we keep
+        // the cursor released so they can use the desktop / other windows. Only the release side is
+        // re-asserted (idempotent, guarded by isMouseGrabbed) — grabbing happens ONLY on an explicit
+        // F12 switch to user control, never automatically.
+        if (aiControlled && mc.mouseHandler != null && mc.mouseHandler.isMouseGrabbed()) {
+            mc.mouseHandler.releaseMouse();
+            LCUMod.LOGGER.info("[Input] AI control: cursor released to the user");
+        }
 
         // Check for user timeout (auto-return to AI)
         if (hasUserTimedOut()) {
@@ -202,20 +203,37 @@ public class InputIsolation {
 
     /**
      * Apply AI controls to the player.
+     *
+     * Key states are only written while the AI actually holds something, plus exactly one release
+     * when it lets go. Writing "all keys up" every tick would clobber a human who is using the same
+     * client instance — their held key is cleared by the next tick and they cannot walk.
      */
     private static void applyAiControls(Minecraft mc) {
         Options options = mc.options;
 
-        // Set key states
-        options.keyUp.setDown(aiForward);
-        options.keyLeft.setDown(aiLeft);
-        options.keyRight.setDown(aiRight);
-        options.keyDown.setDown(aiBack);
-        options.keyJump.setDown(aiJump);
-        options.keyShift.setDown(aiSneak);
-        options.keySprint.setDown(aiSprint);
+        boolean anyKeyState = aiForward || aiBack || aiLeft || aiRight || aiJump || aiSneak || aiSprint;
+        if (anyKeyState) {
+            options.keyUp.setDown(aiForward);
+            options.keyLeft.setDown(aiLeft);
+            options.keyRight.setDown(aiRight);
+            options.keyDown.setDown(aiBack);
+            options.keyJump.setDown(aiJump);
+            options.keyShift.setDown(aiSneak);
+            options.keySprint.setDown(aiSprint);
+            aiKeysDirty = true;
+        } else if (aiKeysDirty) {
+            // Released once, then the key bindings belong to the human again.
+            options.keyUp.setDown(false);
+            options.keyLeft.setDown(false);
+            options.keyRight.setDown(false);
+            options.keyDown.setDown(false);
+            options.keyJump.setDown(false);
+            options.keyShift.setDown(false);
+            options.keySprint.setDown(false);
+            aiKeysDirty = false;
+        }
 
-        // Apply look target
+        // Apply look target (only while the AI actually has one)
         if (aiHasTarget) {
             mc.player.setYRot(aiYaw);
             mc.player.setXRot(aiPitch);

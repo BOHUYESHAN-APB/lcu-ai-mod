@@ -5,3 +5,10 @@ websockets>=14.0
 pydantic>=2.0
 httpx>=0.28.0
 python-dotenv>=1.0
+
+# 视觉（可选）：Python 侧直接抓屏 -> VLM。至少装一个；dxcam 对 GPU 渲染的游戏窗口最可靠。
+# 不装则视觉层静默降级，其它功能不受影响。
+#   dxcam>=0.0.5
+#   mss>=9.0.1
+# Pillow 用于降采样与 JPEG 编码，视觉开启时必需。
+Pillow>=10.0.0

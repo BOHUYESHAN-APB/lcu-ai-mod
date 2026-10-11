@@ -1,7 +1,7 @@
 plugins {
     id 'java-library'
     id 'maven-publish'
-    id 'net.neoforged.moddev' version '2.0.141'
+    id 'net.neoforged.moddev' version '2.0.148'
     id 'idea'
 }
 
@@ -34,17 +34,12 @@ base {
     archivesName = mod_id
 }
 
-// Mojang ships Java 21 to end users in 1.21.1, so mods should target Java 21.
-java.toolchain.languageVersion = JavaLanguageVersion.of(21)
+// Mojang ships Java 25 to end users in 26.3, so mods should target Java 25.
+java.toolchain.languageVersion = JavaLanguageVersion.of(25)
 
 neoForge {
     // Specify the version of NeoForge to use.
     version = project.neo_version
-
-    parchment {
-        mappingsVersion = project.parchment_mappings_version
-        minecraftVersion = project.parchment_minecraft_version
-    }
 
     // This line is optional. Access Transformers are automatically detected
     // accessTransformers = project.files('src/main/resources/META-INF/accesstransformer.cfg')
@@ -57,6 +52,19 @@ neoForge {
 
             // Comma-separated list of namespaces to load gametests from. Empty = all namespaces.
             systemProperty 'neoforge.enabledGameTestNamespaces', project.mod_id
+
+            // 可选自动化测试入口（默认关闭，不影响日常开发）：
+            //   -PquickPlay=<世界目录名>  直接进单人世界（run/saves/<名字>）
+            //   -PquickPlayMp=<host:port> 直连服务器
+            // 有了 player，AI 的整条 tick/输入链路才能真正被跑到。
+            if (providers.gradleProperty('quickPlay').isPresent()) {
+                programArgument '--quickPlaySingleplayer'
+                programArgument providers.gradleProperty('quickPlay').get()
+            }
+            if (providers.gradleProperty('quickPlayMp').isPresent()) {
+                programArgument '--quickPlayMultiplayer'
+                programArgument providers.gradleProperty('quickPlayMp').get()
+            }
         }
 
         server {
@@ -74,7 +82,7 @@ neoForge {
         }
 
         data {
-            data()
+            clientData()
 
             // example of overriding the workingDirectory set in configureEach above, uncomment if you want to use it
             // gameDirectory = project.file('run-data')
@@ -148,7 +156,7 @@ var generateModMetadata = tasks.register("generateModMetadata", ProcessResources
             minecraft_version      : minecraft_version,
             minecraft_version_range: minecraft_version_range,
             neo_version            : neo_version,
-            loader_version_range   : loader_version_range,
+            neo_version_range      : neo_version_range,
             mod_id                 : mod_id,
             mod_name               : mod_name,
             mod_license            : mod_license,
@@ -181,6 +189,96 @@ publishing {
 
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8' // Use the UTF-8 charset for Java compilation
+}
+
+// 纯逻辑自检（M3-5 的边沿触发计数等）。
+// 刻意**零第三方依赖**：本机网络对 maven.neoforged.net 的 DNS 被污染，Gradle 遇到
+// 不可达仓库会直接失败而不回退，因此拉不到 JUnit。这里用 JavaExec 跑一个纯 Java
+// 自检类，等价于单测且不引入任何依赖；接入 check，随 build 一起跑。
+tasks.register('verifyLogic', JavaExec) {
+    group = 'verification'
+    description = '纯逻辑自检（边沿触发计数），零第三方依赖'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.output + sourceSets.main.output
+    mainClass = 'com.lcu.lcumod.action.EdgeTriggerCheck'
+}
+
+tasks.named('check').configure {
+    dependsOn 'verifyLogic'
+    dependsOn 'verifyTitle'
+    dependsOn 'verifyChat'
+    dependsOn 'verifyFinder'
+    dependsOn 'verifyPhrase'
+    dependsOn 'verifyGate'
+}
+
+tasks.register('verifyGate', JavaExec) {
+    group = 'verification'
+    description = '纯逻辑自检（本能反射抑制开关：时间语义/到期恢复/all 覆盖）'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.output + sourceSets.main.output
+    mainClass = 'com.lcu.lcumod.action.ReflexGateCheck'
+}
+
+tasks.register('verifyPhrase', JavaExec) {
+    group = 'verification'
+    description = '纯逻辑自检（HUD 状态词汇表：优先级 + 不得出现"寻路"类工程词）'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.output + sourceSets.main.output
+    mainClass = 'com.lcu.lcumod.client.ActivityPhraseCheck'
+}
+
+tasks.register('verifyFinder', JavaExec) {
+    group = 'verification'
+    description = '纯逻辑自检（方块通配匹配：*_bed 绝不能命中 bedrock），零第三方依赖'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.output + sourceSets.main.output
+    mainClass = 'com.lcu.lcumod.action.BlockFinderCheck'
+}
+
+tasks.register('verifyChat', JavaExec) {
+    group = 'verification'
+    description = '纯逻辑自检（聊天回声去重：不能吃掉用户自己打的字），零第三方依赖'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.output + sourceSets.main.output
+    mainClass = 'com.lcu.lcumod.chat.OutboundChatLogCheck'
+}
+
+tasks.register('verifyTitle', JavaExec) {
+    group = 'verification'
+    description = '纯逻辑自检（窗口标题格式化），零第三方依赖'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.output + sourceSets.main.output
+    mainClass = 'com.lcu.lcumod.client.TitleFormatCheck'
+}
+
+tasks.named('test').configure {
+    // src/test 下是纯 Java 自检类（由 verifyLogic 执行），不是 JUnit 用例；
+    // 没有可发现的测试不应让 build 失败。
+    failOnNoDiscoveredTests = false
+}
+
+// 部署到游戏实例：把构建出的 jar 覆盖拷贝到 mods 目录（同名覆盖，另清理旧版本 lcumod-*.jar）。
+// 默认指向本机实例，可用 -PdeployDir=<路径> 覆盖。
+def deployDirProvider = providers.gradleProperty('deployDir')
+    .orElse('E:/MC/.minecraft/versions/Rapid Optimization-ai/mods')
+def deployTarget = layout.dir(deployDirProvider.map { new File(it) })
+def deployJarName = "lcumod-${project.version}.jar"
+
+tasks.register('deploy', Copy) {
+    group = 'distribution'
+    description = "把模组 jar 覆盖拷贝到游戏实例 mods 目录（默认 ${deployDirProvider.get()}）"
+    dependsOn tasks.named('jar')
+    from(tasks.named('jar'))
+    into(deployTarget)
+    doFirst {
+        File dir = deployTarget.get().asFile
+        if (dir.isDirectory()) {
+            dir.listFiles({ d, n ->
+                n.startsWith('lcumod-') && n.endsWith('.jar') && n != deployJarName
+            } as FilenameFilter)?.each { it.delete() }
+        }
+    }
 }
 
 // IDEA no longer automatically downloads sources/javadoc jars for dependencies, so we need to explicitly enable the behavior.

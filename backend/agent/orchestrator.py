@@ -101,11 +101,10 @@ class Orchestrator:
         status = self.session.get_status()
         action = status.get("action", {})
         logger.info(
-            "[Orch] Stats — action=%s modes=%s memory=%d tasks=%d tokens=%d",
+            "[Orch] Stats — action=%s modes=%s memory=%d tokens=%d",
             action.get("label"),
             status.get("modes", {}).get("active"),
             status.get("memory_size", 0),
-            status.get("task_queue_len", 0),
             status.get("llm_usage", {}).get("total_tokens", 0),
         )
 

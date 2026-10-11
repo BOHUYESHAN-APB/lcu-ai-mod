@@ -26,6 +26,8 @@ public class AIControlOverlay {
     private static final int BUTTON_WIDTH = 120;
     private static final int BUTTON_HEIGHT = 20;
     private static final int MARGIN = 4;
+    /** 状态框实际宽度（文字变长会变宽），点击命中要与绘制一致。 */
+    private static int lastBoxWidth = BUTTON_WIDTH;
 
     @SubscribeEvent
     public static void onRenderGui(RenderGuiLayerEvent.Post event) {
@@ -39,24 +41,41 @@ public class AIControlOverlay {
         int x = MARGIN;
         int y = MARGIN;
 
+        // 文字 = 控制权 + 当前在干什么（趣味词）+ 后端大模型给的描述词
+        String note = com.lcu.lcumod.client.HudNote.current();
+        String text = (aiOn ? "AI 控制中" : "你控制中") + " · " + WindowTitle.activity(mc)
+                + (note.isEmpty() ? "" : " · " + note);
+        int boxWidth = Math.max(BUTTON_WIDTH, mc.font.width(text) + 12);
+        lastBoxWidth = boxWidth;
+
         // Background
         int bgColor = aiOn ? 0xCC1B5E20 : 0xCCB71C1C;
-        graphics.fill(x, y, x + BUTTON_WIDTH, y + BUTTON_HEIGHT, bgColor);
+        graphics.fill(x, y, x + boxWidth, y + BUTTON_HEIGHT, bgColor);
 
         // Border
         int borderColor = aiOn ? 0xFF4CAF50 : 0xFFEF5350;
-        graphics.fill(x, y, x + BUTTON_WIDTH, y + 1, borderColor);
-        graphics.fill(x, y + BUTTON_HEIGHT - 1, x + BUTTON_WIDTH, y + BUTTON_HEIGHT, borderColor);
+        graphics.fill(x, y, x + boxWidth, y + 1, borderColor);
+        graphics.fill(x, y + BUTTON_HEIGHT - 1, x + boxWidth, y + BUTTON_HEIGHT, borderColor);
         graphics.fill(x, y, x + 1, y + BUTTON_HEIGHT, borderColor);
-        graphics.fill(x + BUTTON_WIDTH - 1, y, x + BUTTON_WIDTH, y + BUTTON_HEIGHT, borderColor);
+        graphics.fill(x + boxWidth - 1, y, x + boxWidth, y + BUTTON_HEIGHT, borderColor);
 
         // Text
-        String text = aiOn ? "AI 控制中" : "你控制中";
         int textColor = 0xFFFFFFFF;
         int textWidth = mc.font.width(text);
-        int textX = x + (BUTTON_WIDTH - textWidth) / 2;
+        int textX = x + (boxWidth - textWidth) / 2;
         int textY = y + (BUTTON_HEIGHT - mc.font.lineHeight) / 2;
-        graphics.drawString(mc.font, text, textX, textY, textColor, false);
+        graphics.text(mc.font, text, textX, textY, textColor, false);
+
+        // 端口被占用（多半是开了第二个游戏窗口）时必须**在游戏里**看见：
+        // 否则表现为"聊天/控制全没反应"，用户根本不知道 wire 根本没监听。
+        String listenError = com.lcu.lcumod.network.WireServer.LISTEN_ERROR;
+        if (listenError != null) {
+            String warn = "⚠ " + listenError;
+            int warnWidth = mc.font.width(warn) + 8;
+            int warnY = y + BUTTON_HEIGHT + MARGIN;
+            graphics.fill(x, warnY, x + warnWidth, warnY + 14, 0xCC7F1D1D);
+            graphics.text(mc.font, warn, x + 4, warnY + 3, 0xFFFFD54F, false);
+        }
     }
 
     /**
@@ -123,7 +142,7 @@ public class AIControlOverlay {
      * Check if a click is within the button area.
      */
     public static boolean isClickInButton(double mouseX, double mouseY) {
-        return mouseX >= MARGIN && mouseX <= MARGIN + BUTTON_WIDTH
+        return mouseX >= MARGIN && mouseX <= MARGIN + lastBoxWidth
             && mouseY >= MARGIN && mouseY <= MARGIN + BUTTON_HEIGHT;
     }
 

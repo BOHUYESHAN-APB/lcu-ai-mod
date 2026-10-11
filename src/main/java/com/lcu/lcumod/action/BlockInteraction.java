@@ -22,7 +22,7 @@ public class BlockInteraction {
      * Returns the estimated ticks needed to break the block.
      */
     public static int getBreakTime(ServerPlayer player, BlockPos pos) {
-        ServerLevel level = player.serverLevel();
+        ServerLevel level = player.level();
         BlockState state = level.getBlockState(pos);
 
         if (state.isAir()) return 0;
@@ -51,12 +51,12 @@ public class BlockInteraction {
      * Returns the slot switched to, or -1 if no tool found.
      */
     public static int autoSelectTool(ServerPlayer player, BlockPos pos) {
-        ServerLevel level = player.serverLevel();
+        ServerLevel level = player.level();
         BlockState state = level.getBlockState(pos);
 
         int bestSlot = InventoryManager.findBestTool(player, state);
-        if (bestSlot >= 0 && bestSlot != player.getInventory().selected) {
-            player.getInventory().selected = bestSlot;
+        if (bestSlot >= 0 && bestSlot != player.getInventory().getSelectedSlot()) {
+            player.getInventory().setSelectedSlot(bestSlot);
         }
         return bestSlot;
     }
@@ -68,7 +68,7 @@ public class BlockInteraction {
     public static boolean placeBlock(ServerPlayer player, BlockPos target, ItemStack stack) {
         if (stack.isEmpty()) return false;
 
-        ServerLevel level = player.serverLevel();
+        ServerLevel level = player.level();
         BlockState targetState = level.getBlockState(target);
 
         // The block to place on needs an adjacent face
@@ -121,7 +121,7 @@ public class BlockInteraction {
      * Right-click on a block to open it (chest, furnace, etc.).
      */
     public static boolean interactWithBlock(ServerPlayer player, BlockPos pos) {
-        ServerLevel level = player.serverLevel();
+        ServerLevel level = player.level();
         BlockState state = level.getBlockState(pos);
 
         // Calculate hit position (center of block)
@@ -139,7 +139,7 @@ public class BlockInteraction {
         if (result.consumesAction()) return true;
 
         // Fallback: try block interaction directly
-        player.swing(InteractionHand.MAIN_HAND);
+        player.swing(InteractionHand.MAIN_HAND, net.minecraft.world.item.component.SwingAnimation.DEFAULT, true);
         return false;
     }
 }

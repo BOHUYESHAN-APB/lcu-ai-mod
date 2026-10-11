@@ -11,6 +11,7 @@ Memory System — 长期记忆 + 上下文管理。
 
 import json
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -268,3 +269,166 @@ class Memory:
         self.path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         logger.debug("[Memory] 保存了 %d 条消息、%d 个事件", 
                     len(self.recent_messages), len(self.events))
+
+
+class WorldPoiMemory:
+    """按「服务器 + 世界」命名空间持久化的 POI 记忆（箱子 / 工作站）。
+
+    Java 的 PoiMemory 只活在内存里，离开视野 5 分钟后过期、重启即丢；这一层把
+    观测到的 POI 落盘，并按服务器与存档分开存，避免跨服跨档串数据。
+    """
+
+    def __init__(self, root: str = "data/poi"):
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._namespace = ""
+        self._entries: dict[str, dict] = {}
+        self._dirty = False
+
+    # ── 命名空间 ──
+
+    @property
+    def namespace(self) -> str:
+        return self._namespace
+
+    @property
+    def path(self) -> Path:
+        return self.root / f"{self._namespace or 'unscoped'}.json"
+
+    def use_namespace(self, server: str, world: str) -> str:
+        """切换到指定服务器/世界；与当前不同则先落盘旧的，再载入新的。"""
+        key = f"{self._slug(server, 'unknown-server')}__{self._slug(world, 'unknown-world')}"
+        if key == self._namespace:
+            return key
+        if self._namespace:
+            self.save()
+        self._namespace = key
+        self._entries = {}
+        self._dirty = False
+        self._load()
+        return key
+
+    @staticmethod
+    def _slug(text: str, fallback: str) -> str:
+        cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(text or "").strip()).strip("_")
+        return cleaned[:60] or fallback
+
+    # ── 记录 / 查询 ──
+
+    def observe(self, category: str, poi: dict, dimension: str = "") -> bool:
+        """吸收一个观测到的 POI；位置、方块或内容有变化时返回 True。"""
+        x, y, z = poi.get("x"), poi.get("y"), poi.get("z")
+        if x is None or y is None or z is None:
+            return False
+
+        entry = {
+            "category": category,
+            "block_id": poi.get("block_id", "") or poi.get("id", ""),
+            "name": poi.get("name", ""),
+            "x": x, "y": y, "z": z,
+            "dimension": dimension,
+            "last_seen": time.time(),
+        }
+        contents = poi.get("contents")
+        if contents:
+            entry["contents"] = [
+                {"item_id": c.get("item_id", ""), "count": c.get("count", 1)}
+                for c in contents if isinstance(c, dict)
+            ]
+
+        key = self._key(dimension, x, y, z)
+        existing = self._entries.get(key)
+        if existing is not None and self._same(existing, entry):
+            existing["last_seen"] = entry["last_seen"]
+            return False
+        self._entries[key] = entry
+        self._dirty = True
+        return True
+
+    def observe_state(self, state: dict) -> int:
+        """从一次 state_update 里吸收所有 POI，返回新增/更新的数量。"""
+        dimension = (state.get("player") or {}).get("dimension", "")
+        changed = 0
+        for category, field in (("storage", "nearby_storage"),
+                                ("workstation", "nearby_workstations")):
+            for poi in state.get(field) or []:
+                if isinstance(poi, dict) and self.observe(category, poi, dimension):
+                    changed += 1
+        # Java 侧点名的持久记录点（remember_poi 的产物）：按 poi 自带 category
+        # 归类，缺省 waypoint；坐标与 id 已由 Java 保证。
+        for poi in state.get("remembered_pois") or []:
+            if not isinstance(poi, dict):
+                continue
+            category = str(poi.get("category") or "").strip() or "waypoint"
+            if self.observe(category, poi, dimension):
+                changed += 1
+        return changed
+
+    def find(self, category: Optional[str] = None) -> list[dict]:
+        entries = [e for e in self._entries.values()
+                   if category is None or e.get("category") == category]
+        return sorted(entries, key=lambda e: e.get("last_seen", 0.0), reverse=True)
+
+    _CATEGORY_LABELS = {
+        "storage": "箱子",
+        "workstation": "工作站",
+        "waypoint": "记录点",
+        "bed": "床",
+    }
+
+    def describe(self, category: str = "storage", limit: int = 12) -> str:
+        """给 planner 用的已知 POI 摘要（跨局记忆，可能不在当前视野内）。"""
+        entries = self.find(category)[:limit]
+        label = self._CATEGORY_LABELS.get(category, category)
+        if not entries:
+            return f"暂无已知{label}"
+        lines = []
+        for e in entries:
+            name = str(e.get("name") or "").strip()
+            coords = f"({e.get('x')},{e.get('y')},{e.get('z')})"
+            if category in {"waypoint", "bed"}:
+                # 记录点/床：坐标 + 名字（记忆里最需要的两件事），没有"内容"概念。
+                tag = e.get("block_id") or label
+                lines.append(f"{name + ' ' if name else ''}{tag}@{coords}")
+                continue
+            contents = e.get("contents") or []
+            items = ", ".join(f"{c.get('item_id')}x{c.get('count')}" for c in contents[:5])
+            lines.append(
+                f"{name + ' ' if name else ''}{e.get('block_id')}@{coords} "
+                f"[{e.get('dimension', '?')}]: {items or '内容未知'}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _key(dimension: str, x, y, z) -> str:
+        return f"{dimension}|{int(x)},{int(y)},{int(z)}"
+
+    @staticmethod
+    def _same(a: dict, b: dict) -> bool:
+        return (a.get("block_id") == b.get("block_id")
+                and a.get("contents") == b.get("contents"))
+
+    # ── 持久化 ──
+
+    def _load(self):
+        if not self.path.exists():
+            return
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            entries = data.get("entries", {})
+            self._entries = entries if isinstance(entries, dict) else {}
+            logger.info("[PoiMemory] 载入 %s：%d 个 POI", self._namespace, len(self._entries))
+        except Exception as e:
+            logger.warning("[PoiMemory] 载入失败: %s", e)
+
+    def save(self):
+        if not self._dirty or not self._namespace:
+            return
+        data = {
+            "namespace": self._namespace,
+            "saved_at": time.time(),
+            "entries": self._entries,
+        }
+        self.path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        self._dirty = False
+        logger.debug("[PoiMemory] 保存 %s：%d 个 POI", self._namespace, len(self._entries))

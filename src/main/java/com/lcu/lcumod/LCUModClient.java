@@ -9,8 +9,8 @@ import net.neoforged.fml.common.Mod;
 import net.neoforged.fml.event.lifecycle.FMLClientSetupEvent;
 
 // Client-only mod class.
-@Mod(value = LCUMod.MODID, dist = Dist.CLIENT)
-@EventBusSubscriber(modid = LCUMod.MODID, bus = EventBusSubscriber.Bus.MOD, value = Dist.CLIENT)
+@Mod(value = LCUMod.MODID, dist = {Dist.CLIENT})
+@EventBusSubscriber(modid = LCUMod.MODID, value = Dist.CLIENT)
 public class LCUModClient {
     public LCUModClient(ModContainer container) {
         // Client-side setup placeholder

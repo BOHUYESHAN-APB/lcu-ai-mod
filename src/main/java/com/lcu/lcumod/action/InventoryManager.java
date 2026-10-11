@@ -25,7 +25,7 @@ public class InventoryManager {
         if (stack.isEmpty()) return false;
 
         ItemStack dropped = stack.split(count);
-        player.drop(dropped, false);
+        player.drop(dropped, false, net.minecraft.util.Prediction.PREDICTED);
         inv.setItem(slot, stack.isEmpty() ? ItemStack.EMPTY : stack);
         return true;
     }
@@ -86,7 +86,7 @@ public class InventoryManager {
      * Returns -1 if not equippable.
      */
     private static int getEquipmentSlot(ItemStack stack) {
-        String id = stack.getDescriptionId().toLowerCase();
+        String id = stack.getItem().getDescriptionId().toLowerCase();
 
         // Armor detection by name pattern
         if (id.contains("helmet") || id.contains("cap") || id.contains("hood")) return 36 + 3;
@@ -162,8 +162,8 @@ public class InventoryManager {
 
         if (slotIndex < 0 || slotIndex >= menu.slots.size()) return false;
 
-        // ClickType: 0=PICKUP, 1=QUICK_MOVE, 2=SWAP, etc.
-        menu.clicked(slotIndex, button, net.minecraft.world.inventory.ClickType.PICKUP, player);
+        // ContainerInput: PICKUP, QUICK_MOVE, SWAP, etc.
+        menu.clicked(slotIndex, button, net.minecraft.world.inventory.ContainerInput.PICKUP, player);
         return true;
     }
 
@@ -176,7 +176,7 @@ public class InventoryManager {
 
         if (slotIndex < 0 || slotIndex >= menu.slots.size()) return false;
 
-        menu.clicked(slotIndex, 0, net.minecraft.world.inventory.ClickType.QUICK_MOVE, player);
+        menu.clicked(slotIndex, 0, net.minecraft.world.inventory.ContainerInput.QUICK_MOVE, player);
         return true;
     }
 

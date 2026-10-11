@@ -220,7 +220,7 @@ public class JavaAutonomousBehavior {
         if (mc.player.distanceTo(attackTarget) < 4) {
             if (mc.gameMode != null) {
                 mc.gameMode.attack(mc.player, attackTarget);
-                mc.player.swing(net.minecraft.world.InteractionHand.MAIN_HAND);
+                mc.player.swing(net.minecraft.world.InteractionHand.MAIN_HAND, net.minecraft.world.item.component.SwingAnimation.DEFAULT, true);
             }
             attackCooldown = ATTACK_COOLDOWN_TICKS;
         } else {
@@ -275,9 +275,9 @@ public class JavaAutonomousBehavior {
             if (stack.isEmpty()) continue;
             
             // Check if item is food (by checking if it has food properties)
-            if (stack.getItem().getFoodProperties(stack, mc.player) != null) {
+            if (stack.get(net.minecraft.core.component.DataComponents.FOOD) != null) {
                 // Select and use
-                inv.selected = i;
+                inv.setSelectedSlot(i);
                 if (mc.gameMode != null) {
                     mc.gameMode.useItem(mc.player, net.minecraft.world.InteractionHand.MAIN_HAND);
                 }

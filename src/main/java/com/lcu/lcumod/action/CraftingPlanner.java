@@ -1,11 +1,17 @@
 package com.lcu.lcumod.action;
 
 import net.minecraft.client.Minecraft;
+import net.minecraft.core.Holder;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.crafting.Ingredient;
 import net.minecraft.world.item.crafting.RecipeHolder;
 import net.minecraft.world.item.crafting.RecipeType;
+import net.minecraft.world.item.crafting.display.RecipeDisplay;
+import net.minecraft.world.item.crafting.display.ShapedCraftingRecipeDisplay;
+import net.minecraft.world.item.crafting.display.SlotDisplayContext;
+import net.minecraft.world.level.Level;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -79,7 +85,12 @@ public final class CraftingPlanner {
         boolean resolved = resolve(mc, targetItemId, requestedCount, available, recipeIndexes, visiting, plan);
         plan.success = resolved && plan.missingRaw.isEmpty();
         if (!plan.success && plan.failureReason.isBlank() && !plan.missingRaw.isEmpty()) {
-            plan.failureReason = "missing raw resources";
+            // Clients no longer receive recipes in 26.3 and the full recipe table only exists on the
+            // integrated server. On a dedicated/remote server we simply have no recipe data, so the
+            // honest reason is "unavailable here", not "you are missing raw resources".
+            plan.failureReason = mc.getSingleplayerServer() == null
+                ? "no recipe data on this connection (dedicated/remote server: 26.3 clients are not sent recipes); only items already in the inventory can be resolved"
+                : "missing raw resources";
         }
         return plan;
     }
@@ -122,7 +133,7 @@ public final class CraftingPlanner {
             return false;
         }
 
-        ItemStack result = recipe.value().getResultItem(mc.level.registryAccess());
+        ItemStack result = resolveRecipeResult(recipe, mc.level);
         if (result.isEmpty()) {
             visiting.remove(visitKey);
             plan.failureReason = "recipe has empty result for " + targetItemId;
@@ -135,7 +146,7 @@ public final class CraftingPlanner {
         int craftOperations = (remaining + outputCount - 1) / outputCount;
 
         boolean dependenciesResolved = true;
-        for (Ingredient ingredient : recipe.value().getIngredients()) {
+        for (Ingredient ingredient : recipe.value().placementInfo().ingredients()) {
             if (ingredient == null || ingredient.isEmpty()) {
                 continue;
             }
@@ -162,7 +173,7 @@ public final class CraftingPlanner {
             resolvedResultId,
             craftOperations,
             stationBlockId,
-            stepMode.equals("craft") && !recipe.value().canCraftInDimensions(2, 2),
+            stepMode.equals("craft") && !fitsInInventoryGrid(recipe),
             recipe
         ));
 
@@ -189,8 +200,15 @@ public final class CraftingPlanner {
 
     private static RecipeIndexes buildRecipeIndexes(Minecraft mc) {
         RecipeIndexes indexes = new RecipeIndexes();
-        for (RecipeHolder<?> recipe : mc.level.getRecipeManager().getRecipes()) {
-            ItemStack result = recipe.value().getResultItem(mc.level.registryAccess());
+        // Recipes are no longer synced to the client in 26.3; read them from the integrated server.
+        // With no integrated server (dedicated/remote), indexes stay empty and planning reports
+        // the items as missing raw resources, same as when the recipe map was empty in 1.21.1.
+        var server = mc.getSingleplayerServer();
+        if (server == null) {
+            return indexes;
+        }
+        for (RecipeHolder<?> recipe : server.getRecipeManager().getRecipes()) {
+            ItemStack result = resolveRecipeResult(recipe, mc.level);
             if (result.isEmpty()) {
                 continue;
             }
@@ -210,6 +228,26 @@ public final class CraftingPlanner {
 
     private static RecipeHolder<?> findCraftRecipe(RecipeIndexes indexes, String targetItemId) {
         return findRecipe(indexes.crafting, targetItemId);
+    }
+
+    private static ItemStack resolveRecipeResult(RecipeHolder<?> recipe, Level level) {
+        net.minecraft.util.context.ContextMap context = SlotDisplayContext.fromLevel(level);
+        for (RecipeDisplay display : recipe.value().display()) {
+            ItemStack stack = display.result().resolveForFirstStack(context);
+            if (stack != null && !stack.isEmpty()) {
+                return stack;
+            }
+        }
+        return ItemStack.EMPTY;
+    }
+
+    private static boolean fitsInInventoryGrid(RecipeHolder<?> recipe) {
+        for (RecipeDisplay display : recipe.value().display()) {
+            if (display instanceof ShapedCraftingRecipeDisplay shaped) {
+                return shaped.width() <= 2 && shaped.height() <= 2;
+            }
+        }
+        return recipe.value().placementInfo().ingredients().size() <= 4;
     }
 
     private static RecipeHolder<?> findProcessingRecipe(RecipeIndexes indexes, String targetItemId) {
@@ -239,7 +277,8 @@ public final class CraftingPlanner {
     ) {
         String bestCandidate = null;
         int bestScore = Integer.MIN_VALUE;
-        for (ItemStack stack : ingredient.getItems()) {
+        for (Holder<Item> holder : ingredient.items().toList()) {
+            ItemStack stack = holder.value().getDefaultInstance();
             if (stack.isEmpty()) {
                 continue;
             }

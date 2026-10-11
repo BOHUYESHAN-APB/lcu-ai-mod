@@ -69,11 +69,27 @@ body{font-family:'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;backgroun
 .msg .text{font-size:13px}
 
 /* Player List */
-.player-card{display:flex;align-items:center;gap:10px;padding:10px;background:#0d1117;border-radius:6px;margin-bottom:8px}
+.player-card{display:flex;align-items:center;gap:10px;padding:10px;background:#0d1117;border-radius:6px;margin-bottom:8px;border:1px solid transparent}
+.player-card.speaking{border-color:#58a6ff;background:rgba(88,166,255,.10)}
 .player-card .avatar{width:32px;height:32px;border-radius:4px;background:#30363d}
 .player-card .info{flex:1}
 .player-card .name{font-size:13px;font-weight:600}
 .player-card .meta{font-size:11px;color:#8b949e}
+.speaker-tag{font-size:10px;color:#58a6ff;margin-left:6px;font-weight:400}
+
+/* Task Queue */
+.task-card{background:#0d1117;border-radius:6px;padding:10px}
+.task-card .task-head{font-size:13px;margin-bottom:6px}
+.task-card .task-kind{font-weight:600;color:#58a6ff}
+.task-card .task-status{margin-left:8px;color:#8b949e;font-size:11px}
+.task-card .progress{height:6px;background:#30363d;border-radius:3px;overflow:hidden}
+.task-card .progress-bar{height:100%;background:#1f6feb;border-radius:3px;transition:width .3s}
+.task-card .progress-text{font-size:11px;color:#8b949e;margin-top:4px}
+.task-card .task-detail{font-size:11px;color:#8b949e;margin-top:4px}
+
+/* HUD 描述词 */
+.hud-note{color:#d29922}
+.hud-note::before{content:"· "}
 
 /* Debug Log */
 .debug-log{background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:8px;font-family:monospace;font-size:11px;color:#8b949e;max-height:200px;overflow-y:auto;white-space:pre-wrap}
@@ -84,7 +100,8 @@ body{font-family:'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;backgroun
 <div class="topbar">
   <div class="title">🔴 LCU Command Center <span>— AI 控制台</span></div>
   <div class="online">
-    <span id="connectionStatus" class="status offline">● 未连接</span>
+    <span id="connectionStatus" class="status offline">● 后端未连接</span>
+    <span id="modStatus" class="status offline">● 模组未连接</span>
   </div>
 </div>
 
@@ -119,7 +136,13 @@ body{font-family:'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;backgroun
           <div class="label">控制模式</div>
           <div class="value" id="controlMode">AI</div>
         </div>
+        <div class="stat">
+          <div class="label">最近决策</div>
+          <div class="value" id="lastDecision">-</div>
+        </div>
       </div>
+      <div id="statusLine" class="hint" style="margin-top:10px">状态：-</div>
+      <div id="stateHint" class="hint" style="margin-top:4px">正在检查与游戏端的同步…</div>
       <div style="margin-top:12px">
         <button class="btn primary" onclick="toggleAutonomy()">切换自主模式</button>
         <button class="btn" onclick="toggleControl()">切换控制权</button>
@@ -144,7 +167,7 @@ body{font-family:'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;backgroun
     <h3>💬 聊天记录</h3>
     <div class="chat-container">
       <div class="chat-messages" id="chatMessages">
-        <div style="color:#484f58;text-align:center;padding:40px">等待连接...</div>
+        <div id="chatPlaceholder" style="color:#484f58;text-align:center;padding:40px">等待连接...</div>
       </div>
       <div class="chat-input">
         <input type="text" id="chatInput" placeholder="输入消息..." onkeydown="if(event.key==='Enter')sendChat()">
@@ -158,15 +181,22 @@ body{font-family:'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;backgroun
 <div id="page-settings" class="page">
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
     <div class="card">
-      <h3>🔑 LLM 配置</h3>
+      <h3>🔑 大模型配置（全局）</h3>
+      <div class="form-row">
+        <label>只用一个模型</label>
+        <select id="singleModel">
+          <option value="true">开 —— 规划/决策/视觉/记忆 全用同一个模型（当前阶段推荐）</option>
+          <option value="false">关 —— 按角色分别配置</option>
+        </select>
+      </div>
       <div class="form-row">
         <label>Agent</label>
         <select id="agentSelect" onchange="loadAgentLLMConfig()">
-          <option value="default">默认</option>
-          <option value="planner">Planner</option>
-          <option value="timing_gate">Timing Gate</option>
-          <option value="self_prompter">Self Prompter</option>
-          <option value="conversation">Conversation</option>
+          <option value="default">默认 / 兜底</option>
+          <option value="planner">Planner（规划 · System 2）</option>
+          <option value="decider">Decider（决策/打分 · System 3）</option>
+          <option value="vision">Vision（视觉 · VLM）</option>
+          <option value="embedding">Embedding（记忆检索）</option>
         </select>
       </div>
       <div class="form-row">
@@ -191,7 +221,9 @@ body{font-family:'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;backgroun
         <button class="btn primary" onclick="saveLLMConfig()">保存 LLM 配置</button>
       </div>
       <div id="llmStatus" style="margin-top:8px;font-size:11px;color:#8b949e">⚪ 未配置</div>
-      <div class="hint">服务商预设会自动填 Base URL 和默认模型；API Key 不会从后端回显明文。</div>
+      <div class="hint">各项含义：<b>服务商</b>=从哪家调（选它会自动填 Base URL/默认模型）；<b>Base URL</b>=接口地址；
+      <b>API Key</b>=密钥（不会回显明文）；<b>模型</b>=具体型号，可手打（如 <code>deepseek-v4.1-flash</code>）。
+      改完点「保存 LLM 配置」，然后看下方「运行中实际生效」确认真的换过去了。</div>
     </div>
     
     <div class="card">
@@ -210,6 +242,25 @@ body{font-family:'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;backgroun
       <div class="form-row">
         <label>巡逻半径</label>
         <input type="number" id="patrolRadius" value="8" min="1" max="32">
+      </div>
+      <div class="form-row">
+        <label>夜晚自动睡觉</label>
+        <select id="nightAutoSleep">
+          <option value="true">是</option>
+          <option value="false">否</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>能力层级</label>
+        <select id="capabilityLevel">
+          <option value="1">L1 纯文本单模型（默认：不抓屏、不传图片）</option>
+          <option value="2">L2 单模型 + 视觉（同一个模型看截图）</option>
+          <option value="3" disabled>L3 决策模型 / VLA（规划中，未接入）</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>决策置信度阈值</label>
+        <input type="number" id="confidenceThreshold" value="0.6" min="0" max="1" step="0.05">
       </div>
       <button class="btn primary" onclick="savePermissionConfig()">保存权限配置</button>
     </div>
@@ -236,6 +287,16 @@ body{font-family:'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;backgroun
     <button class="btn primary" onclick="savePersonaConfig()">保存人设</button>
     <div id="personaStatus" style="margin-top:8px;font-size:11px;color:#8b949e">等待加载</div>
   </div>
+
+  <div class="card">
+    <h3>🔎 运行中实际生效（每角色）</h3>
+    <div class="hint">上面配置的是"你填了什么"，这里是**后端此刻真正在用**的值（含从 default 继承的结果、Key 是否就位、上次调用的错误）——「配了却没生效」看这里。</div>
+    <div style="display:flex;gap:8px;align-items:center;margin:8px 0">
+      <button class="btn" onclick="renderEffective()">刷新</button>
+      <span id="effectiveStatus" style="font-size:11px;color:#8b949e">等待加载</span>
+    </div>
+    <div id="effectiveTable"></div>
+  </div>
 </div>
 
 <!-- Debug Page -->
@@ -243,10 +304,10 @@ body{font-family:'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;backgroun
   <div class="card">
     <h3>🔧 调试控制</h3>
     <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:12px">
-      <button class="btn" onclick="dbgCmd('move_to',{x:0,y:0,z:1})">前进</button>
-      <button class="btn" onclick="dbgCmd('move_to',{x:0,y:0,z:-1})">后退</button>
-      <button class="btn" onclick="dbgCmd('move_to',{x:-1,y:0,z:0})">左移</button>
-      <button class="btn" onclick="dbgCmd('move_to',{x:1,y:0,z:0})">右移</button>
+      <button class="btn" onclick="dbgStep('forward')">前进</button>
+      <button class="btn" onclick="dbgStep('back')">后退</button>
+      <button class="btn" onclick="dbgStep('left')">左移</button>
+      <button class="btn" onclick="dbgStep('right')">右移</button>
       <button class="btn" onclick="dbgCmd('jump',{})">跳跃</button>
       <button class="btn" onclick="dbgCmd('attack',{})">攻击</button>
       <button class="btn" onclick="dbgCmd('mine_block',{})">挖掘</button>
@@ -277,11 +338,15 @@ function connectWS() {
   ws.onopen = () => {
     document.getElementById('connectionStatus').className = 'status online';
     document.getElementById('connectionStatus').textContent = '● 已连接';
+    const ph = document.getElementById('chatPlaceholder');
+    if (ph) ph.textContent = '已连接后端。在这里或游戏里发消息试试（建议带唤醒名：AI / 小A）。';
     dbgLog('WebSocket 已连接');
   };
   ws.onclose = () => {
     document.getElementById('connectionStatus').className = 'status offline';
     document.getElementById('connectionStatus').textContent = '● 未连接';
+    const ph = document.getElementById('chatPlaceholder');
+    if (ph) ph.textContent = '后端未连接，正在重连…（先确认 python main.py 在跑）';
     reconnectTimer = setTimeout(connectWS, 3000);
   };
   ws.onmessage = (e) => {
@@ -295,11 +360,14 @@ function connectWS() {
 connectWS();
 
 // ── Page Navigation ──
-function showPage(name) {
+function showPage(name, evt) {
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.getElementById('page-' + name).classList.add('active');
-  event.target.classList.add('active');
+  // 不直接引用全局 event：非用户点击触发（如程序化调用/键盘）时它是 undefined，
+  // 会抛 TypeError 并卡住整页切换。
+  const target = (evt && evt.target) || (typeof event !== 'undefined' && event && event.target);
+  if (target && target.classList) target.classList.add('active');
 }
 
 // ── Local Settings Cache ──
@@ -317,6 +385,14 @@ function handleMessage(msg) {
     handleEvent(msg.data);
   } else if (msg.type === 'chat') {
     addChatMessage(msg.sender, msg.message);
+  } else if (msg.type === 'chat_response') {
+    // 之前这里没有分支 → 后端的回复（以及失败原因）被静默丢掉，表现就是"发消息没反应"
+    const d = msg.data || {};
+    if (d.response) {
+      addChatMessage('AI', d.response);
+    } else {
+      addChatMessage('系统', '（AI 没有回复' + (d.error ? '：' + d.error : '：检查设置页「运行中实际生效」的 Key / 模型') + '）');
+    }
   } else if (msg.type === 'response') {
     dbgLog(`响应: ${msg.success ? '✅' : '❌'} ${msg.data?.message || ''}`);
   }
@@ -333,36 +409,113 @@ function handleEvent(data) {
 
 // ── Dashboard ──
 function updateDashboard(data) {
+  data = data || {};
   const p = data.player || {};
   if (p.health !== undefined) {
     document.getElementById('health').textContent = `${p.health.toFixed(1)}/${p.max_health || 20}`;
   }
   if (p.hunger !== undefined) {
-    document.getElementById('hunger').textContent = `${p.hunger}/20`;
+    // 饱食度/饱和度是两回事：前者决定饿不饿，后者（隐藏值）决定能不能回血。
+    const sat = (typeof p.saturation === 'number') ? `（饱和 ${p.saturation.toFixed(1)}）` : '';
+    document.getElementById('hunger').textContent = `${p.hunger}/20${sat}`;
   }
   if (p.x !== undefined) {
     document.getElementById('position').textContent = `${Math.round(p.x)},${Math.round(p.y)},${Math.round(p.z)}`;
   }
-  
-  // Update players
-  if (data.entities) {
-    const players = data.entities.filter(e => e.type === 'player');
-    const html = players.map(p => `
-      <div class="player-card">
-        <div class="avatar"></div>
-        <div class="info">
-          <div class="name">${p.name || '?'}</div>
-          <div class="meta">${p.distance?.toFixed(1) || '?'}m</div>
-        </div>
-      </div>
-    `).join('');
-    document.getElementById('playerList').innerHTML = html || '暂无玩家';
+
+  // 最近一次决策（两阶段决策的第二阶段结果），便于调参
+  const decision = (data.planner || {}).last_decision || {};
+  if (decision.source) {
+    const conf = typeof decision.confidence === 'number' ? decision.confidence.toFixed(2) : '?';
+    const thr = typeof decision.threshold === 'number' ? decision.threshold.toFixed(2) : '?';
+    const what = decision.tool
+      ? `${decision.tool}${decision.executed === false ? '(未下发)' : ''}`
+      : (decision.choice === null || decision.choice === undefined ? '不下发' : `#${decision.choice}`);
+    document.getElementById('lastDecision').textContent = `${what} ${conf}/${thr}`;
   }
+
+  // 在线玩家：state_update 的 players（模组按距离给的最近 ≤8 个），
+  // 标记最近发话者 —— 用户要求"可视化哪些用户跟他发消息"。
+  renderPlayers(
+    Array.isArray(data.players) ? data.players : [],
+    speakerName(data.last_speaker)
+  );
+
+  // 任务：轮询走 session.task，游戏事件走 task_state（字段一致）。
+  const task = data.task || data.task_state || {};
+  renderTask(task);
+  renderStatusLine(task, data.hud_note);
+}
+
+// last_speaker 既可能是字符串（模组的 last_speaker），也可能是后端记的字典。
+function speakerName(value) {
+  if (!value) return '';
+  if (typeof value === 'string') return value;
+  return value.name || '';
+}
+
+function renderPlayers(players, speaker) {
+  const el = document.getElementById('playerList');
+  if (!el) return;
+  if (!players.length) { el.innerHTML = '暂无玩家'; return; }
+  el.innerHTML = players.map(player => {
+    const name = escapeHtml(String(player.name || '?'));
+    const dist = (typeof player.distance === 'number') ? `${player.distance.toFixed(1)}m` : '?';
+    const isSpeaker = !!player.speaking || (speaker && player.name === speaker);
+    const coords = [player.x, player.y, player.z].every(v => typeof v === 'number')
+      ? ` · ${Math.round(player.x)},${Math.round(player.y)},${Math.round(player.z)}` : '';
+    return `<div class="player-card${isSpeaker ? ' speaking' : ''}">
+      <div class="avatar"></div>
+      <div class="info">
+        <div class="name">${name}${isSpeaker ? '<span class="speaker-tag">刚在跟你说话</span>' : ''}</div>
+        <div class="meta">${dist}${coords}</div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// 任务面板：kind/status/detail + 进度条（终态也照实显示，别把"失败"藏起来）。
+function renderTask(task) {
+  const el = document.getElementById('taskQueue');
+  if (!el) return;
+  task = task || {};
+  const kind = String(task.kind || 'idle').trim();
+  if (!kind || kind === 'idle') { el.innerHTML = '暂无任务'; return; }
+  const status = String(task.status || 'idle').trim();
+  const pct = Math.max(0, Math.min(1, Number(task.progress) || 0)) * 100;
+  const target = task.target ? ` · 目标 ${escapeHtml(String(task.target))}` : '';
+  const detail = task.detail
+    ? `<div class="task-detail">${escapeHtml(String(task.detail))}</div>` : '';
+  el.innerHTML = `<div class="task-card">
+    <div class="task-head"><span class="task-kind">${escapeHtml(kind)}</span><span class="task-status">${escapeHtml(status)}</span>${target}</div>
+    <div class="progress"><div class="progress-bar" style="width:${pct.toFixed(0)}%"></div></div>
+    <div class="progress-text">${pct.toFixed(0)}%</div>
+    ${detail}
+  </div>`;
+}
+
+// AI 状态卡：状态词（当前在干嘛）+ HUD 描述词。词汇表与模组 ActivityPhrase 对齐。
+const STATUS_PHRASES = {
+  craft: '造东西中', collect: '挖矿中', follow: '跟着你呢', travel: '赶路中',
+  move: '赶路中', sleep: '找床睡觉中', eat: '吃东西中', guard: '守着这儿',
+  build: '盖房子中',
+};
+
+function renderStatusLine(task, hudNote) {
+  const el = document.getElementById('statusLine');
+  if (!el) return;
+  const kind = String((task && task.kind) || 'idle').trim();
+  const phrase = STATUS_PHRASES[kind] || '发呆中';
+  const note = (hudNote === undefined || hudNote === null) ? '' : String(hudNote).trim();
+  el.innerHTML = `状态：<span style="color:#58a6ff">${escapeHtml(phrase)}</span>` +
+    (note ? `<span class="hud-note">${escapeHtml(note)}</span>` : '');
 }
 
 // ── Chat ──
 function addChatMessage(sender, message) {
   const container = document.getElementById('chatMessages');
+  // 占位符必须拿掉，否则"等待连接..."会一直挂在那儿（聊天页永远显示没连上）
+  document.getElementById('chatPlaceholder')?.remove();
   const div = document.createElement('div');
   div.className = 'msg';
   div.innerHTML = `<div class="sender">${escapeHtml(sender)}</div><div class="text">${escapeHtml(message)}</div>`;
@@ -401,6 +554,7 @@ function saveLLMConfig() {
   const model = document.getElementById('modelInput').value;
   
   const config = {agent, provider};
+  config.single_model = document.getElementById('singleModel').value === 'true';
   if (baseUrl) config.base_url = baseUrl;
   if (apiKey) config.api_key = apiKey;
   if (model) config.model = model;
@@ -429,6 +583,15 @@ function loadProviders() {
   });
 }
 
+function loadRoles() {
+  return fetch('/api/llm/roles').then(r=>r.json()).then(d=>{
+    const roles = d.roles || [];
+    if (!roles.length) return;
+    const select = document.getElementById('agentSelect');
+    select.innerHTML = roles.map(r => `<option value="${escapeHtml(r.id)}">${escapeHtml(r.name)}</option>`).join('');
+  }).catch(()=>{});
+}
+
 function applyProviderPreset() {
   const providerId = document.getElementById('providerSelect').value;
   const preset = providerPresets.find(p => p.id === providerId);
@@ -440,6 +603,8 @@ function applyProviderPreset() {
 function loadLLMConfig() {
   return fetch('/api/llm/config').then(r=>r.json()).then(d=>{
     llmConfig = d;
+    const single = d.single_model !== false;
+    document.getElementById('singleModel').value = single ? 'true' : 'false';
     const agent = recallSetting('agent', d.default_agent || 'default');
     document.getElementById('agentSelect').value = agent;
     loadAgentLLMConfig();
@@ -450,7 +615,9 @@ function loadAgentLLMConfig() {
   const agent = document.getElementById('agentSelect').value || 'default';
   rememberSetting('agent', agent);
   const cfg = llmConfig?.agents?.[agent] || llmConfig?.agents?.default || {};
-  const provider = cfg.provider || recallSetting('provider', 'openai');
+  // provider 字段为空但写了 Base URL（用户直接手填地址的情况）→ 显示"自定义"，
+  // 否则下拉会显示上次选的（比如 openai），与实际地址对不上，等于 UI 在骗人。
+  const provider = cfg.provider || (cfg.base_url ? 'custom' : recallSetting('provider', 'openai'));
   document.getElementById('providerSelect').value = provider;
   document.getElementById('baseUrl').value = recallSetting('baseUrl.' + agent, cfg.base_url || '');
   document.getElementById('modelInput').value = recallSetting('model.' + agent, cfg.model || '');
@@ -479,16 +646,20 @@ function fetchModels() {
 
 function savePermissionConfig() {
   const whitelist = document.getElementById('whitelist').value.split(',').map(s=>s.trim()).filter(s=>s);
+  const thresholdRaw = parseFloat(document.getElementById('confidenceThreshold').value);
   const config = {
     whitelist: whitelist,
     listen_public: document.getElementById('listenPublic').value === 'true',
-    patrol_radius: parseInt(document.getElementById('patrolRadius').value) || 8
+    patrol_radius: parseInt(document.getElementById('patrolRadius').value) || 8,
+    capability_level: parseInt(document.getElementById('capabilityLevel').value) || 1,
+    night_auto_sleep: document.getElementById('nightAutoSleep').value === 'true',
+    decision: { confidence_threshold: isNaN(thresholdRaw) ? 0.6 : thresholdRaw }
   };
   fetch('/api/config', {
     method:'POST',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify(config)
-  }).then(()=>dbgLog('权限配置已保存'));
+  }).then(()=>dbgLog('权限/决策配置已保存（阈值即时生效）'));
 }
 
 function savePersonaConfig() {
@@ -513,6 +684,10 @@ function loadPermissionConfig() {
     document.getElementById('whitelist').value = (cfg.whitelist || []).join(',');
     document.getElementById('listenPublic').value = String(cfg.listen_public !== false);
     document.getElementById('patrolRadius').value = cfg.patrol_radius || 8;
+    document.getElementById('capabilityLevel').value = String(cfg.capability_level || 1);
+    document.getElementById('nightAutoSleep').value = String(cfg.night_auto_sleep !== false);
+    const threshold = (cfg.decision || {}).confidence_threshold;
+    document.getElementById('confidenceThreshold').value = threshold !== undefined ? threshold : 0.6;
   }).catch(()=>{});
 }
 
@@ -531,6 +706,19 @@ function dbgCmd(cmd, args) {
   if (!ws) return;
   ws.send(JSON.stringify({type:'command', cmd:cmd, args:args}));
   dbgLog(`发送: ${cmd}`);
+}
+
+// 方向按钮 = 走一步：用 set_control_state **按住 1 秒再松开**（相对移动，速度就是原版步行速度）。
+// 以前这里发的是 move_to {x:0,y:0,z:1} —— 那是**绝对世界坐标**，等于让它走去世界原点，
+// 模组侧只会回 "No path found to target"，所以"点了没反应"。
+// 注意：按键只在 **AI 控制中** 生效（InputIsolation 在用户控制下会忽略），需要时按 F12 切回 AI。
+function dbgStep(control) {
+  if (!ws) return;
+  ws.send(JSON.stringify({type:'command', cmd:'set_control_state', args:{control:control, state:true}}));
+  dbgLog(`按住 ${control} 1s（需 AI 控制中）`);
+  setTimeout(() => {
+    if (ws) ws.send(JSON.stringify({type:'command', cmd:'set_control_state', args:{control:control, state:false}}));
+  }, 1000);
 }
 
 function sendDebugCmd() {
@@ -557,20 +745,84 @@ function escapeHtml(str) {
 // ── Init ──
 Promise.resolve()
   .then(loadProviders)
+  .then(loadRoles)
   .then(loadLLMConfig)
   .then(loadPermissionConfig)
   .then(loadPersonaConfig)
+  .then(() => { renderEffective(); updateConnection({}); })
   .catch(err => dbgLog('初始化配置失败: ' + err));
 
-setInterval(()=>{
+// ── 连接状态（后端 vs 模组）与"游戏状态是否同步上"提示 ──
+function setBadge(id, ok, okText, badText) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = ok ? okText : badText;
+  el.className = 'status ' + (ok ? 'online' : 'offline');
+}
+
+function updateConnection(status) {
+  const modOk = !!status.mod_connected;
+  setBadge('modStatus', modOk, '● 模组已连接', '● 模组未连接');
+  const hint = document.getElementById('stateHint');
+  if (!hint) return;
+  const p = status.session && status.session.player;
+  if (!modOk) {
+    hint.textContent = `模组未连接（${status.wire || '127.0.0.1:25568'}）：游戏没在运行，或还没进世界 —— 后端每 5 秒自动重连。`;
+    hint.style.color = '#d29922';
+  } else if (!p) {
+    hint.textContent = '模组已连接，但还没有角色状态：进世界后才会同步生命/坐标等。';
+    hint.style.color = '#d29922';
+  } else {
+    hint.textContent = `已同步：${p.name || '?'} · HP ${p.health ?? '?'} · ${Math.round(p.x)},${Math.round(p.y)},${Math.round(p.z)}`;
+    hint.style.color = '#3fb950';
+  }
+}
+
+// ── "实际生效"面板：把运行中的配置与上次错误摊开 ──
+function renderEffective() {
+  const el = document.getElementById('effectiveTable');
+  const st = document.getElementById('effectiveStatus');
+  if (!el) return;
+  st.textContent = '读取中…';
+  fetch('/api/llm/effective').then(r => r.json()).then(d => {
+    st.textContent = d.mod_connected ? '模组已连接' : '模组未连接';
+    const rows = (d.roles || []).map(r => {
+      const rt = r.runtime || {};
+      const inherited = (r.inherited || []).length ? r.inherited.join(', ') : '—';
+      return `<tr style="border-top:1px solid #30363d">
+        <td style="padding:4px 6px">${escapeHtml(r.id)}</td>
+        <td style="padding:4px 6px;color:#8b949e">${escapeHtml(r.purpose || '')}</td>
+        <td style="padding:4px 6px">${escapeHtml(r.provider || '—')}</td>
+        <td style="padding:4px 6px">${escapeHtml(rt.model || '—')}</td>
+        <td style="padding:4px 6px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(rt.base_url || '—')}</td>
+        <td style="padding:4px 6px">${rt.key_present ? '✅' : '❌'}</td>
+        <td style="padding:4px 6px;color:#8b949e">${escapeHtml(inherited)}</td>
+        <td style="padding:4px 6px;color:#f85149">${escapeHtml(r.last_error || '')}</td>
+      </tr>`;
+    }).join('');
+    el.innerHTML = `<table style="width:100%;border-collapse:collapse;font-size:12px">
+      <thead><tr style="color:#8b949e;text-align:left">
+        <th style="padding:4px 6px">角色</th><th style="padding:4px 6px">用途</th><th style="padding:4px 6px">服务商</th>
+        <th style="padding:4px 6px">模型</th><th style="padding:4px 6px">Base URL</th>
+        <th style="padding:4px 6px">Key</th><th style="padding:4px 6px">继承</th>
+        <th style="padding:4px 6px">上次错误</th>
+      </tr></thead><tbody>${rows}</tbody></table>`;
+  }).catch(e => { st.textContent = '读取失败: ' + e; });
+}
+
+setInterval(() => {
   if (sessionPollInFlight || document.hidden) return;
   sessionPollInFlight = true;
-  fetch('/api/session')
-    .then(r=>r.json())
-    .then(updateDashboard)
-    .catch(()=>{})
-    .finally(()=>{ sessionPollInFlight = false; });
+  fetch('/api/status')
+    .then(r => r.json())
+    .then(d => {
+      updateDashboard(d.session || {});
+      updateConnection(d);
+    })
+    .catch(() => {})
+    .finally(() => { sessionPollInFlight = false; });
 }, 5000);
+
 </script>
 </body>
 </html>

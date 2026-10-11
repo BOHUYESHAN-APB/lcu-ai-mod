@@ -68,13 +68,59 @@ public final class PoiMemory {
     private static final class PoiEntry {
         final String blockId;
         final String category;
+        /** 主动记录的点不会被"扫描看不见"淘汰 —— 这就是"记忆"与"当前视野"的区别。 */
+        final boolean persistent;
+        final String name;
         int lastSeenTick;
 
         PoiEntry(String blockId, String category, int lastSeenTick) {
+            this(blockId, category, lastSeenTick, false, "");
+        }
+
+        PoiEntry(String blockId, String category, int lastSeenTick, boolean persistent, String name) {
             this.blockId = blockId;
             this.category = category;
             this.lastSeenTick = lastSeenTick;
+            this.persistent = persistent;
+            this.name = name == null ? "" : name;
         }
+    }
+
+    /** 主动记录一个点（"记住这里"/走到目标方块后）。persistent → 不会被扫描淘汰。 */
+    public static void remember(BlockPos pos, String blockId, String category, String name, int tickCount) {
+        if (pos == null) {
+            return;
+        }
+        MEMORY.put(pos.immutable(), new PoiEntry(
+                blockId == null ? "" : blockId,
+                category == null || category.isBlank() ? "waypoint" : category,
+                tickCount, true, name));
+    }
+
+    /** 主动记录过的点（可能很远、可能不在视野内），按距离排序。 */
+    public static List<JsonObject> snapshotRemembered(Minecraft mc, int limit) {
+        List<JsonObject> result = new ArrayList<>();
+        if (mc == null || mc.player == null) {
+            return result;
+        }
+        BlockPos origin = mc.player.blockPosition();
+        for (Map.Entry<BlockPos, PoiEntry> entry : MEMORY.entrySet()) {
+            PoiEntry poi = entry.getValue();
+            if (!poi.persistent) {
+                continue;
+            }
+            JsonObject item = new JsonObject();
+            item.addProperty("block_id", poi.blockId);
+            item.addProperty("category", poi.category);
+            item.addProperty("name", poi.name);
+            item.addProperty("x", entry.getKey().getX());
+            item.addProperty("y", entry.getKey().getY());
+            item.addProperty("z", entry.getKey().getZ());
+            item.addProperty("distance", Math.round(Math.sqrt(entry.getKey().distSqr(origin)) * 10.0) / 10.0);
+            result.add(item);
+        }
+        result.sort(Comparator.comparingDouble(item -> item.get("distance").getAsDouble()));
+        return result.size() <= limit ? result : new ArrayList<>(result.subList(0, limit));
     }
 
     public static void tick(Minecraft mc, int tickCount) {
@@ -105,6 +151,9 @@ public final class PoiMemory {
 
         MEMORY.entrySet().removeIf(entry -> {
             PoiEntry poi = entry.getValue();
+            if (poi.persistent) {
+                return false;
+            }
             if (tickCount - poi.lastSeenTick > STALE_TICKS) {
                 return true;
             }

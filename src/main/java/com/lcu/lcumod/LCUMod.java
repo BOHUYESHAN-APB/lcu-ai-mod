@@ -9,12 +9,20 @@ import com.mojang.logging.LogUtils;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.fml.ModContainer;
 import net.neoforged.fml.common.Mod;
-import net.neoforged.fml.config.ModConfig.Type;
 import net.neoforged.fml.event.lifecycle.FMLCommonSetupEvent;
+import net.neoforged.fml.loading.FMLEnvironment;
 import org.slf4j.Logger;
 
 /**
- * LCUMod — LLM Control User mod for NeoForge 1.21.1.
+ * LCUMod — LLM Control User mod for NeoForge 26.3.
+ *
+ * This is a CLIENT-SIDE controller mod: it drives the player of a real Minecraft client. All of its
+ * real work (state push, action execution, wire server, pathfinding) lives in client-only classes,
+ * and every @EventBusSubscriber bridge is declared Dist.CLIENT.
+ *
+ * On a dedicated server those classes do not exist, so this common entrypoint initialises nothing
+ * there — otherwise mod loading aborts with NoClassDefFoundError: net/minecraft/client/...
+ * (verified with `gradlew runServer`). Servers need no installation of this mod at all.
  *
  * Event handling is done via @EventBusSubscriber bridge classes:
  *   - EventTest (debug)
@@ -34,7 +42,12 @@ public class LCUMod {
 
     public LCUMod(IEventBus modEventBus, ModContainer modContainer) {
         modEventBus.addListener(this::commonSetup);
-        modContainer.registerConfig(Type.COMMON, ModConfig.SPEC);
+        modContainer.registerConfig(net.neoforged.fml.config.ModConfig.Type.LOCAL, ModConfig.SPEC);
+
+        if (!FMLEnvironment.getDist().isClient()) {
+            LOGGER.info("[LCUMod] Dedicated server — client-side mod, nothing to initialise.");
+            return;
+        }
 
         // Create singletons (these are referenced by @EventBusSubscriber bridge classes)
         STATE = new StateCollector();
@@ -48,6 +61,9 @@ public class LCUMod {
     }
 
     private void commonSetup(FMLCommonSetupEvent event) {
+        if (!FMLEnvironment.getDist().isClient()) {
+            return;
+        }
         LOGGER.info("[LCUMod] Initializing...");
         WIRE = new WireServer(ModConfig.WIRE_PORT.getAsInt());
         WIRE.start();

@@ -17,14 +17,15 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from agent import LLMService
-from agent.config_store import ConfigStore, DEFAULT_CONFIG_PATH
+from agent.config_store import get_config_store, DEFAULT_CONFIG_PATH
 from agent.orchestrator import Orchestrator
 from protocol import WireClient
 
 app = FastAPI(title="LCUMod Backend")
 
 CONFIG_PATH = DEFAULT_CONFIG_PATH
-config_store = ConfigStore(CONFIG_PATH)
+# 共享实例：Session/Planner 拿到的必须是同一个（否则 UI 改阈值不生效）
+config_store = get_config_store(CONFIG_PATH)
 app_config = config_store.raw(redact=True)
 
 # Global state
@@ -43,6 +44,12 @@ def _apply_config_to_llm_services():
     if orchestrator and orchestrator.session:
         for agent_name, config in config_store.raw(redact=False).get("llm", {}).get("agents", {}).items():
             orchestrator.session.llm.set_agent_config(agent_name, config)
+        # 视觉按**能力层级**开关：L1（默认）纯文本，不抓屏、不传图片；
+        # L2 才启动后台抓屏线程（用同一个多模态模型）。
+        if config_store.get_capability_level() >= 2:
+            orchestrator.session.vision.start()
+        else:
+            orchestrator.session.vision.stop()
 
 
 def _apply_persona_to_session():
@@ -103,7 +110,7 @@ async def startup():
                 print(f"[Backend] Connected to mod at {host}:{port}")
                 o.start()
                 # Event loop: drain wire + tick orchestrator
-                while w.sock:
+                while w.connected:
                     o.tick()
                     time.sleep(0.05)  # 20Hz loop
                 o.stop()
@@ -148,12 +155,26 @@ async def websocket_endpoint(ws: WebSocket):
             elif event_type == "chat":
                 message = msg.get("message", "")
                 sender = msg.get("sender", "web")
+                response = ""
+                error = ""
                 if orchestrator:
-                    response = orchestrator.handle_chat(sender, message)
-                    await ws.send_text(json.dumps({
-                        "type": "chat_response",
-                        "data": {"response": response or ""},
-                    }))
+                    try:
+                        response = orchestrator.handle_chat(sender, message) or ""
+                    except Exception as e:
+                        error = f"{type(e).__name__}: {e}"
+                    if not response and not error:
+                        session = getattr(orchestrator, "session", None)
+                        if session is not None:
+                            error = session.llm.get_last_error("planner")
+                            if not error and not session.llm.api_key:
+                                error = "LLM 未配置 API Key（见设置页「运行中实际生效」）"
+                else:
+                    error = "后端会话未启动（模组尚未连接）"
+
+                await ws.send_text(json.dumps({
+                    "type": "chat_response",
+                    "data": {"response": response, "error": error},
+                }))
 
             elif event_type == "llm_config":
                 data = msg.get("data", {})
@@ -172,11 +193,54 @@ async def websocket_endpoint(ws: WebSocket):
 
 @app.get("/api/status")
 async def get_status():
-    """REST endpoint for current status."""
-    global orchestrator
+    """REST endpoint for current status.
+
+    额外给出**模组连接状态**：前端那个"已连接"只代表浏览器↔后端的 WebSocket，
+    与游戏/模组无关（这正是"连上了却什么都没有"的误导来源）。
+    """
     if orchestrator:
-        return orchestrator.get_status()
-    return {"running": False}
+        status = orchestrator.get_status()
+        status["mod_connected"] = bool(wire and wire.connected)
+        status["wire"] = f"{os.getenv('MOD_HOST', '127.0.0.1')}:{os.getenv('MOD_PORT', '25568')}"
+        return status
+    return {"running": False, "mod_connected": False}
+
+
+@app.get("/api/llm/effective")
+async def get_llm_effective():
+    """**运行中实际生效**的每角色配置 + 上次错误 —— 用来对照"配了却没生效"。
+
+    同时报告两处实例（REST 用的 llm_service 与真正跑 planner/decider/vision 的
+    session.llm）的生效值，不一致就标出来（历史上正是因为角色级旧值把 default 覆盖掉，
+    导致"换了 key/URL 却还在打旧地址"）。
+    """
+    agents = config_store.raw(redact=False).get("llm", {}).get("agents", {})
+    session_llm = orchestrator.session.llm if (orchestrator and orchestrator.session) else None
+
+    roles = []
+    for role in config_store.list_agent_roles():
+        rid = role["id"]
+        own = agents.get(rid, {})
+        runtime = session_llm.effective_config(rid) if session_llm else None
+        api_side = llm_service.effective_config(rid)
+        entry = {
+            "id": rid,
+            "name": role["name"],
+            "purpose": role.get("purpose", ""),
+            "provider": own.get("provider", ""),
+            "inherited": [k for k in ("provider", "base_url", "api_key", "model") if not own.get(k)],
+            "runtime": runtime or api_side,
+            "last_error": (session_llm or llm_service).get_last_error(rid),
+        }
+        if runtime and (runtime["base_url"] != api_side["base_url"] or runtime["model"] != api_side["model"]):
+            entry["mismatch"] = api_side
+        roles.append(entry)
+
+    return {
+        "roles": roles,
+        "mod_connected": bool(wire and wire.connected),
+        "note": "runtime = 真正执行 planner/decider/vision 的实例；继承 = 该字段沿用 default",
+    }
 
 
 @app.get("/api/session")
@@ -212,6 +276,12 @@ async def set_llm_config(data: dict):
 async def get_llm_providers():
     """List known OpenAI-compatible provider presets."""
     return {"providers": config_store.list_provider_presets()}
+
+
+@app.get("/api/llm/roles")
+async def get_llm_roles():
+    """List AI roles (planner / decider / vision / embedding) for per-role model config."""
+    return {"roles": config_store.list_agent_roles()}
 
 
 @app.get("/api/memory")

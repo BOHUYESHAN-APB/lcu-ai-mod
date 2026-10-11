@@ -64,6 +64,53 @@ class LLMServiceTests(unittest.TestCase):
         self.assertIn("brief", prompt)
         self.assertIn("launcher", prompt)
 
+    # ── 零思考契约 ──
+
+    def test_zero_thinking_omits_every_reasoning_param(self):
+        service = LLMService()
+
+        payload = service._build_payload(
+            [{"role": "user", "content": "hi"}],
+            config=service._resolve_config("decider"),
+            thinking=False,
+            reasoning_effort="high",
+        )
+
+        for key in ("reasoning_effort", "reasoning", "thinking", "enable_thinking"):
+            self.assertNotIn(key, payload)
+
+    def test_thinking_true_forwards_only_supplied_params(self):
+        service = LLMService()
+
+        payload = service._build_payload(
+            [{"role": "user", "content": "hi"}],
+            config=service._resolve_config("default"),
+            thinking=True,
+            reasoning_effort="minimal",
+        )
+
+        self.assertEqual(payload["reasoning_effort"], "minimal")
+        self.assertNotIn("thinking", payload)
+
+    def test_role_config_can_enable_thinking(self):
+        service = LLMService()
+        service.set_agent_config("default", {"thinking": True, "reasoning_effort": "medium"})
+
+        payload = service._build_payload([{"role": "user", "content": "hi"}],
+                                         config=service._resolve_config("default"))
+
+        self.assertEqual(payload["reasoning_effort"], "medium")
+
+    def test_role_config_thinking_defaults_to_off(self):
+        service = LLMService()
+        service.set_agent_config("default", {"model": "m"})
+
+        payload = service._build_payload([{"role": "user", "content": "hi"}],
+                                         config=service._resolve_config("default"))
+
+        for key in ("reasoning_effort", "thinking", "enable_thinking"):
+            self.assertNotIn(key, payload)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,25 +3,36 @@ package com.lcu.lcumod.action;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.lcu.lcumod.LCUMod;
+import com.lcu.lcumod.client.WindowTitle;
 import com.lcu.lcumod.network.WireServer;
+import com.lcu.lcumod.state.StateCollector;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.protocol.game.ServerboundClientCommandPacket;
 import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
+import net.minecraft.util.Prediction;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.item.ItemEntity;
-import net.minecraft.world.inventory.ClickType;
+import net.minecraft.world.inventory.AbstractContainerMenu;
+import net.minecraft.world.inventory.ContainerInput;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.component.SwingAnimation;
 import net.minecraft.world.item.crafting.Ingredient;
 import net.minecraft.world.item.crafting.RecipeHolder;
 import net.minecraft.world.item.crafting.RecipeType;
+import net.minecraft.world.item.crafting.display.RecipeDisplayId;
+import net.minecraft.world.item.crafting.display.ShapedCraftingRecipeDisplay;
+import net.minecraft.world.item.crafting.display.SlotDisplayContext;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.core.Direction;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.world.level.block.BedBlock;
 import net.minecraft.world.level.block.Blocks;
 
 import java.util.ArrayList;
@@ -53,6 +64,38 @@ public class ActionExecutor {
     private static int respawnAttempts = 0;
     private static String followTargetName = null;
     private static int followRefreshTicks = 0;
+
+    /** 收到这些命令视为"新任务"，先取消 Java 侧持久跟随（否则会"嘴上说不跟、身体还在跟"）。 */
+    private static final java.util.Set<String> NEW_TASK_COMMANDS = java.util.Set.of(
+            "move_to", "follow_player", "explore", "go_to_block", "collect_blocks",
+            "craft_item", "build", "trade", "mine_block", "dig_block", "place_block", "sleep", "guard");
+
+    // go_to_block：两段式（先寻路过去，到达后再记忆/收尾）
+    private static BlockPos pendingGoTarget = null;
+    private static String pendingGoBlock = "";
+    private static boolean pendingGoRemember = false;
+    private static int pendingGoTicks = 0;
+
+    // sleep：两段式（床在 4 米外→先走过去，到达后自动点床）
+    private static boolean pendingSleep = false;
+    private static BlockPos pendingSleepBed = null;
+    private static int pendingSleepTicks = 0;
+
+    /** 饥饿反射：阈值取自参考实现（mineflayer-auto-eat 的 minHunger=15 / mindcraft 的 14）。 */
+    private static final int HUNGER_REFLEX_FOOD = 14;
+    private static final String REFLEX_EAT_REQ_ID = "reflex_eat";
+    private static int eatReflexCooldown = 0;
+
+    // 卡住看门狗（该动却不动 → 停寻路 + 诚实上报，交后端重规划）
+    private static double stuckLastX = Double.NaN;
+    private static double stuckLastZ = Double.NaN;
+    private static int stuckTicks = 0;
+    private static int stuckCooldown = 0;
+
+    // guard：在某个点附近驻守（用户"在这儿守着" → 按发言瞬间的坐标 + 水平半径）
+    private static BlockPos guardPoint = null;
+    private static int guardRadius = 32;
+    private static int guardCheckCooldown = 0;
     private static String pendingCraftItem = null;
     private static String pendingCraftReqId = null;
     private static int pendingCraftTicks = 0;
@@ -81,6 +124,8 @@ public class ActionExecutor {
     private static String activeTaskTarget = "";
     private static String activeTaskDetail = "";
     private static double activeTaskProgress = 0.0;
+    // Task statuses that end a task — transitions to these force a full state push
+    private static final Set<String> TERMINAL_TASK_STATUSES = Set.of("done", "failed", "cancelled", "idle", "error");
     private int tickCount = 0;
 
     public static void notifyInterrupted(String reason) {
@@ -99,6 +144,9 @@ public class ActionExecutor {
 
         // ── Input isolation (core control system) ──
         InputIsolation.tick(mc);
+
+        // ── Window title：谁在操控 / 在干什么 / 哪个实例 / 在哪 / 什么版本 ──
+        WindowTitle.tick(mc);
 
         // ── Pathfinder (A* navigation) ──
         Pathfinder.tick(mc);
@@ -121,11 +169,26 @@ public class ActionExecutor {
         // ── Eat controller (stateful eating / healing) ──
         tickPendingEat(mc);
 
+        // ── 找方块/睡觉的两段式收尾（走过去 → 记忆/点床/诚实失败）──
+        tickPendingBlockTasks(mc);
+
+        // ── P0 饥饿反射：饿到一定程度自己吃 ──
+        tickHungerReflex(mc);
+
+        // ── 守卫：出了半径自己走回去（用户"在这儿守着"）──
+        tickGuard(mc);
+
+        // ── 卡住看门狗：该动却不动 → 停寻路 + 诚实上报（后端据此重规划）──
+        tickStuckWatchdog(mc);
+
         // ── Movement system (packet-based) ──
         MovementSystem.tick(mc);
 
         // ── Java-side autonomous behavior (works without backend) ──
-        if (InputIsolation.isAiControlled()) {
+        // Single-writer gate: while a backend client is connected, the Python-side
+        // modes_engine owns behavior and Java autonomy must stay idle (fallback only).
+        boolean backendConnected = LCUMod.WIRE != null && LCUMod.WIRE.hasClients();
+        if (!backendConnected && InputIsolation.isAiControlled()) {
             boolean behaviorActive = JavaAutonomousBehavior.tick(mc);
             // If behavior is active and no backend command is pending, skip other actions
             if (behaviorActive && WireServer.commandQueue.isEmpty()) {
@@ -148,6 +211,21 @@ public class ActionExecutor {
 
         // ── Anti-AFK subtle activity pulses ──
         ActivitySignalController.tick(mc, runtimeBusy);
+
+        // ── High-frequency control stream ──
+        // Placed after every other input writer so that, while a stream is active,
+        // it is the last writer and therefore owns movement and look.
+        ControlStream.tick(mc);
+
+        // ── P0 combat reflex: 被敌对生物打了立刻还手 ──
+        // 刻意放在 ControlStream 之后：紧急情形下它必须是**朝向的最后写入者**，
+        // 否则控制流的视角会覆盖掉"转过去打它"，表现为"不会防御"。
+        CombatReflex.tick(mc);
+
+        // ── P0 swim reflex: 头在水下按住跳跃上浮 ──
+        // 用户实机反馈"它不会游泳，在水里面它会死"。溺水是秒级致死，同样不能让 LLM 参与。
+        // 只写 jump 键，不碰 WASD/朝向，因此不会跟寻路/控制流抢横向控制。
+        SwimReflex.tick(mc);
 
         // ── Auto-respawn ──
         if (mc.player.isDeadOrDying()) {
@@ -277,6 +355,12 @@ public class ActionExecutor {
         }
 
         try {
+            // 任何**新任务**命令都要先取消 Java 侧的持久跟随，否则会出现
+            // "嘴上说不跟了、身体还在跟着"：跟随控制器每 10 tick 就重新寻路到目标玩家，
+            // 会把新任务（如 explore/go_to_block）的控制权抢走。
+            if (NEW_TASK_COMMANDS.contains(cmd.cmd())) {
+                followTargetName = null;
+            }
             switch (cmd.cmd()) {
                 case "move_to" -> handleMoveTo(cmd);
                 case "look_at" -> handleLookAt(cmd);
@@ -294,6 +378,8 @@ public class ActionExecutor {
                 case "send_chat" -> handleSendChat(cmd);
                 case "use_item" -> { mc.gameMode.useItem(mc.player, InteractionHand.MAIN_HAND); sendResponse(cmd.id(), true, "Item used"); }
                 case "select_hotbar" -> handleSelectHotbar(cmd);
+                case "drop" -> handleDrop(cmd);
+                case "equip" -> handleEquip(cmd);
                 case "attack" -> handleAttack(cmd);
                 case "stop_digging" -> handleStopDigging(cmd);
                 case "get_state" -> handleGetState(cmd);
@@ -343,6 +429,38 @@ public class ActionExecutor {
                 case "explore" -> handleExplore(cmd);
                 case "trade" -> handleTrade(cmd);
                 case "sleep" -> handleSleep(cmd);
+                case "find_block" -> handleFindBlock(cmd);
+                case "go_to_block" -> handleGoToBlock(cmd);
+                case "remember_poi" -> handleRememberPoi(cmd);
+                case "equip_weapon" -> {
+                    String weapon = equipBestWeapon(mc);
+                    sendResponse(cmd.id(), weapon != null,
+                            weapon == null ? "No weapon in hotbar" : "Equipped " + weapon);
+                }
+                // 守卫：在某个点附近驻守（用户"在这儿守着" → 按发言瞬间的坐标 + 水平半径）
+                case "guard" -> handleGuard(cmd);
+                // 斜杠命令直通（原版 /locate structure|biome 这类"查世界"的能力）
+                case "run_command" -> handleRunCommand(cmd);
+                // HUD 描述词：状态词后面那句话，由后端大模型输出
+                case "set_hud_note" -> {
+                    JsonObject noteArgs = cmd.args();
+                    String noteText = noteArgs != null && noteArgs.has("text")
+                            ? noteArgs.get("text").getAsString() : "";
+                    double noteSeconds = noteArgs != null && noteArgs.has("seconds")
+                            ? noteArgs.get("seconds").getAsDouble() : 30.0;
+                    com.lcu.lcumod.client.HudNote.set(noteText, noteSeconds);
+                    sendResponse(cmd.id(), true, "hud note=" + com.lcu.lcumod.client.HudNote.current());
+                }
+                // 后端覆盖本能反射（用户要求：不能让本能盖过高级指令）
+                case "reflex_override" -> {
+                    JsonObject a = cmd.args();
+                    String name = a != null && a.has("name") ? a.get("name").getAsString() : ReflexGate.ALL;
+                    double seconds = a != null && a.has("seconds") ? a.get("seconds").getAsDouble() : 0.0;
+                    boolean enable = a == null || !a.has("enabled") || a.get("enabled").getAsBoolean();
+                    ReflexGate.suppress(name, enable ? seconds : 0.0);
+                    sendResponse(cmd.id(), true, (enable ? "suppress " : "restore ") + name
+                            + (enable ? " for " + seconds + "s" : ""));
+                }
                 case "eat" -> handleEat(cmd);
                 case "drop_item" -> handleDropItem(cmd);
                 case "sort_inventory" -> handleSortInventory(cmd);
@@ -397,7 +515,7 @@ public class ActionExecutor {
             p.setYRot(yaw);
             p.setXRot(pitch);
             var conn = mc.getConnection();
-            if (conn != null) conn.send(new ServerboundMovePlayerPacket.Rot(yaw, pitch, p.onGround()));
+            if (conn != null) conn.send(new ServerboundMovePlayerPacket.Rot(yaw, pitch, p.onGround(), false));
         }
         sendResponse(cmd.id(), true, "Looked");
     }
@@ -429,6 +547,8 @@ public class ActionExecutor {
                 return;
             }
             mc.player.connection.sendChat(msg);
+            // 记下我们自己发的这条，供 ChatListener 去重（不要按玩家名整类过滤用户的话）
+            com.lcu.lcumod.chat.OutboundChatLog.record(msg);
             sendResponse(cmd.id(), true, "Chat sent");
         } catch (Exception e) {
             LCUMod.LOGGER.error("[Action] sendChat error: {}", e.getMessage());
@@ -443,7 +563,7 @@ public class ActionExecutor {
         }
         int idx = cmd.args().get("index").getAsInt();
         if (idx >= 0 && idx < 9) {
-            Minecraft.getInstance().player.getInventory().selected = idx;
+            Minecraft.getInstance().player.getInventory().setSelectedSlot(idx);
             sendResponse(cmd.id(), true, "Slot " + idx);
         } else {
             sendResponse(cmd.id(), false, "Invalid slot " + idx);
@@ -461,11 +581,11 @@ public class ActionExecutor {
         Entity target = findTargetEntity(mc, 6.0);
         if (target != null) {
             mc.gameMode.attack(mc.player, target);
-            mc.player.swing(InteractionHand.MAIN_HAND);
+            mc.player.swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, true);
             sendResponse(cmd.id(), true, "Attacked " + target.getName().getString());
         } else {
             // Swing anyway
-            mc.player.swing(InteractionHand.MAIN_HAND);
+            mc.player.swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, true);
             sendResponse(cmd.id(), false, "No target found");
         }
     }
@@ -530,8 +650,8 @@ public class ActionExecutor {
         if (conn != null) {
             for (var entry : conn.getOnlinePlayers()) {
                 JsonObject p = new JsonObject();
-                p.addProperty("name", entry.getProfile().getName());
-                p.addProperty("uuid", entry.getProfile().getId().toString());
+                p.addProperty("name", entry.getProfile().name());
+                p.addProperty("uuid", entry.getProfile().id().toString());
                 players.add(p);
             }
         }
@@ -591,11 +711,11 @@ public class ActionExecutor {
 
             // Start digging — track for continuous ticks
             mc.gameMode.startDestroyBlock(pos, dir);
-            mc.player.swing(InteractionHand.MAIN_HAND);
+            mc.player.swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, true);
             diggingPos = pos;
             diggingDir = dir;
             diggingTicks = 0;
-            LCUMod.LOGGER.info("[Action] Started digging {} with tool-slot {}", pos, mc.player.getInventory().selected);
+            LCUMod.LOGGER.info("[Action] Started digging {} with tool-slot {}", pos, mc.player.getInventory().getSelectedSlot());
             sendResponse(cmd.id(), true, "Digging " + pos.toShortString());
         } else {
             sendResponse(cmd.id(), false, "No block targeted");
@@ -619,8 +739,8 @@ public class ActionExecutor {
             float score = stack.isCorrectToolForDrops(blockState) ? speed * 3.0f : speed * 0.5f;
             if (score > bestSpeed) { bestSpeed = score; bestSlot = i; }
         }
-        if (bestSlot >= 0 && bestSlot != inv.selected) {
-            inv.selected = bestSlot;
+        if (bestSlot >= 0 && bestSlot != inv.getSelectedSlot()) {
+            inv.setSelectedSlot(bestSlot);
             LCUMod.LOGGER.debug("[Action] Auto-equipped slot {} for mining", bestSlot);
         }
     }
@@ -665,7 +785,7 @@ public class ActionExecutor {
         mc.gameMode.continueDestroyBlock(diggingPos, diggingDir);
         // Periodic swing animation (every 7 ticks ≈ 0.35s, like vanilla mining)
         if (diggingTicks % 7 == 0) {
-            mc.player.swing(InteractionHand.MAIN_HAND);
+            mc.player.swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, true);
         }
     }
 
@@ -753,8 +873,8 @@ public class ActionExecutor {
             }
         }
 
-        if (bestSlot >= 0 && bestSlot != inv.selected) {
-            inv.selected = bestSlot;
+        if (bestSlot >= 0 && bestSlot != inv.getSelectedSlot()) {
+            inv.setSelectedSlot(bestSlot);
             var toolStack = inv.getItem(bestSlot);
             sendResponse(cmd.id(), true, "Equipped: " + toolStack.getDisplayName().getString());
         } else if (bestSlot >= 0) {
@@ -782,7 +902,7 @@ public class ActionExecutor {
             items.add(item);
         }
         result.add("inventory", items);
-        result.addProperty("selected", inv.selected);
+        result.addProperty("selected", inv.getSelectedSlot());
         sendResponse(cmd.id(), true, result);
     }
 
@@ -835,7 +955,7 @@ public class ActionExecutor {
             mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, blockHit);
             sendResponse(cmd.id(), true, "Right-clicked block");
         } else if (hit instanceof net.minecraft.world.phys.EntityHitResult entityHit) {
-            mc.gameMode.interact(mc.player, entityHit.getEntity(), InteractionHand.MAIN_HAND);
+            mc.gameMode.interact(mc.player, entityHit.getEntity(), new net.minecraft.world.phys.EntityHitResult(entityHit.getEntity()), InteractionHand.MAIN_HAND);
             sendResponse(cmd.id(), true, "Right-clicked entity");
         } else {
             // Use item in hand
@@ -894,8 +1014,8 @@ public class ActionExecutor {
         }
 
         // Shift-click to transfer item quickly (button=1, clickType=QUICK_MOVE)
-        mc.gameMode.handleInventoryMouseClick(menu.containerId, slot, 0,
-            net.minecraft.world.inventory.ClickType.QUICK_MOVE, mc.player);
+        mc.gameMode.handleContainerInput(menu.containerId, slot, 0,
+            net.minecraft.world.inventory.ContainerInput.QUICK_MOVE, mc.player);
         sendResponse(cmd.id(), true, "Taking from slot " + slot);
     }
 
@@ -921,8 +1041,8 @@ public class ActionExecutor {
         }
 
         // Shift-click from player inventory section into container
-        mc.gameMode.handleInventoryMouseClick(menu.containerId, slot, 0,
-            net.minecraft.world.inventory.ClickType.QUICK_MOVE, mc.player);
+        mc.gameMode.handleContainerInput(menu.containerId, slot, 0,
+            net.minecraft.world.inventory.ContainerInput.QUICK_MOVE, mc.player);
         sendResponse(cmd.id(), true, "Putting into slot " + slot);
     }
 
@@ -980,7 +1100,7 @@ public class ActionExecutor {
         int entityId = args.get("id").getAsInt();
         var entity = mc.level.getEntity(entityId);
         if (entity != null) {
-            mc.gameMode.interact(mc.player, entity, InteractionHand.MAIN_HAND);
+            mc.gameMode.interact(mc.player, entity, new net.minecraft.world.phys.EntityHitResult(entity), InteractionHand.MAIN_HAND);
             sendResponse(cmd.id(), true, "Interacted with entity " + entityId);
         } else {
             sendResponse(cmd.id(), false, "Entity " + entityId + " not found");
@@ -1113,20 +1233,574 @@ public class ActionExecutor {
             sendResponse(cmd.id(), false, "Need villager type");
             return;
         }
-        // For now, just send chat
-        var mc = Minecraft.getInstance();
-        if (mc.player != null) {
-            mc.player.connection.sendChat("Looking for " + args.get("villager_type").getAsString() + " villager to trade");
-        }
-        sendResponse(cmd.id(), true, "Looking for villager");
+        // Honest failure: no villager UI automation yet
+        sendResponse(cmd.id(), false, "trade not implemented (villager UI automation pending)");
     }
 
     private void handleSleep(WireServer.WireCommand cmd) {
         var mc = Minecraft.getInstance();
-        if (mc.player != null) {
-            mc.player.connection.sendChat("Looking for a bed to sleep");
+        if (mc.player == null || mc.level == null || mc.gameMode == null) {
+            sendResponse(cmd.id(), false, "No player");
+            return;
         }
-        sendResponse(cmd.id(), true, "Looking for bed");
+        var player = mc.player;
+        JsonObject data = new JsonObject();
+
+        if (player.isSleeping()) {
+            data.addProperty("status", "already_sleeping");
+            data.addProperty("message", "already in bed");
+            sendResponse(cmd.id(), true, data);
+            return;
+        }
+
+        // 26.3 的 ClientLevel **不再暴露 getDayTime**（常量池实证：只有 getGameTime/getSkyDarken）。
+        // 用**天空暗度**判定夜晚：它同时含天色与天气，正好等价于原版"夜晚或雷雨天可睡"。
+        int skyDarken = mc.level.getSkyDarken();
+        boolean night = skyDarken >= 4 || mc.level.isThundering();
+        data.addProperty("sky_darken", skyDarken);
+        // day_time 只是 gameTime 的近似（睡觉会重置真正的 dayTime），**不要**据此下判断
+        data.addProperty("day_time", (int) (mc.level.getGameTime() % 24000L));
+        data.addProperty("is_night", night);
+        if (!night) {
+            data.addProperty("status", "not_night");
+            data.addProperty("message", "not night yet (sky_darken=" + skyDarken + ")");
+            sendResponse(cmd.id(), false, data);
+            return;
+        }
+
+        var beds = BlockFinder.scan(mc, "*_bed", 32, 1);
+        if (beds.isEmpty()) {
+            data.addProperty("status", "no_bed");
+            data.addProperty("message", "no bed within 32m");
+            sendResponse(cmd.id(), false, data);
+            return;
+        }
+
+        BlockFinder.Hit bed = beds.get(0);
+        BlockPos bedPos = new BlockPos(bed.x(), bed.y(), bed.z());
+        data.addProperty("distance", Math.round(bed.distance() * 10.0) / 10.0);
+        data.add("bed", hitJson(bed));
+
+        if (bed.distance() > BlockFinder.REACH_DISTANCE) {
+            // 关键改动：旧实现床在 4 米外就直接失败（"bed too far, move closer"）——
+            // 于是表现成"他不会找床睡觉"。现在**自动寻路过去**，到达后由
+            // tickPendingBlockTasks 接手点床。
+            followTargetName = null;
+            Pathfinder.navigateTo(cmd.id(), bed.x(), bed.y(), bed.z());
+            pendingSleep = true;
+            pendingSleepBed = bedPos;
+            pendingSleepTicks = 0;
+            setTaskState("sleep", "running", posKey(bedPos), "walking to bed", 0.1);
+            data.addProperty("status", "walking");
+            data.addProperty("message", "walking to bed " + posKey(bedPos));
+            sendResponse(cmd.id(), true, data);
+            return;
+        }
+
+        useBed(mc, bedPos);
+        data.addProperty("status", "sleeping");
+        data.addProperty("message", "sleeping");
+        sendResponse(cmd.id(), true, data);
+    }
+
+    // ── 找方块 / 走过去 / 记忆点：用户要的"获得周围方块位置 + 寻路 + 记忆"三件套 ──
+
+    private static JsonObject hitJson(BlockFinder.Hit h) {
+        JsonObject o = new JsonObject();
+        o.addProperty("x", h.x());
+        o.addProperty("y", h.y());
+        o.addProperty("z", h.z());
+        o.addProperty("id", h.id());
+        o.addProperty("distance", Math.round(h.distance() * 10.0) / 10.0);
+        return o;
+    }
+
+    /** 只扫、只回报（不移动）：让 LLM/用户拿到"周围有什么、多远"。 */
+    private void handleFindBlock(WireServer.WireCommand cmd) {
+        var mc = Minecraft.getInstance();
+        if (mc.player == null || mc.level == null) {
+            sendResponse(cmd.id(), false, "No player");
+            return;
+        }
+        JsonObject args = cmd.args();
+        String block = args != null && args.has("block") ? args.get("block").getAsString() : "";
+        if (block.isBlank()) {
+            sendResponse(cmd.id(), false, "Need block (id or pattern like *_bed)");
+            return;
+        }
+        int radius = args.has("radius") ? args.get("radius").getAsInt() : BlockFinder.DEFAULT_RADIUS;
+        int limit = args.has("limit") ? args.get("limit").getAsInt() : BlockFinder.DEFAULT_LIMIT;
+
+        long started = System.currentTimeMillis();
+        var hits = BlockFinder.scan(mc, block, radius, limit);
+        JsonObject data = new JsonObject();
+        data.addProperty("block", block);
+        data.addProperty("radius", radius);
+        data.addProperty("count", hits.size());
+        data.addProperty("took_ms", (int) (System.currentTimeMillis() - started));
+        JsonArray arr = new JsonArray();
+        for (BlockFinder.Hit hit : hits) {
+            arr.add(hitJson(hit));
+        }
+        data.add("found", arr);
+        if (!hits.isEmpty()) {
+            data.add("nearest", hitJson(hits.get(0)));
+        }
+        if (hits.isEmpty()) {
+            data.addProperty("message", "no " + block + " within " + radius + "m");
+        }
+        sendResponse(cmd.id(), !hits.isEmpty(), data);
+    }
+
+    /** 找到最近的目标方块并**自动寻路过去**；到达后（可选）写入持久记忆。 */
+    private void handleGoToBlock(WireServer.WireCommand cmd) {
+        var mc = Minecraft.getInstance();
+        if (mc.player == null || mc.level == null) {
+            sendResponse(cmd.id(), false, "No player");
+            return;
+        }
+        JsonObject args = cmd.args();
+        String block = args != null && args.has("block") ? args.get("block").getAsString() : "";
+        if (block.isBlank()) {
+            sendResponse(cmd.id(), false, "Need block (id or pattern like *_bed)");
+            return;
+        }
+        int radius = args.has("radius") ? args.get("radius").getAsInt() : BlockFinder.DEFAULT_RADIUS;
+        boolean remember = !args.has("remember") || args.get("remember").getAsBoolean();
+
+        var hits = BlockFinder.scan(mc, block, radius, 1);
+        if (hits.isEmpty()) {
+            JsonObject data = new JsonObject();
+            data.addProperty("block", block);
+            data.addProperty("radius", radius);
+            data.addProperty("count", 0);
+            data.addProperty("message", "no " + block + " within " + radius + "m");
+            sendResponse(cmd.id(), false, data);
+            return;
+        }
+
+        BlockFinder.Hit hit = hits.get(0);
+        followTargetName = null;
+        Pathfinder.navigateTo(cmd.id(), hit.x(), hit.y(), hit.z());
+        pendingGoTarget = new BlockPos(hit.x(), hit.y(), hit.z());
+        pendingGoBlock = hit.id();
+        pendingGoRemember = remember;
+        pendingGoTicks = 0;
+        setTaskState("travel", "running", hit.id() + " " + hit.x() + "," + hit.y() + "," + hit.z(),
+                "heading to " + hit.id(), 0.1);
+
+        JsonObject data = hitJson(hit);
+        data.addProperty("going", true);
+        data.addProperty("remember", remember);
+        sendResponse(cmd.id(), true, data);
+    }
+
+    /** 主动记住一个点（当前脚下或指定坐标）。 */
+    private void handleRememberPoi(WireServer.WireCommand cmd) {
+        var mc = Minecraft.getInstance();
+        if (mc.player == null || mc.level == null) {
+            sendResponse(cmd.id(), false, "No player");
+            return;
+        }
+        JsonObject args = cmd.args();
+        String name = args != null && args.has("name") ? args.get("name").getAsString() : "";
+        String category = args != null && args.has("category") && !args.get("category").getAsString().isBlank()
+                ? args.get("category").getAsString() : "waypoint";
+        BlockPos base = mc.player.blockPosition();
+        int x = args != null && args.has("x") ? args.get("x").getAsInt() : base.getX();
+        int y = args != null && args.has("y") ? args.get("y").getAsInt() : base.getY();
+        int z = args != null && args.has("z") ? args.get("z").getAsInt() : base.getZ();
+        BlockPos pos = new BlockPos(x, y, z);
+
+        var state = mc.level.getBlockState(pos);
+        String blockId = net.minecraft.core.registries.BuiltInRegistries.BLOCK
+                .getKey(state.getBlock()).toString();
+        PoiMemory.remember(pos, blockId, category, name, tickCount);
+        StateCollector.requestRefresh();
+
+        JsonObject data = new JsonObject();
+        data.addProperty("saved", true);
+        data.addProperty("name", name);
+        data.addProperty("category", category);
+        data.addProperty("x", x);
+        data.addProperty("y", y);
+        data.addProperty("z", z);
+        data.addProperty("block_id", blockId);
+        sendResponse(cmd.id(), true, data);
+    }
+
+    /** 两段式收尾：go_to_block 到达 → 记忆/收尾；sleep 到达 → 自动点床。 */
+    private void tickPendingBlockTasks(Minecraft mc) {
+        if (mc.player == null || mc.level == null) {
+            return;
+        }
+        if (pendingGoTarget != null) {
+            pendingGoTicks++;
+            double distance = Math.sqrt(mc.player.blockPosition().distSqr(pendingGoTarget));
+            boolean arrived = distance <= 3.0;
+            boolean navigationEnded = !Pathfinder.isNavigating() && pendingGoTicks > 20;
+            if (arrived || navigationEnded) {
+                if (pendingGoRemember) {
+                    PoiMemory.remember(pendingGoTarget, pendingGoBlock, "waypoint",
+                            "found:" + pendingGoBlock, tickCount);
+                }
+                setTaskState("travel", arrived ? "done" : "failed", pendingGoBlock,
+                        (arrived ? "arrived " : "navigation ended ") + String.format("%.1f", distance) + "m away",
+                        arrived ? 1.0 : 0.0);
+                pendingGoTarget = null;
+                pendingGoBlock = "";
+                pendingGoTicks = 0;
+                StateCollector.requestRefresh();
+            } else if (pendingGoTicks > 20 * 60) {
+                setTaskState("travel", "failed", pendingGoBlock, "timeout after 60s", 0.0);
+                Pathfinder.stop();
+                pendingGoTarget = null;
+                pendingGoBlock = "";
+                pendingGoTicks = 0;
+            }
+        }
+
+        if (pendingSleep && pendingSleepBed != null) {
+            pendingSleepTicks++;
+            double distance = Math.sqrt(mc.player.blockPosition().distSqr(pendingSleepBed));
+            if (distance <= BlockFinder.REACH_DISTANCE) {
+                useBed(mc, pendingSleepBed);
+                setTaskState("sleep", "done", posKey(pendingSleepBed), "sleeping", 1.0);
+                pendingSleep = false;
+                pendingSleepBed = null;
+            } else if (!Pathfinder.isNavigating() && pendingSleepTicks > 20) {
+                setTaskState("sleep", "failed", posKey(pendingSleepBed), "cannot reach bed", 0.0);
+                pendingSleep = false;
+                pendingSleepBed = null;
+            } else if (pendingSleepTicks > 20 * 90) {
+                setTaskState("sleep", "failed", posKey(pendingSleepBed), "timeout walking to bed", 0.0);
+                Pathfinder.stop();
+                pendingSleep = false;
+                pendingSleepBed = null;
+            }
+        }
+    }
+
+    private static String posKey(BlockPos pos) {
+        return pos.getX() + "," + pos.getY() + "," + pos.getZ();
+    }
+
+    /** 盯着床并右键；是否允许睡由服务器裁决。 */
+    private void useBed(Minecraft mc, BlockPos bedPos) {
+        var player = mc.player;
+        if (player == null || mc.gameMode == null) {
+            return;
+        }
+        double dx = bedPos.getX() + 0.5 - player.getX();
+        double dy = bedPos.getY() + 0.5 - player.getEyeY();
+        double dz = bedPos.getZ() + 0.5 - player.getZ();
+        double horizontal = Math.sqrt(dx * dx + dz * dz);
+        player.setYRot((float) Math.toDegrees(Math.atan2(-dx, dz)));
+        player.setXRot((float) Math.toDegrees(-Math.atan2(dy, horizontal)));
+        var hit = new BlockHitResult(Vec3.atCenterOf(bedPos), Direction.UP, bedPos, false);
+        mc.gameMode.useItemOn(player, InteractionHand.MAIN_HAND, hit);
+        StateCollector.requestRefresh();
+    }
+
+    /** 供 HUD / 窗口标题显示"现在在干什么"。 */
+    public static String getActiveTaskKind() {
+        return activeTaskKind;
+    }
+
+    /** 正在走去睡 / 已在床（HUD 用）。 */
+    public static boolean isSleepingPending() {
+        return pendingSleep;
+    }
+
+    /**
+     * 换成热栏里"最强武器"（用户要求：被打了要会切物品栏、先用手上的东西还击）。
+     * 判定**只用物品 id 字符串**（`_sword` > `_trident/_mace` > `_axe`，材质 netherite>diamond>iron>stone>gold>wood），
+     * 因此不依赖可能变化的物品类 API；非武器（方块/食物）返回 0 不参与。
+     */
+    public static String equipBestWeapon(Minecraft mc) {
+        if (mc == null || mc.player == null) {
+            return null;
+        }
+        var inv = mc.player.getInventory();
+        int bestSlot = -1;
+        int bestScore = 0;
+        for (int i = 0; i < 9; i++) {
+            var stack = inv.getItem(i);
+            if (stack.isEmpty()) {
+                continue;
+            }
+            int score = weaponScore(stack.getItem().toString());
+            if (score > bestScore) {
+                bestScore = score;
+                bestSlot = i;
+            }
+        }
+        if (bestSlot < 0) {
+            return null;
+        }
+        inv.setSelectedSlot(bestSlot);
+        return inv.getItem(bestSlot).getItem().toString();
+    }
+
+    private static int weaponScore(String itemId) {
+        String id = itemId == null ? "" : itemId.toLowerCase();
+        int kind;
+        if (id.endsWith("_sword")) {
+            kind = 40;
+        } else if (id.endsWith("_trident") || id.endsWith("_mace")) {
+            kind = 35;
+        } else if (id.endsWith("_axe")) {
+            kind = 30;
+        } else {
+            return 0;
+        }
+        int tier;
+        if (id.contains("netherite")) {
+            tier = 6;
+        } else if (id.contains("diamond")) {
+            tier = 5;
+        } else if (id.contains("iron")) {
+            tier = 4;
+        } else if (id.contains("stone")) {
+            tier = 3;
+        } else if (id.contains("gold")) {
+            tier = 2;
+        } else {
+            tier = 1;
+        }
+        return kind + tier;
+    }
+
+    /** 绝不自吃的有害食物（参考项目黑名单：腐肉/蜘蛛眼/毒马铃薯/河豚/紫颂果）。 */
+    private static final java.util.Set<String> REFLEX_HARMFUL_FOOD = java.util.Set.of(
+            "minecraft:rotten_flesh", "minecraft:spider_eye", "minecraft:poisonous_potato",
+            "minecraft:pufferfish", "minecraft:chorus_fruit");
+
+    /** 生食：能吃但收益差，只在没有更好选择时才吃（注意用**精确 id**，别用 "chicken" 子串——会误伤熟鸡肉）。 */
+    private static final java.util.Set<String> REFLEX_RAW_FOOD = java.util.Set.of(
+            "minecraft:chicken", "minecraft:beef", "minecraft:porkchop", "minecraft:mutton",
+            "minecraft:rabbit", "minecraft:cod", "minecraft:salmon", "minecraft:tropical_fish");
+
+    /** 守卫：在给定点（默认当前脚下）的水平半径内驻守；越界自动走回。 */
+    private void handleGuard(WireServer.WireCommand cmd) {
+        var mc = Minecraft.getInstance();
+        if (mc.player == null || mc.level == null) {
+            sendResponse(cmd.id(), false, "No player");
+            return;
+        }
+        JsonObject args = cmd.args();
+        boolean enable = args == null || !args.has("enabled") || args.get("enabled").getAsBoolean();
+        if (!enable) {
+            guardPoint = null;
+            setTaskState("guard", "cancelled", "", "guard off", 0.0);
+            sendResponse(cmd.id(), true, "Guard off");
+            return;
+        }
+        BlockPos base = mc.player.blockPosition();
+        int x = args != null && args.has("x") ? args.get("x").getAsInt() : base.getX();
+        int y = args != null && args.has("y") ? args.get("y").getAsInt() : base.getY();
+        int z = args != null && args.has("z") ? args.get("z").getAsInt() : base.getZ();
+        int radius = args != null && args.has("radius")
+                ? Math.max(4, Math.min(args.get("radius").getAsInt(), 128)) : 32;
+        guardPoint = new BlockPos(x, y, z);
+        guardRadius = radius;
+        guardCheckCooldown = 0;
+        followTargetName = null;
+        var state = mc.level.getBlockState(guardPoint);
+        PoiMemory.remember(guardPoint, BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString(),
+                "guard", "guard post", tickCount);
+        setTaskState("guard", "running", posKey(guardPoint), "guarding r=" + radius + "m", 1.0);
+        StateCollector.requestRefresh();
+        sendResponse(cmd.id(), true, "Guarding " + posKey(guardPoint) + " r=" + radius);
+    }
+
+    /** 原版斜杠命令直通（`/locate structure minecraft:village` 这类"查世界"能力靠它）。 */
+    private void handleRunCommand(WireServer.WireCommand cmd) {
+        var mc = Minecraft.getInstance();
+        if (mc.player == null || mc.player.connection == null) {
+            sendResponse(cmd.id(), false, "No connection");
+            return;
+        }
+        JsonObject args = cmd.args();
+        String command = args != null && args.has("command") ? args.get("command").getAsString().strip() : "";
+        if (command.startsWith("/")) {
+            command = command.substring(1);
+        }
+        if (command.isBlank()) {
+            sendResponse(cmd.id(), false, "Need command");
+            return;
+        }
+        followTargetName = null;
+        mc.player.connection.sendCommand(command);
+        sendResponse(cmd.id(), true, "Ran /" + command);
+    }
+
+    /** 驻守 tick：出了半径就走回去（只补"回家"意图，不抢战斗反射/寻路的控制权）。 */
+    private void tickGuard(Minecraft mc) {
+        if (guardPoint == null) {
+            return;
+        }
+        double dx = mc.player.getX() - (guardPoint.getX() + 0.5);
+        double dz = mc.player.getZ() - (guardPoint.getZ() + 0.5);
+        if (Math.sqrt(dx * dx + dz * dz) <= guardRadius) {
+            guardCheckCooldown = 0;
+            return;
+        }
+        if (guardCheckCooldown-- > 0) {
+            return;
+        }
+        guardCheckCooldown = 20;
+        Pathfinder.navigateTo("guard", guardPoint.getX(), guardPoint.getY(), guardPoint.getZ());
+        setTaskState("guard", "running", posKey(guardPoint), "returning to post", 0.5);
+    }
+
+    /**
+     * 卡住看门狗（用户实机："追进水里就站住不动"、"有些情况下莫名其妙站在原地不动"）。
+     *
+     * 这是**通用**机制、不是特判：只要"当前有该走完全程的任务"，3 秒内水平位移 <0.6 格，
+     * 就停止寻路、把任务诚实标成 failed 并附上 `Pathfinder` 的失败原因，随后由后端（LLM）
+     * 重新规划——本地层不硬撑、也不假装还在推进。
+     */
+    private void tickStuckWatchdog(Minecraft mc) {
+        boolean shouldMove = Pathfinder.isNavigating() || guardPoint != null
+                || pendingGoTarget != null || pendingSleep;
+        if (!shouldMove) {
+            stuckTicks = 0;
+            stuckLastX = Double.NaN;
+            return;
+        }
+        if (stuckCooldown > 0) {
+            stuckCooldown--;
+            return;
+        }
+        if (Double.isNaN(stuckLastX)) {
+            stuckLastX = mc.player.getX();
+            stuckLastZ = mc.player.getZ();
+            stuckTicks = 0;
+            return;
+        }
+
+        double moved = Math.sqrt(Math.pow(mc.player.getX() - stuckLastX, 2)
+                + Math.pow(mc.player.getZ() - stuckLastZ, 2));
+        if (moved > 0.6) {
+            stuckTicks = 0;
+            stuckLastX = mc.player.getX();
+            stuckLastZ = mc.player.getZ();
+            return;
+        }
+
+        stuckTicks++;
+        if (stuckTicks < 60) {
+            return; // 3 秒容忍（含正常转身/挖方块的时间）
+        }
+
+        String reason = Pathfinder.getLastFailureReason();
+        Pathfinder.stop();
+        setTaskState(activeTaskKind == null || activeTaskKind.isBlank() ? "move" : activeTaskKind,
+                "failed", activeTaskTarget, "stuck: " + (reason == null || reason.isBlank() ? "no progress" : reason), 0.0);
+        StateCollector.requestRefresh();
+        LCUMod.LOGGER.warn("[Stuck] 3s 无位移，已停止寻路并上报：{}", reason);
+        stuckTicks = 0;
+        stuckLastX = Double.NaN;
+        stuckCooldown = 20 * 5;
+    }
+
+    /**
+     * P0 饥饿反射：饿到一定程度**自己找热栏里的食物吃**（用户实机反馈"它也不会吃东西"）。
+     *
+     * 阈值与选食物口径来自参考实现（scout 取证）：
+     * - `mineflayer-auto-eat`：`minHunger=15` / `minHealth=14`，按 `foodPoints` 选最佳，且带 bannedFood 黑名单；
+     * - `mindcraft`：`startAt:14`；`minecraft-agent`：吃完靠"物品数减少"确认。
+     * 本实现：食物按 `FoodProperties.nutrition()/saturation()` 择优，**有害食物永不自吃**，
+     * 生食仅作兜底；复用既有吃食物状态机（合成 req id，后端不会误判命令完成）。
+     * 后端若要用自己的节奏控制进食，可 `reflex_override {name:"eat"}` 临时关掉本反射。
+     */
+    private void tickHungerReflex(Minecraft mc) {
+        if (eatReflexCooldown > 0) {
+            eatReflexCooldown--;
+            return;
+        }
+        if (pendingEatReqId != null) {
+            return; // 后端或上一次反射正在吃，交给状态机
+        }
+        if (ReflexGate.isSuppressed("eat")) {
+            return;
+        }
+        int food = mc.player.getFoodData().getFoodLevel();
+        float health = mc.player.getHealth();
+        boolean hungry = food <= HUNGER_REFLEX_FOOD;
+        boolean hurt = health <= 14.0f && food < 20;
+        if (!hungry && !hurt) {
+            return;
+        }
+
+        int slot = bestFoodSlot(mc);
+        if (slot < 0) {
+            return;
+        }
+
+        pendingEatReqId = REFLEX_EAT_REQ_ID;
+        pendingEatTicks = 0;
+        pendingEatAttempts = 0;
+        pendingEatStartHunger = food;
+        pendingEatStartHealth = health;
+        setTaskState("eat", "running", "food", "reflex: hungry", 0.05);
+        startEatingSlot(mc, slot);
+        eatReflexCooldown = 20 * 10;
+        LCUMod.LOGGER.info("[Reflex] Auto-eat: food={} health={} slot={} item={}",
+                food, health, slot, mc.player.getInventory().getItem(slot).getItem());
+    }
+
+    /** 热栏里最该吃的那一格：先排除有害食物，按营养值优先、饱和度为次；生食只在没别的可吃时兜底。 */
+    private int bestFoodSlot(Minecraft mc) {
+        var inv = mc.player.getInventory();
+        int bestPreferred = -1;
+        int bestRaw = -1;
+        int bestPreferredNutrition = -1;
+        float bestPreferredSaturation = -1.0f;
+        int bestRawNutrition = -1;
+        float bestRawSaturation = -1.0f;
+
+        for (int i = 0; i < 9; i++) {
+            var stack = inv.getItem(i);
+            if (stack.isEmpty() || !stack.has(DataComponents.FOOD)) {
+                continue;
+            }
+            var props = stack.get(DataComponents.FOOD);
+            if (props == null) {
+                continue;
+            }
+            String id = stack.getItem().toString().toLowerCase();
+            if (REFLEX_HARMFUL_FOOD.contains(id)) {
+                continue;
+            }
+            int nutrition = props.nutrition();
+            float saturation = props.saturation();
+            if (REFLEX_RAW_FOOD.contains(id)) {
+                if (nutrition > bestRawNutrition
+                        || (nutrition == bestRawNutrition && saturation > bestRawSaturation)) {
+                    bestRawNutrition = nutrition;
+                    bestRawSaturation = saturation;
+                    bestRaw = i;
+                }
+            } else if (nutrition > bestPreferredNutrition
+                    || (nutrition == bestPreferredNutrition && saturation > bestPreferredSaturation)) {
+                bestPreferredNutrition = nutrition;
+                bestPreferredSaturation = saturation;
+                bestPreferred = i;
+            }
+        }
+        return bestPreferred >= 0 ? bestPreferred : bestRaw;
+    }
+
+    /** 吃指定热栏格的食物。 */
+    private void startEatingSlot(Minecraft mc, int slot) {
+        var inv = mc.player.getInventory();
+        if (slot < 0 || slot > 8 || inv.getItem(slot).isEmpty()) {
+            return;
+        }
+        inv.setSelectedSlot(slot);
+        mc.gameMode.useItem(mc.player, InteractionHand.MAIN_HAND);
     }
 
     private void handleEat(WireServer.WireCommand cmd) {
@@ -1171,7 +1845,7 @@ public class ActionExecutor {
         }
         String itemName = args.get("item").getAsString();
         int count = args.has("count") ? args.get("count").getAsInt() : 1;
-        
+
         // Find item in inventory and drop
         var inv = mc.player.getInventory();
         for (int i = 0; i < inv.getContainerSize(); i++) {
@@ -1179,7 +1853,8 @@ public class ActionExecutor {
             if (stack.isEmpty()) continue;
             if (stack.getItem().toString().contains(itemName)) {
                 // Drop item
-                mc.player.drop(stack.split(count), false);
+                mc.player.drop(stack.split(count), false, Prediction.PREDICTED);
+                StateCollector.requestRefresh();
                 sendResponse(cmd.id(), true, "Dropped " + itemName);
                 return;
             }
@@ -1187,9 +1862,160 @@ public class ActionExecutor {
         sendResponse(cmd.id(), false, "Item " + itemName + " not found");
     }
 
+    private void handleDrop(WireServer.WireCommand cmd) {
+        var args = cmd.args();
+        if (args == null || !args.has("slot")) {
+            sendResponse(cmd.id(), false, "Missing slot");
+            return;
+        }
+        var mc = Minecraft.getInstance();
+        if (mc.player == null) {
+            sendResponse(cmd.id(), false, "No player");
+            return;
+        }
+        int slot = args.get("slot").getAsInt();
+        int count = args.has("count") ? args.get("count").getAsInt() : 1;
+
+        var inv = mc.player.getInventory();
+        int invSlot = slot == -1 ? inv.getSelectedSlot() : slot;
+        if (invSlot < 0 || invSlot >= inv.getContainerSize()) {
+            sendResponse(cmd.id(), false, "Invalid slot " + slot);
+            return;
+        }
+        var stack = inv.getItem(invSlot);
+        if (stack.isEmpty()) {
+            sendResponse(cmd.id(), false, "Slot " + slot + " is empty");
+            return;
+        }
+        int dropCount = Math.max(1, Math.min(count, stack.getCount()));
+        var dropped = stack.split(dropCount);
+        mc.player.drop(dropped, true, Prediction.PREDICTED);
+        StateCollector.requestRefresh();
+        sendResponse(cmd.id(), true, "Dropped " + dropped.getCount() + " x " + dropped.getItem());
+    }
+
+    private void handleEquip(WireServer.WireCommand cmd) {
+        var args = cmd.args();
+        if (args == null || !args.has("slot")) {
+            sendResponse(cmd.id(), false, "Missing slot");
+            return;
+        }
+        var mc = Minecraft.getInstance();
+        if (mc.player == null) {
+            sendResponse(cmd.id(), false, "No player");
+            return;
+        }
+        String slot = args.get("slot").getAsString();
+        if ("mainhand".equals(slot)) {
+            sendResponse(cmd.id(), true, "Mainhand already selected");
+            return;
+        }
+        int idx = -1;
+        try {
+            idx = Integer.parseInt(slot);
+        } catch (NumberFormatException ignored) {
+        }
+        if (idx >= 0 && idx < 9) {
+            mc.player.getInventory().setSelectedSlot(idx);
+            sendResponse(cmd.id(), true, "Equipped hotbar slot " + idx);
+        } else {
+            sendResponse(cmd.id(), false, "Unsupported equip slot: " + slot);
+        }
+    }
+
     private void handleSortInventory(WireServer.WireCommand cmd) {
-        // For now, just send confirmation
-        sendResponse(cmd.id(), true, "Inventory sorted");
+        var mc = Minecraft.getInstance();
+        if (mc.player == null || mc.gameMode == null) {
+            sendResponse(cmd.id(), false, "No player");
+            return;
+        }
+        var player = mc.player;
+        var menu = player.inventoryMenu;
+        if (player.containerMenu != menu) {
+            sendResponse(cmd.id(), false, "Close the open container first");
+            return;
+        }
+        var inv = player.getInventory();
+
+        // Map player-inventory index (0-35) → inventory-menu slot index via container identity
+        Map<Integer, Integer> invToMenu = new HashMap<>();
+        for (int i = 0; i < menu.slots.size(); i++) {
+            var slot = menu.slots.get(i);
+            if (slot.container == inv) {
+                invToMenu.put(slot.getContainerSlot(), i);
+            }
+        }
+
+        // Group partial stacks of the same item
+        Map<Item, List<Integer>> groups = new HashMap<>();
+        for (int i = 0; i < 36; i++) {
+            var stack = inv.getItem(i);
+            if (stack.isEmpty() || stack.getCount() >= stack.getMaxStackSize()) continue;
+            groups.computeIfAbsent(stack.getItem(), k -> new ArrayList<>()).add(i);
+        }
+
+        final int clickCap = 20;
+        int clicks = 0;
+        int mergedStacks = 0;
+        boolean anyMergeable = false;
+        boolean capReached = false;
+
+        for (List<Integer> slots : groups.values()) {
+            if (slots.size() < 2) continue;
+            anyMergeable = true;
+            int anchor = 0;
+            while (anchor < slots.size() - 1 && clicks + 3 <= clickCap) {
+                int a = slots.get(anchor);
+                var aStack = inv.getItem(a);
+                if (aStack.isEmpty() || aStack.getCount() >= aStack.getMaxStackSize()) {
+                    anchor++;
+                    continue;
+                }
+                int b = -1;
+                for (int gi = anchor + 1; gi < slots.size(); gi++) {
+                    var bStack = inv.getItem(slots.get(gi));
+                    if (!bStack.isEmpty() && bStack.getItem() == aStack.getItem()
+                            && bStack.getCount() < bStack.getMaxStackSize()) {
+                        b = slots.get(gi);
+                        break;
+                    }
+                }
+                if (b < 0) {
+                    anchor++;
+                    continue;
+                }
+                Integer menuA = invToMenu.get(a);
+                Integer menuB = invToMenu.get(b);
+                if (menuA == null || menuB == null) {
+                    sendResponse(cmd.id(), false, "Inventory slot mapping failed");
+                    return;
+                }
+                // Pick up stack A, drop it onto B to merge, place any remainder back in A.
+                // handleContainerInput sends the click packet AND applies it to the client menu.
+                mc.gameMode.handleContainerInput(menu.containerId, menuA, 0, ContainerInput.PICKUP, player);
+                clicks++;
+                mc.gameMode.handleContainerInput(menu.containerId, menuB, 0, ContainerInput.PICKUP, player);
+                clicks++;
+                if (!menu.getCarried().isEmpty()) {
+                    mc.gameMode.handleContainerInput(menu.containerId, menuA, 0, ContainerInput.PICKUP, player);
+                    clicks++;
+                }
+                mergedStacks++;
+                anchor = b == slots.get(anchor) ? anchor + 1 : anchor;
+                if (clicks >= clickCap) capReached = true;
+            }
+        }
+
+        if (!anyMergeable) {
+            sendResponse(cmd.id(), false, "Nothing to sort");
+            return;
+        }
+        StateCollector.requestRefresh();
+        if (capReached) {
+            sendResponse(cmd.id(), true, "Sorted " + mergedStacks + " stacks (click cap of " + clickCap + " reached, repeat to continue)");
+        } else {
+            sendResponse(cmd.id(), true, "Sorted " + mergedStacks + " stacks");
+        }
     }
 
     private void handleBuild(WireServer.WireCommand cmd) {
@@ -1264,6 +2090,10 @@ public class ActionExecutor {
         activeTaskTarget = target == null ? "" : target;
         activeTaskDetail = detail == null ? "" : detail;
         activeTaskProgress = Math.max(0.0, Math.min(1.0, progress));
+        // Terminal transition: force the next state_update so the backend sees the task end immediately
+        if (TERMINAL_TASK_STATUSES.contains(status)) {
+            StateCollector.requestRefresh();
+        }
         sendTaskState();
     }
 
@@ -1273,6 +2103,8 @@ public class ActionExecutor {
         activeTaskTarget = "";
         activeTaskDetail = "";
         activeTaskProgress = 0.0;
+        // Terminal transition: force the next state_update so the backend sees the task end immediately
+        StateCollector.requestRefresh();
         sendTaskState();
     }
 
@@ -1397,8 +2229,13 @@ public class ActionExecutor {
             }
 
             pendingCraftAttempts++;
-            mc.gameMode.handlePlaceRecipe(mc.player.containerMenu.containerId, step.recipe, false);
-            mc.gameMode.handleInventoryMouseClick(mc.player.containerMenu.containerId, 0, 0, ClickType.QUICK_MOVE, mc.player);
+            RecipeDisplayId displayId = resolveRecipeDisplayId(step.recipe);
+            if (displayId != null) {
+                mc.gameMode.handlePlaceRecipe(mc.player.containerMenu.containerId, displayId, false);
+                mc.gameMode.handleContainerInput(mc.player.containerMenu.containerId, 0, 0, ContainerInput.QUICK_MOVE, mc.player);
+            } else {
+                LCUMod.LOGGER.debug("[Action] No recipe display id for craft step {}", step.itemId);
+            }
             String detail = "craft step " + pendingCraftAttempts + ": " + step.itemId + " x" + step.craftOperations;
             setTaskState("craft", "crafting", pendingCraftItem, detail, Math.min(0.9, 0.35 + pendingCraftAttempts * 0.12));
             if (LCUMod.WIRE != null) {
@@ -1453,7 +2290,12 @@ public class ActionExecutor {
             }
 
             pendingCraftAttempts++;
-            mc.gameMode.handlePlaceRecipe(mc.player.containerMenu.containerId, step.recipe, false);
+            RecipeDisplayId displayId = resolveRecipeDisplayId(step.recipe);
+            if (displayId != null) {
+                mc.gameMode.handlePlaceRecipe(mc.player.containerMenu.containerId, displayId, false);
+            } else {
+                LCUMod.LOGGER.debug("[Action] No recipe display id for craft step {}", step.itemId);
+            }
             String detail = step.mode + " step " + pendingCraftAttempts + ": " + step.itemId + " x" + step.craftOperations;
             setTaskState("craft", "processing", pendingCraftItem, detail, Math.min(0.9, 0.45 + pendingCraftAttempts * 0.08));
             if (LCUMod.WIRE != null) {
@@ -1557,7 +2399,7 @@ public class ActionExecutor {
             autoEquipForBlock(mc, pendingCollectTargetPos);
             mc.player.lookAt(net.minecraft.commands.arguments.EntityAnchorArgument.Anchor.EYES, Vec3.atCenterOf(pendingCollectTargetPos));
             mc.gameMode.startDestroyBlock(pendingCollectTargetPos, Direction.UP);
-            mc.player.swing(InteractionHand.MAIN_HAND);
+            mc.player.swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, true);
             diggingPos = pendingCollectTargetPos;
             diggingDir = Direction.UP;
             diggingTicks = 0;
@@ -1709,9 +2551,9 @@ public class ActionExecutor {
 
         // Shift-click each matching slot to withdraw
         for (int slot : matchingSlots) {
-            mc.gameMode.handleInventoryMouseClick(
+            mc.gameMode.handleContainerInput(
                 mc.player.containerMenu.containerId, slot, 0,
-                ClickType.QUICK_MOVE, mc.player);
+                ContainerInput.QUICK_MOVE, mc.player);
         }
 
         return matchingSlots.size();
@@ -1745,16 +2587,34 @@ public class ActionExecutor {
     }
 
     private RecipeHolder<?> findRecipeByResult(Minecraft mc, String itemName) {
-        for (RecipeHolder<?> recipe : mc.level.getRecipeManager().getRecipes()) {
+        var server = mc.getSingleplayerServer();
+        if (server == null) return null;
+        net.minecraft.util.context.ContextMap context = SlotDisplayContext.fromLevel(mc.level);
+        for (RecipeHolder<?> recipe : server.getRecipeManager().getRecipes()) {
             if (recipe.value().getType() != RecipeType.CRAFTING) continue;
-            var result = recipe.value().getResultItem(mc.level.registryAccess());
-            if (result.isEmpty()) continue;
-            String id = BuiltInRegistries.ITEM.getKey(result.getItem()).toString();
-            if (id.equals(itemName) || id.endsWith(":" + itemName)) {
-                return recipe;
+            for (var display : recipe.value().display()) {
+                var result = display.result().resolveForFirstStack(context);
+                if (result == null || result.isEmpty()) continue;
+                String id = BuiltInRegistries.ITEM.getKey(result.getItem()).toString();
+                if (id.equals(itemName) || id.endsWith(":" + itemName)) {
+                    return recipe;
+                }
             }
         }
         return null;
+    }
+
+    /**
+     * 26.3: server-side recipe placement (ServerboundPlaceRecipePacket) needs a RecipeDisplayId
+     * (the index the server's RecipeManager assigned to the recipe's display) instead of a RecipeHolder.
+     * Only resolvable against the integrated server's recipe manager.
+     */
+    private RecipeDisplayId resolveRecipeDisplayId(RecipeHolder<?> recipe) {
+        var server = Minecraft.getInstance().getSingleplayerServer();
+        if (server == null || recipe == null) return null;
+        List<RecipeDisplayId> ids = new ArrayList<>();
+        server.getRecipeManager().listDisplaysForRecipe(recipe.id(), entry -> ids.add(entry.id()));
+        return ids.isEmpty() ? null : ids.get(0);
     }
 
     private boolean isCraftingTableOpen(Minecraft mc) {
@@ -1802,7 +2662,7 @@ public class ActionExecutor {
             mc.player.getInventory().setItem(swapHotbar, target);
             slot = swapHotbar;
         }
-        mc.player.getInventory().selected = slot;
+        mc.player.getInventory().setSelectedSlot(slot);
 
         BlockPos placePos = findNearbyStationPlacement(mc);
         if (placePos == null) {
@@ -1902,7 +2762,7 @@ public class ActionExecutor {
         if (!CraftingPlanner.matchesRegistryId(outputId, expectedItemId)) {
             return false;
         }
-        mc.gameMode.handleInventoryMouseClick(mc.player.containerMenu.containerId, 2, 0, ClickType.QUICK_MOVE, mc.player);
+        mc.gameMode.handleContainerInput(mc.player.containerMenu.containerId, 2, 0, ContainerInput.QUICK_MOVE, mc.player);
         return true;
     }
 
@@ -1920,7 +2780,7 @@ public class ActionExecutor {
         }
 
         var fuelStack = mc.player.containerMenu.slots.get(1).getItem();
-        if (!fuelStack.isEmpty() && net.minecraft.world.level.block.entity.AbstractFurnaceBlockEntity.isFuel(fuelStack)) {
+        if (!fuelStack.isEmpty() && fuelStack.has(DataComponents.COOKING_FUEL)) {
             return true;
         }
 
@@ -1929,10 +2789,10 @@ public class ActionExecutor {
             return false;
         }
 
-        mc.gameMode.handleInventoryMouseClick(mc.player.containerMenu.containerId, fuelSlot, 0, ClickType.PICKUP, mc.player);
-        mc.gameMode.handleInventoryMouseClick(mc.player.containerMenu.containerId, 1, 0, ClickType.PICKUP, mc.player);
+        mc.gameMode.handleContainerInput(mc.player.containerMenu.containerId, fuelSlot, 0, ContainerInput.PICKUP, mc.player);
+        mc.gameMode.handleContainerInput(mc.player.containerMenu.containerId, 1, 0, ContainerInput.PICKUP, mc.player);
         if (!mc.player.containerMenu.getCarried().isEmpty()) {
-            mc.gameMode.handleInventoryMouseClick(mc.player.containerMenu.containerId, fuelSlot, 0, ClickType.PICKUP, mc.player);
+            mc.gameMode.handleContainerInput(mc.player.containerMenu.containerId, fuelSlot, 0, ContainerInput.PICKUP, mc.player);
         }
         return true;
     }
@@ -1943,7 +2803,7 @@ public class ActionExecutor {
         }
         for (int slot = 3; slot < mc.player.containerMenu.slots.size(); slot++) {
             var stack = mc.player.containerMenu.slots.get(slot).getItem();
-            if (!stack.isEmpty() && net.minecraft.world.level.block.entity.AbstractFurnaceBlockEntity.isFuel(stack)) {
+            if (!stack.isEmpty() && stack.has(DataComponents.COOKING_FUEL)) {
                 return slot;
             }
         }
@@ -1970,7 +2830,7 @@ public class ActionExecutor {
         double nearestDistance = Double.MAX_VALUE;
         for (Entity entity : mc.level.getEntities(mc.player, searchBox)) {
             if (!(entity instanceof ItemEntity itemEntity)) continue;
-            if (!net.minecraft.world.level.block.entity.AbstractFurnaceBlockEntity.isFuel(itemEntity.getItem())) continue;
+            if (!itemEntity.getItem().has(DataComponents.COOKING_FUEL)) continue;
             double distance = mc.player.distanceToSqr(itemEntity);
             if (distance < nearestDistance) {
                 nearest = itemEntity;
@@ -1993,7 +2853,7 @@ public class ActionExecutor {
                     var blockItem = blockState.getBlock().asItem();
                     if (blockItem == net.minecraft.world.item.Items.AIR) continue;
                     var blockStack = new net.minecraft.world.item.ItemStack(blockItem);
-                    if (!net.minecraft.world.level.block.entity.AbstractFurnaceBlockEntity.isFuel(blockStack)) continue;
+                    if (!blockStack.has(DataComponents.COOKING_FUEL)) continue;
                     double distance = origin.distSqr(pos);
                     if (distance < bestDistance) {
                         bestDistance = distance;
@@ -2209,8 +3069,8 @@ public class ActionExecutor {
                 bestSlot = i;
             }
         }
-        if (bestSlot >= 0 && bestSlot != inv.selected) {
-            inv.selected = bestSlot;
+        if (bestSlot >= 0 && bestSlot != inv.getSelectedSlot()) {
+            inv.setSelectedSlot(bestSlot);
         }
     }
 
@@ -2235,7 +3095,15 @@ public class ActionExecutor {
         }
 
         // 检查是否需要工作台
-        boolean needsTable = !recipe.value().canCraftInDimensions(2, 2);
+        boolean needsTable = true;
+        for (var display : recipe.value().display()) {
+            if (display instanceof ShapedCraftingRecipeDisplay shaped) {
+                needsTable = shaped.width() > 2 || shaped.height() > 2;
+            } else {
+                needsTable = recipe.value().placementInfo().ingredients().size() > 4;
+            }
+            break;
+        }
         if (needsTable && !isCraftingTableOpen(mc)) {
             if (!first) sb.append("；");
             sb.append("需要工作台（附近没有）");
@@ -2243,11 +3111,13 @@ public class ActionExecutor {
         }
 
         // 检查材料
-        var ingredients = recipe.value().getIngredients();
+        var ingredients = recipe.value().placementInfo().ingredients();
         for (Ingredient ingredient : ingredients) {
             if (ingredient == null || ingredient.isEmpty()) continue;
+            var options = ingredient.items().toList();
             boolean hasAny = false;
-            for (ItemStack stack : ingredient.getItems()) {
+            for (var item : options) {
+                ItemStack stack = item.value().getDefaultInstance();
                 if (stack.isEmpty()) continue;
                 String stackId = BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
                 if (countInventoryItem(mc, stackId) > 0) {
@@ -2257,7 +3127,7 @@ public class ActionExecutor {
             }
             if (!hasAny) {
                 if (!first) sb.append("；");
-                sb.append("缺材料：").append(ingredient.getItems()[0].getDisplayName().getString());
+                sb.append("缺材料：").append(options.get(0).value().getDefaultInstance().getDisplayName().getString());
                 first = false;
             }
         }
@@ -2282,7 +3152,7 @@ public class ActionExecutor {
         var inv = mc.player.getInventory();
         for (int i = 0; i < 9; i++) {
             var stack = inv.getItem(i);
-            if (!stack.isEmpty() && stack.getItem().getFoodProperties(stack, mc.player) != null) {
+            if (!stack.isEmpty() && stack.has(DataComponents.FOOD)) {
                 return true;
             }
         }
@@ -2294,8 +3164,8 @@ public class ActionExecutor {
         for (int i = 0; i < 9; i++) {
             var stack = inv.getItem(i);
             if (stack.isEmpty()) continue;
-            if (stack.getItem().getFoodProperties(stack, mc.player) != null) {
-                inv.selected = i;
+            if (stack.has(DataComponents.FOOD)) {
+                inv.setSelectedSlot(i);
                 mc.gameMode.useItem(mc.player, InteractionHand.MAIN_HAND);
                 return;
             }

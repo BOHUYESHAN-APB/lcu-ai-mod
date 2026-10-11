@@ -10,6 +10,7 @@ Features:
 - Multiple model support
 """
 
+import base64
 import json
 import logging
 import time
@@ -22,6 +23,7 @@ logger = logging.getLogger("llm_service")
 # No default provider - user must configure
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-4o-mini"
+DEFAULT_REQUEST_TIMEOUT = 120.0
 
 
 class LLMService:
@@ -36,6 +38,8 @@ class LLMService:
         self.model = DEFAULT_MODEL
         self._client = httpx.Client(timeout=120)
         self._agent_configs: dict[str, dict[str, Any]] = {}
+        # 每个角色最近一次调用失败的原因（UI 直接显示，避免"配了却不知道错在哪"）
+        self._last_error: dict[str, str] = {}
 
         # Token tracking
         self.total_prompt_tokens = 0
@@ -89,14 +93,37 @@ class LLMService:
 
     # ── Chat ──
 
-    def chat(self, messages: list[dict], agent: str | None = None, **kwargs) -> dict:
-        """Send a chat completion request. Returns parsed response."""
+    def chat(self, messages: list[dict], agent: str | None = None,
+             timeout: float | None = None, **kwargs) -> dict:
+        """Send a chat completion request. Returns parsed response.
+
+        `timeout` overrides the default request timeout for this call only. A
+        latency-sensitive role such as the decider uses it so a slow response can be
+        abandoned instead of blocking the caller.
+        """
         config = self._resolve_config(agent)
         data = self._build_payload(messages, config=config, **kwargs)
-        response = self._post("chat/completions", data, config=config)
+        response = self._post("chat/completions", data, config=config, timeout=timeout, agent=agent)
         result = self._parse_response(response)
         self._track_usage(response)
         return result
+
+    def chat_vision(self, prompt: str, image_jpeg: bytes, agent: str = "vision",
+                    timeout: float | None = None, **kwargs) -> dict:
+        """单图多模态请求：把 JPEG 以 data URI 内联进 user 消息。
+
+        走 OpenAI 兼容的 content-parts 格式，因此任何支持视觉的兼容模型都能用。
+        """
+        encoded = base64.b64encode(image_jpeg).decode("ascii")
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {
+                    "url": f"data:image/jpeg;base64,{encoded}"}},
+            ],
+        }]
+        return self.chat(messages, agent=agent, timeout=timeout, **kwargs)
 
     def chat_stream(self, messages: list[dict], agent: str | None = None, **kwargs) -> Generator[str, None, None]:
         """Stream a chat completion. Yields content chunks."""
@@ -184,31 +211,73 @@ class LLMService:
                     models.append(str(model_id))
         return models
 
+    # 零思考契约：默认**不发送任何**思考/推理字段，模型直接给最终结果。
+    # 对 decider 这类"只回一行 JSON / 只做工具调用"的角色，这比任何思考模式都合适——
+    # 通用大语言模型直接输出 JSON 或 tool call 本来就是标准做法，不需要专有模型。
+    # thinking=False（默认）：一个字段都不发。
+    # thinking=True：把下面这些键按调用方/角色配置透传给供应商。
+    #   注意 thinking 本身只是**本项目的控制开关**，永远不会作为字段发出去；
+    #   需要按某供应商的格式显式声明时，用下面这些键（各家命名不同，按需增补）。
+    THINKING_KEYS = ("reasoning_effort", "reasoning", "enable_thinking")
+
     def _build_payload(self, messages: list[dict], stream: bool = False,
                        config: dict[str, Any] | None = None, **kwargs) -> dict:
         resolved = config or self._resolve_config(None)
-        return {
+        payload = {
             "model": kwargs.get("model", resolved["model"]),
             "messages": messages,
-            "temperature": kwargs.get("temperature", 0.7),
-            "max_tokens": kwargs.get("max_tokens", 2048),
+            "temperature": kwargs.get("temperature", resolved.get("temperature", 0.7)),
+            "max_tokens": kwargs.get("max_tokens", resolved.get("max_tokens", 2048)),
             "stream": stream,
         }
+        # 角色级默认在角色配置里（thinking 缺省=False），调用方可按次覆盖；
+        # 透传时调用参数优先，其次取角色配置里的同名键。
+        if kwargs.get("thinking", resolved.get("thinking", False)):
+            passed = {key: kwargs.get(key, resolved.get(key)) for key in self.THINKING_KEYS
+                      if key in kwargs or key in resolved}
+            payload.update(passed)
+            logger.debug("[LLM] thinking 已开启，透传字段: %s", sorted(passed))
+        return payload
 
-    def _post(self, endpoint: str, data: dict, config: dict[str, Any] | None = None) -> dict:
+    def _post(self, endpoint: str, data: dict, config: dict[str, Any] | None = None,
+              timeout: float | None = None, agent: str | None = None) -> dict:
         resolved = config or self._resolve_config(None)
         url = f"{resolved['base_url']}/{endpoint}"
         headers = self._headers(resolved)
+        effective_timeout = timeout if timeout is not None else DEFAULT_REQUEST_TIMEOUT
+        role = agent or "default"
         try:
-            resp = self._client.post(url, json=data, headers=headers)
+            resp = self._client.post(url, json=data, headers=headers, timeout=effective_timeout)
             resp.raise_for_status()
+            self._last_error.pop(role, None)
             return resp.json()
         except httpx.HTTPStatusError as e:
-            logger.error("[LLM] HTTP %d: %s", e.response.status_code, e.response.text[:200])
+            message = f"HTTP {e.response.status_code}: {e.response.text[:160]}"
+            logger.error("[LLM] %s -> %s", url, message)
+            self._last_error[role] = message
             raise
         except Exception as e:
-            logger.error("[LLM] Request failed: %s", e)
+            message = f"{type(e).__name__}: {e}"
+            logger.error("[LLM] %s -> %s", url, message)
+            self._last_error[role] = message
             raise
+
+    def get_last_error(self, agent: str | None = None) -> str:
+        """该角色上一次调用失败的原因（空串=最近一次成功），供 UI 直接显示。"""
+        return self._last_error.get(agent or "default", "")
+
+    def effective_config(self, agent: str) -> dict[str, Any]:
+        """**运行中实际生效**的配置（含从 default 继承的结果）；不返回密钥明文，
+        只告诉调用方 key 是否就位。与持久化文件对照，就能看出"配了但没生效"。"""
+        resolved = self._resolve_config(agent)
+        return {
+            "base_url": resolved["base_url"],
+            "model": resolved["model"],
+            "key_present": bool(resolved.get("api_key")),
+            "thinking": bool(resolved.get("thinking", False)),
+            "temperature": resolved.get("temperature"),
+            "max_tokens": resolved.get("max_tokens"),
+        }
 
     def _headers(self, config: dict[str, Any] | None = None) -> dict:
         headers = {"Content-Type": "application/json"}
@@ -219,13 +288,24 @@ class LLMService:
 
     def _resolve_config(self, agent: str | None) -> dict[str, Any]:
         config = dict(self._agent_configs.get("default", {}))
-        if agent and agent in self._agent_configs:
-            config.update(self._agent_configs[agent])
-        return {
+        if agent:
+            role = self._agent_configs.get(agent)
+            if role:
+                # 角色未填写的字段（None / 空串）回落到 default，避免空 key 覆盖主配置。
+                config.update({k: v for k, v in role.items() if v not in (None, "")})
+        resolved = {
             "base_url": str(config.get("base_url") or self.base_url).rstrip("/"),
             "model": config.get("model") or self.model,
             "api_key": config.get("api_key", self.api_key),
+            "temperature": config.get("temperature", 0.7),
+            "max_tokens": config.get("max_tokens", 2048),
+            # 零思考是默认值；角色配置里显式打开 thinking 才会发送思考字段。
+            "thinking": bool(config.get("thinking", False)),
         }
+        for key in self.THINKING_KEYS:
+            if key in config:
+                resolved[key] = config[key]
+        return resolved
 
     @staticmethod
     def _redact_config(config: dict[str, Any]) -> dict[str, Any]:
