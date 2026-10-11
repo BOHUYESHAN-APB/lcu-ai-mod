@@ -79,6 +79,13 @@ public final class WireServerFixtureMain {
                     sawClient = true;
                     trace("CONNECTED backend client attached to " + bindAddress + ":" + port);
                 }
+                if (!connected && sawClient) {
+                    // 后端断开后就不再空等：夹具的活已经干完了 ⇒ 自己退出。
+                    // 否则测试收尾只能靠 `fixture_shutdown`（连接一旦被服务端关掉就送不到 ✗）
+                    // 或者等到 180 秒自毁，然后被 kill —— 那既慢又掩盖真问题 ✗。
+                    trace("CLIENT GONE - exiting");
+                    break;
+                }
                 if (connected && System.nanoTime() - lastStateAt >= STATE_INTERVAL_MS * 1_000_000L) {
                     server.sendEvent("state_update", stateSnapshot());
                     lastStateAt = System.nanoTime();

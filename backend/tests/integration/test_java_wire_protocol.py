@@ -122,26 +122,15 @@ class JavaWireProtocolIntegrationTests(unittest.TestCase):
     @classmethod
     def _teardown_fixture(cls):
         if cls.wire is not None:
-            if not cls.wire.connected:
-                # 连接可能已被**服务端**关掉（例如"坏 token 被拒"那个用例）⇒ 重连一次再请它退出。
-                # 否则夹具会空跑到 180 秒自毁，这里还会报"没退出" —— 那是误导，不是夹具的问题。
-                try:
-                    cls.wire.disconnect()
-                    cls.wire = cls._make_client(cls.port)
-                    for _ in range(50):
-                        if cls.wire.connect():
-                            break
-                        time.sleep(0.2)
-                except Exception:
-                    pass
-            if cls.wire is not None and cls.wire.connected:
+            if cls.wire.connected:
                 # Graceful: the fixture then leaves its loop, stops the server and exits 0.
                 try:
                     cls.wire.send_command("fixture_shutdown")
                 except Exception:
                     pass
-            if cls.wire is not None:
-                cls.wire.disconnect()
+            # 不管这一句送没送到：夹具**看到客户端断开就会自己退出**（见 WireServerFixtureMain），
+            # 所以收尾不依赖这条命令能不能发出去（连接被服务端关掉时它是送不到的 ✗）。
+            cls.wire.disconnect()
             cls.wire = None
         proc = cls.process
         cls.process = None
