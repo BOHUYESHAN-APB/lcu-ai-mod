@@ -123,6 +123,27 @@ public class WireServer {
         send(msg);
     }
 
+    /**
+     * 终局结果（completion="outcome" 的技能：mine_block / eat 等需要**诚实**的成功/失败）。
+     * 后端只在收到 outcome 时才会把这类 run 判定为成功，因此成功必须显式下发本消息。
+     *
+     * @param status  succeeded / failed / cancelled
+     * @param message 人类可读原因
+     * @param code    机器可读原因码（如 timeout / target_lost）
+     */
+    public void sendOutcome(String id, String status, String message, String code) {
+        JsonObject msg = new JsonObject();
+        msg.addProperty("type", "outcome");
+        msg.addProperty("id", id);
+        msg.addProperty("status", status);
+        msg.addProperty("message", message);
+        if (code != null && !code.isEmpty()) {
+            msg.addProperty("code", code);
+        }
+        msg.addProperty("ts", System.currentTimeMillis());
+        send(msg);
+    }
+
     private void runServer() {
         // 端口被占用时**不要一次失败就永久残废**：每 5s 重绑一次。
         // 典型场景：用户之前那个游戏窗口没退干净；关掉它以后本窗口应自动恢复，不必重启游戏。

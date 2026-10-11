@@ -210,6 +210,15 @@ tasks.named('check').configure {
     dependsOn 'verifyFinder'
     dependsOn 'verifyPhrase'
     dependsOn 'verifyGate'
+    dependsOn 'verifyHold'
+}
+
+tasks.register('verifyHold', JavaExec) {
+    group = 'verification'
+    description = '纯逻辑自检（按住语义：hold N tick 到期松开 / 条件命中即松开 / 超时带原因 / 安全释放 / eat 幂等 / reflex_eat）'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.output + sourceSets.main.output
+    mainClass = 'com.lcu.lcumod.action.HoldCheck'
 }
 
 tasks.register('verifyGate', JavaExec) {

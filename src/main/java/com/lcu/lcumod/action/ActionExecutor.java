@@ -20,6 +20,7 @@ import net.minecraft.world.inventory.AbstractContainerMenu;
 import net.minecraft.world.inventory.ContainerInput;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.component.SwingAnimation;
 import net.minecraft.world.item.crafting.Ingredient;
 import net.minecraft.world.item.crafting.RecipeHolder;
@@ -33,6 +34,7 @@ import net.minecraft.world.phys.Vec3;
 import net.minecraft.core.Direction;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.world.level.block.BedBlock;
+import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 
 import java.util.ArrayList;
@@ -100,11 +102,29 @@ public class ActionExecutor {
     private static String pendingCraftReqId = null;
     private static int pendingCraftTicks = 0;
     private static int pendingCraftAttempts = 0;
-    private static String pendingEatReqId = null;
-    private static int pendingEatTicks = 0;
-    private static int pendingEatAttempts = 0;
-    private static int pendingEatStartHunger = -1;
-    private static float pendingEatStartHealth = -1;
+    /** 进食状态机（幂等 / 饱食度-饱和度-数量三判据 / 40 tick 超时）；见 {@link EatController}。 */
+    private static final EatController EAT = new EatController();
+    private static int pendingEatSlot = -1;
+    /** 用于进度上报的主请求 id（反射合成 id 时不刷后端进度）。 */
+    private static String pendingEatPrimary = null;
+
+    // mine_block / dig：按住 attack，直到目标方块消失或超时（20s）
+    private static HoldController.Handle miningHold = null;
+    private static String miningReqId = null;
+    private static BlockPos miningPos = null;
+    private static int miningProgressTicks = 0;
+    private static final int MINE_TIMEOUT_TICKS = 20 * 20;
+
+    // place_block：看向目标面 → 单次 use（2 tick）→ 校验目标位置是否变成要放的方块
+    private static HoldController.Handle placeHold = null;
+    private static String placeReqId = null;
+    private static BlockPos placeExpectPos = null;
+    private static Block placeExpectBlock = null;
+    private static float placeYaw = 0f;
+    private static float placePitch = 0f;
+    private static int placeTicks = 0;
+    private static final int PLACE_VERIFY_TICKS = 8;
+
     private static String pendingCollectItem = null;
     private static String pendingCollectReqId = null;
     private static int pendingCollectGoalCount = 0;
@@ -260,6 +280,10 @@ public class ActionExecutor {
         // ── Continuous digging ──
         handleContinuousDigging(mc);
 
+        // ── Held-action controllers (mine / place) ──
+        tickMining(mc);
+        tickPlace(mc);
+
         // ── Drain command queue ──
         int processed = 0;
         while (processed < 5) {
@@ -360,6 +384,10 @@ public class ActionExecutor {
             // 会把新任务（如 explore/go_to_block）的控制权抢走。
             if (NEW_TASK_COMMANDS.contains(cmd.cmd())) {
                 followTargetName = null;
+                // 也立刻释放所有“按住”：新任务到来时旧的吃/挖/放必须让路，不能粘键。
+                releaseActiveHolds(HoldController.Release.NEW_TASK);
+                abortEat("new_task");
+                abortPendingPlace();
             }
             switch (cmd.cmd()) {
                 case "move_to" -> handleMoveTo(cmd);
@@ -376,7 +404,7 @@ public class ActionExecutor {
                 case "sneak" -> { mc.player.setShiftKeyDown(cmd.args() != null && cmd.args().has("sneak") ? cmd.args().get("sneak").getAsBoolean() : true); sendResponse(cmd.id(), true, "Sneak"); }
                 case "sprint" -> { mc.player.setSprinting(cmd.args() == null || !cmd.args().has("sprint") || cmd.args().get("sprint").getAsBoolean()); sendResponse(cmd.id(), true, "Sprint"); }
                 case "send_chat" -> handleSendChat(cmd);
-                case "use_item" -> { mc.gameMode.useItem(mc.player, InteractionHand.MAIN_HAND); sendResponse(cmd.id(), true, "Item used"); }
+                case "use_item" -> handleUseItem(cmd);
                 case "select_hotbar" -> handleSelectHotbar(cmd);
                 case "drop" -> handleDrop(cmd);
                 case "equip" -> handleEquip(cmd);
@@ -505,18 +533,10 @@ public class ActionExecutor {
         }
         var mc = Minecraft.getInstance();
         var p = mc.player;
-        double dx = args.get("x").getAsDouble() - p.getX();
-        double dy = (args.has("y") ? args.get("y").getAsDouble() : p.getEyeY()) - p.getEyeY();
-        double dz = args.get("z").getAsDouble() - p.getZ();
-        double dist = Math.sqrt(dx * dx + dz * dz);
-        if (dist > 0.01) {
-            float yaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
-            float pitch = (float) Math.toDegrees(-Math.asin(dy / Math.sqrt(dx*dx + dy*dy + dz*dz)));
-            p.setYRot(yaw);
-            p.setXRot(pitch);
-            var conn = mc.getConnection();
-            if (conn != null) conn.send(new ServerboundMovePlayerPacket.Rot(yaw, pitch, p.onGround(), false));
-        }
+        double x = args.get("x").getAsDouble();
+        double y = args.has("y") ? args.get("y").getAsDouble() : p.getEyeY();
+        double z = args.get("z").getAsDouble();
+        aimAt(mc, x, y, z);
         sendResponse(cmd.id(), true, "Looked");
     }
 
@@ -696,30 +716,78 @@ public class ActionExecutor {
 
     private void handleMine(WireServer.WireCommand cmd) {
         var mc = Minecraft.getInstance();
-        if (mc.player == null || mc.gameMode == null) {
+        if (mc.player == null || mc.gameMode == null || mc.level == null) {
             sendResponse(cmd.id(), false, "No player/gameMode");
             return;
         }
         var hit = mc.hitResult;
-        if (hit != null && hit.getType() == net.minecraft.world.phys.HitResult.Type.BLOCK) {
-            var blockHit = (net.minecraft.world.phys.BlockHitResult) hit;
-            BlockPos pos = blockHit.getBlockPos();
-            Direction dir = blockHit.getDirection();
-
-            // Auto-equip best tool (mineflayer-style)
-            autoEquipForBlock(mc);
-
-            // Start digging — track for continuous ticks
-            mc.gameMode.startDestroyBlock(pos, dir);
-            mc.player.swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, true);
-            diggingPos = pos;
-            diggingDir = dir;
-            diggingTicks = 0;
-            LCUMod.LOGGER.info("[Action] Started digging {} with tool-slot {}", pos, mc.player.getInventory().getSelectedSlot());
-            sendResponse(cmd.id(), true, "Digging " + pos.toShortString());
-        } else {
+        if (!(hit instanceof BlockHitResult blockHit) || mc.level.isEmptyBlock(blockHit.getBlockPos())) {
             sendResponse(cmd.id(), false, "No block targeted");
+            return;
         }
+
+        // Auto-equip best tool (mineflayer-style)
+        autoEquipForBlock(mc);
+
+        BlockPos pos = blockHit.getBlockPos();
+        Direction dir = blockHit.getDirection();
+
+        // 按住 attack，直到方块消失（成功）或不再瞄准它；20s 未破坏 → 诚实失败。
+        // 谓词每 tick 在 ControlStream 里复查：false = 目标达成（方块没了）/ 失去目标。
+        miningHold = ControlStream.holdUntil("attack", () -> {
+            Minecraft m = Minecraft.getInstance();
+            if (m.level == null) {
+                return false;
+            }
+            if (m.level.isEmptyBlock(pos)) {
+                return false; // 破坏成功
+            }
+            return m.hitResult instanceof BlockHitResult b && b.getBlockPos().equals(pos);
+        }, MINE_TIMEOUT_TICKS);
+        miningReqId = cmd.id();
+        miningPos = pos;
+        miningProgressTicks = 0;
+        setTaskState("mine", "running", pos.toShortString(), "holding attack", 0.05);
+        LCUMod.LOGGER.info("[Action] Mining {} (dir={}) with tool-slot {}", pos, dir, mc.player.getInventory().getSelectedSlot());
+        sendResponse(cmd.id(), true, "Digging " + pos.toShortString());
+    }
+
+    /** 挖掘 hold 的收尾：hold 已松开时判断成功/失败并诚实上报。 */
+    private void tickMining(Minecraft mc) {
+        if (miningHold == null) {
+            return;
+        }
+        if (miningHold.isActive()) {
+            miningProgressTicks++;
+            if (miningReqId != null && miningProgressTicks % 10 == 0 && LCUMod.WIRE != null) {
+                LCUMod.WIRE.sendProgress(miningReqId, 0.3, "mining");
+            }
+            return;
+        }
+
+        HoldController.Release reason = miningHold.releaseReason();
+        boolean broken = miningPos != null && mc.level != null && mc.level.isEmptyBlock(miningPos);
+        String id = miningReqId;
+        BlockPos done = miningPos;
+        miningHold = null;
+        miningReqId = null;
+        miningPos = null;
+        miningProgressTicks = 0;
+
+        String target = done == null ? "" : done.toShortString();
+        if (broken) {
+            setTaskState("mine", "done", target, "block broken", 1.0);
+            if (id != null && LCUMod.WIRE != null) {
+                LCUMod.WIRE.sendOutcome(id, "succeeded", "block broken", "");
+            }
+        } else {
+            String code = reason == HoldController.Release.TIMEOUT ? "timeout" : reason.code();
+            setTaskState("mine", "failed", target, "mine failed: " + code, 0.0);
+            if (id != null) {
+                sendResponse(id, false, "Mine failed: " + code);
+            }
+        }
+        sendBehaviorSnapshot();
     }
 
     /** Auto-select best tool for the targeted block (used internally by handleMine). */
@@ -750,7 +818,44 @@ public class ActionExecutor {
         sendResponse(cmd.id(), true, "Digging stopped");
     }
 
+    /**
+     * use_item：按住 use {@code ticks} tick（默认 4）再松开。
+     * 放方块/开门/吃等原版动作需要“按住”，只按一下会被原版在下一 tick 释放掉。
+     * 参数 {@code ticks} 可选，缺省 4 —— 保证与后端 {@code skills.py} 的 {@code use_item{}} 兼容。
+     */
+    private void handleUseItem(WireServer.WireCommand cmd) {
+        var mc = Minecraft.getInstance();
+        if (mc.player == null || mc.gameMode == null) {
+            sendResponse(cmd.id(), false, "No player");
+            return;
+        }
+        int ticks = 4;
+        var args = cmd.args();
+        if (args != null && args.has("ticks")) {
+            try {
+                ticks = Math.max(1, Math.min(args.get("ticks").getAsInt(), 200));
+            } catch (Exception ignored) {
+                // 非法值回落到默认 4
+            }
+        }
+        ControlStream.hold("use", ticks);
+        sendResponse(cmd.id(), true, "Using item for " + ticks + " ticks");
+    }
+
     private void stopDigging() {
+        // 取消命令级“按住 attack”的挖掘（mine_block/dig）
+        if (miningHold != null) {
+            ControlStream.releaseHold("attack");
+            String id = miningReqId;
+            miningHold = null;
+            miningReqId = null;
+            miningPos = null;
+            miningProgressTicks = 0;
+            if (id != null) {
+                sendResponse(id, false, "Digging stopped");
+            }
+        }
+        // 取消资源采集用的连续挖掘
         if (diggingPos != null) {
             var mc = Minecraft.getInstance();
             if (mc.gameMode != null) {
@@ -791,17 +896,177 @@ public class ActionExecutor {
 
     private void handlePlace(WireServer.WireCommand cmd) {
         var mc = Minecraft.getInstance();
-        if (mc.player == null || mc.gameMode == null) {
+        if (mc.player == null || mc.gameMode == null || mc.level == null) {
             sendResponse(cmd.id(), false, "No player/gameMode");
             return;
         }
-        var hit = mc.hitResult;
-        if (hit != null && hit.getType() == net.minecraft.world.phys.HitResult.Type.BLOCK) {
-            var blockHit = (net.minecraft.world.phys.BlockHitResult) hit;
-            mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, blockHit);
-            sendResponse(cmd.id(), true, "Placed");
+        var args = cmd.args();
+        BlockPos targetPos;
+        Direction dir;
+        if (args != null && args.has("x") && args.has("y") && args.has("z")) {
+            targetPos = new BlockPos(args.get("x").getAsInt(), args.get("y").getAsInt(), args.get("z").getAsInt());
+            Direction explicit = args.has("dir") ? Direction.byName(args.get("dir").getAsString()) : null;
+            dir = explicit != null ? explicit : nearestFace(mc, targetPos);
+        } else if (mc.hitResult instanceof BlockHitResult blockHit) {
+            targetPos = blockHit.getBlockPos();
+            dir = blockHit.getDirection();
         } else {
             sendResponse(cmd.id(), false, "No block targeted");
+            return;
+        }
+
+        // 手上必须是方块，否则校验的目标方块无从谈起
+        ItemStack hand = mc.player.getItemInHand(InteractionHand.MAIN_HAND);
+        if (!(hand.getItem() instanceof BlockItem blockItem)) {
+            sendResponse(cmd.id(), false, "No block in hand");
+            return;
+        }
+
+        // 先把旧的 place 收尾（幂等：重复调用不叠加）
+        abortPendingPlace();
+
+        placeExpectPos = targetPos.relative(dir);
+        placeExpectBlock = blockItem.getBlock();
+        // 先看向目标面（方块面中心），否则原版 useItemOn 会打错面 → 放空
+        Vec3 face = faceCenter(targetPos, dir);
+        aimAt(mc, face.x, face.y, face.z);
+        placeYaw = mc.player.getYRot();
+        placePitch = mc.player.getXRot();
+        // 单次 use：按住 use 2 tick 再松开
+        placeHold = ControlStream.hold("use", 2);
+        placeReqId = cmd.id();
+        placeTicks = 0;
+        setTaskState("place", "running", placeExpectPos.toShortString(), "placing block", 0.1);
+        sendResponse(cmd.id(), true, "Placing block at " + placeExpectPos.toShortString());
+    }
+
+    /** place_block 的收尾：保持朝向目标面，松手后校验目标位置是否变成要放的方块。 */
+    private void tickPlace(Minecraft mc) {
+        if (placeHold == null) {
+            return;
+        }
+        if (!InputIsolation.isAiControlled()
+                || (mc.mouseHandler != null && mc.mouseHandler.isMouseGrabbed())) {
+            abortPendingPlace();
+            return;
+        }
+        placeTicks++;
+        // use 生效前保持朝向，避免被其它视角写入者（控制流/反射）带偏
+        if (placeTicks <= 3 && mc.player != null) {
+            mc.player.setYRot(placeYaw);
+            mc.player.setXRot(placePitch);
+        }
+        if (placeTicks < PLACE_VERIFY_TICKS) {
+            return;
+        }
+
+        boolean placed = placeExpectPos != null && placeExpectBlock != null
+                && mc.level != null && mc.level.getBlockState(placeExpectPos).is(placeExpectBlock);
+        String id = placeReqId;
+        BlockPos expect = placeExpectPos;
+        placeHold = null;
+        placeReqId = null;
+        placeExpectPos = null;
+        placeExpectBlock = null;
+        placeTicks = 0;
+
+        String target = expect == null ? "" : expect.toShortString();
+        if (placed) {
+            setTaskState("place", "done", target, "block placed", 1.0);
+            StateCollector.requestRefresh();
+            if (id != null) {
+                sendResponse(id, true, "Placed at " + target);
+            }
+        } else {
+            setTaskState("place", "failed", target, "block not placed", 0.0);
+            if (id != null) {
+                sendResponse(id, false, "Block not placed at " + target);
+            }
+        }
+        sendBehaviorSnapshot();
+    }
+
+    private void abortPendingPlace() {
+        if (placeHold != null) {
+            ControlStream.releaseHold("use");
+        }
+        String id = placeReqId;
+        placeHold = null;
+        placeReqId = null;
+        placeExpectPos = null;
+        placeExpectBlock = null;
+        placeTicks = 0;
+        if (id != null) {
+            sendResponse(id, false, "Place aborted");
+        }
+    }
+
+    /** 中止进食（stop_all / 新任务 / AI 关闭）：松开 hold 并向所有 waiter 诚实回执失败。 */
+    private void abortEat(String reason) {
+        if (!EAT.isActive()) {
+            return;
+        }
+        List<String> waiters = EAT.drainWaiters();
+        EAT.reset();
+        pendingEatSlot = -1;
+        pendingEatPrimary = null;
+        setTaskState("eat", "failed", "food", reason, 0.0);
+        sendBehaviorSnapshot();
+        for (String id : waiters) {
+            if (id == null || REFLEX_EAT_REQ_ID.equals(id)) {
+                continue;
+            }
+            JsonObject data = new JsonObject();
+            data.addProperty("ok", false);
+            data.addProperty("reason", reason);
+            if (LCUMod.WIRE != null) {
+                LCUMod.WIRE.sendResponse(id, false, data, reason);
+            }
+        }
+    }
+
+    /** 目标面中心（世界坐标）。 */
+    private static Vec3 faceCenter(BlockPos pos, Direction dir) {
+        return new Vec3(
+                pos.getX() + 0.5 + dir.getStepX() * 0.5,
+                pos.getY() + 0.5 + dir.getStepY() * 0.5,
+                pos.getZ() + 0.5 + dir.getStepZ() * 0.5);
+    }
+
+    /** 离玩家眼睛最近的那个面（未显式给 dir 时用）。 */
+    private static Direction nearestFace(Minecraft mc, BlockPos pos) {
+        Vec3 center = Vec3.atCenterOf(pos);
+        Vec3 eye = mc.player.getEyePosition();
+        double dx = eye.x - center.x;
+        double dy = eye.y - center.y;
+        double dz = eye.z - center.z;
+        double ax = Math.abs(dx), ay = Math.abs(dy), az = Math.abs(dz);
+        if (ax >= ay && ax >= az) {
+            return dx > 0 ? Direction.EAST : Direction.WEST;
+        }
+        if (ay >= az) {
+            return dy > 0 ? Direction.UP : Direction.DOWN;
+        }
+        return dz > 0 ? Direction.SOUTH : Direction.NORTH;
+    }
+
+    /** 让玩家朝向某世界坐标点（并同步一次旋转包）。 */
+    private void aimAt(Minecraft mc, double x, double y, double z) {
+        var p = mc.player;
+        double dx = x - p.getX();
+        double dy = y - p.getEyeY();
+        double dz = z - p.getZ();
+        double dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (dist < 1.0E-4) {
+            return;
+        }
+        float yaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
+        float pitch = (float) Math.toDegrees(-Math.asin(dy / dist));
+        p.setYRot(yaw);
+        p.setXRot(pitch);
+        var conn = mc.getConnection();
+        if (conn != null) {
+            conn.send(new ServerboundMovePlayerPacket.Rot(yaw, pitch, p.onGround(), false));
         }
     }
 
@@ -914,9 +1179,7 @@ public class ActionExecutor {
         pendingCraftTicks = 0;
         pendingCraftAttempts = 0;
         pendingCraftGoalCount = 1;
-        pendingEatReqId = null;
-        pendingEatTicks = 0;
-        pendingEatAttempts = 0;
+        abortEat("stopped");
         pendingCollectItem = null;
         pendingCollectReqId = null;
         pendingCollectGoalCount = 0;
@@ -927,6 +1190,8 @@ public class ActionExecutor {
         Pathfinder.stop();
         MovementSystem.stop();
         releaseAllInputs();
+        releaseActiveHolds(HoldController.Release.MANUAL);
+        abortPendingPlace();
         if (mc.player != null) {
             if (mc.gameMode != null) stopDigging();
             if (mc.player.isUsingItem()) {
@@ -1125,9 +1390,7 @@ public class ActionExecutor {
         pendingCraftReqId = null;
         pendingCraftTicks = 0;
         pendingCraftAttempts = 0;
-        pendingEatReqId = null;
-        pendingEatTicks = 0;
-        pendingEatAttempts = 0;
+        abortEat("new_task");
         followTargetName = playerName;
         followRefreshTicks = 0;
         setTaskState("follow", "running", playerName, "following player", 0.1);
@@ -1720,8 +1983,8 @@ public class ActionExecutor {
             eatReflexCooldown--;
             return;
         }
-        if (pendingEatReqId != null) {
-            return; // 后端或上一次反射正在吃，交给状态机
+        if (EAT.isActive()) {
+            return; // 后端或上一次反射正在吃，交给进食状态机（幂等复用）
         }
         if (ReflexGate.isSuppressed("eat")) {
             return;
@@ -1739,16 +2002,19 @@ public class ActionExecutor {
             return;
         }
 
-        pendingEatReqId = REFLEX_EAT_REQ_ID;
-        pendingEatTicks = 0;
-        pendingEatAttempts = 0;
-        pendingEatStartHunger = food;
-        pendingEatStartHealth = health;
+        var stack = mc.player.getInventory().getItem(slot);
+        boolean started = EAT.begin(REFLEX_EAT_REQ_ID, true, slot, food,
+                mc.player.getFoodData().getSaturationLevel(), stack.getCount());
+        if (!started) {
+            return;
+        }
+        pendingEatSlot = slot;
+        pendingEatPrimary = null; // 反射不吃后端进度
+        mc.player.getInventory().setSelectedSlot(slot); // 选中，等 2 tick 生效后再按住 use
         setTaskState("eat", "running", "food", "reflex: hungry", 0.05);
-        startEatingSlot(mc, slot);
         eatReflexCooldown = 20 * 10;
         LCUMod.LOGGER.info("[Reflex] Auto-eat: food={} health={} slot={} item={}",
-                food, health, slot, mc.player.getInventory().getItem(slot).getItem());
+                food, health, slot, stack.getItem());
     }
 
     /** 热栏里最该吃的那一格：先排除有害食物，按营养值优先、饱和度为次；生食只在没别的可吃时兜底。 */
@@ -1793,16 +2059,11 @@ public class ActionExecutor {
         return bestPreferred >= 0 ? bestPreferred : bestRaw;
     }
 
-    /** 吃指定热栏格的食物。 */
-    private void startEatingSlot(Minecraft mc, int slot) {
-        var inv = mc.player.getInventory();
-        if (slot < 0 || slot > 8 || inv.getItem(slot).isEmpty()) {
-            return;
-        }
-        inv.setSelectedSlot(slot);
-        mc.gameMode.useItem(mc.player, InteractionHand.MAIN_HAND);
-    }
-
+    /**
+     * eat：找热栏食物 → 选中该槽（等选中生效）→ 按住 use 直到食物生效 → 松开。
+     * 判定：饱食度 ↑ 或 饱和度 ↑ 或该槽数量 −。40 tick 未生效 → 松开并回
+     * {@code {ok:false, reason:"timeout"}}。重复调用幂等（正在吃就复用，不重复切槽/不重复按）。
+     */
     private void handleEat(WireServer.WireCommand cmd) {
         var mc = Minecraft.getInstance();
         if (mc.player == null || mc.gameMode == null) {
@@ -1810,21 +2071,36 @@ public class ActionExecutor {
             return;
         }
 
-        if (!hasFoodInHotbar(mc)) {
+        // 幂等：正在吃就复用同一状态机，只登记 waiter，不重复切槽/按 use
+        if (EAT.isActive()) {
+            EAT.addWaiter(cmd.id());
+            sendResponse(cmd.id(), true, "Already eating");
+            return;
+        }
+
+        int slot = bestFoodSlot(mc);
+        if (slot < 0) {
             sendResponse(cmd.id(), false, "No food in hotbar");
             return;
         }
 
         followTargetName = null;
-
-        pendingEatReqId = cmd.id();
-        pendingEatTicks = 0;
-        pendingEatAttempts = 0;
-        pendingEatStartHunger = mc.player.getFoodData().getFoodLevel();
-        pendingEatStartHealth = mc.player.getHealth();
         clearPendingCollectTask();
+
+        var stack = mc.player.getInventory().getItem(slot);
+        boolean started = EAT.begin(cmd.id(), false, slot,
+                mc.player.getFoodData().getFoodLevel(),
+                mc.player.getFoodData().getSaturationLevel(),
+                stack.getCount());
+        if (!started) {
+            EAT.addWaiter(cmd.id());
+            sendResponse(cmd.id(), true, "Already eating");
+            return;
+        }
+        pendingEatSlot = slot;
+        pendingEatPrimary = cmd.id();
+        mc.player.getInventory().setSelectedSlot(slot); // 选中该槽，等 2 tick 生效后再按住 use
         setTaskState("eat", "running", "food", "consuming food", 0.05);
-        startEating(mc);
         sendBehaviorSnapshot();
         if (LCUMod.WIRE != null) {
             LCUMod.WIRE.sendProgress(cmd.id(), 0.05, "eat queued");
@@ -2065,7 +2341,7 @@ public class ActionExecutor {
         data.addProperty("behaviors_enabled", LCUMod.BEHAVIORS == null || LCUMod.BEHAVIORS.isEnabled());
         data.addProperty("follow_target", followTargetName == null ? "" : followTargetName);
         data.addProperty("pending_craft_item", pendingCraftItem == null ? "" : pendingCraftItem);
-        data.addProperty("pending_eat", pendingEatReqId != null);
+        data.addProperty("pending_eat", EAT.isActive());
         data.addProperty("pending_collect_item", pendingCollectItem == null ? "" : pendingCollectItem);
         data.addProperty("navigating", Pathfinder.isNavigating());
         LCUMod.WIRE.sendEvent("behavior_state", data);
@@ -2880,47 +3156,67 @@ public class ActionExecutor {
     }
 
     private void tickPendingEat(Minecraft mc) {
-        if (pendingEatReqId == null || mc.player == null || mc.gameMode == null) {
+        if (!EAT.isActive() || mc.player == null || mc.gameMode == null) {
+            return;
+        }
+        // 玩家接管 / AI 关闭：立即中止进食（不能在没有输入控制权时假装还在吃）
+        if (!InputIsolation.isAiControlled()
+                || (mc.mouseHandler != null && mc.mouseHandler.isMouseGrabbed())) {
+            abortEat("takeover");
             return;
         }
 
-        pendingEatTicks++;
-        if (mc.player.isUsingItem()) {
-            if (LCUMod.WIRE != null && pendingEatTicks % 10 == 0) {
-                LCUMod.WIRE.sendProgress(pendingEatReqId, 0.4, "eating in progress");
+        var inv = mc.player.getInventory();
+        int slot = EAT.slot();
+        int count = (slot >= 0 && slot < 9) ? inv.getItem(slot).getCount() : 0;
+        EatController.Outcome outcome = EAT.tick(
+                mc.player.getFoodData().getFoodLevel(),
+                mc.player.getFoodData().getSaturationLevel(),
+                count);
+
+        if (outcome != EatController.Outcome.NONE) {
+            finishEat(outcome);
+            return;
+        }
+
+        // 等选中生效后再按住 use；谓词 = “还在吃”，吃完/超时即 release
+        if (EAT.shouldStartUse()) {
+            EAT.markUseStarted();
+            ControlStream.holdUntil("use", EAT::isActive, EatController.MAX_TICKS + 5);
+        }
+        if (pendingEatPrimary != null && EAT.ticks() % 10 == 0 && LCUMod.WIRE != null) {
+            LCUMod.WIRE.sendProgress(pendingEatPrimary, 0.4, "eating in progress");
+        }
+    }
+
+    /** 进食结束：松开 hold，按可验证结果诚实回执（成功 = outcome succeeded；超时 = ok:false/reason:timeout）。 */
+    private void finishEat(EatController.Outcome outcome) {
+        List<String> waiters = EAT.drainWaiters();
+        EAT.reset();
+        pendingEatSlot = -1;
+        pendingEatPrimary = null;
+
+        boolean success = outcome == EatController.Outcome.SUCCESS;
+        setTaskState("eat", success ? "done" : "failed", "food",
+                success ? "ate food" : "timeout", success ? 1.0 : 0.0);
+        sendBehaviorSnapshot();
+
+        for (String id : waiters) {
+            if (id == null || REFLEX_EAT_REQ_ID.equals(id)) {
+                continue; // 反射合成 id：后端没有对应请求，不回执
             }
-            return;
-        }
-
-        int hunger = mc.player.getFoodData().getFoodLevel();
-        float health = mc.player.getHealth();
-        if ((hunger > pendingEatStartHunger || health > pendingEatStartHealth) && pendingEatTicks > 5) {
-            if (LCUMod.WIRE != null) {
-                LCUMod.WIRE.sendProgress(pendingEatReqId, 1.0, "eat complete");
+            if (success) {
+                if (LCUMod.WIRE != null) {
+                    LCUMod.WIRE.sendOutcome(id, "succeeded", "ate food", "");
+                }
+            } else {
+                JsonObject data = new JsonObject();
+                data.addProperty("ok", false);
+                data.addProperty("reason", "timeout");
+                if (LCUMod.WIRE != null) {
+                    LCUMod.WIRE.sendResponse(id, false, data, "timeout");
+                }
             }
-            pendingEatReqId = null;
-            pendingEatTicks = 0;
-            pendingEatAttempts = 0;
-            clearTaskState();
-            sendBehaviorSnapshot();
-            return;
-        }
-
-        if (pendingEatTicks % 8 == 0 && pendingEatAttempts < 3) {
-            pendingEatAttempts++;
-            startEating(mc);
-            return;
-        }
-
-        if (pendingEatAttempts >= 3 && pendingEatTicks > 30) {
-            if (LCUMod.WIRE != null) {
-                LCUMod.WIRE.sendProgress(pendingEatReqId, 0.0, "eat failed or cannot start use animation");
-            }
-            pendingEatReqId = null;
-            pendingEatTicks = 0;
-            pendingEatAttempts = 0;
-            clearTaskState();
-            sendBehaviorSnapshot();
         }
     }
 
@@ -3077,7 +3373,7 @@ public class ActionExecutor {
     private String resolveRootTaskKind() {
         if (pendingCraftReqId != null) return "craft";
         if (pendingCollectReqId != null) return "collect";
-        if (pendingEatReqId != null) return "eat";
+        if (EAT.isActive()) return "eat";
         if (followTargetName != null) return "follow";
         if (Pathfinder.isNavigating()) return "move";
         return "idle";
@@ -3148,28 +3444,14 @@ public class ActionExecutor {
         return Math.min(0.95, gained / (double) required);
     }
 
-    private boolean hasFoodInHotbar(Minecraft mc) {
-        var inv = mc.player.getInventory();
-        for (int i = 0; i < 9; i++) {
-            var stack = inv.getItem(i);
-            if (!stack.isEmpty() && stack.has(DataComponents.FOOD)) {
-                return true;
-            }
-        }
-        return false;
+    /** 本地饥饿反射是否正在进食（用于 state 里的 reflex_eat）。 */
+    public static boolean isReflexEating() {
+        return EAT.isReflex();
     }
 
-    private void startEating(Minecraft mc) {
-        var inv = mc.player.getInventory();
-        for (int i = 0; i < 9; i++) {
-            var stack = inv.getItem(i);
-            if (stack.isEmpty()) continue;
-            if (stack.has(DataComponents.FOOD)) {
-                inv.setSelectedSlot(i);
-                mc.gameMode.useItem(mc.player, InteractionHand.MAIN_HAND);
-                return;
-            }
-        }
+    /** 立即释放所有“按住”（新任务 / stop_all / 玩家接管等），并停止关联的挖掘/使用收尾。 */
+    private static void releaseActiveHolds(HoldController.Release reason) {
+        ControlStream.releaseHolds(reason);
     }
 
     // ── Break Tasks ──

@@ -227,6 +227,7 @@ public class StateCollector {
         // 本能反射正在干什么：后端据此**不要重复**同一件事（后端与本地反射同时出手 = 动作抖动/循环）
         state.addProperty("reflex_combat", com.lcu.lcumod.action.CombatReflex.isEngaged());
         state.addProperty("reflex_swim", com.lcu.lcumod.action.SwimReflex.isActive());
+        state.addProperty("reflex_eat", com.lcu.lcumod.action.ActionExecutor.isReflexEating());
 
         // Player
         JsonObject player = new JsonObject();

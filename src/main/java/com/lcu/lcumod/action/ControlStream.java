@@ -5,7 +5,10 @@ import com.lcu.lcumod.LCUMod;
 import net.minecraft.client.Minecraft;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.item.component.SwingAnimation;
+import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.EntityHitResult;
+
+import java.util.function.BooleanSupplier;
 
 /**
  * 高频控制流（fire-and-forget）。
@@ -39,6 +42,12 @@ public final class ControlStream {
      */
     private static final EdgeTrigger attackTrigger = new EdgeTrigger(4);
     private static final EdgeTrigger useTrigger = new EdgeTrigger(4);
+
+    /**
+     * 一等公民的“按住”语义（吃食物 / 挖掘 / 放方块等需要**持续按住**的动作）。
+     * 与上面的边沿触发互补：边沿负责“点一下”，hold 负责“按住 N tick 到期自动松开”。
+     */
+    private static final HoldController holds = new HoldController();
 
     /** 待消费的视角增量（度），高频消息快于 tick 时累加，避免丢位移。 */
     private static volatile float lookDx, lookDy;
@@ -86,33 +95,167 @@ public final class ControlStream {
         active = false;
     }
 
+    // ── 一等公民的“按住”语义 ──────────────────────────────────────
+
+    /**
+     * 从当前 tick 起按住 {@code control} {@code ticks} tick，到期**自动松开**（宁早松不粘键）。
+     * 支持的控制：{@code forward/back/left/right/jump/sneak/sprint/attack/use}。
+     * 调用方可保存返回的 {@link HoldController.Handle} 观察何时/为何松开。
+     */
+    public static HoldController.Handle hold(String control, int ticks) {
+        return holds.hold(control, ticks);
+    }
+
+    /**
+     * 按住 {@code control} 直到 {@code stillWanted} 返回 false 或超过 {@code maxTicks}。
+     * 松开原因在返回的 handle 上可验证（CONDITION_MET / TIMEOUT / 安全释放…）。
+     */
+    public static HoldController.Handle holdUntil(String control, BooleanSupplier stillWanted, int maxTicks) {
+        return holds.holdUntil(control, stillWanted, maxTicks);
+    }
+
+    /** 立即释放某个控制上的 hold（若存在），并松开对应输入。 */
+    public static HoldController.Handle releaseHold(String control) {
+        HoldController.Handle h = holds.release(control, HoldController.Release.MANUAL);
+        if (h != null) {
+            Minecraft mc = Minecraft.getInstance();
+            if (mc != null && mc.player != null) {
+                releaseHoldInput(mc, h.control());
+            }
+        }
+        return h;
+    }
+
+    /** 立即释放全部 hold（stop_all / 断线 / 新任务 / 收尾），并松开对应输入。 */
+    public static void releaseHolds(HoldController.Release reason) {
+        java.util.List<HoldController.Handle> released = holds.releaseAll(reason);
+        if (released.isEmpty()) {
+            return;
+        }
+        Minecraft mc = Minecraft.getInstance();
+        if (mc != null && mc.player != null) {
+            for (HoldController.Handle h : released) {
+                releaseHoldInput(mc, h.control());
+            }
+        }
+    }
+
+    public static boolean isHolding(String control) {
+        return holds.isHeld(control);
+    }
+
     /** 每个客户端 tick 调用，置于其它输入写入者之后，使其成为活跃时的最后写入者。 */
     public static void tick(Minecraft mc) {
+        if (mc == null || mc.player == null) {
+            return;
+        }
+
+        // ── hold 的统一安全闸门：AI 关闭 / 玩家接管 / 反射接管 → 当 tick 立即释放 ──
+        boolean aiActive = InputIsolation.isAiControlled();
+        boolean playerTakeover = mc.mouseHandler != null && mc.mouseHandler.isMouseGrabbed();
+        boolean reflexOverride = ReflexGate.isSuppressed(ReflexGate.ALL);
+        HoldController.TickResult holdTick = holds.tick(aiActive, playerTakeover, reflexOverride);
+        for (HoldController.Handle h : holdTick.released()) {
+            releaseHoldInput(mc, h.control());
+        }
+
         if (releasePending) {
             releasePending = false;
             targetYaw = null;
             clearIntent();
             InputIsolation.clearAiControls();
-            return;
-        }
-        if (!active || mc == null || mc.player == null) {
-            return;
-        }
-        if (System.currentTimeMillis() - lastUpdateMs > STALE_TIMEOUT_MS) {
-            requestRelease();
+            for (HoldController.Handle h : holds.releaseAll(HoldController.Release.MANUAL)) {
+                releaseHoldInput(mc, h.control());
+            }
             return;
         }
 
-        InputIsolation.setAiControlState("forward", forward);
-        InputIsolation.setAiControlState("back", back);
-        InputIsolation.setAiControlState("left", left);
-        InputIsolation.setAiControlState("right", right);
-        InputIsolation.setAiControlState("jump", jump);
-        InputIsolation.setAiControlState("sneak", sneak);
-        InputIsolation.setAiControlState("sprint", sprint);
+        if (!aiActive) {
+            // AI 不控制时绝不写任何输入
+            return;
+        }
 
-        applyLook(mc);
+        if (active && System.currentTimeMillis() - lastUpdateMs > STALE_TIMEOUT_MS) {
+            // 控制流自身超时：只松控制流自己的键，**不动**命令级 hold（吃/挖/放由命令驱动）
+            active = false;
+            targetYaw = null;
+            clearIntent();
+            InputIsolation.clearAiControls();
+        }
+
+        if (active) {
+            InputIsolation.setAiControlState("forward", forward);
+            InputIsolation.setAiControlState("back", back);
+            InputIsolation.setAiControlState("left", left);
+            InputIsolation.setAiControlState("right", right);
+            InputIsolation.setAiControlState("jump", jump);
+            InputIsolation.setAiControlState("sneak", sneak);
+            InputIsolation.setAiControlState("sprint", sprint);
+
+            applyLook(mc);
+        }
+
+        // 命令级 hold（吃/挖/放/use_item）：每 tick 写入，到期或条件命中已在上面的 tick 里松开
+        for (String control : holdTick.applied()) {
+            applyHoldInput(mc, control);
+        }
+
         applyCombatActions(mc);
+    }
+
+    /** 把一个 hold 控制写进实际的输入（按键 / 挖掘）。 */
+    private static void applyHoldInput(Minecraft mc, String control) {
+        switch (control) {
+            case "forward", "back", "left", "right", "jump", "sneak", "sprint" ->
+                    InputIsolation.setAiControlState(control, true);
+            case "use" -> {
+                if (mc.options != null) {
+                    mc.options.keyUse.setDown(true);
+                }
+            }
+            case "attack" -> {
+                if (mc.options != null) {
+                    mc.options.keyAttack.setDown(true);
+                }
+                // 直接驱动挖掘：原版 continueAttack 需要 isMouseGrabbed，本模组刻意不抓鼠标，
+                // 所以这里自己按 hitResult 每 tick 继续破坏（continueDestroyBlock 会自动 startDestroyBlock）。
+                if (mc.gameMode != null && mc.level != null) {
+                    if (mc.hitResult instanceof BlockHitResult bh
+                            && !mc.level.getBlockState(bh.getBlockPos()).isAir()) {
+                        mc.gameMode.continueDestroyBlock(bh.getBlockPos(), bh.getDirection());
+                    } else if (mc.hitResult instanceof EntityHitResult eh) {
+                        mc.gameMode.attack(mc.player, eh.getEntity());
+                        mc.player.swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, true);
+                    }
+                }
+            }
+            default -> { /* 未知控制：忽略 */ }
+        }
+    }
+
+    /** 一个 hold 结束时的收尾：松开对应按键并停止挖掘 / 取消使用。 */
+    private static void releaseHoldInput(Minecraft mc, String control) {
+        switch (control) {
+            case "forward", "back", "left", "right", "jump", "sneak", "sprint" ->
+                    InputIsolation.setAiControlState(control, false);
+            case "use" -> {
+                if (mc.options != null) {
+                    mc.options.keyUse.setDown(false);
+                }
+                if (mc.gameMode != null && mc.player != null && mc.player.isUsingItem()) {
+                    mc.gameMode.releaseUsingItem(mc.player);
+                }
+            }
+            case "attack" -> {
+                if (mc.options != null) {
+                    mc.options.keyAttack.setDown(false);
+                }
+                if (mc.gameMode != null) {
+                    mc.gameMode.stopDestroyBlock();
+                }
+            }
+            default -> { /* ignore */ }
+        }
     }
 
     /** 视角：以自己维护的目标为基准叠加增量；绝对视角优先。 */
@@ -186,6 +329,9 @@ public final class ControlStream {
         o.addProperty("use", useTrigger.isHeld());
         o.addProperty("pending_attacks", attackTrigger.pending());
         o.addProperty("pending_uses", useTrigger.pending());
+        o.addProperty("holding_attack", holds.isHeld("attack"));
+        o.addProperty("holding_use", holds.isHeld("use"));
+        o.addProperty("holds", holds.activeCount());
         return o;
     }
 
