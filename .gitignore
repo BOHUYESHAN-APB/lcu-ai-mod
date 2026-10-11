@@ -58,3 +58,9 @@ docs/dev/
 
 # Shallow-cloned upstream references used for local architecture research
 references/
+
+# Local runtime junk (JVM crash dumps, game/client logs, flight recordings)
+hs_err_pid*.log
+replay_pid*.log
+crash-reports/
+logs/
