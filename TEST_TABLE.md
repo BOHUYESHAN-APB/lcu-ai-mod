@@ -154,7 +154,7 @@
 
 ## 注意事项
 
-1. **默认玩家控制** — 进入安全位置并启动后端后，按 `F12` 才会把身体控制权交给 AI；不会因玩家空闲自动回切
+1. **控制权语义（已按代码实测更正）** — 默认就是 **AI 持控制权**（进世界即如此，鼠标**不会被抓走**、你可以自由用桌面 ✓）；按 `F12` 切到**玩家控制**（此时才会抓鼠标让你转视角 ✓）；**不会自动切回 AI** ✗（`InputIsolation.autoReturnEnabled=false` ✓）。这条由 `InputIsolation` 的类说明与 `toggleControl()` 实现实证 ✓；旧版本这里写成"按 F12 才把控制权交给 AI"是**反的** ✗
 2. **挖掘需要生存模式** — 创造模式不会破坏方块
 3. **物品收集需要** 在热栏有正确工具
 4. **自动进食** 需要食物在热栏（按住 use ≈1.6s / 32 tick；40 tick 未生效判超时）
@@ -170,4 +170,4 @@
 14. **配方检索自检** — `gradlew verifyRecipe` → **106 checks passed**（id 精确 → 中英文名 → tag；歧义回候选不猜；工作站全覆盖；酿造如实 `unsupported_station`）；已接入 `check`
 15. **落地水自检** — `gradlew verifyMlg` → **91 checks passed**（伤害 = 原版 `floor((落距 − SAFE_FALL_DISTANCE) × 倍率)` / 羽落 3 EPF、保护 1 EPF/件、总上限 20、抗性先算 / 读不到减免时按**裸伤害**判的保守分支 / 13 类安全缓冲直接让路 / 不致命绝不放水）；已接入 `check`
 
-> 零依赖自检共 **13 套 753 项**（`verifyLogic 21`、`verifyTitle 11`、`verifyChat 59`、`verifyFinder 18`、`verifyPhrase 16`、`verifyGate 12`、`verifyHold 43`、`verifyContainer 98`、`verifyRoute 132`、`verifyRecipe 106`、`verifyGuard 109`、`verifyProto 37`、`verifyMlg 91`）。跑单个任务**必须加 `--rerun` 且逐个跑**（一次跑多个会被判 UP-TO-DATE 静默跳过 ✗）。
+> 零依赖自检共 **15 套 779 项**（`verifyLogic 21`、`verifyTitle 11`、`verifyChat 59`、`verifyFinder 18`、`verifyPhrase 16`、`verifyGate 12`、`verifyHold 43`、`verifyContainer 98`、`verifyRoute 132`、`verifyRecipe 106`、`verifyGuard 109`、`verifyProto 37`、`verifyMlg 91`、`verifyMixin 13`、`verifyLang 13`）。跑单个任务**必须加 `--rerun` 且逐个跑**（一次跑多个会被判 UP-TO-DATE 静默跳过 ✗）。
