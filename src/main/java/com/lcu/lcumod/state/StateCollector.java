@@ -93,6 +93,17 @@ public class StateCollector {
         LCUMod.WIRE.sendEvent("state_update", state);
     }
 
+    /** 单个装备槽摘要：{@code name}=物品 id（注册名）、{@code count}、{@code display}；空槽 → 空对象 {@code {}}。 */
+    private static JsonObject slotItem(ItemStack stack) {
+        JsonObject o = new JsonObject();
+        if (stack != null && !stack.isEmpty()) {
+            o.addProperty("name", stack.getItem().toString());
+            o.addProperty("count", stack.getCount());
+            o.addProperty("display", stack.getDisplayName().getString());
+        }
+        return o;
+    }
+
     /** 存档/服务器标识：单人用存档名，多人用服务器条目名；无法确定时返回空串。 */
     private static String resolveWorldName(Minecraft mc) {
         try {
@@ -270,6 +281,18 @@ public class StateCollector {
         } else {
             player.addProperty("gamemode", "unknown");
         }
+        // 已穿装备：头/胸/腿/脚 + 主手/副手，是**带名字的槽位**（只加字段，不动上面既有字段语义）。
+        // 需要它的原因：MLG 预判"会不会摔死"要先知道羽落（脚）与保护（四件）——物品 id 即注册名。
+        // 注：inventory 是按容器槽位平铺的原始清单（装备槽也在其中，索引在物品栏之后），
+        // 但那里看不出"哪一格是哪个部位"，所以这里再给一份按部位命名的。
+        JsonObject equipment = new JsonObject();
+        equipment.add("head", slotItem(p.getItemBySlot(EquipmentSlot.HEAD)));
+        equipment.add("chest", slotItem(p.getItemBySlot(EquipmentSlot.CHEST)));
+        equipment.add("legs", slotItem(p.getItemBySlot(EquipmentSlot.LEGS)));
+        equipment.add("feet", slotItem(p.getItemBySlot(EquipmentSlot.FEET)));
+        equipment.add("main_hand", slotItem(p.getItemBySlot(EquipmentSlot.MAINHAND)));
+        equipment.add("off_hand", slotItem(p.getItemBySlot(EquipmentSlot.OFFHAND)));
+        player.add("equipment", equipment);
         state.add("player", player);
 
         // World

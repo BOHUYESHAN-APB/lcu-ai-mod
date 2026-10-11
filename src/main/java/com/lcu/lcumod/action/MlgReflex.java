@@ -4,9 +4,16 @@ import com.google.gson.JsonObject;
 import com.lcu.lcumod.LCUMod;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.world.effect.MobEffectInstance;
+import net.minecraft.world.effect.MobEffects;
+import net.minecraft.world.entity.EquipmentSlot;
+import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
+import net.minecraft.world.item.enchantment.Enchantment;
+import net.minecraft.world.item.enchantment.Enchantments;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.Vec3;
@@ -32,7 +39,9 @@ import java.util.Locale;
  * 已有安全缓冲（水 / 垫子 / 梯子 / 蛛网 / 区块未加载）→ 立即 {@code abort}。
  *
  * <h2>保守优先（不抢未来的活）</h2>
- * 只在 {@link FallPlan} 判定"预计落地伤害 ≥ 生命值"（真会摔死）时才动；离地还远时不动手，
+ * 只在 {@link FallPlan} 判定"**减免后**的预计落地伤害 ≥ 生命值"（真会摔死）时才动；减免来自
+ * {@link FallPlan.Mitigation}（羽落/保护附魔 + 抗性 + 缓降 + 安全落距属性，见 {@link #readMitigation}），
+ * 读不到物品/附魔信息时按裸伤害判（假阳性无害，假阴性会死人）。离地还远时不动手，
  * 等进入反应窗口再判。没水桶 / 来不及 → **如实上报** {@code unavailable}/{@code too_late}，绝不编造动作。
  *
  * <p>调用时机：{@code ActionExecutor.onTick} 中放在其它反射之后，保证放水时它是视角的最后写入者。
@@ -72,6 +81,11 @@ public final class MlgReflex {
     /** 向下扫描地面的最大深度（格）。 */
     private static final int GROUND_SCAN_DEPTH = 96;
 
+    /** 四个盔甲位（头/胸/腿/脚）：羽落只看脚，保护四件合计。 */
+    private static final EquipmentSlot[] ARMOR_SLOTS = {
+            EquipmentSlot.HEAD, EquipmentSlot.CHEST, EquipmentSlot.LEGS, EquipmentSlot.FEET
+    };
+
     private static volatile boolean enabled = true;
 
     private static Phase phase = Phase.IDLE;
@@ -90,6 +104,8 @@ public final class MlgReflex {
     private static float savedYaw = 0f;
     private static float savedPitch = 0f;
     private static boolean lookSaved = false;
+    /** 最近一次读到的摔落减免（state 上报用；null = 还没读过）。 */
+    private static FallPlan.Mitigation lastMitigation = null;
 
     private MlgReflex() {
     }
@@ -117,6 +133,17 @@ public final class MlgReflex {
         o.addProperty("phase", phase.name().toLowerCase(Locale.ROOT));
         o.addProperty("reason", reason);
         o.addProperty("receipt", receipt);
+        // 判"会不会摔死"时用到的减免（后端据此理解为什么没放水）
+        FallPlan.Mitigation m = lastMitigation;
+        if (m != null) {
+            o.addProperty("safe_fall_distance", round(m.safeFallDistance()));
+            o.addProperty("fall_damage_multiplier", round(m.fallDamageMultiplier()));
+            o.addProperty("feather_falling_level", m.featherFallingLevel());
+            o.addProperty("protection_level_sum", m.protectionLevelSum());
+            o.addProperty("epf", FallPlan.totalEpf(m.featherFallingLevel(), m.protectionLevelSum()));
+            o.addProperty("resistance_amplifier", m.resistanceAmplifier());
+            o.addProperty("slow_falling", m.slowFalling());
+        }
         return o;
     }
 
@@ -233,9 +260,11 @@ public final class MlgReflex {
         armed = true;
         reason = "fatal_fall";
         receipt = RECEIPT_ARMED;
-        LCUMod.LOGGER.info("[Reflex] MLG armed: y={} vy={} drop={} ticksToLand={} slot={}",
+        LCUMod.LOGGER.info("[Reflex] MLG armed: y={} vy={} drop={} damage={} ticksToLand={} slot={}",
                 round(in.y()), round(in.velY()),
                 round(FallPlan.predictedDrop(in.y(), in.groundY(), in.fallDistanceSoFar())),
+                round(FallPlan.mitigatedFallDamage(
+                        FallPlan.predictedDrop(in.y(), in.groundY(), in.fallDistanceSoFar()), in.mitigation())),
                 FallPlan.ticksToLand(in.y(), in.velY(), in.groundY()), bucketSlot);
     }
 
@@ -456,10 +485,56 @@ public final class MlgReflex {
         var player = mc.player;
         Vec3 v = player.getDeltaMovement();
         double horizontal = Math.hypot(v.x, v.z);
+        FallPlan.Mitigation mitigation = readMitigation(mc);
+        lastMitigation = mitigation;
         return new FallPlan.Input(
                 player.getY(), v.y, horizontal,
                 s.groundY, player.fallDistance, player.getHealth(),
-                hasItem(mc, Items.WATER_BUCKET), s.buffer, enabled, 20);
+                hasItem(mc, Items.WATER_BUCKET), s.buffer, enabled, 20,
+                mitigation);
+    }
+
+    /**
+     * 读当前摔落减免（{@link FallPlan.Mitigation}）：安全落距/倍率属性 + 四件盔甲附魔 + 药水效果。
+     *
+     * <p>零猜测、全部走原版 API：属性用 {@code getAttributeValue}（已含跳跃提升等修饰符），
+     * 附魔用物品的 {@code DataComponents.ENCHANTMENTS}（与 {@code EnchantmentHelper.getItemEnchantmentLevel} 同源）。
+     */
+    private static FallPlan.Mitigation readMitigation(Minecraft mc) {
+        var player = mc.player;
+        int featherFalling = FallPlan.clampFeatherFallingLevel(
+                enchantLevel(player.getItemBySlot(EquipmentSlot.FEET), Enchantments.FEATHER_FALLING));
+        int protection = 0;
+        for (EquipmentSlot slot : ARMOR_SLOTS) {
+            protection += FallPlan.clampProtectionLevel(
+                    enchantLevel(player.getItemBySlot(slot), Enchantments.PROTECTION));
+        }
+        MobEffectInstance resistance = player.getEffect(MobEffects.RESISTANCE);
+        return new FallPlan.Mitigation(
+                true,
+                player.getAttributeValue(Attributes.SAFE_FALL_DISTANCE),
+                player.getAttributeValue(Attributes.FALL_DAMAGE_MULTIPLIER),
+                featherFalling,
+                protection,
+                resistance == null ? -1 : resistance.getAmplifier(),
+                player.hasEffect(MobEffects.SLOW_FALLING));
+    }
+
+    /**
+     * 物品上的附魔等级；没有 → 0。
+     *
+     * <p>按注册名（{@code ResourceKey}）匹配，不依赖 Holder 是否绑定注册表 → 不会抛异常。
+     */
+    private static int enchantLevel(ItemStack stack, ResourceKey<Enchantment> enchantment) {
+        if (stack == null || stack.isEmpty()) {
+            return 0;
+        }
+        for (var entry : stack.getEnchantments().entrySet()) {
+            if (entry.getKey().unwrapKey().filter(enchantment::equals).isPresent()) {
+                return entry.getIntValue();
+            }
+        }
+        return 0;
     }
 
     private static boolean hasItem(Minecraft mc, Item item) {
