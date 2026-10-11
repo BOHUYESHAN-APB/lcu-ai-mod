@@ -294,6 +294,10 @@ def _default_config() -> dict[str, Any]:
         # 把模型请回来做下一步。**不是定时器**、**不是后台自主引擎**。
         # 默认**开**（用户明确要这个）；关掉 ⇒ 行为回到现在（不再有编排轮）。
         "job_orchestration": True,
+        # 复合体（声明式能力复合，`agent/composites.py`；AGENT_ARCH §10.2 #4）：
+        # 开（**默认**）→ 复合体作为工具可用，内部**逐步**走各自的权限/区域/容器/借用门；
+        # 关 → 复合体调用被**如实拒绝**（一步都不发），行为回到"还没有复合体"之前。
+        "composites": {"enabled": True},
     }
 
 
@@ -450,6 +454,10 @@ class ConfigStore:
                 parsed_orch = _parse_bool(payload["job_orchestration"])
                 if parsed_orch is not None:
                     self._data["job_orchestration"] = parsed_orch
+            if isinstance(payload.get("composites"), dict):
+                parsed_comp = _parse_bool(payload["composites"].get("enabled"))
+                if parsed_comp is not None:
+                    self._data["composites"] = {"enabled": parsed_comp}
             self.save()
             return self.raw(redact=True)
 
@@ -520,6 +528,17 @@ class ConfigStore:
         with self._lock:
             raw = self._data.get("job_orchestration", True)
         return _as_bool(raw, True)
+
+    def get_composites_enabled(self) -> bool:
+        """复合体开关（``config.json`` → ``composites.enabled``，**默认开**）。
+
+        开 → 复合体工具可用（内部**逐步**走各自的权限/区域/容器/借用门）；
+        关 → 复合体调用被**如实拒绝**（一步都不发），行为回到"还没有复合体"之前。
+        """
+        with self._lock:
+            raw = self._data.get("composites")
+        enabled = raw.get("enabled") if isinstance(raw, dict) else None
+        return _as_bool(enabled, True)
 
     def get_decision_threshold(self) -> float:
         """decider 置信度阈值；非法值回退默认。"""

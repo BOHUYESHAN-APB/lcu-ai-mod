@@ -26,6 +26,9 @@ from .container_view import (CODE_BUSY as CONTAINER_VIEW_BUSY, CODE_NO_TOUCH,
                              CODE_OTHER_CONTAINER, CODE_UNAUTHORIZED)
 from .container_view import is_open as container_is_open
 from .container_view import matches as container_matches
+from .composites import (CODE_TOOL, COMPOSITE_BY_NAME, DEFAULT_FAILURE_CODE, GATE_CODES,
+                         CompositeRun, abort_run as abort_composite_run,
+                         composite_note, run_composite)
 from .container_view import other_container_note as container_view_other_note
 from .container_view import title_of as container_title
 from .container_view import view as container_view_snapshot
@@ -420,7 +423,7 @@ class Planner:
                  whisper_sender=None, tpa_responder=None, tpa_requester=None,
                  player_resolver=None, territory=None, action_manager=None,
                  poi=None, places=None, resource_lease=None, state_governor=None,
-                 job_registry=None, task_list=None):
+                 job_registry=None, task_list=None, composites_enabled=None):
         self.llm = llm_service
         self.memory = memory
         self.skills = skills
@@ -478,6 +481,17 @@ class Planner:
         self._farm_pending: Optional[dict] = None
         # 复合链（farm_cycle）的**逐步入账**（收割/补种/取料/合成/喂各成了什么、缺什么）。
         self._cycle_steps: list[dict] = []
+        # 复合体（`agent/composites.py` §10.2 #4）：本轮的如实说明 + 最近一次运行的逐步账；
+        # 运行栈用来挡住"复合体套自己"（不许无限递归）。
+        self._composite_note: Optional[str] = None
+        self._composite_last: Optional[dict] = None
+        self._composite_stack: list[str] = []
+        # 复合体的总开关（`config.json → composites.enabled`，默认**开**）：没注入就按默认开，
+        # 注入后关掉 ⇒ 复合体调用被**如实拒绝**（一步都不发，行为回到"没有复合体"之前）。
+        self._composites_enabled_provider = composites_enabled
+        # 最近一次派发**被哪道门拦下**（"" = 没被门拦；permission/container/resource/backoff）：
+        # 只给复合体的"卡在第几步 + code"用（如实转发门的原因，不另造一套判定）。
+        self._last_tool_gate: str = ""
         # 别人家的田：每次动手（含被拒）都留审计 —— "这谁让他动的"必须能查。
         self._farm_others_audit: list[dict] = []
         # L1 版本键 + 上一次组装的 L0+L1 字符串：键不变就复用**同一份字符串**
@@ -538,6 +552,8 @@ class Planner:
         self._farm_note = None
         # 复合链的逐步账每一轮从零开始记（免得上一轮的缺口串到这一轮）。
         self._cycle_steps = []
+        # 复合体的如实说明同理（免得上一轮的"卡在第几步"串到这一轮）。
+        self._composite_note = None
         # 上一轮在造床、这一轮看到床边了 → 认成 home_bed（§8 造 + 放 + 认领）。
         self._claim_pending_home_bed(context)
         # 上一轮收完了、这一轮看到耕地了 → 补种同一作物（同一套"看到才认"的机制）。
@@ -622,7 +638,7 @@ class Planner:
         """
         text = self._with_locate_note(reply)
         for note in (self._craft_note, self._action_note, self._territory_note,
-                     self._haul_note, self._farm_note):
+                     self._haul_note, self._farm_note, self._composite_note):
             if not note:
                 continue
             text = f"{text}\n{note}" if text else note
@@ -1405,6 +1421,8 @@ class Planner:
             logger.debug("[Planner] 未登记的工具：%s", tool_name)
             return False
         payload = payload if isinstance(payload, dict) else {}
+        # 这一条调用的"被哪道门拦下"从零开始记（复合体要把门的原因如实转发出来）。
+        self._last_tool_gate = ""
         if not self._authorize_tool(spec, payload, context):
             return False
         # 资源仲裁（同资源互斥、异资源并行、P0 优先）：只**仲裁**，不新增能力。
@@ -1437,6 +1455,10 @@ class Planner:
         registry = self.job_registry
         action_manager = self.action_manager
         if registry is None or action_manager is None or not spec.job:
+            return
+        if spec.name in COMPOSITE_BY_NAME:
+            # 复合体**自己**登记 job（进度按步、取消到步、失败 code = 那一步的 code）——
+            # 不在这里再登记一个"整条调用"的 job，免得同一个调用出现两条账。
             return
         label = action_manager.current_label
         if not label or label == before_label or not action_manager.is_busy:
@@ -1486,6 +1508,7 @@ class Planner:
         target = spec.name
         if governor is not None and governor.is_backed_off(target):
             wait = max(0.0, governor.backoff_until(target) - time.time())
+            self._last_tool_gate = "backoff"
             self._action_note = f"（{target} 刚被判定卡死，退避中（还剩约 {wait:.0f}s），先不重试）"
             logger.info("[Planner] %s 在治理退避窗口内，暂不下发", target)
             return False, None
@@ -1498,6 +1521,7 @@ class Planner:
             reason=f"工具 {spec.name}", kind=spec.name, target=target, actor="planner")
         if not result.get("granted"):
             blocked = "、".join(result.get("blocked_by") or []) or "别的状态"
+            self._last_tool_gate = "resource"
             self._action_note = f"（{spec.name} 要用的资源正被 {blocked} 占用，本次已排队，暂不下发）"
             logger.info("[Planner] %s 资源冲突（被 %s 占用）→ 排队", spec.name, blocked)
             return False, None
@@ -1526,6 +1550,149 @@ class Planner:
                 return max(0, min(1000, int(raw)))
         return PRIORITY_DEFAULT
 
+    # ── 复合体（声明式，`agent/composites.py`；AGENT_ARCH §10.2 #4）──────
+    #
+    # 复合体在模型眼里就是**一条工具**；**定义**在 `agent/composites.py`（唯一事实来源），
+    # 这里只是入口 + 落账：每一步都从**同一个** `_dispatch_tool_call` 出去 ⇒ 权限门
+    # （tier / 容器 / 借用 / 区域保护）与资源租约**一步都不跳**；失败**不重试、不换路**，
+    # 如实报出「第几步、哪一步、它自己的 code」+ **已完成的前几步**（§10.4 验收③）。
+
+    def _composites_enabled(self) -> bool:
+        """复合体总开关（`config.json → composites.enabled`，默认**开**）。"""
+        provider = self._composites_enabled_provider
+        if provider is None:
+            return True
+        try:
+            return bool(provider())
+        except Exception as exc:  # noqa: BLE001 — 开关读不到就按声明的默认（开）走
+            logger.warning("[Planner] 复合体开关读取失败: %s", exc)
+            return True
+
+    def _run_composite(self, name: str, payload: dict, context: dict) -> bool:
+        """跑一个声明式复合体：逐步走各自的门 + 登记 job（四样门槛齐备）+ 失败指到步。
+
+        - 关掉开关 ⇒ **一步都不发**，如实说不干（行为回到"没有复合体"之前）；
+        - job 句柄：进度=按步（单调）/ 终止条件=步走完或某步失败 / 失败 code=**那一步自己的
+          code** / 取消路径=停当前步 + 不再往下（取消复用 `action_manager.stop`，不另造）；
+        - 结果：`run.result()` 逐步账 + 卡在第几步，说明里写全（`self._composite_note`）。
+        """
+        comp = COMPOSITE_BY_NAME.get(str(name or "").strip())
+        if comp is None:
+            self._composite_note = f"（没有叫「{name}」的复合体）"
+            logger.info("[Planner] 认不出的复合体：%s", name)
+            return False
+        if not self._composites_enabled():
+            self._composite_note = (
+                f"（复合体「{comp.name}」被关掉了（config.json → composites.enabled=false）："
+                f"我就不按复合体跑，得一步一条地下）")
+            logger.info("[Planner] 复合体 %s 被开关关掉：一步都不发", comp.name)
+            return False
+        if comp.name in self._composite_stack:
+            self._composite_note = f"（复合体「{comp.name}」正在跑：不套着自己调自己）"
+            logger.info("[Planner] 复合体 %s 递归调用被拒", comp.name)
+            return False
+        ctx = context if isinstance(context, dict) else {}
+        args = {str(key): value for key, value in payload.items()} \
+            if isinstance(payload, dict) else {}
+        run = CompositeRun(comp, args)
+        job = self._register_composite_job(comp, run, args, ctx)
+        self._composite_stack.append(comp.name)
+        try:
+            run_composite(run, dispatch=self._composite_dispatch, context=ctx,
+                          cancel_current=self._stop_current_action)
+        except Exception as exc:  # noqa: BLE001 — 复合体自己坏掉也要留账，绝不假装成功
+            logger.exception("[Planner] 复合体 %s 异常", comp.name)
+            abort_composite_run(run, "composite_crashed", f"（复合体自己跑挂了：{exc}）")
+        finally:
+            self._composite_stack.pop()
+        self._composite_last = run.result()
+        self._composite_note = run.note or composite_note(run)
+        self._settle_composite_job(job, run)
+        return run.status == JOB_DONE
+
+    def _register_composite_job(self, comp, run: CompositeRun, args: dict, context: dict):
+        """登记复合体的 job（四样门槛齐备；缺一就干脆不登记，绝不半成品）。"""
+        registry = self.job_registry
+        if registry is None:
+            return None
+        _tier, actor = self._actor_of(context)
+        try:
+            return registry.register(
+                comp.name, progress=run.progress, terminal=run.terminal,
+                failure=DEFAULT_FAILURE_CODE, cancel=run.cancel,
+                priority=self._lease_priority(context), actor=actor,
+                detail=f"{comp.name} {json.dumps(args, ensure_ascii=False)}"[:200])
+        except JobRejected as exc:
+            logger.info("[Planner] 复合体 %s 未登记为 job：%s", comp.name, exc.reason)
+            return None
+
+    def _settle_composite_job(self, job, run: CompositeRun) -> None:
+        """把跑完的复合体落进 job 台账（失败带**那一步的 code**；结果带逐步账）。"""
+        registry = self.job_registry
+        if job is None or registry is None:
+            return
+        if run.status == JOB_DONE:
+            registry.finish(job.id, result=run.result())
+        elif run.status == JOB_FAILED:
+            registry.fail(job.id, code=run.failure(),
+                          message=f"卡在第 {run.failed_index} 步 {run.failed_step}",
+                          result=run.result())
+        else:
+            registry.cancel(job.id, reason=run.cancel_reason or "cancelled")
+
+    def _composite_dispatch(self, tool: str, payload: dict, context: dict):
+        """复合体的一步：走**同一个**派发口（注册表 → 权限门 → 资源租约 → handler）。
+
+        返回 `True` 或 `{ok: False, code, detail}`——`detail` 是**那一步自己**新写的如实说明
+        （门/工具的原话，一字不改地转发；不重试、不换路）。
+        """
+        before = self._notes_snapshot()
+        ok = self._dispatch_tool_call(tool, payload, context)
+        if ok:
+            return True
+        return {"ok": False, "code": self._composite_failure_code(tool),
+                "detail": self._note_delta(before)}
+
+    def _composite_failure_code(self, tool: str) -> str:
+        """失败那一步**自己的 code**：先看被哪道门拦下，再看工具自己的回执（沿用它的口径）。"""
+        gate = GATE_CODES.get(str(self._last_tool_gate or ""))
+        if gate:
+            return gate
+        receipt = self._haul_last if str(tool) == "haul" else None
+        if isinstance(receipt, dict) and receipt.get("reason"):
+            return f"{tool}:{receipt['reason']}"
+        return CODE_TOOL
+
+    def _notes_snapshot(self) -> tuple:
+        """本轮五条"如实说明"的当前值（比对一步前后，取**这一步自己**新写的那条）。"""
+        return (self._craft_note, self._action_note, self._territory_note,
+                self._haul_note, self._farm_note)
+
+    def _note_delta(self, before: tuple) -> str:
+        """这一步**自己**新写的如实说明（取"变了的那条"；一步没写就给空串，绝不抄旧话 ✗）。"""
+        now = self._notes_snapshot()
+        for old, new in zip(before, now):
+            if new and new != old:
+                return str(new)
+        return ""
+
+    def _stop_current_action(self) -> None:
+        """复合体取消时"停当前步"的落点：复用既有停止路径（不新造取消通道）。"""
+        manager = self.action_manager
+        if manager is not None:
+            manager.stop()
+            return
+        stop = getattr(self.skills, "stop_all", None)
+        if callable(stop):
+            stop()
+
+    # 入口（`agent/tool_registry.py` 按复合体声明生成 handler 名；一条声明 = 一个两行入口）
+    def _dispatch_composite_make_bed(self, payload: dict, context: dict) -> bool:
+        return self._run_composite("make_bed", payload, context)
+
+    def _dispatch_composite_deposit_all(self, payload: dict, context: dict) -> bool:
+        return self._run_composite("deposit_all", payload, context)
+
     # ── 统一授权（注册表权限字段驱动）──────────────────────────
     def _authorize_tool(self, spec: ToolSpec, payload: dict, context: dict) -> bool:
         """派发前的**唯一**授权点：tier 门 + 容器访问授权。
@@ -1535,6 +1702,7 @@ class Planner:
         """
         perm = spec.permission
         if perm.tier and not self._has_capability(perm.tier, context):
+            self._last_tool_gate = "permission"
             if perm.tier == "craft":
                 self._craft_note = self._auth_note(self._craft_policy(context), "造东西")
             else:
@@ -1546,6 +1714,7 @@ class Planner:
             access = self._container_read_access if perm.read_only else self._container_access
             ok, note, _cpolicy, crow = access(context)
             if not ok:
+                self._last_tool_gate = "container"
                 self._craft_note = note
                 logger.info("[Planner] 工具 %s 被拒：容器访问未授权 %s",
                             spec.name, (crow or {}).get("name"))

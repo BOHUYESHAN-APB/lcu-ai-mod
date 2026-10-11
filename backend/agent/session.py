@@ -340,6 +340,9 @@ class Session:
             job_registry=self.jobs,
             # 长期目标（set_goal/end_goal）写进**同一份** task_list（不另建第二套存储）。
             task_list=self.tasks,
+            # 复合体开关（`config.json → composites.enabled`，默认**开**）：关掉 ⇒ 复合体
+            # 调用被如实拒绝（一步都不发），行为回到"还没有复合体"之前。
+            composites_enabled=get_config_store(DEFAULT_CONFIG_PATH).get_composites_enabled,
         )
 
         # Vision (Python 侧直接抓屏 -> VLM，后台线程低频刷新，不阻塞动作链路)

@@ -21,6 +21,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+# 复合体（声明式能力复合，`docs/dev/AGENT_ARCH.md` §10.2 #4）：**定义**在 `agent/composites.py`
+# ——这里只把声明投影成注册表条目（复合体也是**工具**，注册表仍是工具清单的唯一事实来源）。
+from .composites import COMPOSITES, validate_composite
+
 # ── 参数名 → JSON Schema 类型 ────────────────────────────────
 # 工具参数都可有默认值，故 `required` 一律留空；类型按参数名约定推断。
 _NUMERIC_TOOL_ARGS = frozenset({"x", "y", "z", "radius", "limit", "count", "index",
@@ -114,6 +118,24 @@ class ToolSpec:
                 "parameters": self.parameters(),
             },
         }
+
+
+# ── 复合体（声明式，唯一事实来源在 `agent/composites.py`）────────
+# 复合体在模型眼里就是**一条工具**：L3 里照常出现（只减不抬的静态前缀 L0/L1 不受影响 ✗），
+# 派发口与别的工具**同一个**（`Planner._run_composite` → 逐步走 `_dispatch_tool_call`）。
+# `job=True`：复合体是长任务，登记 job 句柄（逐条声明都齐备四样门槛，见 `composites.py`）。
+COMPOSITE_GROUP = "composite"
+
+
+def composite_specs() -> tuple[ToolSpec, ...]:
+    """把 `COMPOSITES` 的声明投影成注册表条目（handler = Planner 上的那个入口）。"""
+    return tuple(
+        ToolSpec(comp.name, comp.description, ",".join(comp.args), (COMPOSITE_GROUP,),
+                 f"_dispatch_composite_{comp.name}", job=True,
+                 permission=ToolPermission(
+                     note="复合体：内部只调**已注册**工具，每一步都走它自己的门"
+                          "（tier/白名单/区域/容器/借用），失败会说清卡在第几步"))
+        for comp in COMPOSITES)
 
 
 # 顺序即动作组内顺序：**逐字沿用**旧 `ACTION_GROUPS` 的组序与组内序，
@@ -297,25 +319,35 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("set_home", "在基地范围内自己找床；找不到就自己造（缺料/不安全如实报）",
              "base", ("territory",), "_dispatch_set_home"),
     ToolSpec("go_home", "回基地的床位（没床就回锚点）", "base", ("territory",), "_dispatch_go_home"),
-)
+) + composite_specs()
+# ↑ 末尾接上复合体条目（声明在 `agent/composites.py`；顺序＝注册表顺序＝L3 展示顺序）。
 
 # name → 规格（派发查表用）。
 TOOL_BY_NAME: dict[str, ToolSpec] = {spec.name: spec for spec in TOOL_SPECS}
+
+# 复合体声明校验（唯一判定处）：每一步**只准**引用已注册的工具（没有第二份清单可漏）。
+def _validate_composites() -> None:
+    for comp in COMPOSITES:
+        validate_composite(comp, is_registered=lambda name: name in TOOL_BY_NAME)
+
+
+_validate_composites()
 
 # ── 阶段 → 注入哪些组（顺序即 prompt 中的展示顺序）──────────────
 # night / guard / hud / memory 全局注入：睡觉、守点、HUD 描述词与记忆点在任何阶段
 # 都可能有意义（用户说"在这儿守着"时他可能正在看着 AI 挖矿）。
 PHASE_GROUPS: dict[str, tuple[str, ...]] = {
     "idle": ("move", "locate", "gather", "craft", "container", "farm", "guard", "items",
-             "survive", "combat", "hud", "night", "server", "memory", "goal", "territory"),
+             "survive", "combat", "hud", "night", "server", "memory", "goal", "territory",
+             COMPOSITE_GROUP),
     "travel": ("move", "locate", "combat", "guard", "items", "container", "farm", "survive",
-               "hud", "night", "server", "memory", "goal", "territory"),
+               "hud", "night", "server", "memory", "goal", "territory", COMPOSITE_GROUP),
     "gather": ("move", "locate", "gather", "guard", "items", "craft", "container", "farm",
-               "hud", "night", "server", "memory", "goal", "territory"),
+               "hud", "night", "server", "memory", "goal", "territory", COMPOSITE_GROUP),
     "craft": ("move", "locate", "craft", "container", "farm", "guard", "items", "gather",
-              "hud", "night", "server", "memory", "goal", "territory"),
+              "hud", "night", "server", "memory", "goal", "territory", COMPOSITE_GROUP),
     "survive": ("survive", "hud", "night", "server", "memory", "goal", "guard", "farm",
-                "items", "move", "locate", "territory"),
+                "items", "move", "locate", "territory", COMPOSITE_GROUP),
 }
 
 
