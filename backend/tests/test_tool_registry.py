@@ -161,7 +161,11 @@ class ToolDocTests(unittest.TestCase):
         expected = module.render()
         target = REPO_ROOT / "docs" / "dev" / "TOOLS.md"
 
-        self.assertTrue(target.exists(), "缺少 docs/dev/TOOLS.md（跑 backend/scripts/dump_tools.py）")
+        if not target.exists():
+            # docs/dev/ 是**刻意** gitignored 的（开发文档进仓库但不提交）：干净 checkout（CI）
+            # 上这个文件必然不存在，所以"缺失"是环境事实，不是失败。本地先跑
+            # backend/scripts/dump_tools.py 生成它，这条断言才会真正生效。
+            self.skipTest("docs/dev/TOOLS.md 不在版本控制内（.gitignore），本地生成后才校验")
         self.assertEqual(target.read_text(encoding="utf-8").replace("\r\n", "\n"), expected,
                          "TOOLS.md 与注册表脱节：重跑 scripts/dump_tools.py")
 

@@ -212,7 +212,9 @@ class ControlStream:
         self._yaw: float | None = None
         self._pitch: float | None = None
         self._dirty = False
-        self._last_sent = 0.0
+        # 用 -inf 而不是 0.0：`time.monotonic()` 在**刚启动的机器**上可能只有几十秒
+        # （CI runner 很常见），拿 0.0 当"上次发送时间"会让**第一帧**就被 interval 限流掐掉。
+        self._last_sent = float("-inf")
 
     @property
     def holding(self) -> bool:
