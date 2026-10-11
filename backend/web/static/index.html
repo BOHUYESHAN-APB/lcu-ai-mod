@@ -100,6 +100,15 @@ dialog{width:min(680px,calc(100vw - 24px));max-height:calc(100dvh - 24px);margin
 .chat-messages{flex:1;overflow-y:auto;padding:10px;background:var(--ov-bg,#0d1117);border-radius:6px;margin-bottom:10px}
 .chat-input{display:flex;gap:8px}
 .chat-input input{flex:1}
+/* 私信两栏（聊天页签）：别人靠左、AI 靠右，像聊天软件。 */
+.dm-list{display:flex;flex-direction:column;gap:8px;padding:12px}
+.dm-bubble{max-width:78%;padding:8px 11px;border-radius:10px;font-size:12px;line-height:1.45;white-space:pre-wrap;overflow-wrap:anywhere}
+.dm-bubble.in{align-self:flex-start;background:#21262d;border-top-left-radius:2px}
+.dm-bubble.out{align-self:flex-end;background:#1f6feb;color:#fff;border-top-right-radius:2px}
+.dm-bubble .stamp{font-size:10px;color:#8b949e;margin-top:4px;text-align:right}
+.dm-bubble.out .stamp{color:rgba(255,255,255,.72)}
+.dm-row{width:100%;display:block;text-align:left;background:transparent;color:var(--ov-fg,#c9d1d9);border:0;border-bottom:1px solid #21262d;padding:10px 12px;cursor:pointer}
+.dm-row:hover,.dm-row.active{background:#21262d}
 .msg{margin-bottom:8px;padding:8px;background:var(--ov-surface,#161b22);border-radius:6px}
 .msg .sender{font-size:11px;color:#58a6ff;margin-bottom:4px}
 .msg .text{font-size:13px}
@@ -203,16 +212,15 @@ textarea{width:100%;min-height:68px;resize:vertical;background:var(--ov-bg,#0d11
 
 <div class="tabs">
   <button class="tab active" onclick="showPage('dashboard',this)">仪表盘</button>
-  <button class="tab" onclick="showPage('bodies',this)">Bodies（待移植）</button>
-  <button class="tab" onclick="showPage('operations',this)">操作（待移植）</button>
+  <button class="tab" onclick="showPage('operations',this)">操作</button>
   <button class="tab" onclick="showPage('chat',this)">聊天</button>
-  <button class="tab" onclick="showPage('memory',this)">记忆（待移植）</button>
-  <button class="tab" onclick="showPage('providers',this)">模型服务商（待移植）</button>
-  <button class="tab" onclick="showPage('access',this)">访问权限（待移植）</button>
+  <button class="tab" onclick="showPage('memory',this)">记忆</button>
+  <button class="tab" onclick="showPage('providers',this)">模型服务商</button>
+  <button class="tab" onclick="showPage('access',this)">访问权限</button>
   <button class="tab" onclick="showPage('settings',this)">基础设置</button>
   <button class="tab" onclick="showPage('commands',this)">指令白名单</button>
   <button class="tab" onclick="showPage('overlay',this)">OBS 组件</button>
-  <button class="tab" onclick="showPage('diagnostics',this)">Diagnostics（待移植）</button>
+  <button class="tab" onclick="showPage('diagnostics',this)">Diagnostics</button>
   <button class="tab" onclick="showPage('debug',this)">调试</button>
 </div>
 
@@ -299,26 +307,40 @@ textarea{width:100%;min-height:68px;resize:vertical;background:var(--ov-bg,#0d11
   </div>
 </div>
 
-<!-- Bodies Page -->
-<div id="page-bodies" class="page">
-  <div class="card">
-    <h3>身体注册表（待移植）</h3>
-    <div class="hint">此面板依赖 master 分支的 <code>/api/v2/bodies</code> 能力，当前后端未提供该端点，调用会 404。已暂时移除面板内容，待 /api/v2 能力回捞后恢复。</div>
-  </div>
-</div>
-
 <!-- Operations Page -->
 <div id="page-operations" class="page">
   <div class="card">
-    <h3>操作面板（待移植）</h3>
-    <div class="hint">此面板依赖 master 分支的 <code>/api/v2/control</code>、<code>/api/v2/skills</code>、<code>/api/v2/task-presets</code>、<code>/api/v2/runs</code>、<code>/api/v2/schedules</code>、<code>/api/v2/events</code> 能力，当前后端未提供这些端点，调用会 404。已暂时移除面板内容，待 /api/v2 能力回捞后恢复。</div>
+    <h3>🎮 操作 · 任务队列</h3>
+    <div class="hint">数据源：<code>/api/tasks</code>。取消 / 插队走后端既有的 <code>/api/tasks/{cancel,activate}</code>（tier 硬门由后端判定，前端不自行放行）。</div>
+    <div class="memory-status-strip" id="opsStatus">加载中…</div>
+    <div id="opsTasks">—</div>
   </div>
 </div>
 <!-- Chat Page -->
 <div id="page-chat" class="page">
   <div class="card">
-    <h3>玩家会话收件箱（待移植）</h3>
-    <div class="hint">通讯录与会话历史依赖 master 分支的 <code>/api/v2/inbox/*</code> 能力，当前后端未提供这些端点，调用会 404。已暂时移除该区块；下方的「后台直接对话」走 <code>/ws</code> 实时链路，可正常使用。</div>
+    <h3>💬 私信 · 通讯簿</h3>
+    <div class="hint">
+      悄悄话＝MC 原版的私信（<code>/msg</code> <code>/tell</code> <code>/w</code>）：定向消息、回复门<b>硬旁路</b>（必须回）、
+      防注入双层清洗 —— 全部由后端实现，这里只做展示与代发。线程按 <b>服务器 + 对方</b> 隔离。
+    </div>
+    <div class="inbox-layout">
+      <div class="memory-pane">
+        <div class="memory-pane-header"><h3>通讯簿</h3><span class="contact-meta" id="dmCount"></span></div>
+        <div class="memory-list" id="dmContacts" style="max-height:460px"><div class="empty">加载中…</div></div>
+      </div>
+      <div class="memory-pane" style="display:flex;flex-direction:column">
+        <div class="memory-pane-header"><h3 id="dmPeerName">未选择联系人</h3><span class="contact-meta" id="dmPeerMeta"></span></div>
+        <div id="dmMessages" class="chat-messages dm-list" style="flex:1;max-height:420px;margin:0;border-radius:0;background:transparent"><div class="empty">左侧点一个联系人，看你们的来往私信</div></div>
+        <div style="padding:10px 12px;border-top:1px solid var(--ov-line,#30363d)">
+          <div class="chat-input">
+            <input type="text" id="dmInput" placeholder="以 AI 的身份代发一条私信（会过服务端出站清洗 + 指令白名单）" onkeydown="if(event.key==='Enter')sendDm()">
+            <button class="btn primary" onclick="sendDm()">发送</button>
+          </div>
+          <div class="hint" id="dmHint">发送走 POST /api/contacts/&lt;uuid&gt;/send。</div>
+        </div>
+      </div>
+    </div>
   </div>
   <section class="memory-pane" style="margin-top:16px">
     <div class="memory-pane-header"><h3>后台直接对话</h3></div>
@@ -327,7 +349,7 @@ textarea{width:100%;min-height:68px;resize:vertical;background:var(--ov-bg,#0d11
         <div id="chatEmpty" class="empty">暂无后台直接对话</div>
       </div>
       <div class="chat-input">
-        <input type="text" id="chatInput" placeholder="向当前 AI 后台发送消息" onkeydown="if(event.key==='Enter')sendChat()">
+        <input type="text" id="chatInput" placeholder="向当前 AI 后台发送消息（走 /ws 实时链路）" onkeydown="if(event.key==='Enter')sendChat()">
         <button class="btn primary" onclick="sendChat()">发送</button>
       </div>
     </div>
@@ -337,23 +359,57 @@ textarea{width:100%;min-height:68px;resize:vertical;background:var(--ov-bg,#0d11
 <!-- Memory Page -->
 <div id="page-memory" class="page">
   <div class="card">
-    <h3>记忆面板（待移植）</h3>
-    <div class="hint">此面板依赖 master 分支的 <code>/api/v2/memory/*</code> 能力，当前后端未提供这些端点，调用会 404。已暂时移除面板内容，待 /api/v2 能力回捞后恢复。</div>
+    <h3>🧠 记忆概览（只读）</h3>
+    <div class="hint">数据源：<code>/api/memory</code>、<code>/api/database</code>、<code>/api/tokens</code>。四层记忆与台账由后端落盘，这里只展示运行时快照；会话未启动时显示安全空值。</div>
+    <div class="usage-strip">
+      <div class="usage-item"><div class="label">互动数</div><div class="value" id="memInteractions">—</div></div>
+      <div class="usage-item"><div class="label">累计动作</div><div class="value" id="memActions">—</div></div>
+      <div class="usage-item"><div class="label">消息库条数</div><div class="value" id="memMessages">—</div></div>
+      <div class="usage-item"><div class="label">Token 用量</div><div class="value" id="memTokens">—</div></div>
+    </div>
+    <div class="settings-section">
+      <h4>已知地点</h4>
+      <div class="hint" id="memLocations">—</div>
+    </div>
+    <div class="settings-section">
+      <h4>最近上下文（memory.build_context）</h4>
+      <div class="memory-json" id="memRecent">—</div>
+    </div>
   </div>
 </div>
 
 <!-- Providers Page -->
 <div id="page-providers" class="page">
   <div class="card">
-    <h3>模型服务商 Profile（待移植）</h3>
-    <div class="hint">多 Profile 管理与 Agent 路由依赖 master 分支的 <code>/api/v2/llm/profiles</code> 能力，当前后端未提供该端点，调用会 404。已暂时移除面板内容。<br>当前后端支持的模型配置请到「基础设置」页配置（<code>/api/llm/config</code>、<code>/api/llm/models</code>、<code>/api/llm/providers</code>、<code>/api/llm/roles</code>）。</div>
+    <h3>🔌 模型服务商（只读）</h3>
+    <div class="hint">
+      数据源：<code>/api/llm/providers</code>（预设）、<code>/api/llm/effective</code>（各角色<b>运行中实际生效</b>的 base_url/model 与 key 是否就位）。
+      <b>密钥一律不回显</b>，只显示「已设置 / 未设置」。编辑请到「基础设置」页。
+    </div>
+    <div class="settings-section">
+      <h4>内置服务商预设</h4>
+      <div id="providersList" class="hint">加载中…</div>
+    </div>
+    <div class="settings-section">
+      <h4>各角色实际生效配置</h4>
+      <div id="providersEffective">加载中…</div>
+    </div>
   </div>
 </div>
 <!-- Access Page -->
 <div id="page-access" class="page">
   <div class="card">
-    <h3>授权主体与访问策略（待移植）</h3>
-    <div class="hint">此面板依赖 master 分支的 <code>/api/v2/access/policy</code> 与 <code>/api/v2/access/principals</code> 能力，当前后端未提供这些端点，调用会 404。已暂时移除面板内容。<br>当前后端支持的基础权限（server_mode / master / friends 等）请到「基础设置」页配置（<code>/api/permissions</code>）。</div>
+    <h3>🔐 授权主体与 tier（只读）</h3>
+    <div class="hint">
+      数据源：<code>/api/permissions</code>（<code>.local/permissions.json</code>）。tier 规则：<b>master &gt; friend &gt; guest</b>，
+      名单外一律 guest（默认拒绝）。当前后端基础权限请到「基础设置」页编辑（后端硬门把关，前端不自行判定）。
+    </div>
+    <div id="accessBody">加载中…</div>
+  </div>
+  <div class="card">
+    <h3>🏠 领地 / 基地 / 容器 / 区域（只读）</h3>
+    <div class="hint">数据源：<code>/api/status</code> 的 <code>session.territory</code>（后端 TerritoryStore 台账，按 server 分区）。授予/撤销走后端既有路径，前端只展示。</div>
+    <div id="territoryBody" class="hint">加载中…</div>
   </div>
 </div>
 
@@ -639,8 +695,25 @@ textarea{width:100%;min-height:68px;resize:vertical;background:var(--ov-bg,#0d11
 <!-- Diagnostics Page -->
 <div id="page-diagnostics" class="page">
   <div class="card">
-    <h3>诊断审计（待移植）</h3>
-    <div class="hint">此面板依赖 master 分支的 <code>/api/v2/audit</code> 能力，当前后端未提供该端点，调用会 404。已暂时移除面板内容，待 /api/v2 能力回捞后恢复。</div>
+    <h3>🩺 连接与运行状态（只读）</h3>
+    <div class="hint">
+      数据源：<code>/api/status</code>、<code>/api/session</code>。注意区分两条连接：「浏览器 ↔ 后端」（页面上的绿点）与
+      <b>「后端 ↔ 模组」</b>（<code>mod_connected</code>）—— 前者连上不代表游戏在跑。
+    </div>
+    <div class="usage-strip">
+      <div class="usage-item"><div class="label">后端进程</div><div class="value" id="diagRunning">—</div></div>
+      <div class="usage-item"><div class="label">模组连接</div><div class="value" id="diagMod">—</div></div>
+      <div class="usage-item"><div class="label">wire 地址</div><div class="value" id="diagWire">—</div></div>
+      <div class="usage-item"><div class="label">tick 数</div><div class="value" id="diagTicks">—</div></div>
+    </div>
+    <div class="settings-section">
+      <h4>回复决策门（为什么理 / 不理）</h4>
+      <div class="memory-json" id="diagGate">—</div>
+    </div>
+    <div class="settings-section">
+      <h4>最近会话决策</h4>
+      <div class="memory-json" id="diagDecisions">—</div>
+    </div>
   </div>
 </div>
 
@@ -726,9 +799,8 @@ function connectWS() {
 connectWS();
 
 // ── Page Navigation ──
-// 当前后端只提供 /api/status、/api/llm/*、/api/config、/api/permissions、/api/persona、
-// /api/tasks/{cancel,activate} 与 /ws；master 线的 /api/v2/* 尚未移植。
-// 因此这里不再为「待移植」页面触发任何加载调用，避免请求不存在的端点（404）。
+// 每个页签都接**当前后端真实存在**的端点（/api/status、/api/llm/*、/api/config、
+// /api/permissions、/api/contacts/*、/api/tasks/* 与 /ws 等）；没有占位页签。
 function showPage(name, tab) {
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -737,6 +809,12 @@ function showPage(name, tab) {
   // 新面板按需拉数据（避免初始化时打一堆 404/空请求）。
   if (name === 'commands') loadCommandsConfig();
   if (name === 'overlay') { loadOverlayComponents(); loadOverlayTheme(); }
+  if (name === 'chat') loadDmInbox();
+  if (name === 'memory') loadMemoryPanel();
+  if (name === 'providers') loadProvidersPage();
+  if (name === 'access') loadAccessPage();
+  if (name === 'operations') loadOperationsPage();
+  if (name === 'diagnostics') loadDiagnosticsPage();
 }
 
 // ── Local Settings Cache ──
@@ -1582,6 +1660,239 @@ function saveOverlayTheme() {
     document.getElementById('ovThemeFontScale').value = (t.font_scale == null ? '' : String(t.font_scale));
     document.getElementById('ovThemeHint').textContent = '已保存（非法值已被后端回退为默认）。';
   }).catch(e => { document.getElementById('ovThemeHint').textContent = '保存失败: ' + e; });
+}
+
+// ── 私信 · 通讯簿（/api/contacts 系列；后端已按 server + person 存线程）──
+const dmState = { contacts: [], current: null, currentIndex: -1, messages: [], sending: false };
+
+function dmFmtTime(ts) {
+  const n = Number(ts);
+  if (!isFinite(n) || n <= 0) return '';
+  const d = new Date(n * 1000);
+  const pad = x => String(x).padStart(2, '0');
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+function dmSameContact(c) {
+  if (!dmState.current) return false;
+  return [c.uuid, c.key, c.name].some(k => k && k === dmState.current);
+}
+function loadDmInbox() {
+  const box = document.getElementById('dmContacts');
+  return fetch('/api/contacts').then(r => r.json()).then(d => {
+    dmState.contacts = Array.isArray(d.contacts) ? d.contacts : [];
+    renderDmContacts(); renderDmPeerHeader();
+  }).catch(() => { if (box) box.innerHTML = '<div class="empty">读取通讯簿失败（后端未连上？）</div>'; });
+}
+function renderDmContacts() {
+  const box = document.getElementById('dmContacts');
+  if (!box) return;
+  const count = document.getElementById('dmCount');
+  if (count) count.textContent = dmState.contacts.length ? `共 ${dmState.contacts.length} 人` : '';
+  if (!dmState.contacts.length) {
+    box.innerHTML = '<div class="empty">还没有私下聊过的人。<br>等世界里的玩家先私信它。</div>';
+    return;
+  }
+  box.innerHTML = dmState.contacts.map((c, i) => {
+    const active = dmSameContact(c) ? ' active' : '';
+    const unread = Number(c.unread) || 0;
+    const dir = c.last_direction === 'out' ? '我：' : '';
+    const tier = String(c.tier || '').toLowerCase();
+    const tierTag = tier ? ` <span class="tag-pill">${escapeHtml(tier)}</span>` : '';
+    const unreadTag = unread ? ` <span class="tag-pill risk">未读 ${unread}</span>` : '';
+    return `<button class="dm-row${active}" onclick="selectDmContact(${i})">
+      <div class="contact-name">${c.online ? '🟢 ' : '⚪ '}${escapeHtml(c.name || c.uuid || '?')}${tierTag}${unreadTag}</div>
+      <div class="contact-meta">${escapeHtml(dir + (c.last_text || '（无内容）'))}</div>
+    </button>`;
+  }).join('');
+}
+function renderDmPeerHeader() {
+  const nameEl = document.getElementById('dmPeerName');
+  if (!nameEl) return;
+  const c = dmState.contacts.find(dmSameContact);
+  nameEl.textContent = c ? (c.name || c.uuid) : (dmState.current || '未选择联系人');
+  const metaEl = document.getElementById('dmPeerMeta');
+  if (metaEl) {
+    const bits = [];
+    if (c && c.tier) bits.push('层级 ' + c.tier);
+    if (c) bits.push(c.online ? '在线' : '离线');
+    metaEl.textContent = bits.join(' · ');
+  }
+}
+function selectDmContact(index) {
+  const c = dmState.contacts[index];
+  if (!c) return Promise.resolve();
+  dmState.currentIndex = index;
+  dmState.current = c.uuid || c.key || c.name;
+  renderDmContacts(); renderDmPeerHeader();
+  const key = dmState.current;
+  return fetch(`/api/contacts/${encodeURIComponent(key)}/messages`).then(r => r.json()).then(d => {
+    dmState.messages = Array.isArray(d.messages) ? d.messages : [];
+    renderDmMessages();
+  }).catch(() => {})
+    .then(() => fetch(`/api/contacts/${encodeURIComponent(key)}/read`, {method: 'POST'}).catch(() => {}))
+    .then(loadDmInbox);
+}
+function renderDmMessages() {
+  const box = document.getElementById('dmMessages');
+  if (!box) return;
+  if (!dmState.current) { box.innerHTML = '<div class="empty">左侧点一个联系人，看你们的来往私信</div>'; return; }
+  if (!dmState.messages.length) { box.innerHTML = '<div class="empty">还没有消息。下面可以直接代它发第一条。</div>'; return; }
+  box.innerHTML = dmState.messages.map(m => {
+    const out = m.direction === 'out';
+    const model = m.model ? ` · 模型 ${escapeHtml(m.model)}` : '';
+    return `<div class="dm-bubble ${out ? 'out' : 'in'}">
+      <div>${escapeHtml(m.text || '')}</div>
+      <div class="stamp">${out ? 'AI（代发）' : '对方'}${model} · ${escapeHtml(dmFmtTime(m.ts))}</div>
+    </div>`;
+  }).join('');
+  box.scrollTop = box.scrollHeight;
+}
+function sendDm() {
+  if (!dmState.current || dmState.sending) return;
+  const input = document.getElementById('dmInput');
+  const text = input.value.trim();
+  if (!text) return;
+  dmState.sending = true;
+  const hint = document.getElementById('dmHint');
+  fetch(`/api/contacts/${encodeURIComponent(dmState.current)}/send`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text})
+  }).then(r => r.json()).catch(() => ({})).then(d => {
+    dmState.sending = false;
+    if (d && d.status === 'ok') { input.value = ''; hint.textContent = '已发出。'; }
+    else { hint.textContent = '被服务端拦下了：' + ((d && (d.blocked || d.reason || d.detail)) || '未知原因') + '（白名单未勾选 / 硬黑名单 / 需二次确认）。'; }
+    return selectDmContact(dmState.currentIndex);
+  });
+}
+
+// ── 记忆概览（只读）──
+function loadMemoryPanel() {
+  fetch('/api/memory').then(r => r.json()).then(m => {
+    document.getElementById('memInteractions').textContent = (m.interactions != null ? m.interactions : '—');
+    document.getElementById('memActions').textContent = (m.actions != null ? m.actions : '—');
+    const locs = Array.isArray(m.locations) ? m.locations : [];
+    document.getElementById('memLocations').textContent = locs.length ? locs.join('、') : '（暂无已知地点）';
+    document.getElementById('memRecent').textContent = m.recent ? String(m.recent) : '（无 —— 会话未启动或还没有上下文）';
+  }).catch(e => { document.getElementById('memRecent').textContent = '读取失败: ' + e; });
+  fetch('/api/database').then(r => r.json()).then(db => {
+    const s = (db && db.stats) || {};
+    document.getElementById('memMessages').textContent = (s.total_messages != null ? s.total_messages : '—');
+  }).catch(() => { document.getElementById('memMessages').textContent = '—'; });
+  fetch('/api/tokens').then(r => r.json()).then(t => {
+    document.getElementById('memTokens').textContent = (t && t.total_tokens != null ? t.total_tokens : '—');
+  }).catch(() => {});
+}
+
+// ── 模型服务商（只读；绝不回显密钥）──
+function loadProvidersPage() {
+  const list = document.getElementById('providersList');
+  fetch('/api/llm/providers').then(r => r.json()).then(d => {
+    const ps = (d && d.providers) || [];
+    list.innerHTML = ps.length ? ps.map(p =>
+      `<div class="data-row"><div>
+        <div class="data-title">${escapeHtml(p.name || p.id || '?')}</div>
+        <div class="data-meta">${escapeHtml(p.base_url || '')} · 默认模型 ${escapeHtml(p.default_model || '—')}${p.api_key_required ? ' · 需密钥' : ' · 免密钥'}</div>
+      </div></div>`).join('') : '<div class="hint">没有内置预设。</div>';
+  }).catch(e => { list.textContent = '读取失败: ' + e; });
+
+  const eff = document.getElementById('providersEffective');
+  fetch('/api/llm/effective').then(r => r.json()).then(d => {
+    const roles = (d && d.roles) || [];
+    if (!roles.length) { eff.innerHTML = '<div class="hint">没有角色数据。</div>'; return; }
+    const rows = roles.map(r => {
+      const rt = r.runtime || {};
+      return `<tr>
+        <td>${escapeHtml(r.name || r.id || '?')}</td>
+        <td>${escapeHtml(r.provider || '（继承）')}</td>
+        <td>${escapeHtml(rt.model || '—')}</td>
+        <td>${escapeHtml(rt.base_url || '—')}</td>
+        <td>${rt.key_present ? '已设置' : '未设置'}</td>
+        <td style="color:#8b949e">${escapeHtml((r.inherited || []).join('/'))}</td>
+        <td style="color:#f85149">${escapeHtml(r.last_error || '')}</td>
+      </tr>`;
+    }).join('');
+    eff.innerHTML = `<table class="cmd-table"><thead><tr>
+      <th>角色</th><th>服务商</th><th>模型</th><th>Base URL</th><th>密钥</th><th>继承</th><th>上次错误</th>
+    </tr></thead><tbody>${rows}</tbody></table>`;
+  }).catch(e => { eff.textContent = '读取失败: ' + e; });
+}
+
+// ── 访问权限（只读）──
+function loadAccessPage() {
+  const body = document.getElementById('accessBody');
+  fetch('/api/permissions').then(r => r.json()).then(p => {
+    const pills = names => (names || []).map(n => `<span class="tag-pill">${escapeHtml(n)}</span>`).join(' ') || '<span class="hint">（无）</span>';
+    body.innerHTML = `<div class="memory-detail-grid">
+      <div class="memory-detail-key">服务器模式</div><div class="memory-detail-value">${escapeHtml(p.server_mode || '—')}</div>
+      <div class="memory-detail-key">公开回 guest</div><div class="memory-detail-value">${p.public_reply_guests ? '开' : '关'}</div>
+      <div class="memory-detail-key">会话调节系数</div><div class="memory-detail-value">${escapeHtml(String(p.session_adjust != null ? p.session_adjust : '—'))}</div>
+      <div class="memory-detail-key">master</div><div class="memory-detail-value">${pills(p.master)}</div>
+      <div class="memory-detail-key">friends</div><div class="memory-detail-value">${pills(p.friends)}</div>
+    </div>`;
+  }).catch(e => { body.innerHTML = '<div class="hint">读取失败: ' + escapeHtml(String(e)) + '</div>'; });
+
+  const tb = document.getElementById('territoryBody');
+  fetch('/api/status').then(r => r.json()).then(d => {
+    const t = (d.session && d.session.territory) || {};
+    const part = (label, rows, fmt) => `<div class="settings-section"><h4>${label}（${rows.length}）</h4>${
+      rows.length ? rows.map(fmt).join('') : '<div class="hint">（空）</div>'}</div>`;
+    tb.innerHTML = `<div class="hint">分区：${escapeHtml(t.namespace || '—')}</div>`
+      + part('领地', Array.isArray(t.territories) ? t.territories : [],
+          r => `<div class="data-row"><div><div class="data-title">${escapeHtml(r.name || '?')}</div>
+            <div class="data-meta">授权：${escapeHtml((r.grants || []).join('、') || '—')} · 由 ${escapeHtml(r.granted_by || '?')} 授予</div></div></div>`)
+      + part('基地', Array.isArray(t.bases) ? t.bases : [],
+          r => `<div class="data-row"><div><div class="data-title">${escapeHtml(r.name || '?')}</div>
+            <div class="data-meta">半径 ${escapeHtml(String(r.radius != null ? r.radius : '—'))}</div></div></div>`)
+      + part('容器', Array.isArray(t.containers) ? t.containers : [],
+          r => `<div class="data-row"><div><div class="data-title">${escapeHtml(r.name || '?')}</div>
+            <div class="data-meta">策略 ${escapeHtml(String(r.policy != null ? r.policy : '—'))}</div></div></div>`)
+      + part('区域', Array.isArray(t.zones) ? t.zones : [],
+          r => `<div class="data-row"><div><div class="data-title">${escapeHtml(r.name || '?')}</div>
+            <div class="data-meta">保护 ${escapeHtml(String(r.protect != null ? r.protect : '—'))}</div></div></div>`);
+  }).catch(e => { tb.innerHTML = '<div class="hint">读取失败: ' + escapeHtml(String(e)) + '</div>'; });
+}
+
+// ── 操作 · 任务队列 ──
+let opsState = { items: [] };
+function loadOperationsPage() {
+  fetch('/api/tasks').then(r => r.json()).then(d => {
+    opsState.items = Array.isArray(d.items) ? d.items : [];
+    document.getElementById('opsStatus').textContent = opsState.items.length
+      ? `共 ${opsState.items.length} 个任务（计数 ${d.count != null ? d.count : opsState.items.length}）` : '当前没有任务。';
+    document.getElementById('opsTasks').innerHTML = opsState.items.length ? opsState.items.map((t, i) => {
+      const pct = Math.round((Number(t.progress) || 0) * 100);
+      return `<div class="data-row"><div>
+        <div class="data-title">${escapeHtml(t.kind || '?')} <span class="tag-pill">${escapeHtml(t.status || '')}</span></div>
+        <div class="data-meta">${escapeHtml(t.owner || t.actor || '')}${t.target ? ' · 目标 ' + escapeHtml(t.target) : ''} · ${pct}%${t.detail ? ' · ' + escapeHtml(t.detail) : ''}</div>
+      </div><div>
+        <button class="btn" onclick="opsTaskAction('cancel',${i})">取消</button>
+        <button class="btn" onclick="opsTaskAction('activate',${i})">插队</button>
+      </div></div>`;
+    }).join('') : '<div class="empty">没有任务。让 AI 开始干活后这里会出现。</div>';
+  }).catch(e => { document.getElementById('opsTasks').innerHTML = '<div class="hint">读取失败: ' + escapeHtml(String(e)) + '</div>'; });
+}
+function opsTaskAction(action, index) {
+  const t = opsState.items[index];
+  if (!t) return;
+  fetch(`/api/tasks/${action}`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: t.id})
+  }).then(r => r.json()).then(d => {
+    if (d && d.status === 'denied') dbgLog(`任务 ${action} 被拒: ${d.reason || ''}`);
+    loadOperationsPage();
+  }).catch(() => loadOperationsPage());
+}
+
+// ── Diagnostics（只读连接与运行状态）──
+function loadDiagnosticsPage() {
+  fetch('/api/status').then(r => r.json()).then(d => {
+    document.getElementById('diagRunning').textContent = d.running ? '运行中' : '未运行';
+    document.getElementById('diagMod').textContent = d.mod_connected ? '已连接' : '未连接';
+    document.getElementById('diagWire').textContent = d.wire || '—';
+    document.getElementById('diagTicks').textContent = (d.ticks != null ? d.ticks : '—');
+    const s = d.session || {};
+    document.getElementById('diagGate').textContent = s.gate ? JSON.stringify(s.gate, null, 2) : '（无 —— 会话未启动）';
+    const dec = Array.isArray(s.chat_decisions) ? s.chat_decisions : [];
+    document.getElementById('diagDecisions').textContent = dec.length ? JSON.stringify(dec, null, 2) : '（暂无决策记录）';
+  }).catch(e => { document.getElementById('diagGate').textContent = '读取失败: ' + e; });
 }
 
 // ── Init ──
