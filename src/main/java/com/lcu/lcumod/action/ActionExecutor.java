@@ -531,6 +531,8 @@ public class ActionExecutor {
                 case "route_follow" -> handleRouteFollow(cmd);
                 // 后端回灌：把持久化在**后端**的路径整条推回模组（灌进来即可直接 route_follow）
                 case "remember_route" -> handleRememberRoute(cmd);
+                // 路径几何导出：把整条点列原样给后端（跨重启回灌用；别塞进每帧 state）
+                case "route_export" -> handleRouteExport(cmd);
                 case "equip_weapon" -> {
                     String weapon = equipBestWeapon(mc);
                     sendResponse(cmd.id(), weapon != null,
@@ -538,8 +540,13 @@ public class ActionExecutor {
                 }
                 // 守卫：在某个点附近驻守（用户"在这儿守着" → 按发言瞬间的坐标 + 水平半径）
                 case "guard" -> handleGuard(cmd);
+                // 区域声明与硬保护（"这里是不是农场" → 声明语义 + 硬拦）
+                case "define_zone" -> handleDefineZone(cmd);
+                case "clear_zone" -> handleClearZone(cmd);
                 // 斜杠命令直通（原版 /locate structure|biome 这类"查世界"的能力）
                 case "run_command" -> handleRunCommand(cmd);
+                // 控件级点击：在**服务端弹出的**当前界面里按控件（不碰鼠标、不开界面）
+                case "click_screen_button" -> handleClickScreenButton(cmd);
                 // HUD 描述词：状态词后面那句话，由后端大模型输出
                 case "set_hud_note" -> {
                     JsonObject noteArgs = cmd.args();
@@ -547,8 +554,18 @@ public class ActionExecutor {
                             ? noteArgs.get("text").getAsString() : "";
                     double noteSeconds = noteArgs != null && noteArgs.has("seconds")
                             ? noteArgs.get("seconds").getAsDouble() : 30.0;
-                    com.lcu.lcumod.client.HudNote.set(noteText, noteSeconds);
-                    sendResponse(cmd.id(), true, "hud note=" + com.lcu.lcumod.client.HudNote.current());
+                    // HUD 描述词同样是 AI 生成的出站文本 → 同一套清洗（防 `/` 注入）
+                    com.lcu.lcumod.chat.TextSanitizer.Result noteSanitized =
+                            com.lcu.lcumod.chat.TextSanitizer.sanitize(noteText);
+                    if (noteSanitized.sanitized()) {
+                        LCUMod.LOGGER.warn("[Safety] set_hud_note 已清洗：{}", noteSanitized.text());
+                    }
+                    com.lcu.lcumod.client.HudNote.set(noteSanitized.text(), noteSeconds);
+                    JsonObject noteData = new JsonObject();
+                    noteData.addProperty("message", "hud note=" + com.lcu.lcumod.client.HudNote.current());
+                    noteData.addProperty("text", noteSanitized.text());
+                    noteData.addProperty("sanitized", noteSanitized.sanitized());
+                    sendResponse(cmd.id(), true, noteData);
                 }
                 // 后端覆盖本能反射（用户要求：不能让本能盖过高级指令）
                 case "reflex_override" -> {
@@ -637,10 +654,26 @@ public class ActionExecutor {
                 sendResponse(cmd.id(), false, "Empty message");
                 return;
             }
+            // 出站清洗（防注入）：**绝不**让 AI 说的话以 `/` 开头（那在聊天通道里就等于执行指令）。
+            com.lcu.lcumod.chat.TextSanitizer.Result sanitized =
+                    com.lcu.lcumod.chat.TextSanitizer.sanitize(msg);
+            msg = sanitized.text();
+            if (msg.isBlank()) {
+                sendResponse(cmd.id(), false, "Empty message after sanitize");
+                return;
+            }
+            if (sanitized.sanitized()) {
+                LCUMod.LOGGER.warn("[Safety] send_chat 已清洗（剥掉行首空白/斜杠 {} 字符，行首斜杠={}）：{}",
+                        sanitized.removedChars(), sanitized.hadLeadingSlash(), msg);
+            }
             mc.player.connection.sendChat(msg);
             // 记下我们自己发的这条，供 ChatListener 去重（不要按玩家名整类过滤用户的话）
             com.lcu.lcumod.chat.OutboundChatLog.record(msg);
-            sendResponse(cmd.id(), true, "Chat sent");
+            JsonObject data = new JsonObject();
+            data.addProperty("message", "Chat sent");
+            data.addProperty("text", msg);
+            data.addProperty("sanitized", sanitized.sanitized());
+            sendResponse(cmd.id(), true, data);
         } catch (Exception e) {
             LCUMod.LOGGER.error("[Action] sendChat error: {}", e.getMessage());
             sendResponse(cmd.id(), false, "Chat error: " + e.getMessage());
@@ -671,6 +704,13 @@ public class ActionExecutor {
         // Find nearest living entity in crosshair direction
         Entity target = findTargetEntity(mc, 6.0);
         if (target != null) {
+            // 区域硬保护：被保护区域里的动物不许打（喂食/剪毛等交互不在此列）
+            ZoneGuard.Block zoneBlock = ZoneGuard.block(target.getX(), target.getY(), target.getZ(),
+                    ZoneGuard.Action.ATTACK, target instanceof net.minecraft.world.entity.animal.Animal);
+            if (zoneBlock != null) {
+                sendZoneBlocked(cmd, zoneBlock, "attack " + target.getName().getString());
+                return;
+            }
             mc.gameMode.attack(mc.player, target);
             mc.player.swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, true);
             sendResponse(cmd.id(), true, "Attacked " + target.getName().getString());
@@ -679,6 +719,16 @@ public class ActionExecutor {
             mc.player.swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, true);
             sendResponse(cmd.id(), false, "No target found");
         }
+    }
+
+    /** 区域硬拦的统一回执：{@code {blocked_by_zone, rule, action}}（后端据此告诉 LLM"这里是农场"）。 */
+    private void sendZoneBlocked(WireServer.WireCommand cmd, ZoneGuard.Block blocked, String action) {
+        JsonObject data = new JsonObject();
+        data.addProperty("blocked_by_zone", blocked.zone());
+        data.addProperty("rule", blocked.rule());
+        data.addProperty("action", action);
+        LCUMod.LOGGER.warn("[Zone] 拦截 {}：zone={} rule={}", action, blocked.zone(), blocked.rule());
+        sendResponse(cmd.id(), false, data, "blocked_by_zone:" + blocked.zone() + " rule:" + blocked.rule());
     }
 
     private Entity findTargetEntity(Minecraft mc, double range) {
@@ -755,6 +805,7 @@ public class ActionExecutor {
         state.add("route", describeRoute());
         state.add("stations", describeStations());
         state.add("routes", describeRoutes());
+        state.add("zones", describeZones());
         var moveTgt = MovementSystem.getTarget();
         if (moveTgt != null) {
             JsonObject target = new JsonObject();
@@ -799,6 +850,14 @@ public class ActionExecutor {
 
         BlockPos pos = blockHit.getBlockPos();
         Direction dir = blockHit.getDirection();
+
+        // 区域硬保护：农场/基地里不许破坏方块（保护优先于允许）
+        ZoneGuard.Block mineBlock = ZoneGuard.block(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5,
+                ZoneGuard.Action.MINE, false);
+        if (mineBlock != null) {
+            sendZoneBlocked(cmd, mineBlock, "mine_block " + pos.toShortString());
+            return;
+        }
 
         // 按住 attack，直到方块消失（成功）或不再瞄准它；20s 未破坏 → 诚实失败。
         // 谓词每 tick 在 ControlStream 里复查：false = 目标达成（方块没了）/ 失去目标。
@@ -984,17 +1043,71 @@ public class ActionExecutor {
             return;
         }
 
+        // 区域硬保护：农场/基地里不许放置方块（保护优先于允许）；判定的是"将要被放进去的那一格"
+        BlockPos expectPos = targetPos.relative(dir);
+        ZoneGuard.Block placeZone = ZoneGuard.block(
+                expectPos.getX() + 0.5, expectPos.getY() + 0.5, expectPos.getZ() + 0.5,
+                ZoneGuard.Action.PLACE, false);
+        if (placeZone != null) {
+            sendZoneBlocked(cmd, placeZone, "place_block " + expectPos.toShortString());
+            return;
+        }
+
+        // 物品由**后端点名**（方块选择不在本地做启发式）。点名的物品必须真在背包里：找不到就如实失败，
+        // **绝不回落到"手边随便一个方块"**（用户："若 place_block 收到一个不在背包里的物品 → 如实失败"）。
+        String requested = args != null && args.has("item") ? args.get("item").getAsString() : "";
+        ItemPick.Result pick = resolvePlaceItem(mc, requested);
+        switch (pick.outcome()) {
+            case NOT_FOUND -> {
+                JsonObject data = new JsonObject();
+                data.addProperty("ok", false);
+                data.addProperty("reason", "item_not_in_inventory");
+                data.addProperty("item", pick.id());
+                LCUMod.LOGGER.warn("[Place] 点名的物品不在背包：{}（不替换成别的方块）", pick.id());
+                sendResponse(cmd.id(), false, data, "item_not_in_inventory: " + pick.id());
+                return;
+            }
+            case SELECT_HOTBAR, SWAP_INTO_HOTBAR -> {
+                if (pick.outcome() == ItemPick.Outcome.SWAP_INTO_HOTBAR
+                        && !swapIntoHotbar(mc, pick.slot())) {
+                    JsonObject data = new JsonObject();
+                    data.addProperty("ok", false);
+                    data.addProperty("reason", "item_not_in_hotbar");
+                    data.addProperty("item", pick.id());
+                    sendResponse(cmd.id(), false, data, "item_not_in_hotbar: " + pick.id());
+                    return;
+                }
+                if (pick.outcome() == ItemPick.Outcome.SELECT_HOTBAR) {
+                    mc.player.getInventory().setSelectedSlot(pick.slot());
+                }
+            }
+            default -> {
+                // NOT_REQUESTED / IN_HAND：用当前手持，保持原有行为
+            }
+        }
+
         // 手上必须是方块，否则校验的目标方块无从谈起
         ItemStack hand = mc.player.getItemInHand(InteractionHand.MAIN_HAND);
         if (!(hand.getItem() instanceof BlockItem blockItem)) {
             sendResponse(cmd.id(), false, "No block in hand");
             return;
         }
+        if (!ItemPick.normalize(requested).isEmpty()
+                && !ItemPick.normalize(requested).equals(ItemPick.normalize(hand.getItem().toString()))) {
+            // 点名的物品没能拿到手上（交换失败/被别的规则挪走）→ 如实失败，不拿别的方块顶
+            JsonObject data = new JsonObject();
+            data.addProperty("ok", false);
+            data.addProperty("reason", "item_not_in_hand");
+            data.addProperty("item", ItemPick.normalize(requested));
+            data.addProperty("held", ItemPick.normalize(hand.getItem().toString()));
+            sendResponse(cmd.id(), false, data, "item_not_in_hand");
+            return;
+        }
 
         // 先把旧的 place 收尾（幂等：重复调用不叠加）
         abortPendingPlace();
 
-        placeExpectPos = targetPos.relative(dir);
+        placeExpectPos = expectPos;
         placeExpectBlock = blockItem.getBlock();
         // 先看向目标面（方块面中心），否则原版 useItemOn 会打错面 → 放空
         Vec3 face = faceCenter(targetPos, dir);
@@ -1068,6 +1181,53 @@ public class ActionExecutor {
         if (id != null) {
             sendResponse(id, false, "Place aborted");
         }
+    }
+
+    /** 把后端点名的物品对上背包里真实存在的那一格（纯逻辑在 {@link ItemPick}）。 */
+    private static ItemPick.Result resolvePlaceItem(Minecraft mc, String requested) {
+        var inv = mc.player.getInventory();
+        List<ItemPick.Slot> slots = new ArrayList<>();
+        for (int i = 0; i < inv.getContainerSize(); i++) {
+            ItemStack stack = inv.getItem(i);
+            if (stack.isEmpty()) {
+                continue;
+            }
+            slots.add(new ItemPick.Slot(i, stack.getItem().toString(), stack.getCount()));
+        }
+        String held = mc.player.getItemInHand(InteractionHand.MAIN_HAND).getItem().toString();
+        return ItemPick.resolve(requested, slots, held, inv.getSelectedSlot());
+    }
+
+    /**
+     * 把背包主区的一格换到当前快捷栏格（原版 {@code SWAP} 窗口点击，**不需要界面**）。
+     *
+     * <p>注意这只是"搬运同一个物品"，不是"换别的物品"；换不过去就返回 false，由调用方如实失败。
+     * 开着别的容器时不动（避免和容器命令抢同一套槽位）。
+     */
+    private static boolean swapIntoHotbar(Minecraft mc, int invIndex) {
+        var player = mc.player;
+        if (player == null || mc.gameMode == null) {
+            return false;
+        }
+        var menu = player.inventoryMenu;
+        if (player.containerMenu != menu) {
+            return false;
+        }
+        var inv = player.getInventory();
+        Integer menuSlot = null;
+        for (int i = 0; i < menu.slots.size(); i++) {
+            var slot = menu.slots.get(i);
+            if (slot.container == inv && slot.getContainerSlot() == invIndex) {
+                menuSlot = i;
+                break;
+            }
+        }
+        if (menuSlot == null) {
+            return false;
+        }
+        mc.gameMode.handleContainerInput(menu.containerId, menuSlot, inv.getSelectedSlot(),
+                ContainerInput.SWAP, player);
+        return true;
     }
 
     /** 中止进食（stop_all / 新任务 / AI 关闭）：松开 hold 并向所有 waiter 诚实回执失败。 */
@@ -2206,6 +2366,8 @@ public class ActionExecutor {
         data.addProperty("saved", route != null);
         data.addProperty("name", name);
         data.addProperty("points", points.size());
+        // 点列不在这里重复发（最多 2000 点）：告诉后端"要用就来 route_export"
+        data.addProperty("export_available", route != null);
         sendResponse(cmd.id(), route != null, data);
     }
 
@@ -2250,6 +2412,63 @@ public class ActionExecutor {
         data.addProperty("total", ROUTE.total());
         data.addProperty("index", 0);
         data.addProperty("speed", ROUTE.speed());
+        sendResponse(cmd.id(), true, data);
+    }
+
+    /**
+     * 路径几何导出：把一条路径的**完整点列原样**发给后端（不抽稀、不加工）。
+     *
+     * <p>为什么需要：`state.routes[]` 只有 name/点数/tick（每帧几十 KB 不能塞点列），
+     * 于是路径跨模组重启回灌时后端推不出几何、只能记 `no_geometry`。这里给一条按需出口：
+     * 后端要回灌某条路径时先 `route_export {name}` 取点列，再用 `remember_route` 灌回来。
+     *
+     * <p>失败如实：路径不存在 → `unknown_route`；点列为空 → `no_geometry`。
+     */
+    private void handleRouteExport(WireServer.WireCommand cmd) {
+        JsonObject args = cmd.args();
+        String name = args != null && args.has("name") ? args.get("name").getAsString().strip() : "";
+        if (name.isEmpty()) {
+            JsonObject data = new JsonObject();
+            data.addProperty("ok", false);
+            data.addProperty("reason", "need_name");
+            sendResponse(cmd.id(), false, data, "need_name");
+            return;
+        }
+        RouteMemory.Route route = RouteMemory.get(name);
+        if (route == null) {
+            JsonObject data = new JsonObject();
+            data.addProperty("ok", false);
+            data.addProperty("name", name);
+            data.addProperty("reason", "unknown_route");
+            sendResponse(cmd.id(), false, data, "unknown_route");
+            return;
+        }
+        if (route.points() == null || route.points().isEmpty()) {
+            JsonObject data = new JsonObject();
+            data.addProperty("ok", false);
+            data.addProperty("name", name);
+            data.addProperty("reason", "no_geometry");
+            sendResponse(cmd.id(), false, data, "no_geometry");
+            return;
+        }
+        JsonObject data = new JsonObject();
+        data.addProperty("ok", true);
+        data.addProperty("name", route.name());
+        JsonArray points = new JsonArray();
+        for (RouteMemory.RoutePoint p : route.points()) {
+            JsonObject o = new JsonObject();
+            o.addProperty("x", p.x());
+            o.addProperty("y", p.y());
+            o.addProperty("z", p.z());
+            o.addProperty("yaw", p.yaw());
+            points.add(o);
+        }
+        data.add("points", points);
+        data.addProperty("count", route.points().size());
+        data.addProperty("saved_at_tick", route.savedAtTick());
+        // 单帧一次发完（最多 2000 点）；线协议一行一条 JSON，这里顺手量一下真实字节数供排障。
+        LCUMod.LOGGER.info("[Route] export '{}' points={} payloadChars={}",
+                route.name(), route.points().size(), data.toString().length());
         sendResponse(cmd.id(), true, data);
     }
 
@@ -2711,9 +2930,190 @@ public class ActionExecutor {
             sendResponse(cmd.id(), false, "Need command");
             return;
         }
+        // 硬黑名单兜底（用户："有些指令绝对不可以用：kill、kick 之类"）：大小写/前导斜杠/多余空白/
+        // 命名空间前缀都在 normalize 里处理；命中即拒绝，**绝不发出去**（后端白名单被绕过也拦得住）。
+        CommandBlacklist.Verdict verdict = CommandBlacklist.check(command);
+        if (verdict.blocked()) {
+            JsonObject data = new JsonObject();
+            data.addProperty("blocked", true);
+            data.addProperty("reason", CommandBlacklist.REASON);
+            data.addProperty("command", verdict.family());
+            LCUMod.LOGGER.warn("[Safety] run_command 被硬黑名单拒绝：{}", verdict.family());
+            sendResponse(cmd.id(), false, data, CommandBlacklist.REASON + ": " + verdict.family());
+            return;
+        }
         followTargetName = null;
         mc.player.connection.sendCommand(command);
         sendResponse(cmd.id(), true, "Ran /" + command);
+    }
+
+    /**
+     * 控件级点击：在**当前已打开的**界面里找文本匹配 {@code match} 的控件，直接触发它的
+     * {@code onPress} / {@code mouseClicked}（{@link com.lcu.lcumod.client.ScreenButtonClick}）。
+     *
+     * <p>不移动真鼠标、不发鼠标事件、不开界面；界面来自**服务端**弹的那个（我们从不主动开界面）。
+     * 失败路径都是**如实**的：{@code no_screen}（当前没界面）、{@code user_screen_open}（玩家自己的
+     * 界面 → 让路）、{@code no_match}（附界面上可点控件的文字，便于后端调识别规则）。
+     */
+    private void handleClickScreenButton(WireServer.WireCommand cmd) {
+        JsonObject args = cmd.args();
+        String query = args != null && args.has("match") ? args.get("match").getAsString() : "";
+        var mc = Minecraft.getInstance();
+        com.lcu.lcumod.client.ScreenButtonClick.Result result =
+                com.lcu.lcumod.client.ScreenButtonClick.click(mc, query);
+        JsonObject data = new JsonObject();
+        data.addProperty("status", result.status());
+        data.addProperty("screen", result.screen());
+        data.addProperty("screen_title", result.screenTitle());
+        data.addProperty("match", query);
+        if (result.hit() != null) {
+            var hit = result.hit();
+            JsonObject h = new JsonObject();
+            h.addProperty("type", hit.type());
+            h.addProperty("text", hit.label());
+            h.addProperty("x", hit.x());
+            h.addProperty("y", hit.y());
+            h.addProperty("width", hit.width());
+            h.addProperty("height", hit.height());
+            data.add("clicked", h);
+        }
+        JsonArray candidates = new JsonArray();
+        for (String c : result.candidates()) {
+            candidates.add(c);
+        }
+        data.add("candidates", candidates);
+
+        boolean ok = "ok".equals(result.status());
+        if (ok) {
+            StateCollector.requestRefresh();
+            LCUMod.LOGGER.info("[Screen] clicked '{}' in {} (match='{}')",
+                    result.hit() == null ? "" : result.hit().label(), result.screen(), query);
+        } else {
+            LCUMod.LOGGER.warn("[Screen] click_screen_button={} (screen={}, match='{}')",
+                    result.status(), result.screen(), query);
+        }
+        sendResponse(cmd.id(), ok, data, ok ? null : result.status());
+    }
+
+    /**
+     * 声明一个区域：{@code define_zone {name, kind, x, y, z, radius?, box?, protect[]}}。
+     *
+     * <p>区域是**语义 + 硬保护**（用户："他无法识别这里是不是农场" → 不能靠提示词，得硬拦）。
+     * {@code radius} = 球（三维欧氏）；{@code box} = 轴对齐长方体（端点含）；两者都给按 box 判。
+     */
+    private void handleDefineZone(WireServer.WireCommand cmd) {
+        JsonObject args = cmd.args();
+        if (args == null || !args.has("name")) {
+            sendResponse(cmd.id(), false, "Need name");
+            return;
+        }
+        String name = args.get("name").getAsString();
+        String kind = args.has("kind") ? args.get("kind").getAsString() : "";
+        var mc = Minecraft.getInstance();
+        BlockPos base = mc.player != null ? mc.player.blockPosition() : BlockPos.ZERO;
+        double x = args.has("x") ? args.get("x").getAsDouble() : base.getX() + 0.5;
+        double y = args.has("y") ? args.get("y").getAsDouble() : base.getY();
+        double z = args.has("z") ? args.get("z").getAsDouble() : base.getZ() + 0.5;
+        Double radius = args.has("radius") && !args.get("radius").isJsonNull()
+                ? args.get("radius").getAsDouble() : null;
+        ZoneGuard.Box box = null;
+        if (args.has("box") && args.get("box").isJsonObject()) {
+            JsonObject b = args.getAsJsonObject("box");
+            box = new ZoneGuard.Box(
+                    b.has("min_x") ? b.get("min_x").getAsDouble() : 0.0,
+                    b.has("min_y") ? b.get("min_y").getAsDouble() : 0.0,
+                    b.has("min_z") ? b.get("min_z").getAsDouble() : 0.0,
+                    b.has("max_x") ? b.get("max_x").getAsDouble() : 0.0,
+                    b.has("max_y") ? b.get("max_y").getAsDouble() : 0.0,
+                    b.has("max_z") ? b.get("max_z").getAsDouble() : 0.0);
+        }
+        List<String> protect = new ArrayList<>();
+        if (args.has("protect") && args.get("protect").isJsonArray()) {
+            for (var el : args.getAsJsonArray("protect")) {
+                protect.add(el.getAsString());
+            }
+        }
+        ZoneGuard.DefineResult defined = ZoneGuard.define(name, kind, x, y, z, radius, box, protect);
+        if (!defined.ok()) {
+            JsonObject data = new JsonObject();
+            data.addProperty("ok", false);
+            data.addProperty("reason", defined.reason());
+            sendResponse(cmd.id(), false, data, defined.reason());
+            return;
+        }
+        StateCollector.requestRefresh();
+        ZoneGuard.Zone zone = defined.zone();
+        LCUMod.LOGGER.info("[Zone] define '{}' kind={} shape={} protect={}",
+                zone.name(), zone.kind(), zone.shape(), zone.protect());
+        JsonObject data = new JsonObject();
+        data.addProperty("ok", true);
+        data.add("zone", zoneJson(zone));
+        sendResponse(cmd.id(), true, data);
+    }
+
+    /** 删除一个区域（不存在则如实回 {@code unknown_zone}）。 */
+    private void handleClearZone(WireServer.WireCommand cmd) {
+        JsonObject args = cmd.args();
+        String name = args != null && args.has("name") ? args.get("name").getAsString() : "";
+        if (ZoneGuard.clear(name)) {
+            StateCollector.requestRefresh();
+            JsonObject data = new JsonObject();
+            data.addProperty("ok", true);
+            data.addProperty("cleared", name.strip());
+            data.addProperty("zones", ZoneGuard.size());
+            sendResponse(cmd.id(), true, data);
+            return;
+        }
+        JsonObject data = new JsonObject();
+        data.addProperty("ok", false);
+        data.addProperty("reason", "unknown_zone");
+        sendResponse(cmd.id(), false, data, "unknown_zone");
+    }
+
+    /** 一个区域 → JSON（状态与命令回执共用同一形状）。 */
+    private static JsonObject zoneJson(ZoneGuard.Zone zone) {
+        JsonObject o = new JsonObject();
+        o.addProperty("name", zone.name());
+        o.addProperty("kind", zone.kind());
+        JsonArray protect = new JsonArray();
+        for (String p : zone.protect()) {
+            protect.add(p);
+        }
+        o.add("protect", protect);
+        JsonObject center = new JsonObject();
+        center.addProperty("x", zone.x());
+        center.addProperty("y", zone.y());
+        center.addProperty("z", zone.z());
+        o.add("center", center);
+        o.addProperty("shape", zone.shape());
+        if (zone.radius() != null) {
+            o.addProperty("radius", zone.radius());
+        } else {
+            o.add("radius", com.google.gson.JsonNull.INSTANCE);
+        }
+        if (zone.box() != null) {
+            ZoneGuard.Box b = zone.box();
+            JsonObject box = new JsonObject();
+            box.addProperty("min_x", b.minX());
+            box.addProperty("min_y", b.minY());
+            box.addProperty("min_z", b.minZ());
+            box.addProperty("max_x", b.maxX());
+            box.addProperty("max_y", b.maxY());
+            box.addProperty("max_z", b.maxZ());
+            o.add("box", box);
+        } else {
+            o.add("box", com.google.gson.JsonNull.INSTANCE);
+        }
+        return o;
+    }
+
+    /** 所有区域（进 state 的 {@code zones[]}）。 */
+    public static JsonArray describeZones() {
+        JsonArray arr = new JsonArray();
+        for (ZoneGuard.Zone zone : ZoneGuard.all()) {
+            arr.add(zoneJson(zone));
+        }
+        return arr;
     }
 
     /** 驻守 tick：出了半径就走回去（只补"回家"意图，不抢战斗反射/寻路的控制权）。 */
@@ -2792,11 +3192,14 @@ public class ActionExecutor {
         }
 
         String reason = Pathfinder.getLastFailureReason();
+        String stuckReason = reason == null || reason.isBlank()
+                ? "no progress; " + Pathfinder.NO_RESCUE_POLICY
+                : reason;
         Pathfinder.stop();
         setTaskState(activeTaskKind == null || activeTaskKind.isBlank() ? "move" : activeTaskKind,
-                "failed", activeTaskTarget, "stuck: " + (reason == null || reason.isBlank() ? "no progress" : reason), 0.0);
+                "failed", activeTaskTarget, "stuck: " + stuckReason, 0.0);
         StateCollector.requestRefresh();
-        LCUMod.LOGGER.warn("[Stuck] 3s 无位移，已停止寻路并上报：{}", reason);
+        LCUMod.LOGGER.warn("[Stuck] 3s 无位移，已停止寻路并上报（不搭方块自救）：{}", stuckReason);
         stuckTicks = 0;
         stuckLastX = Double.NaN;
         stuckCooldown = 20 * 5;
@@ -3195,10 +3598,19 @@ public class ActionExecutor {
     }
 
     private void setTaskState(String kind, String status, String target, String detail, double progress) {
+        // 任务 detail/target 也可能带上后端给的文字（物品名、目标名）→ 同一套出站清洗兜底
+        com.lcu.lcumod.chat.TextSanitizer.Result cleanTarget =
+                com.lcu.lcumod.chat.TextSanitizer.sanitize(target);
+        com.lcu.lcumod.chat.TextSanitizer.Result cleanDetail =
+                com.lcu.lcumod.chat.TextSanitizer.sanitize(detail);
+        if (cleanTarget.sanitized() || cleanDetail.sanitized()) {
+            LCUMod.LOGGER.warn("[Safety] task detail 已清洗：target={} detail={}",
+                    cleanTarget.text(), cleanDetail.text());
+        }
         activeTaskKind = kind;
         activeTaskStatus = status;
-        activeTaskTarget = target == null ? "" : target;
-        activeTaskDetail = detail == null ? "" : detail;
+        activeTaskTarget = cleanTarget.text();
+        activeTaskDetail = cleanDetail.text();
         activeTaskProgress = Math.max(0.0, Math.min(1.0, progress));
         // Terminal transition: force the next state_update so the backend sees the task end immediately
         if (TERMINAL_TASK_STATUSES.contains(status)) {
@@ -3238,6 +3650,11 @@ public class ActionExecutor {
 
     private void sendResponse(String id, boolean success, JsonObject data) {
         if (LCUMod.WIRE != null) LCUMod.WIRE.sendResponse(id, success, data);
+    }
+
+    /** 带机器可读原因码的回执（安全拦截 / 区域拦截 / 如实失败都用它）。 */
+    private void sendResponse(String id, boolean success, JsonObject data, String error) {
+        if (LCUMod.WIRE != null) LCUMod.WIRE.sendResponse(id, success, data, error);
     }
 
     private void tickFollowTarget(Minecraft mc) {
@@ -3506,6 +3923,29 @@ public class ActionExecutor {
         }
 
         if (diggingPos == null || !pendingCollectTargetPos.equals(diggingPos)) {
+            // 区域硬保护同样管到这条路：`collect_blocks` 也是"破坏方块"，农场的作物/建筑一样不许动。
+            ZoneGuard.Block collectZone = ZoneGuard.block(
+                    pendingCollectTargetPos.getX() + 0.5,
+                    pendingCollectTargetPos.getY() + 0.5,
+                    pendingCollectTargetPos.getZ() + 0.5,
+                    ZoneGuard.Action.MINE, false);
+            if (collectZone != null) {
+                String reqId = pendingCollectReqId;
+                JsonObject data = new JsonObject();
+                data.addProperty("blocked_by_zone", collectZone.zone());
+                data.addProperty("rule", collectZone.rule());
+                data.addProperty("action", "collect_blocks " + pendingCollectTargetPos.toShortString());
+                pendingCollectItem = null;
+                pendingCollectReqId = null;
+                pendingCollectTargetPos = null;
+                setTaskState("collect", "failed", "",
+                        "blocked_by_zone:" + collectZone.zone() + " rule:" + collectZone.rule(), 0.0);
+                if (reqId != null && LCUMod.WIRE != null) {
+                    LCUMod.WIRE.sendResponse(reqId, false, data,
+                            "blocked_by_zone:" + collectZone.zone() + " rule:" + collectZone.rule());
+                }
+                return;
+            }
             autoEquipForBlock(mc, pendingCollectTargetPos);
             mc.player.lookAt(net.minecraft.commands.arguments.EntityAnchorArgument.Anchor.EYES, Vec3.atCenterOf(pendingCollectTargetPos));
             mc.gameMode.startDestroyBlock(pendingCollectTargetPos, Direction.UP);

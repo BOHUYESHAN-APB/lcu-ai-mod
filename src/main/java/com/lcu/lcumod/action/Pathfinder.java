@@ -41,6 +41,17 @@ public class Pathfinder {
     private static final int STUCK_TIMEOUT_TICKS = 40;
     private static final int MAX_SEARCH_EXPANSIONS = 2048;
 
+    /**
+     * 寻路失败时随原因一起上报的口径（**不搭方块**）。
+     *
+     * 用户口径：「他尝试搭方块这件事还是不要做了……AI 要是不小心掉到某个坑里、或者被苦力怕炸到坑里，
+     * 它会乱搭方块」。因此寻路/自救**绝不**放方块：宁可站着不动、宁可如实失败，也不自己造桥/立柱/填坑。
+     * 放方块这件事只保留"显式任务"入口（后端点名物品 + 位置的放置命令），本类不碰。
+     *
+     * <p>（本文件刻意不出现放方块相关调用的字面量，{@code verifyGuard} 会静态扫描这一点。）
+     */
+    public static final String NO_RESCUE_POLICY = "bridging/pillar-up disabled; report for replanning";
+
     private static final int[][] DIRECTIONS = new int[][] {
         {1, 0}, {-1, 0}, {0, 1}, {0, -1},
         {1, 1}, {1, -1}, {-1, 1}, {-1, -1}
@@ -153,7 +164,11 @@ public class Pathfinder {
 
         List<Vec3> solved = findPath(mc, start, goal);
         if (solved.isEmpty()) {
-            lastFailureReason = String.format("A* search failed from %s to %s", start.supportPos, goal.supportPos);
+            // 寻路失败的正确行为 = **如实上报**，交后端重规划。
+            // 绝不"自救"：本地**不做**搭桥 / 立柱上爬 / 填坑（用户实机：掉坑或挨炸后它会乱搭方块）；
+            // 也无从断言"搭桥就能过"——所以只如实说"这里没有路，且本地不会造路"。
+            lastFailureReason = String.format(
+                    "no path from %s to %s (%s)", start.supportPos, goal.supportPos, NO_RESCUE_POLICY);
             LCUMod.LOGGER.warn("[Pathfinder] {}", lastFailureReason);
             return false;
         }

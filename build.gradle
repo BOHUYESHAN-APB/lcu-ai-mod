@@ -214,6 +214,15 @@ tasks.named('check').configure {
     dependsOn 'verifyContainer'
     dependsOn 'verifyRoute'
     dependsOn 'verifyRecipe'
+    dependsOn 'verifyGuard'
+}
+
+tasks.register('verifyGuard', JavaExec) {
+    group = 'verification'
+    description = '纯逻辑自检（出站文本清洗防注入 / 指令硬黑名单 / 区域保护硬拦与优先级 / click_screen_button 放行与匹配 / place_block 物品不在背包即失败 / 导航不搭方块的静态扫描）'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.output + sourceSets.main.output
+    mainClass = 'com.lcu.lcumod.action.GuardCheck'
 }
 
 tasks.register('verifyRecipe', JavaExec) {

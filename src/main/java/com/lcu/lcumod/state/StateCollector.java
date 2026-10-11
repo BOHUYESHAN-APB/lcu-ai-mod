@@ -476,6 +476,8 @@ public class StateCollector {
         state.add("route", com.lcu.lcumod.action.ActionExecutor.describeRoute());
         state.add("stations", com.lcu.lcumod.action.ActionExecutor.describeStations());
         state.add("routes", com.lcu.lcumod.action.ActionExecutor.describeRoutes());
+        // 区域声明（语义 + 保护项）：后端据此**事前**就知道"这里是农场，别挖/别放/别打动物"
+        state.add("zones", com.lcu.lcumod.action.ActionExecutor.describeZones());
 
         LCUMod.WIRE.sendEvent("state_update", state);
     }
