@@ -17,6 +17,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from .craft import inventory_counts, normalize_item
+from .territory import ACTION_FARM, may_act
 
 # 作物方块 → 种子/种植物品（"补种用同一作物"就靠这张表）。
 CROP_SEEDS: dict[str, str] = {
@@ -269,3 +270,209 @@ def note(action: Any, plot: Any, target: Any, *, reason: str = "", missing: Any 
         pos = f"({float(target.get('x')):.0f},{float(target.get('y')):.0f},{float(target.get('z')):.0f})"
     tail = f"，补种用{seed}" if seed else ""
     return f"（在{where}干{action_label(action)}{pos}{tail}）"
+
+
+# ── 别人家的田（人设驱动；**默认关**，权限表显式放开）────────────
+# 用户口径：「别人家的田，那要看情况……如果是朋友家的，那可以**帮忙种一种**，也可以去
+# **捣乱**……想**展示出人设**、**个性化**一点，让他更像**人**」。所以：
+#   `none`（默认）= 别人家的田一概不碰；
+#   `help`        = 可以**帮忙种**（锄地/播种/收割/补种这类）；
+#   `mischief`    = 人设允许时还能搞点**无伤大雅**的恶作剧（**禁止破坏财产/伤害生物** ✗）。
+# 「当前被允许做哪种」如实给 L2，**用不用由 LLM 决定** —— 决策链里**不写 tier 分支**。
+OTHERS_NONE = "none"
+OTHERS_HELP = "help"
+OTHERS_MISCHIEF = "mischief"
+FARM_OTHERS_MODES: tuple[str, ...] = (OTHERS_NONE, OTHERS_HELP, OTHERS_MISCHIEF)
+# help 能做的活（"帮忙种一种"）：不破坏、不伤害。
+HELP_ACTIONS: tuple[str, ...] = (ACTION_TILL, ACTION_PLANT, ACTION_HARVEST, ACTION_REPLANT)
+# mischief 能做的：**只动土/种东西**这一档，绝不破坏财产、绝不伤害生物 ✗。
+MISCHIEF_ACTIONS: tuple[str, ...] = (ACTION_TILL, ACTION_PLANT)
+
+
+def normalize_others(value: Any, default: str = OTHERS_NONE) -> str:
+    """`farm_others` 档位归一化：认不出的回默认（默认＝**不碰**）。"""
+    text = str(value or "").strip().lower()
+    return text if text in FARM_OTHERS_MODES else default
+
+
+def others_verdict(mode: Any, action: Any, *, mischievous: bool = False) -> dict:
+    """别人家田上"这次允不允许动手、算不算捣乱"的判定（**全查表，不写 tier 分支**）。
+
+    返回 `{"allowed", "mischief", "reason"}`；`allowed=False` 时 `reason` 说清为什么。
+    """
+    mode = normalize_others(mode)
+    verb = normalize_action(action)
+    if mode == OTHERS_NONE:
+        return {"allowed": False, "mischief": False, "reason": "farm_others_off"}
+    if mischievous:
+        if mode != OTHERS_MISCHIEF:
+            return {"allowed": False, "mischief": False, "reason": "farm_others_no_mischief"}
+        if verb not in MISCHIEF_ACTIONS:
+            return {"allowed": False, "mischief": False, "reason": "mischief_not_harmless"}
+        return {"allowed": True, "mischief": True, "reason": "mischief_allowed"}
+    if verb in HELP_ACTIONS:
+        return {"allowed": True, "mischief": False, "reason": "help_allowed"}
+    return {"allowed": False, "mischief": False, "reason": "farm_others_action"}
+
+
+def land_owner(row: Any) -> dict:
+    """这块田/畜栏是谁的：`granted_by` 是 master（或没写）→ 自家；否则算**别人家**。
+
+    邻居只可能是"别人明确声明成他家的"（`granted_by.tier` 是 friend/guest）——
+    没写授予人的一律当自家（那是我们自己记下来/被 master 授的）。
+    """
+    granted = row.get("granted_by") if isinstance(row, dict) else None
+    granted = granted if isinstance(granted, dict) else {}
+    tier = str(granted.get("tier") or "").strip().lower()
+    name = str(granted.get("name") or "").strip()
+    if tier and tier != "master":
+        return {"mine": False, "tier": tier, "name": name}
+    return {"mine": True, "tier": tier or "master", "name": name}
+
+
+def others_note(owner: dict, action: Any, verdict: dict) -> str:
+    """动别人家田时的**如实**说法（让 LLM 知道"这是谁家的、这次算不算捣乱"）。"""
+    who = owner.get("name") or owner.get("tier") or "别人"
+    label = action_label(action) or "动手"
+    if not verdict.get("allowed"):
+        if verdict.get("reason") == "farm_others_off":
+            return f"（那是{who}家的田：权限表里没放开采别人家的田，我不动）"
+        if verdict.get("reason") == "farm_others_no_mischief":
+            return f"（那是{who}家的田：只许帮忙种，不许搞恶作剧）"
+        if verdict.get("reason") == "mischief_not_harmless":
+            return f"（那是{who}家的田：恶作剧只许无伤大雅的，破坏/伤生物的我不做）"
+        return f"（那是{who}家的田：这一档没放开「{label}」）"
+    if verdict.get("mischief"):
+        return f"（在{who}家的田上搞点无伤大雅的恶作剧：{label}）"
+    return f"（帮{who}家的田{label}）"
+
+
+# ── 喂动物（只喂**授权区域**内的；走通用右键，不新增 Java 命令）──────
+# 动物种类 → 能喂的食物（按 id 认；认不出就不喂 —— 不硬凑）。
+ANIMAL_FOODS: dict[str, tuple[str, ...]] = {
+    "cow": ("wheat",), "mooshroom": ("wheat",), "sheep": ("wheat",),
+    "goat": ("wheat",), "llama": ("wheat",), "trader_llama": ("wheat",),
+    "pig": ("carrot", "potato", "beetroot"),
+    "chicken": ("wheat_seeds", "beetroot_seeds", "melon_seeds", "pumpkin_seeds"),
+    "rabbit": ("carrot", "dandelion"),
+    "horse": ("golden_apple", "apple"), "donkey": ("golden_apple", "apple"),
+    "mule": ("golden_apple", "apple"), "fox": ("sweet_berries",),
+    "panda": ("bamboo",), "turtle": ("seagrass",), "bee": ("dandelion", "poppy"),
+    "cat": ("cod", "salmon"), "ocelot": ("cod", "salmon"),
+    "parrot": ("wheat_seeds", "melon_seeds", "pumpkin_seeds", "beetroot_seeds"),
+    "wolf": ("beef", "cooked_beef", "chicken", "cooked_chicken", "porkchop",
+             "cooked_porkchop", "mutton", "cooked_mutton", "rabbit", "cooked_rabbit"),
+}
+
+
+def animal_kind(entity: Any) -> str:
+    """这只实体是不是动物、是哪一种（只按 `type`/`name` 认，认不出返回空串）。"""
+    if not isinstance(entity, dict):
+        return ""
+    text = normalize_item(entity.get("type") or entity.get("entity_type")
+                          or entity.get("name"))
+    if not text:
+        return ""
+    short = text.rsplit("/", 1)[-1]
+    for kind in ANIMAL_FOODS:
+        if short == kind or short.endswith("_" + kind) or short.endswith(kind):
+            return kind
+    return ""
+
+
+def foods_for(entity: Any) -> tuple[str, ...]:
+    """这只动物能吃的食物表（认不出就空表）。"""
+    return ANIMAL_FOODS.get(animal_kind(entity), ())
+
+
+def feed_food(counts: Any, entity: Any) -> str:
+    """背包里能喂这只动物的食物（按食物表顺序挑真有的）——没有就空串（不硬凑）。"""
+    rows = counts if isinstance(counts, dict) else {}
+    for food in foods_for(entity):
+        if int(rows.get(food, 0) or 0) > 0:
+            return food
+    return ""
+
+
+def _entity_rows(entities: Any) -> list[dict]:
+    return [row for row in (entities or []) if isinstance(row, dict)]
+
+
+def feed_targets(entities: Any, zones: Any, territories: Any) -> dict:
+    """能喂的动物（**只喂授权区域**内的）+ 被硬拦的（报区域名+规则）+ 没授权的。
+
+    授权口径与农活一致（`may_act(..., ACTION_FARM)`）：自家畜栏能喂，别人家的畜栏不碰；
+    动物若站在带保护的保护区里 → 如实报"区域名 + 规则"，**不绕过**。
+    """
+    feedable: list[dict] = []
+    blocked: list[dict] = []
+    unauthorized: list[dict] = []
+    for entity in _entity_rows(entities):
+        kind = animal_kind(entity)
+        if not kind:
+            continue
+        x, y, z = entity.get("x"), entity.get("y"), entity.get("z")
+        if any(not isinstance(value, (int, float)) or isinstance(value, bool)
+               for value in (x, y, z)):
+            unauthorized.append({"animal": kind, "reason": "no_position"})
+            continue
+        verdict = may_act(territories, zones, float(x), float(y), float(z), ACTION_FARM)
+        if verdict.get("allowed"):
+            feedable.append({**entity, "kind": kind})
+            continue
+        if verdict.get("reason") == "zone_protection":
+            blocked.append({"animal": kind, "zone": verdict.get("zone"),
+                            "rule": verdict.get("rule"), "x": float(x), "y": float(y),
+                            "z": float(z)})
+        else:
+            unauthorized.append({"animal": kind, "reason": str(verdict.get("reason") or "")})
+    return {"feedable": feedable, "blocked": blocked, "unauthorized": unauthorized}
+
+
+def feed_note(targets: dict, *, fed: Any = None, missing: Any = None) -> str:
+    """喂食这一段的**如实**说法（喂了几只 / 缺什么 / 被哪条规则拦下）。"""
+    blocked = (targets or {}).get("blocked") or []
+    if blocked:
+        hit = blocked[0]
+        return (f"（「{hit.get('zone')}」的「{hit.get('rule')}」规则不许在这儿动手，"
+                f"那只 {hit.get('animal')} 我没喂）")
+    fed_rows = {str(k): int(v) for k, v in (fed or {}).items() if int(v or 0) > 0}
+    if fed_rows:
+        total = sum(fed_rows.values())
+        detail = "、".join(f"{kind} x{count}" for kind, count in fed_rows.items())
+        return f"（喂了 {total} 只（{detail}））"
+    if missing:
+        return f"（没喂成：缺 {'、'.join(str(item) for item in missing)}）"
+    unauthorized = (targets or {}).get("unauthorized") or []
+    if unauthorized:
+        return "（附近没有授权给我的畜栏，别人的牲口我不喂）"
+    return "（附近没有能喂的动物）"
+
+
+# ── 复合链（farm_cycle）：收割 → 补种 → 取料 → 合成 → 喂 ────────────
+# 用户口径：「种田和喂养动物可以是**一连套**的东西……究竟可以**收割，然后再种下去**，
+# 然后再把收割出来的东西**直接去喂动物**，也有可能**要合成再喂**」。
+CYCLE_STEPS: tuple[str, ...] = ("harvest", "replant", "fetch", "craft", "feed")
+
+
+def cycle_step(name: Any, ok: bool, *, reason: str = "", detail: str = "",
+               items: Any = None) -> dict:
+    """复合链的一步账：**每一步的产物/缺口都如实入账**（不收成分也不硬凑）。"""
+    return {"step": str(name or ""), "ok": bool(ok), "reason": str(reason or ""),
+            "detail": str(detail or ""),
+            "items": {str(k): int(v) for k, v in (items or {}).items() if int(v or 0) > 0}}
+
+
+def cycle_note(steps: Any) -> str:
+    """复合链的**如实**一句：哪几步成了、哪几步缺什么（差在哪里说得清）。"""
+    rows = [row for row in (steps or []) if isinstance(row, dict)]
+    if not rows:
+        return ""
+    done = [f"{row.get('step')}" for row in rows if row.get("ok")]
+    gaps = [f"{row.get('step')}（{row.get('reason') or '没成'}"
+            + (f"：{row.get('detail')}" if row.get("detail") else "") + "）"
+            for row in rows if not row.get("ok")]
+    head = f"（复合链：成了 {'、'.join(done)}" if done else "（复合链："
+    if gaps:
+        return head + f"；缺口 {'、'.join(gaps)}）"
+    return head + "，全成了）"

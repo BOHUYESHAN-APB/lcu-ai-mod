@@ -112,6 +112,17 @@ ZONE_AUTHORITY: dict[str, bool] = {
 # 他要把自己箱子上的 `free`（随取）降成 `borrow_only`（走借用台账）。
 FRIEND_MAX_CONTAINER_POLICY = "borrow_only"
 
+# 别人家的田（用户口径：「如果是朋友家的，那可以帮忙种一种，也可以去捣乱……想展示出
+# 人设、个性化一点」）。**捣乱必须是权限表显式放开且默认关闭** ——
+# tier → none（默认，一概不碰）| help（帮忙种）| mischief（人设允许时搞点无伤大雅的）。
+# 同样是数据表：决策链只读它，**不写 tier 分支**；要放开就改 `.local/permissions.json`。
+FARM_OTHERS_AUTHORITY: dict[str, str] = {
+    TIER_MASTER: "none",
+    TIER_FRIEND: "none",
+    TIER_GUEST: "none",
+}
+FARM_OTHERS_MODES: tuple[str, ...] = ("none", "help", "mischief")
+
 DEFAULT_SESSION_ADJUST = 1.0
 
 # 各层"能干什么"的**自然语言范围**（设计文档 §4：表是硬门，文本是语义范围）。
@@ -143,6 +154,8 @@ def _default_permissions() -> dict[str, Any]:
         "containers": dict(CONTAINER_AUTHORITY),
         "territory": dict(TERRITORY_AUTHORITY),
         "zones": dict(ZONE_AUTHORITY),
+        # 别人家的田：默认全关（none）；捣乱必须在这里显式放开（mischief）。
+        "farm_others": dict(FARM_OTHERS_AUTHORITY),
         # TPA 分层策略（用户口径：master 自动接受 / friend 默认询问 / guest 拒绝且不点
         # / 主动发起仅 master）。默认值定义在 `agent/tpa.py`，这里只做挂载。
         "tpa": copy.deepcopy(TPA_POLICY_DEFAULTS),
@@ -272,6 +285,20 @@ def _as_capability_map(value: Any, default: dict[str, bool]) -> dict[str, bool]:
     return dict(default)
 
 
+def _as_level_map(value: Any, default: dict[str, str]) -> dict[str, str]:
+    """档位表解析（`farm_others`）：`{tier: none|help|mischief}`；认不出的回退默认那一格。
+
+    默认拒绝：把"对别人家动手"的范围配错成放行的代价远大于少搭理。
+    """
+    if isinstance(value, dict):
+        out: dict[str, str] = {}
+        for tier in TIERS:
+            text = str(value.get(tier, default[tier])).strip().lower()
+            out[tier] = text if text in FARM_OTHERS_MODES else default[tier]
+        return out
+    return dict(default)
+
+
 def _normalize_base_rates(raw: Any) -> dict[str, dict[str, float]]:
     """base_rates 补全成 {private|public: {master|friend|guest: float}}，缺格取默认。"""
     defaults = _default_permissions()["base_rates"]
@@ -306,6 +333,7 @@ def _normalize(raw: Any) -> dict[str, Any]:
     data["containers"] = _as_capability_map(source.get("containers"), CONTAINER_AUTHORITY)
     data["territory"] = _as_capability_map(source.get("territory"), TERRITORY_AUTHORITY)
     data["zones"] = _as_capability_map(source.get("zones"), ZONE_AUTHORITY)
+    data["farm_others"] = _as_level_map(source.get("farm_others"), FARM_OTHERS_AUTHORITY)
     data["tpa"] = normalize_tpa_policy(source.get("tpa"))
     data["scope"] = _normalize_scope(source.get("scope"))
     return data
@@ -584,6 +612,16 @@ class PermissionsStore:
         tier = _as_tier(tier)
         with self._lock:
             return bool(self._data["zones"].get(tier, False))
+
+    def farm_others(self, tier: str) -> str:
+        """别人家的田这一档：`none`（默认）/`help`/`mischief`（决策链唯一的入口）。
+
+        认不出的 tier 当 guest → 默认 `none`（**默认拒绝**，不是默认放行）。
+        """
+        tier = _as_tier(tier)
+        with self._lock:
+            level = str((self._data.get("farm_others") or {}).get(tier) or "none").strip().lower()
+        return level if level in FARM_OTHERS_MODES else "none"
 
     def container_grant_policy(self, tier: str, *, actor: str = "", owner: str = "",
                                policy: str = "") -> dict:

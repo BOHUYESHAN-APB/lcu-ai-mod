@@ -25,9 +25,10 @@ from typing import Any
 # 工具参数都可有默认值，故 `required` 一律留空；类型按参数名约定推断。
 _NUMERIC_TOOL_ARGS = frozenset({"x", "y", "z", "radius", "limit", "count", "index",
                                 "from_slot", "to_slot", "slot"})
-_BOOLEAN_TOOL_ARGS = frozenset({"remember"})
-# 数组参数：`run_server_command` 的 `args`（指令参数表，元素是字符串）。
+_BOOLEAN_TOOL_ARGS = frozenset({"remember", "feed", "craft", "mischief", "whole"})
+# 数组参数：`run_server_command` 的 `args`（字符串表）与 `haul` 的 `items`（物品表）。
 _ARRAY_TOOL_ARGS = frozenset({"args"})
+_ARRAY_OBJECT_ARGS = frozenset({"items"})
 
 
 def tool_schema(args: str) -> dict:
@@ -43,6 +44,8 @@ def tool_schema(args: str) -> dict:
             properties[name] = {"type": "boolean"}
         elif name in _ARRAY_TOOL_ARGS:
             properties[name] = {"type": "array", "items": {"type": "string"}}
+        elif name in _ARRAY_OBJECT_ARGS:
+            properties[name] = {"type": "array", "items": {"type": "object"}}
         else:
             properties[name] = {"type": "string"}
     return properties
@@ -160,14 +163,24 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
              ToolPermission(borrow=True,
                             note="归还借用台账里的物品并核对；需翻箱授权")),
     # ── farm ──
-    ToolSpec("haul", "在容器之间搬运（from/to＝已记住的容器名或 self；"
-                     "省 item＝搬全部可搬的；单趟≤256、源箱留底不搬空、两侧对账，卡住就报在哪一步）",
-             "from,to,item,count", ("farm",), "_dispatch_haul",
+    ToolSpec("haul", "在容器之间搬运（from/to＝已记住的容器名或 self；省 item＝搬全部可搬的；"
+                     "items=[{item,count}]＝一次搬多种；mode=item|whole|inside：whole＝整箱连"
+                     "内容一起搬（潜影盒不拆散）、inside＝先取出盒里的这件再搬、箱名放 box；"
+                     "单趟≤256、源箱留底不搬空、两侧对账（含内容物），卡住就报在哪一步）",
+             "from,to,item,count,items,mode,box", ("farm",), "_dispatch_haul",
              ToolPermission(note="no_touch 不碰、borrow_only 只借不搬；单趟≤256、源箱留底")),
     ToolSpec("farm", "在授权农田里干活（action=till锄地|plant播种|harvest收割|replant补种；"
-                     "全走右键/挖，缺种子或锄头如实报）", "plot,action", ("farm",), "_dispatch_farm",
+                     "mischief=true 表示这就是对别人家田的恶作剧，只有权限表放开才准；"
+                     "全走右键/挖，缺种子或锄头如实报）", "plot,action,mischief",
+             ("farm",), "_dispatch_farm",
              ToolPermission(area=True, deny_label="种田",
-                            note="只在已授权农田动手；保护区里的作物不碰")),
+                            note="只在已授权农田动手；保护区里的作物不碰；别人家田看权限表")),
+    ToolSpec("farm_cycle", "农场复合链：收割→补种→（田边取料）→可选合成→喂动物（feed=true；"
+                           "喂食用通用右键、只喂授权畜栏）；craft=true 时缺料就地合成；"
+                           "每一步产物/缺口都如实入账）", "plot,feed,craft,animal",
+             ("farm",), "_dispatch_farm_cycle",
+             ToolPermission(area=True, deny_label="种田",
+                            note="全链只在授权地块/畜栏里动手；缺口如实报，不硬凑")),
     # ── combat ──
     ToolSpec("attack", "攻击附近敌人", "", ("combat",), "_tool_attack"),
     # ── items ──

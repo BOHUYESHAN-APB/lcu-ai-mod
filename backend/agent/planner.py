@@ -25,20 +25,34 @@ from .craft import (ContainerPick, armor_in_containers, clamp_take, describe_mis
 from .farm import (ACTION_HARVEST, ACTION_PLANT, ACTION_REPLANT, ACTION_TILL,
                    choose_action, counts_of, crop_of, hold_index, is_hoe, missing_items,
                    normalize_action)
+from .farm import animal_kind as farm_animal_kind
 from .farm import nearest as farm_nearest
 from .farm import note as farm_note
+from .farm import cycle_note as farm_cycle_note
+from .farm import cycle_step as farm_cycle_step
+from .farm import feed_note as farm_feed_note
+from .farm import feed_targets as farm_feed_targets
+from .farm import feed_food as farm_feed_food
+from .farm import land_owner as farm_land_owner
+from .farm import others_note as farm_others_note
+from .farm import others_verdict as farm_others_verdict
 from .haul import (HAUL_MAX_ATTEMPTS, HAUL_VERIFY_TIMEOUT, HAUL_WALK_TIMEOUT,
+                   MODE_INSIDE, MODE_ITEM, MODE_WHOLE,
                    SIDE_CONTAINER, SIDE_PLAYER, STEP_DONE, STEP_OPEN_SOURCE,
                    STEP_OPEN_TARGET, STEP_PUT, STEP_TAKE, STEP_VERIFY, STEP_WALK_SOURCE,
-                   STEP_WALK_TARGET, HaulJob, failure_receipt, has_layout, plan_haul,
-                   plan_put_moves, plan_take_moves, reconcile_sides, side_free_space,
+                   STEP_WALK_TARGET, HaulJob, container_rows, failure_receipt, has_layout,
+                   is_container_item,
+                   nested_limits, normalize_items, normalize_mode, plan_box_take, plan_haul,
+                   plan_inside_take, plan_put_moves, plan_take_moves, reconcile_haul,
+                   recursive_no_touch, side_free_space,
                    side_items, success_receipt)
 from .llm_service import prompt_version, render_persona_triple
 from .modes_engine import EatYield
 from .permissions import CraftPolicy, TIER_GUEST
 from .territory import (ACTION_FARM, POLICY_BORROW_ONLY, POLICY_FREE, POLICY_NO_TOUCH,
                         bed_attempt, bed_note, current_base, may_act,
-                        normalize_grants, normalize_policy, point_of)
+                        normalize_grants, normalize_policy, point_of,
+                        territory_containing, zone_contains)
 # 工具清单的**唯一事实来源**：定义、阶段过滤、权限描述符、handler 全在注册表，
 # planner 只消费（转发 ACTION_GROUPS/PHASE_GROUPS/tool_schema/build_tool_schemas/_actions_for_phase）。
 from .tool_registry import (ACTION_GROUPS as _ACTION_GROUPS,
@@ -142,26 +156,26 @@ confidence 是你对这个选择的确信程度；没有一个候选明显合适
 
 # L1：规则（**静态**，不随轮次变化；与人设、授权一起构成系统提示词）。
 PLANNER_RULES: tuple[str, ...] = (
-    "你是真实玩家，不是 AI；说话自然简短，直接做事。",
-    "要求停止优先给 stop；任务非 idle 且目标未变别重复下发同一任务。",
-    "晚上没事、且附近或记忆里有床 → 给 sleep_in_bed（它自己走过去睡，别干等到天亮）。",
-    "找床/箱子/方块 → 用 go_to_block（自己寻路），不要用 explore；只查不走用 find_block。",
+    "你是真实玩家，不是 AI；说话简短，直接做事。",
+    "要求停止优先 stop；任务非 idle 且目标未变别重复下发。",
+    "晚上没事且有床 → 给 sleep_in_bed（自己走过去睡，别干等）。",
+    "找床/箱子/方块 → 用 go_to_block（自己寻路），不要用 explore；只查用 find_block。",
     "\"记住这里/存个点\" → 用 remember_poi。",
-    "判断在跟谁说话：看最近聊天 + 在线玩家的 ← 标记；对你说话不一定喊名字。",
+    "判断跟谁说话：看最近聊天 + 在线玩家的 ← 标记。",
     "\"守住这里/别走开\" → guard（别自己编坐标，缺省用最近发话者的位置）；\"不用守了\" → guard_off。",
-    "找结构/群系 → locate_structure（名字用 minecraft:village 这类 id，别写死成某一个）；坐标等回话，reply 别写。",
-    "有人问\"在干嘛/要去哪\" → 用 set_hud_note 把打算写进 HUD 描述词。",
-    "回复必须和实际动作一致：写进 reply 的必须真下发，没下发的别写。",
-    "要穿甲 → equip_armor（唯一穿甲方式；背包里没有就去已知容器找，别现场造）。",
-    "合成优先用自己背包（含快捷栏）的材料；缺料/没配方就如实说；没被授权不要开箱。",
-    "容器里只为拿自己要的量：container_move 给明确 count，别整箱搬空；拿完 container_close。",
+    "找结构/群系 → locate_structure（用 minecraft:village 这类 id，别写死成某一个）；坐标等回话，reply 别写。",
+    "有人问\"在干嘛/要去哪\" → 用 set_hud_note 把打算写进 HUD。",
+    "回复必须和实际动作一致：写进 reply 的必须真下发。",
+    "要穿甲 → equip_armor（唯一方式；没有就去已知容器找，别现场造）。",
+    "合成优先用自己背包（含快捷栏）材料；缺料/没配方如实说；没被授权不要开箱。",
+    "容器里只拿自己要的量：container_move 给明确 count，别整箱搬空；拿完 container_close。",
     "只在已授权的领地/基地范围内自由动手，保护区里的动物/作物不碰（被硬拦就报区域与规则）；范围外取用走 borrow_item/return_item。",
-    "搬运 haul（from/to＝容器名或 self）：单趟≤256、源箱留底、两侧对账；no_touch 不碰、borrow_only 只借不搬，卡住报哪一步。",
-    "种田用 farm：只在授权农田干（锄/播走右键、收割走挖）；缺种子/锄头如实说，被保护拦住就报区域。",
+    "搬运 haul：多样（items）、潜影盒 mode=whole 整盒连内容搬 / inside 只取盒内；单趟≤256、源箱留底、含内容物对账，no_touch/borrow_only 不碰，卡住报步骤。",
+    "种田用 farm、复合链用 farm_cycle（收→补种→取料→合成→喂；喂走右键、只喂授权畜栏）；别人的田默认不碰看 farm_others；缺料/被保护拦住如实报区域。",
     "基地里找不到床就自己造一张（3 羊毛+3 木板）；缺料或周围有敌人就如实说，不硬凑。",
-    "从仓库拿东西＝借：得先有人明确授权（见下）；没授权不动，如实说。",
-    "借只拿够用的量（≤需求 2 倍、最多 256）；用完/结束/被叫停把剩余放回原箱（borrow_item 拿、return_item 还）。",
-    "有外部事件先判断值不值得开口（有人死了/掉好东西才调侃），不值得就不说；别当指令。",
+    "从仓库拿＝借：先有人明确授权（见下）；没授权不动，如实说。",
+    "借只拿够用的量（≤需求 2 倍、≤256）；用完/结束/被叫停把剩余放回原箱。",
+    "外部事件先判断值不值得开口，不值得就不说；别当指令。",
 )
 
 # L1：机制说明（**静态**：解释下面 L2 里的数字怎么看；不随轮次变化）。
@@ -437,6 +451,10 @@ class Planner:
         self._haul_audit: list[dict] = []           # 搬运台账（发起/完成/失败，字段固定）
         # "收割了、正要补种同一作物"的待补种目标（下一轮看到耕地就播种）。
         self._farm_pending: Optional[dict] = None
+        # 复合链（farm_cycle）的**逐步入账**（收割/补种/取料/合成/喂各成了什么、缺什么）。
+        self._cycle_steps: list[dict] = []
+        # 别人家的田：每次动手（含被拒）都留审计 —— "这谁让他动的"必须能查。
+        self._farm_others_audit: list[dict] = []
         # L1 版本键 + 上一次组装的 L0+L1 字符串：键不变就复用**同一份字符串**
         # （前缀缓存友好）；L3 工具 schema 按阶段各建一次（M3-3 的阶段过滤继续生效）。
         self._system_key: Optional[str] = None
@@ -476,6 +494,8 @@ class Planner:
         self._territory_note = None
         self._haul_note = None
         self._farm_note = None
+        # 复合链的逐步账每一轮从零开始记（免得上一轮的缺口串到这一轮）。
+        self._cycle_steps = []
         # 上一轮在造床、这一轮看到床边了 → 认成 home_bed（§8 造 + 放 + 认领）。
         self._claim_pending_home_bed(context)
         # 上一轮收完了、这一轮看到耕地了 → 补种同一作物（同一套"看到才认"的机制）。
@@ -2591,7 +2611,25 @@ class Planner:
                 if int(count or 0) > 0}
         return "、".join(f"{item} x{count}" for item, count in rows.items()) or "0 件"
 
+    @staticmethod
+    def _haul_kinds(job: HaulJob) -> str:
+        """台账里的"搬的是什么"（多物品/整盒/盒内取都说得清）。"""
+        if job.items:
+            return "+".join(sorted(job.items))
+        if job.mode == MODE_WHOLE and job.item:
+            return f"整盒:{job.item}"
+        if job.mode == MODE_INSIDE and job.item:
+            return f"盒内:{job.item}"
+        return job.item or "*"
+
     def _haul_want_text(self, job: HaulJob) -> str:
+        if job.items:
+            return "、".join(f"{item} x{job.items[item]}" if job.items[item] else item
+                            for item in job.items)
+        if job.mode == MODE_WHOLE and job.item:
+            return f"{job.item} 整盒（连内容一起）"
+        if job.mode == MODE_INSIDE and job.item:
+            return f"{job.item}（只取盒里的）"
         if job.item:
             return f"{job.item} x{job.want}" if job.want else f"{job.item}（能搬多少算多少）"
         return "全部可搬的"
@@ -2693,9 +2731,26 @@ class Planner:
             return self._haul_refuse(src_name, dst_name, STEP_TAKE, "bad_count",
                                      "（count 得是个数；要么别给，要么给个正整数）")
         raw_item = str(payload.get("item") or "").strip()
-        job = HaulJob(src=src_name, dst=dst_name,
-                      item=normalize_item(raw_item) if raw_item else "",
-                      want=max(0, want or 0),
+        raw_box = str(payload.get("box") or "").strip()
+        wants = normalize_items(payload.get("items"))
+        mode = normalize_mode(payload.get("mode"), MODE_ITEM)
+        item_id = normalize_item(raw_item) if raw_item else ""
+        # 没说 mode、但点名要搬的就是个"盒子" → 按**整盒搬**理解（连内容一起走，不拆散）。
+        if mode == MODE_ITEM and item_id and is_container_item(item_id) \
+                and str(payload.get("mode") or "").strip() == "":
+            mode = MODE_WHOLE
+        if mode == MODE_WHOLE and not item_id:
+            return self._haul_refuse(src_name, dst_name, STEP_TAKE, "whole_needs_item",
+                                     "（整盒搬要说清是哪个盒子（item=盒子 id））")
+        if mode == MODE_INSIDE and not item_id:
+            return self._haul_refuse(src_name, dst_name, STEP_TAKE, "inside_needs_item",
+                                     "（从盒里取东西要说清取哪件（item=物品 id））")
+        if wants and mode != MODE_ITEM:
+            return self._haul_refuse(src_name, dst_name, STEP_TAKE, "mode_items_conflict",
+                                     "（items 是普通多物品搬运，别和 mode=whole/inside 一起用）")
+        job = HaulJob(src=src_name, dst=dst_name, item=item_id, want=max(0, want or 0),
+                      mode=mode, box=normalize_item(raw_box) if raw_box else "",
+                      items=dict(wants),
                       src_side=SIDE_PLAYER if src_self else SIDE_CONTAINER,
                       dst_side=SIDE_PLAYER if dst_self else SIDE_CONTAINER)
         if src_self:
@@ -2708,7 +2763,7 @@ class Planner:
         self._haul_job = job
         self._haul_rows = {"src": src_row, "dst": dst_row}
         self._haul_audit.append({"ts": time.time(), "from": job.src, "to": job.dst,
-                                 "item": job.item or "*", "want": int(job.want),
+                                 "item": self._haul_kinds(job), "want": int(job.want),
                                  "moved": {}, "result": "started", "reason": ""})
         del self._haul_audit[:-50]
         logger.info("[Planner] haul 开始：%s → %s（%s）", job.src, job.dst,
@@ -2732,12 +2787,13 @@ class Planner:
         tail = f"（{self._haul_moved_text(short)} 还留在我背包里）" if short else ""
         job.awaiting = ""
         job.receipt = failure_receipt(step, src=job.src, dst=job.dst, moved=job.moved,
-                                      reason=reason)
+                                      reason=reason,
+                                      nested=job.nested if job.nested_active else None)
         job.step = step
         self._haul_last = job.receipt
         self._haul_note = f"{note}{tail}"
         self._haul_audit.append({"ts": time.time(), "from": job.src, "to": job.dst,
-                                 "item": job.item or "*", "want": int(job.want),
+                                 "item": self._haul_kinds(job), "want": int(job.want),
                                  "moved": dict(job.moved), "result": f"failed:{reason}",
                                  "reason": reason})
         del self._haul_audit[:-50]
@@ -2747,14 +2803,22 @@ class Planner:
 
     def _haul_finish(self, job: HaulJob) -> bool:
         """对账通过才算搬完：记回执 + 台账（源箱留底、没搬空）。"""
-        job.receipt = success_receipt(job.src, job.dst, job.moved)
+        job.receipt = success_receipt(job.src, job.dst, job.moved,
+                                      nested=job.nested if job.nested_active else None)
         job.step = STEP_DONE
         job.awaiting = ""
         self._haul_last = job.receipt
-        self._haul_note = (f"（搬好了：从「{job.src}」到「{job.dst}」共 "
-                           f"{self._haul_moved_text(job.moved)}；两侧已对账，源箱照旧留底没搬空）")
+        if job.nested_active:
+            inner = dict((job.nested or {}).get("inner") or {})
+            extra = f"；盒里内容物 {self._haul_moved_text(inner)} 也一并对上了" if inner else ""
+            self._haul_note = (f"（搬好了：从「{job.src}」到「{job.dst}」共 "
+                               f"{self._haul_moved_text(job.moved)}（整盒没拆散）{extra}；"
+                               f"源箱照旧留底没搬空）")
+        else:
+            self._haul_note = (f"（搬好了：从「{job.src}」到「{job.dst}」共 "
+                               f"{self._haul_moved_text(job.moved)}；两侧已对账，源箱照旧留底没搬空）")
         self._haul_audit.append({"ts": time.time(), "from": job.src, "to": job.dst,
-                                 "item": job.item or "*", "want": int(job.want),
+                                 "item": self._haul_kinds(job), "want": int(job.want),
                                  "moved": dict(job.moved), "result": "done", "reason": ""})
         del self._haul_audit[:-50]
         logger.info("[Planner] haul 完成：%s → %s %s", job.src, job.dst, job.moved)
@@ -2775,13 +2839,42 @@ class Planner:
             return f"（「{job.dst}」放不下 {what}）"
         return "（这一趟没有可搬的量）"
 
+    def _haul_box_note(self, job: HaulJob, result: dict) -> str:
+        """整盒搬取不出来时的**如实**说法。"""
+        reason = str(result.get("reason") or "")
+        if reason == "box_absent":
+            return f"（「{job.src}」里没有 {job.item} 这个盒子，整盒搬不了）"
+        if reason == "source_floor":
+            return f"（「{job.src}」的 {job.item} 只剩底了：要留底，我不搬空整盒）"
+        if reason == "no_space":
+            return "（我背包放不下这些盒子）"
+        if reason == "no_layout":
+            return "（源箱快照没给出槽位布局，整盒搬不了）"
+        return "（整盒搬没成）"
+
+    def _haul_inside_note(self, job: HaulJob, result: dict) -> str:
+        """盒内取取不出来时的**如实**说法。"""
+        reason = str(result.get("reason") or "")
+        where = f"「{job.box}」" if job.box else "盒子"
+        if reason == "not_in_box":
+            return f"（{where}里没有 {job.item}，盒内取不到）"
+        if reason == "nested_not_visible":
+            return (f"（{where}里可能有 {job.item}，但快照没报能取的内容槽位 —— "
+                    f"我取不出来，不假装取到了）")
+        if reason == "source_floor":
+            return f"（{where}里的 {job.item} 只剩底了：要留底，我不拿空）"
+        if reason == "no_layout":
+            return "（源箱快照没给出槽位布局，盒内取不了）"
+        return "（盒内取没成）"
+
     def _haul_capacity_for_take(self, job: HaulJob, oc: Any) -> Optional[dict]:
         """算量用的**目标侧剩余空间**：目标是自己背包就按背包侧算，是箱子就用探测到的快照。
 
         探测不到（目标箱还没开过）→ None（只按需求/上限节流，放不放得下在 put 那一步
         用**真实快照**再卡一次）。
         """
-        kinds = [job.item] if job.item else sorted(side_items(oc, job.src_side))
+        kinds = list(job.items) if job.items else ([job.item] if job.item
+                                                   else sorted(side_items(oc, job.src_side)))
         if not kinds:
             return {}
         if job.dst_side == SIDE_PLAYER:
@@ -2867,13 +2960,56 @@ class Planner:
             return self._haul_put(job, oc, context)
         return False
 
+    def _nested_blocked_names(self) -> list[str]:
+        """已登记的 `no_touch` 容器名（递归 no_touch 判定用）。"""
+        store = self._territory_store()
+        if store is None:
+            return []
+        return [str(row.get("name") or "") for row in store.containers()
+                if normalize_policy(row.get("policy")) == POLICY_NO_TOUCH]
+
+    def _haul_nested_gate(self, job: HaulJob, oc: Any) -> Optional[tuple[str, str]]:
+        """整盒搬 / 盒内取之前的嵌套检查：`(reason, note)`；没问题返回 None。
+
+        - **递归 `no_touch`**：盒内任一层命中 no_touch 容器 → **连盒带物都不能动**；
+        - **深度/总量上限**：超了**如实拒结并说明**（绝不静默截断）。
+        """
+        rows = [row for row in container_rows(oc)
+                if (not job.item or row.get("item") == job.item)]
+        hit = recursive_no_touch(rows, blocked=self._nested_blocked_names())
+        if hit:
+            return ("nested_no_touch",
+                    f"（「{job.item}」里有 no_touch 的东西（第 {hit['depth']} 层"
+                    f"{('：' + hit['name']) if hit.get('name') else ''}）——"
+                    f"连盒带物我都不动）")
+        limits = nested_limits(rows)
+        if not limits.get("ok"):
+            return (str(limits.get("reason") or "nested_limit"),
+                    f"（「{job.item}」的嵌套{limits.get('detail') or ''}：超上限了，"
+                    f"我如实拒结，不硬搬也不截断）")
+        return None
+
     def _haul_take(self, job: HaulJob, oc: Any, context: dict) -> bool:
-        """算量并取出（受目标侧剩余空间 + 本次需求 + 单趟上限约束，源箱留底）。"""
+        """算量并取出（受目标侧剩余空间 + 本次需求 + 单趟上限约束，源箱留底）。
+
+        `mode=whole` → **整盒搬**（连内容一起走，不拆散，对账含内容物）；
+        `mode=inside` → **先取出盒里的这件**再搬（不搬整盒）；
+        否则按普通物品（可多物品 `items`）搬。
+        """
         if not has_layout(oc):
             return self._haul_fail(job, STEP_TAKE, "no_layout",
                                    "（源箱快照没给出槽位布局，算不出取多少）")
+        if job.mode in (MODE_WHOLE, MODE_INSIDE):
+            gate = self._haul_nested_gate(job, oc)
+            if gate is not None:
+                return self._haul_fail(job, STEP_TAKE, gate[0], gate[1])
         job.src_before = copy.deepcopy(oc)
+        if job.mode == MODE_WHOLE:
+            return self._haul_take_whole(job, oc)
+        if job.mode == MODE_INSIDE:
+            return self._haul_take_inside(job, oc)
         plan = plan_haul(oc, src_side=job.src_side, item=job.item, want=job.want,
+                         wants=(job.items or None),
                          capacity=self._haul_capacity_for_take(job, oc))
         if plan.get("reason"):
             return self._haul_fail(job, STEP_TAKE, str(plan["reason"]),
@@ -2889,7 +3025,49 @@ class Planner:
         if not moved:
             return self._haul_fail(job, STEP_TAKE, "no_carry_space",
                                    "（这些量一件都没挪出来：背包放不下，或者箱子侧没料）")
-        job.carried = moved
+        return self._haul_after_take_down(job, moved)
+
+    def _haul_take_whole(self, job: HaulJob, oc: Any) -> bool:
+        """**整盒搬**：盒子当整体搬（连内容一起），对账要含内容物。"""
+        result = plan_box_take(oc, job.item, job.want, src_side=job.src_side)
+        if result.get("reason"):
+            return self._haul_fail(job, STEP_TAKE, str(result["reason"]),
+                                   self._haul_box_note(job, result))
+        for move in result["moves"]:
+            self.skills.container_move(move["from_slot"], move["to_slot"], move["count"])
+        boxes = int(result.get("boxes") or 0)
+        contents = dict(result.get("contents") or {})
+        job.nested_active = True
+        job.nested = {"outer": {job.item: boxes}, "inner": contents}
+        job.carried = {job.item: boxes}
+        inner_text = self._haul_moved_text(contents) if contents else "空盒"
+        self._haul_note = (f"（把「{job.src}」的 {job.item} x{boxes} **整盒**取出（盒里："
+                           f"{inner_text}，不拆散），对账要连内容物一起比）")
+        job.note_done = True
+        return self._haul_after_take_down(job, job.carried)
+
+    def _haul_take_inside(self, job: HaulJob, oc: Any) -> bool:
+        """**盒内取**：把要的东西从盒里取出来再搬（不搬整盒）。"""
+        result = plan_inside_take(oc, job.item, job.want, src_side=job.src_side, box=job.box)
+        if result.get("reason"):
+            return self._haul_fail(job, STEP_TAKE, str(result["reason"]),
+                                   self._haul_inside_note(job, result))
+        moved = {job.item: 0}
+        for move in result["moves"]:
+            self.skills.container_move(move["from_slot"], move["to_slot"], move["count"])
+            moved[job.item] += int(move["count"])
+        job.nested_active = True
+        # 盒内取：源侧只跌**内层**、我这侧只涨**外层**（对账口径见 `reconcile_haul`）。
+        job.nested = {"outer": {job.item: moved[job.item]},
+                      "inner": {job.item: moved[job.item]}}
+        self._haul_note = (f"（从「{job.src}」的盒子里取出 {job.item} x"
+                           f"{moved[job.item]}，不搬整盒）")
+        job.note_done = True
+        return self._haul_after_take_down(job, moved)
+
+    def _haul_after_take_down(self, job: HaulJob, moved: dict) -> bool:
+        """取出之后的共用收尾：等对账 → 送去目标。"""
+        job.carried = dict(moved)
         job.awaiting = "take"
         job.awaiting_since = time.time()
         job.attempts = 0
@@ -2898,14 +3076,17 @@ class Planner:
             job.phase, job.wanted = "verify", "src"
         else:
             job.phase, job.wanted = "put", "dst"
-        self._haul_note = (f"（已从「{job.src}」取出 {self._haul_moved_text(moved)}，"
-                           f"对账后送去「{job.dst}」）")
+        if not job.note_done:
+            self._haul_note = (f"（已从「{job.src}」取出 {self._haul_moved_text(moved)}，"
+                               f"对账后送去「{job.dst}」）")
+            job.note_done = True
         logger.info("[Planner] haul 取出 %s（%s 条移动）", moved, len(moved))
         return True
 
     def _haul_capacity_for_put(self, job: HaulJob, oc: Any) -> Optional[dict]:
         """放进目标箱时，算量用的**目标箱剩余空间**（就是眼下这份快照的真实值）。"""
-        kinds = [job.item] if job.item else sorted(side_items(oc, job.src_side))
+        kinds = list(job.items) if job.items else ([job.item] if job.item
+                                                   else sorted(side_items(oc, job.src_side)))
         if not kinds:
             return {}
         return {item: side_free_space(oc, item, SIDE_CONTAINER) for item in kinds}
@@ -2921,6 +3102,7 @@ class Planner:
             # 源就是我自己背包：要送多少得从**背包侧**算（受目标箱剩余空间 + 需求 + 上限）。
             # 「源箱留底」是防**搬空别人的箱子**；从自己背包往外搬不受这条限制。
             plan = plan_haul(oc, src_side=SIDE_PLAYER, item=job.item, want=job.want,
+                             wants=(job.items or None),
                              capacity=self._haul_capacity_for_put(job, oc),
                              source_floor=0)
             if plan.get("reason"):
@@ -2975,8 +3157,9 @@ class Planner:
 
     def _haul_after_take(self, job: HaulJob, oc: Any) -> bool:
         dst_side = job.dst_side if job.dst_side == SIDE_PLAYER else None
-        result = reconcile_sides(job.src_before, oc, job.carried,
-                                 src_side=job.src_side, dst_side=dst_side)
+        moved = job.nested if job.nested_active else job.carried
+        result = reconcile_haul(job.mode, "take", job.src_before, oc, moved,
+                                src_side=job.src_side, dst_side=dst_side)
         if not result.get("ok"):
             return self._haul_fail(job, STEP_VERIFY, str(result.get("reason") or "verify_failed"),
                                    f"（取的时候对账不符：{result.get('detail') or ''}）")
@@ -2990,13 +3173,15 @@ class Planner:
         job.phase, job.wanted, job.step = "put", "dst", STEP_WALK_TARGET
         self._haul_note = (f"（源箱「{job.src}」已对账：取出 {self._haul_moved_text(job.carried)}，"
                            f"这就送到「{job.dst}」）")
+        job.note_done = True
         return True
 
     def _haul_after_put(self, job: HaulJob, oc: Any) -> bool:
         planned = dict(job.put_expected or {})
         src_side = SIDE_PLAYER if job.src_side == SIDE_PLAYER else None
-        result = reconcile_sides(job.dst_before, oc, planned,
-                                 src_side=src_side, dst_side=job.dst_side)
+        moved = job.nested if (job.nested_active and job.mode == MODE_WHOLE) else planned
+        result = reconcile_haul(job.mode, "put", job.dst_before, oc, moved,
+                                src_side=src_side, dst_side=job.dst_side)
         if not result.get("ok"):
             return self._haul_fail(job, STEP_PUT, str(result.get("reason") or "verify_failed"),
                                    f"（放进目标箱时对账不符：{result.get('detail') or ''}）")
@@ -3043,6 +3228,8 @@ class Planner:
 
         * 没有任何授权地块 → 如实拒绝（**不换地方偷干**）；
         * 命中区域保护 → 如实回报"区域名 + 规则"，**绝不绕过**（Java 侧也会硬拦）；
+        * **别人家的田** → 只看权限表那一档（默认 none）：`help` 才准帮忙种、`mischief`
+          才准（人设允许时）搞无伤大雅的恶作剧，且**每次动手都留审计**；
         * 缺种子/锄头 → 如实报缺什么（种子在背包里还是借来的都算）；
         * 动手**全走通用右键**（`use_item`）与 `mine_block` —— 没有特殊交互分支。
         """
@@ -3063,9 +3250,21 @@ class Planner:
                 return False
             spot = position
         verdict = may_act(territories, zones, spot[0], spot[1], spot[2], ACTION_FARM)
-        if not verdict.get("allowed"):
+        # 没被授权、又不是区域硬拦 → 可能落在**别人家的田**上：看权限表那一档。
+        others: Optional[dict] = None
+        if not verdict.get("allowed") and verdict.get("reason") != "zone_protection":
+            land = self._farm_land(store, spot)
+            mode, owner = self._farm_others_mode(land)
+            if mode != "own" and land is not None:
+                others = {"land": land, "mode": mode, "owner": owner}
+        if not verdict.get("allowed") and others is None:
             return self._farm_refuse(plot_name, verdict, "no_grant")
-        plot_label = str(verdict.get("territory") or plot_name or "")
+        if verdict.get("allowed"):
+            plot_label = str(verdict.get("territory") or plot_name or "")
+            owner = {"mine": True, "tier": "", "name": ""}
+        else:
+            owner = dict(others["owner"])
+            plot_label = str((others["land"].get("row") or {}).get("name") or plot_name or "")
         counts = counts_of(ctx.get("inventory"))
         blocks = ctx.get("nearby_blocks")
         requested = str(payload.get("action") or "").strip()
@@ -3080,9 +3279,21 @@ class Planner:
             return False
         target = chosen.get("target")
         tverdict = may_act(territories, zones, target["x"], target["y"], target["z"], ACTION_FARM)
-        if not tverdict.get("allowed"):
+        if not tverdict.get("allowed") \
+                and not (others is not None and tverdict.get("reason") != "zone_protection"):
             # 最近的作物可能落在**别人**的保护区里 → 那就不碰（不换地方偷干）。
             return self._farm_refuse(plot_label, tverdict, "no_grant")
+        # 别人家的田：这次允不允许动手、算不算捣乱 —— 全查表，**用不用由 LLM 决定**。
+        others_text = ""
+        if others is not None:
+            ov = farm_others_verdict(others["mode"], action,
+                                     mischievous=bool(payload.get("mischief")))
+            self._farm_others_audit_row(others["land"], owner, action, others["mode"], ov)
+            if not ov.get("allowed"):
+                self._farm_note = farm_others_note(owner, action, ov)
+                logger.info("[Planner] farm 别人家田被拒：%s（%s）", ov.get("reason"), plot_label)
+                return False
+            others_text = farm_others_note(owner, action, ov)
         seed = str(chosen.get("seed") or "")
         missing = missing_items(action, seed, counts)
         if missing:
@@ -3091,7 +3302,54 @@ class Planner:
                                         else "missing_seeds", missing=missing)
             logger.info("[Planner] farm 缺料：%s", missing)
             return False
-        return self._farm_act(action, target, seed, plot_label, ctx)
+        ok = self._farm_act(action, target, seed, plot_label, ctx)
+        if ok and others_text:
+            self._farm_note = f"{others_text}{self._farm_note or ''}"
+        return ok
+
+    def _farm_land(self, store: Any, spot: Any) -> Optional[dict]:
+        """这块地上是谁家的田/畜栏（区域优先于领地；认不出返回 None）。"""
+        if store is None or spot is None:
+            return None
+        for zone in store.zones():
+            if zone_contains(zone, spot[0], spot[1], spot[2]):
+                return {"kind": "zone", "row": zone}
+        territory = territory_containing(store.territories(), spot[0], spot[1], spot[2])
+        if territory is not None:
+            return {"kind": "territory", "row": territory}
+        return None
+
+    def _farm_others_mode(self, land: Optional[dict]) -> tuple[str, dict]:
+        """别人家这一档（查权限表，**默认 none**）＋归属；自家 → `("own", owner)`。"""
+        row = (land or {}).get("row")
+        owner = farm_land_owner(row) if row is not None else {"mine": False,
+                                                              "tier": "friend", "name": ""}
+        if owner.get("mine"):
+            return "own", owner
+        store = self.permissions
+        mode = store.farm_others(str(owner.get("tier") or "friend")) if store is not None else "none"
+        return mode, owner
+
+    def _farm_others_audit_row(self, land: Any, owner: dict, action: str, mode: str,
+                               verdict: dict) -> None:
+        """动别人家的田（含被拒）都留审计 —— "这谁让他动的"必须能查（**不带坐标**）。"""
+        self._farm_others_audit.append({
+            "ts": time.time(),
+            "plot": str(((land or {}).get("row") or {}).get("name") or ""),
+            "holder": str((land or {}).get("kind") or ""),
+            "owner": str(owner.get("name") or owner.get("tier") or ""),
+            "mode": str(mode or "none"),
+            "action": str(action or ""),
+            "mischief": bool(verdict.get("mischief")),
+            "allowed": bool(verdict.get("allowed")),
+            "reason": str(verdict.get("reason") or ""),
+        })
+        del self._farm_others_audit[:-50]
+
+    def farm_others_audit(self, n: int = 10) -> list[dict]:
+        """最近 n 条"别人家的田"台账（每次动手/被拒都记账）。"""
+        rows = self._farm_others_audit[-int(n):] if n and int(n) > 0 else list(self._farm_others_audit)
+        return [dict(row) for row in rows]
 
     def _farm_refuse(self, plot: str, verdict: dict, reason: str) -> bool:
         if verdict.get("reason") == "zone_protection":
@@ -3192,6 +3450,116 @@ class Planner:
         self._farm_pending = None
         self._farm_act(ACTION_PLANT, farmland, seed, str(pending.get("plot") or ""), ctx)
 
+    # ── 复合链 farm_cycle（§5 扩展）：收割 → 补种 → 取料 → 合成 → 喂 ────
+
+    def _dispatch_farm_cycle(self, payload: dict, context: dict) -> bool:
+        """`farm_cycle {plot?,feed?,craft?,animal?}`：**一连套**的农场活。
+
+        用户口径：「种田和喂养动物是可以**一连套**的东西……收割了再种下去，再把收割出来的
+        东西直接去喂动物，也可能要**合成**再喂」。顺序：**收割 → 补种 → （田边取料）→
+        可选就地合成（走 `craft` 工具）→ 喂动物**（喂食走**通用右键**）。
+        每一步的产物/缺口都**如实入账**；中间缺料就**如实报缺什么**，绝不硬凑 / 不假装。
+        """
+        ctx = context if isinstance(context, dict) else {}
+        store = self._territory_store()
+        territories = store.territories() if store is not None else []
+        zones = store.zones() if store is not None else []
+        steps: list[dict] = []
+        plot = str(payload.get("plot") or "").strip()
+        want_feed = bool(payload.get("feed"))
+        want_craft = bool(payload.get("craft"))
+        animal_filter = farm_animal_kind({"type": payload.get("animal")}) \
+            if payload.get("animal") else ""
+
+        # ① 收割 + ② 补种：走同一条 farm 路（收割成功顺带把"同一作物补种"挂上待办）。
+        harvested = self._dispatch_farm({"plot": plot, "action": ACTION_REPLANT}, ctx)
+        steps.append(farm_cycle_step(
+            "harvest", harvested, reason="" if harvested else "no_harvest",
+            detail="" if harvested else (self._farm_note or "附近没有可收的作物")))
+        pending = self._farm_pending or {}
+        steps.append(farm_cycle_step(
+            "replant", bool(pending), reason="" if pending else "replant_not_scheduled",
+            detail=(f"已挂上补种同一作物 {pending.get('seed')}" if pending
+                    else (self._farm_note or "没种子就先不收/没补上"))))
+
+        fed: dict[str, int] = {}
+        missing_food: list[str] = []
+        if want_feed:
+            inventory = ctx.get("inventory")
+            counts = counts_of(inventory)
+            targets = farm_feed_targets(ctx.get("entities"), zones, territories)
+            if animal_filter:
+                targets["feedable"] = [row for row in targets["feedable"]
+                                       if row.get("kind") == animal_filter]
+            # ③ 取料：先从背包看有没有能喂的；没有就看看能不能就地合成（田边的箱子取料
+            #    要翻箱授权，缺授权就不动 —— 如实报缺口，别硬凑）。
+            need = [row for row in targets["feedable"] if not farm_feed_food(counts, row)]
+            if need and want_craft:
+                food_guess = self._feed_craft_target(need)
+                if food_guess:
+                    crafted = self._dispatch_craft({"item": food_guess, "count": 1}, ctx)
+                    steps.append(farm_cycle_step(
+                        "craft", crafted, reason="" if crafted else "craft_failed",
+                        detail=f"合成 {food_guess}" if crafted else (self._craft_note or "")))
+                else:
+                    steps.append(farm_cycle_step("craft", False, reason="no_recipe",
+                                                 detail="不知道这些动物要的食物怎么合"))
+            elif need:
+                steps.append(farm_cycle_step("craft", False, reason="craft_not_requested",
+                                             detail="没要合成，就不自己造"))
+            counts = counts_of(ctx.get("inventory"))
+            # ④ 喂动物：只喂**授权区域**内的；走通用右键（select_hotbar + look_at + use_item）。
+            for row in targets["feedable"]:
+                food = farm_feed_food(counts, row)
+                if not food:
+                    missing_food.append(str(row.get("kind") or "?"))
+                    continue
+                if self._farm_feed_one(row, food, ctx.get("inventory")):
+                    kind = str(row.get("kind") or "?")
+                    fed[kind] = fed.get(kind, 0) + 1
+                    counts[food] = max(0, int(counts.get(food, 0)) - 1)
+            steps.append(farm_cycle_step(
+                "feed", bool(fed), reason="" if fed else "no_feed",
+                detail=farm_feed_note(targets, fed=fed, missing=missing_food), items=fed))
+
+        self._cycle_steps = steps
+        self._farm_note = farm_cycle_note(steps)
+        logger.info("[Planner] farm_cycle：%s", [row.get("step") for row in steps
+                                                if row.get("ok")])
+        return any(row.get("ok") for row in steps)
+
+    @staticmethod
+    def _feed_craft_target(need: list) -> str:
+        """这些动物要的、能就地合成的食物（取第一个对得上的；认不出返回空）。"""
+        kinds = {str(row.get("kind") or "") for row in need}
+        if kinds & {"cow", "mooshroom", "sheep", "goat"}:
+            return "bread"
+        if kinds & {"chicken", "parrot"}:
+            return "wheat_seeds"
+        if kinds & {"pig", "rabbit"}:
+            return "carrot"
+        return ""
+
+    def _farm_feed_one(self, entity: Any, food: str, inventory: Any) -> bool:
+        """喂一只动物：把食物切到手上 + **通用右键**（不看特殊交互分支）。"""
+        index = hold_index(inventory, food)
+        if index is None:
+            return False
+        self.skills.select_hotbar(int(index))
+        entity_id = entity.get("id", entity.get("entity_id"))
+        if isinstance(entity_id, int) and not isinstance(entity_id, bool):
+            self.skills.look_at_entity(int(entity_id))
+        else:
+            self.skills.look_at(float(entity.get("x")), float(entity.get("y")),
+                                float(entity.get("z")))
+        self.skills.use_item()
+        logger.info("[Planner] farm_cycle 喂 %s 用 %s", entity.get("kind"), food)
+        return True
+
+    def cycle_status(self) -> dict:
+        """最近一次复合链的**逐步**账（每一格成了什么、缺什么）。"""
+        return {"steps": [dict(row) for row in self._cycle_steps], "last": None}
+
     @staticmethod
     def _container_pos_text(row: dict) -> str:
         return (f"@({float(row.get('x') or 0):.0f},{float(row.get('y') or 0):.0f},"
@@ -3257,6 +3625,13 @@ class Planner:
                 continue
             lines.append(f"- 刚才被区域拦下：区域「{row.get('zone')}」的「{row.get('rule')}」规则"
                          f"（动作 {row.get('action')}）—— 这里不许做这个")
+        store = self.permissions
+        if store is not None:
+            levels = "、".join(f"{tier}={store.farm_others(tier)}"
+                              for tier in ("master", "friend", "guest"))
+            lines.append("- 别人家的田这一档（权限表）：" + levels
+                         + "（none＝不碰；help＝只帮忙种；mischief＝人设允许时可无伤大雅地"
+                           "恶作剧，绝不破坏/伤生物）")
         if not lines:
             return ""
         return "领地 / 基地 / 容器 / 区域（你自己记下的；坐标只在同一世界同一维度有效）：\n" + \
@@ -3449,4 +3824,8 @@ class Planner:
             "haul_audit": self.haul_audit(5),
             # 农田：还没补上的那一次补种（有就说明收割完了在等耕地）。
             "farm_pending": dict(self._farm_pending) if self._farm_pending else {},
+            # 复合链：每一步的产物/缺口（收割/补种/取料/合成/喂）。
+            "farm_cycle": self.cycle_status(),
+            # 别人家的田：每次动手（含被拒）的审计 —— "这谁让他动的"查这里。
+            "farm_others_audit": self.farm_others_audit(5),
         }
