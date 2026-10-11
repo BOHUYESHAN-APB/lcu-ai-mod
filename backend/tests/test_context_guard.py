@@ -592,6 +592,8 @@ class AutoEatTests(unittest.TestCase):
         skills = DummySkills()
         skills.select_hotbar = lambda index: skills.calls.append(("select_hotbar", index))
         skills.use_item = lambda: skills.calls.append(("use_item",))
+        skills.eat = lambda: skills.calls.append(("eat",)) or {
+            "success": True, "message": "eat sent", "req_id": "req_eat"}
         return skills
 
     def test_hurt_with_unsaturated_hunger_triggers_eat(self):
@@ -649,7 +651,7 @@ class AutoEatTests(unittest.TestCase):
         ], hurt=True)
         self.assertEqual(both["slot"], 4)
 
-    def test_tick_selects_hotbar_and_uses_item(self):
+    def test_tick_dispatches_eat_to_java(self):
         mode = AutoEatMode()
         skills = self._skills()
         state = self._state(health=12, hunger=16)
@@ -657,7 +659,8 @@ class AutoEatTests(unittest.TestCase):
 
         message = mode.tick(skills, state)
 
-        self.assertEqual(skills.calls, [("select_hotbar", 2), ("use_item",)])
+        # Java 新 `eat` 自己选格子 + 按住右键直到生效 → Python 不再 select_hotbar/use_item。
+        self.assertEqual(skills.calls, [("eat",)])
         self.assertIn("saturation-first", message)
 
     def test_tick_ignores_food_in_backpack(self):

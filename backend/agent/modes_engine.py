@@ -25,6 +25,45 @@ from typing import Any, Optional
 logger = logging.getLogger("modes_engine")
 
 
+# ── 退避闸门 ────────────────────────────────────────────────────
+# 模式过去直接调 `skills.*`，于是 action_manager 打出"本次拒绝"后 wire 帧照样发出
+# （用户实机日志：`select_hotbar 正在退避，本次拒绝` → `[Skills] Sent: select_hotbar`）。
+# 修法：模式看到的 `skills` 是下面这层薄代理——下发前先查 action_manager 的退避窗口，
+# 被禁则**本次不下发**（只留一条 debug 日志），保证退避期内零 wire 帧。
+_GATE_BYPASS = frozenset({
+    "drive", "release_control", "command_context",
+    "set_wire", "set_command_observer", "set_control_stream",
+})
+
+
+class _GatedSkills:
+    """只读代理：把模式的下发卡在 action_manager 的退避窗口之外。
+
+    只代理"命令"类方法（方法名 == wire cmd 名）；控制流（`drive`/`release_control`，
+    P0 逃生用）与内部装配方法一律直通——命比节奏重要，永远不许被退避挡住。
+    """
+
+    def __init__(self, skills, action_manager=None):
+        self._skills = skills
+        self.action_manager = action_manager
+
+    def __getattr__(self, name):
+        attr = getattr(self._skills, name)
+        if (name.startswith("_") or not callable(attr)
+                or name in _GATE_BYPASS or self.action_manager is None):
+            return attr
+        action_manager = self.action_manager
+
+        def gated(*args, **kwargs):
+            if action_manager.is_backed_off(name):
+                logger.debug("[Mode] %s 正在退避，本次不下发（无 wire 帧）", name)
+                return {"success": False, "message": f"{name} backed off",
+                        "backoff": True, "req_id": None}
+            return attr(*args, **kwargs)
+
+        return gated
+
+
 class Mode(ABC):
     """Base class for a behavior mode."""
 
@@ -403,17 +442,34 @@ class AutoEatMode(Mode):
         所以血量不满就该主动补到 18+，而不是等饿到见底。
     选食物：缺血优先**高饱和度**（回血门槛靠饱和度），单纯饿优先**高营养**；
     有害食物永不自吃、生食兜底 —— 见 `select_food`。
+
+    下发走 Java 的 `eat`（"按住右键直到食物生效"的长任务，参数名不变）：Java 侧自己会
+    选好热栏格子并持续右键，所以 Python 只负责"该不该吃 / 吃什么"，不再自己 select_hotbar。
+
+    三条硬约束（都来自用户实机日志）：
+      1. `state.reflex_eat == True` → 本地饥饿反射正在吃，后端**一个字都不发**；
+      2. 下发前先过 `_GatedSkills` 的退避闸门 → 退避期内不产生 wire 帧；
+      3. `eat` 失败/超时 → **本次任务结束 + 10s 冷却**，并如实把原因写进 `task_state`，
+         绝不每 2 秒重试到触发 action_manager 的循环保护。
     """
 
     # 单纯饿的阈值：到 14 就该补（与原版/参考实现一致的保守值）。
     HUNGRY_HUNGER = 14
     # 缺血时的目标饱食度：吃到 18+ 才可能自然回血。
     HURT_HUNGER = 18
+    # 一次 `eat` 的等待上限（Java 侧 task_state 的 running→done 一般 2~3s；超时＝没回执）。
+    EAT_TIMEOUT = 8.0
+    # 失败后的冷却：用户口径"不要每 2 秒重试到触发循环保护"。
+    FAIL_COOLDOWN = 10.0
 
     def __init__(self):
         super().__init__("auto_eat", priority=4, interrupts=True, cooldown=5.0)
-        # 一次进食是一个持续动作，别在模式活跃期间每 tick 重发 use_item。
+        # 一次进食是持续动作，别在模式活跃期间每 tick 重发 `eat`。
         self.redispatch_interval = 2.0
+        self._pending_at = 0.0          # 上一次 `eat` 的下发时刻
+        self._pending = False           # 上一次 `eat` 还没收到终态
+        self._fail_until = 0.0          # 失败冷却的截止时刻
+        self._fail_reason = ""
 
     @staticmethod
     def _num(value, default: float) -> float:
@@ -432,14 +488,27 @@ class AutoEatMode(Mode):
         return hunger, health < max_health
 
     def should_activate(self, state: dict) -> bool:
+        # 本地饥饿反射（Java 侧"按住右键直到食物生效"）在吃 → 后端别抢：
+        # 两边一起补食就是日志里"每 2 秒重复吃、饥饿值一直不动"的那条线。
+        if state.get("reflex_eat"):
+            return False
+        if time.time() < self._fail_until:
+            return False
         hunger, hurt = self._hunger_and_hurt(state)
         if hunger < self.HUNGRY_HUNGER:
             return True
         return hurt and hunger < self.HURT_HUNGER
 
     def tick(self, skills, state: dict) -> str | None:
+        if state.get("reflex_eat"):
+            return None
+        outcome = self._absorb_outcome(skills, state)
+        if outcome:
+            return outcome
+        if time.time() < self._fail_until:
+            return None
         hunger, hurt = self._hunger_and_hurt(state)
-        # 只看热栏：wire 的 use_item 用的是"当前手持格"，背包里的食物再好吃也没法直接吃。
+        # 只看热栏：Java 的 `eat` 也只在热栏里找食物，背包里的再好吃也吃不到。
         hotbar = [
             item for item in (state.get("inventory") or [])
             if isinstance(item, dict) and 0 <= int(item.get("slot", -1)) < 9
@@ -447,14 +516,64 @@ class AutoEatMode(Mode):
         food = select_food(hotbar, hurt=hurt)
         if food is None:
             return "auto_eat: no food in hotbar"
+        if self._pending:
+            return None                 # Java 侧还在吃（按住右键）→ 别重复下发
         slot = int(food.get("slot", -1))
         if not self.should_dispatch(f"eat:{slot}:{food.get('name', '')}"):
             return None
-        skills.select_hotbar(slot)
-        skills.use_item()
+        result = skills.eat()
+        if isinstance(result, dict) and result.get("backoff"):
+            return None                 # 退避闸门拦下：本次不下发、不算吃过、不记 pending
+        if getattr(skills, "action_manager", None) is not None:
+            self._pending = True
+            self._pending_at = time.time()
         mode = "saturation-first" if hurt else "nutrition-first"
         return (f"auto_eat: ate {food.get('name')} (hunger={hunger:.0f}, "
                 f"{'hurt ' if hurt else ''}{mode})")
+
+    # ── eat 结果回收 ──
+
+    def _absorb_outcome(self, skills, state):
+        """收上一次 `eat` 的终态：失败/超时 → 结束本次任务 + 冷却 + 如实写 task_state。
+
+        返回一句描述（用于日志）或 None。
+        """
+        if not self._pending:
+            return None
+        action_manager = getattr(skills, "action_manager", None)
+        outcome = action_manager.outcome_since("eat", self._pending_at) if action_manager else None
+        if outcome is None:
+            if time.time() - self._pending_at < self.EAT_TIMEOUT:
+                return None             # 还在吃，等回执
+            outcome = {"success": False,
+                       "error": f"eat timeout (> {self.EAT_TIMEOUT:.0f}s 无回执)"}
+        self._pending = False
+        if outcome.get("success"):
+            self._fail_until = 0.0
+            self._fail_reason = ""
+            return None
+        reason = str(outcome.get("error") or "eat failed")
+        self._fail_until = time.time() + self.FAIL_COOLDOWN
+        self._fail_reason = reason
+        self._write_task_state(state, reason)
+        logger.warning("[Mode] auto_eat 失败（%s）→ 本次任务结束，冷却 %.0fs",
+                       reason, self.FAIL_COOLDOWN)
+        return f"auto_eat: failed ({reason}) → 冷却 {self.FAIL_COOLDOWN:.0f}s"
+
+    @staticmethod
+    def _write_task_state(state, reason: str) -> None:
+        """把失败原因如实写进 task_state（上层 planner/仪表盘据此知道为什么没吃上）。"""
+        if not isinstance(state, dict):
+            return
+        task_state = state.get("task_state")
+        task_state = dict(task_state) if isinstance(task_state, dict) else {}
+        task_state.update({
+            "kind": "eat",
+            "status": "failed",
+            "detail": reason,
+            "source": "auto_eat",
+        })
+        state["task_state"] = task_state
 
 
 class ItemCollectMode(Mode):
@@ -703,9 +822,12 @@ class ModesEngine:
     - interrupts=False modes only run when action manager is idle
     """
 
-    def __init__(self, skills, memory=None):
+    def __init__(self, skills, memory=None, action_manager=None):
         self.skills = skills
         self.memory = memory
+        self.action_manager = action_manager
+        # 模式只看见这层退避代理：action_manager 说"本次拒绝"时，退避期内零 wire 帧。
+        self._mode_skills = _GatedSkills(skills, action_manager)
         self.modes: list[Mode] = []
         self._sorted: list[Mode] = []
         self._active_mode: Optional[Mode] = None
@@ -741,13 +863,13 @@ class ModesEngine:
         # **重新激活**的门（在下面的候选扫描里），绝不能用来掐死正在运行的模式。
         if self._active_mode:
             if self._should_stay_active(self._active_mode, state):
-                action = self._active_mode.tick(self.skills, state)
+                action = self._active_mode.tick(self._mode_skills, state)
                 if action:
                     self._last_action = action
                     logger.info("[Mode] %s: %s", self._active_mode.name, action)
                 return action
             logger.info("[Mode] Deactivated: %s", self._active_mode.name)
-            self._active_mode.on_deactivate(self.skills)
+            self._active_mode.on_deactivate(self._mode_skills)
             self._active_mode = None
             self._reset_streak_credit()
 
@@ -763,7 +885,7 @@ class ModesEngine:
                 self._active_mode = mode
                 mode.on_activate()
                 logger.info("[Mode] Activated: %s (priority=%d)", mode.name, mode.priority)
-                action = mode.tick(self.skills, state)
+                action = mode.tick(self._mode_skills, state)
                 if action:
                     self._last_action = action
                     mode._mark_triggered()
@@ -805,7 +927,7 @@ class ModesEngine:
 
     def reset(self):
         if self._active_mode:
-            self._active_mode.on_deactivate(self.skills)
+            self._active_mode.on_deactivate(self._mode_skills)
         self._active_mode = None
         for mode in self.modes:
             mode.active = False

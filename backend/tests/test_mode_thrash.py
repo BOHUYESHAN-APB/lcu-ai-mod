@@ -51,6 +51,10 @@ class DummySkills:
     def use_item(self):
         self.calls.append(("use_item",))
 
+    def eat(self):
+        self.calls.append(("eat",))
+        return {"success": True, "message": "eat sent", "req_id": "req_eat"}
+
     def count(self, name):
         return sum(1 for call in self.calls if call[0] == name)
 
@@ -123,7 +127,7 @@ class SustainedActionSpamTests(unittest.TestCase):
 
         self.assertEqual(skills.count("move_to"), 1)
 
-    def test_auto_eat_does_not_spam_use_item(self):
+    def test_auto_eat_does_not_spam_eat(self):
         from agent.modes_engine import AutoEatMode
 
         engine, skills = self._engine(AutoEatMode())
@@ -133,8 +137,10 @@ class SustainedActionSpamTests(unittest.TestCase):
         for _ in range(5):
             engine.tick(state)
 
-        self.assertEqual(skills.count("select_hotbar"), 1)
-        self.assertEqual(skills.count("use_item"), 1)
+        # 进食改走 Java 的 `eat`（Java 自己选格子 + 按住右键）→ 只该发一次。
+        self.assertEqual(skills.count("eat"), 1)
+        self.assertEqual(skills.count("select_hotbar"), 0)
+        self.assertEqual(skills.count("use_item"), 0)
 
 
 class CooldownGateTests(unittest.TestCase):

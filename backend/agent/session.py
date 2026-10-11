@@ -153,7 +153,8 @@ class Session:
         # POI 记忆：按「服务器 + 世界」命名空间持久化，跨局记住箱子位置与内容
         self.poi = WorldPoiMemory()
         self.commands = Commands(self.skills)
-        self.modes_engine = ModesEngine(self.skills, self.memory)
+        self.modes_engine = ModesEngine(self.skills, self.memory,
+                                        action_manager=self.action_manager)
         self.llm = LLMService()
 
         # Message database (SQLite persistence)

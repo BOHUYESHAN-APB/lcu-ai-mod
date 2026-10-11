@@ -68,6 +68,9 @@ class ActionManager:
         self._backoff_max = 60.0
         # 上报给上层重新规划的循环失败（拉取式：`pop_loop_failure()`）。
         self.last_loop_failure: Optional[dict] = None
+        # label → 最近一次**终态**结果（成功/失败/超时）。模式层（AutoEatMode 等）靠它
+        # 判断"我刚下发的动作到底成没成"——`handle_response`/`complete_current`/超时都会写。
+        self.last_outcome: dict[str, dict] = {}
 
     # ── Public API ──────────────────────────────────────────────
 
@@ -140,13 +143,34 @@ class ActionManager:
         logger.info("[ActionMgr] Tracking: %s (req=%s, timeout=%.1fs)", label, req_id, timeout)
         return True
 
+    def is_backed_off(self, label: str) -> bool:
+        """该 label 是否还在退避窗口内（模式层下发前查这个，被禁则别发）。"""
+        until, _level = self._backoff.get(label, (0.0, 0))
+        return time.time() < until
+
     def _admit(self, label: str) -> bool:
         """退避准入：该 label 还在退避窗口内 → 拒绝下发（返回 False）。"""
-        until, _level = self._backoff.get(label, (0.0, 0))
-        if time.time() < until:
+        if self.is_backed_off(label):
+            until, _level = self._backoff[label]
             logger.debug("[ActionMgr] %s 正在退避（%.1fs 后解禁），本次拒绝", label, until - time.time())
             return False
         return True
+
+    # ── Outcome bookkeeping（模式层用）──────────────────────────
+
+    def outcome_since(self, label: str, since: float) -> Optional[dict]:
+        """该 label 在 `since` 之后是否已有终态结果；没有则 None。"""
+        record = self.last_outcome.get(label)
+        if record and record.get("at", 0.0) >= since:
+            return record
+        return None
+
+    def _record_outcome(self, label: str, success: bool, error: str = "") -> None:
+        self.last_outcome[label] = {
+            "success": bool(success),
+            "error": error or "",
+            "at": time.time(),
+        }
 
     def stop(self):
         """Stop current action immediately."""
@@ -174,6 +198,7 @@ class ActionManager:
         if cur.elapsed > cur.timeout:
             logger.warning("[ActionMgr] Timeout: %s (%.1fs > %.1fs)", cur.label, cur.elapsed, cur.timeout)
             cur.timed_out = True
+            self._record_outcome(cur.label, False, f"timeout after {cur.timeout:.0f}s")
             self.current = None
             return
 
@@ -196,6 +221,7 @@ class ActionManager:
         except Exception as e:
             cur.error = str(e)
             cur.interrupted = True
+            self._record_outcome(cur.label, False, str(e))
             logger.error("[ActionMgr] Error in %s: %s", cur.label, e)
             self.current = None
 
@@ -217,6 +243,7 @@ class ActionManager:
             if not success:
                 cur.error = f"command failed: {req_id}"
                 cur.interrupted = True
+            self._record_outcome(cur.label, success, cur.error or "")
             self.current = None
 
     def complete_current(self, success: bool, detail: str = ""):
@@ -231,6 +258,7 @@ class ActionManager:
             self._repeat_streak.pop(cur.label, None)
         else:
             cur.error = detail or "task failed"
+        self._record_outcome(cur.label, success, cur.error or "")
         self.current = None
 
     def handle_progress(self, req_id: str, progress: float, message: str = ""):
@@ -344,6 +372,7 @@ class ActionManager:
             cur.completed = True
             cur.interrupted = True
             cur.error = f"loop detected: {label} x{count}"
+            self._record_outcome(label, False, cur.error)
             self.current = None
         logger.error("[ActionMgr] LOOP: %s 连续 %d 次没有成功完成 → 已标失败并上报（退避 %.0fs）",
                      label, count, delay)
