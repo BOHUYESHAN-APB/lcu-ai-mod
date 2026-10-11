@@ -162,3 +162,12 @@
 6. **聊天冷却** 1.5s 防止服务端反刷踢出
 7. **记忆删除为软删除** — SQLite 开发阶段不会硬删除消息库或 `memory.json` 原始记录，可从“已删除”恢复
 8. **按住类动作自检** — `gradlew verifyHold` → **43 checks passed**（hold N tick 到期松开 / 条件命中即松开 / 超时带原因 / AI关闭·玩家接管·反射覆盖立即释放 / eat 幂等 / `reflex_eat`）；已接入 `check`，随 `build` 跑
+9. **安全/防护自检** — `gradlew verifyGuard` → **109 checks passed**（出站文本清洗 `//`·全角空格·行首空白 / 指令硬黑名单 `kill kick ban …` 的大小写·命名空间·前导斜杠·多余空白 / 区域保护球·长方体命中与"保护优先、多区取最保守、无保护项不拦"·四个破坏/放置入口都装保护 / `click_screen_button` 的 `no_screen`·`no_match`·让路 / `place_block` 物品不在背包即失败不替换 / 导航不搭方块的静态扫描）；已接入 `check`，随 `build` 跑
+10. **线协议预留自检** — `gradlew verifyProto` → **37 checks passed**（`{v,type,seq,ts,payload}` 封装 / 未知字段与未知 `type` 忽略 / 坏 JSON 返回 null / `Body` 抽象 0 处 `net.minecraft` / `PROTOCOL_VERSION` + 6 个能力位）；已接入 `check`
+11. **聊天分类自检** — `gradlew verifyChat` → **59 checks passed**（按翻译键分类 public_text/whisper_in/whisper_out/announcement/system/emote/unknown；未知键→公屏；`whisper` 只给 whisper_in；`whisper_out` 不带收件人名）；已接入 `check`
+12. **容器 UI 自检** — `gradlew verifyContainer` → **98 checks passed**（AI 自己开容器时只取消自己的界面 / 玩家自己开着界面时让路 / 容器点击一律走窗口点击包、不 `setScreen`）；已接入 `check`
+13. **站点与路径自检** — `gradlew verifyRoute` → **132 checks passed**（站点滞回 + keepalive **绝不写移动键** / 路径录制 <2 或 >2000 点拒绝 / 逐点接力 ≤9 格 / 失败如实上报且不搭桥自救）；已接入 `check`
+14. **配方检索自检** — `gradlew verifyRecipe` → **106 checks passed**（id 精确 → 中英文名 → tag；歧义回候选不猜；工作站全覆盖；酿造如实 `unsupported_station`）；已接入 `check`
+15. **落地水自检** — `gradlew verifyMlg` → **91 checks passed**（伤害 = 原版 `floor((落距 − SAFE_FALL_DISTANCE) × 倍率)` / 羽落 3 EPF、保护 1 EPF/件、总上限 20、抗性先算 / 读不到减免时按**裸伤害**判的保守分支 / 13 类安全缓冲直接让路 / 不致命绝不放水）；已接入 `check`
+
+> 零依赖自检共 **13 套 753 项**（`verifyLogic 21`、`verifyTitle 11`、`verifyChat 59`、`verifyFinder 18`、`verifyPhrase 16`、`verifyGate 12`、`verifyHold 43`、`verifyContainer 98`、`verifyRoute 132`、`verifyRecipe 106`、`verifyGuard 109`、`verifyProto 37`、`verifyMlg 91`）。跑单个任务**必须加 `--rerun` 且逐个跑**（一次跑多个会被判 UP-TO-DATE 静默跳过 ✗）。

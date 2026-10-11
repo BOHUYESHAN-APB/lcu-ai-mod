@@ -95,18 +95,20 @@ SDK 分为三类接口：
 
 ## 许可证
 
-本项目按模块采用不同许可证：
+整个项目以 **AGPL-3.0** 发布（与构建元数据 `gradle.properties` 的 `mod_license=AGPL-3.0` 一致）：
 
 | 部分 | 协议 | 说明 |
 |------|------|------|
-| Minecraft 客户端模组 (`src/`) | **MIT** | 便于整合包、客户端和兼容项目采用 |
+| Minecraft 客户端模组 (`src/`) | **AGPL-3.0** | 与 `gradle.properties` 的 `mod_license` 一致 |
 | Python 后端 (`backend/`，不含 `sdk/`) | **AGPL-3.0** | 人格、记忆、规划和服务端实现 |
-| 集成 SDK (`backend/sdk/`) | **Apache-2.0** | 面向第三方 Python、Browser 和 Electron 集成 |
+| 集成 SDK (`backend/sdk/`) | **Apache-2.0**（有意保留的例外） | 面向第三方 Python / Browser / Electron 集成；协议层保持宽松，避免 AGPL 传染到接入方的程序 |
+
+非本项目代码：`TEMPLATE_LICENSE.txt` 是 NeoForge MDK 模板自带的声明（MIT，属模板本身）。
 
 详见：
-- [MIT License](LICENSE) — 模组部分
-- [AGPL License](backend/LICENSE) — 后端部分
-- [Apache-2.0 License](backend/sdk/LICENSE) — SDK 部分
+- [AGPL-3.0](LICENSE) — 项目根与模组
+- [AGPL-3.0](backend/LICENSE) — 后端
+- [Apache-2.0](backend/sdk/LICENSE) — SDK（唯一例外，见上）
 
 ## 快速开始
 
