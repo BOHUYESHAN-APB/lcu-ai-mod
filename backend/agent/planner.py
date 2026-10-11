@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from .borrow import BorrowLedger
+from .control_lease import ControlLease
 from .craft import (ContainerPick, armor_in_containers, clamp_take, describe_missing,
                     evaluate_craft, is_armor, normalize_item, route_containers)
 from .farm import (ACTION_HARVEST, ACTION_PLANT, ACTION_REPLANT, ACTION_TILL,
@@ -460,8 +461,11 @@ class Planner:
         self._system_key: Optional[str] = None
         self._system_cache: str = ""
         self._tools_cache: dict[str, list[dict]] = {}
+        # 控制租约（docs/dev/AGENT_ARCH.md §8）：双脑分工的仲裁接口。本批**只落接口**——
+        # 唯一接线是把本地 P0 反射抢占登记一行审计；不启用仲裁、不改任何下发行为。
+        self.control_lease = ControlLease()
         # BackendEatYield：进食的让路/退避/冷却闸门（`eat` 工具下发前都要过它）。
-        self.eat_yield = EatYield(action_manager)
+        self.eat_yield = EatYield(action_manager, control_lease=self.control_lease)
 
     def _threshold(self) -> float:
         """当前 decider 置信度阈值：读注入的 provider，失败回退默认常量。"""

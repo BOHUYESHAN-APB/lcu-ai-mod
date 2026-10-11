@@ -18,6 +18,9 @@ import time
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 
+from .control_lease import (HOLDER_REFLEX_EAT, REASON_SURVIVAL_EAT, ControlLease,
+                            register_reflex_preemption)
+
 logger = logging.getLogger("modes_engine")
 
 
@@ -343,6 +346,10 @@ class EatYield:
          `task_state`，绝不每 2 秒重试到触发 action_manager 的循环保护。
 
     它**不是模式**：没有"饿了自动吃"的自主触发（那是被删掉的 AutoEatMode）。
+
+    接线（docs/dev/AGENT_ARCH.md §8）：构造函数可注入 `ControlLease`；本地饥饿反射抢占
+    控制权时**经租约登记一行审计**（带理由 `survival:eat` 与时限）。没注入租约＝不登记，
+    行为与字节完全照旧。此处**不启用**双脑仲裁、不改任何下发逻辑。
     """
 
     # 一次 `eat` 的等待上限（Java 侧 task_state 的 running→done 一般 2~3s；超时＝没回执）。
@@ -350,17 +357,32 @@ class EatYield:
     # 失败后的冷却：用户口径"不要每 2 秒重试到触发循环保护"。
     FAIL_COOLDOWN = 10.0
 
-    def __init__(self, action_manager=None):
+    def __init__(self, action_manager=None, control_lease: Optional[ControlLease] = None):
         self._action_manager = action_manager
         self._pending_at = 0.0          # 上一次 `eat` 的下发时刻
         self._pending = False           # 上一次 `eat` 还没收到终态
         self._fail_until = 0.0          # 失败冷却的截止时刻
         self._fail_reason = ""
+        # 控制租约（docs/dev/AGENT_ARCH.md §8）：本地饥饿反射抢占时**只登记一行审计**；
+        # 没接线（None）＝行为与字节完全照旧。
+        self._control_lease = control_lease
+        self._reflex_logged = False     # 一次连续反射只登记一次，避免每 tick 刷审计
+
+    def _note_reflex_hold(self) -> None:
+        """本地饥饿反射抢占控制权：经租约登记（带理由与时限），留一行审计。"""
+        if self._reflex_logged:
+            return
+        self._reflex_logged = True
+        register_reflex_preemption(self._control_lease, holder=HOLDER_REFLEX_EAT,
+                                   reason=REASON_SURVIVAL_EAT, ttl=self.EAT_TIMEOUT,
+                                   detail={"source": "eat_yield", "reflex": "reflex_eat"})
 
     def allow(self, state: dict) -> tuple[bool, str]:
         """能否下发 `eat`：返回 `(是否放行, 被挡时的一句如实说明)`。"""
         if isinstance(state, dict) and state.get("reflex_eat"):
+            self._note_reflex_hold()
             return False, "（本地饥饿反射正在吃，我不抢）"
+        self._reflex_logged = False
         if time.time() < self._fail_until:
             return False, f"（上次进食没成：{self._fail_reason}；冷却中，稍后再吃）"
         if self._pending:
