@@ -63,18 +63,18 @@ public final class SwimReflex {
         }
 
         holdFastSwim(player);
-        ActionExecutor.setInput("jump", true);
+        InputIsolation.setControlState("swim", "jump", true);
         // 证据（clones/mindcraft/patches/mineflayer-pathfinder+2.4.5.patch:631-640）：
         // 憋气时 setControlState('jump',true) **且明确 sprint=false** —— 冲刺会干扰原版的上浮；
         // 只在"不缺氧气"时才用冲刺做加速游泳（见上面的分支）。
-        ActionExecutor.setInput("sprint", false);
+        InputIsolation.setControlState("swim", "sprint", false);
         if (player.getXRot() > -30.0f) {
             player.setXRot(Math.max(-55.0f, player.getXRot() - 5.0f));
         }
 
         // 2 秒没起色（多半头上有方块/在水下洞里）→ 同时向前游找出口
         if (stuckTicks > 40) {
-            ActionExecutor.setInput("forward", true);
+            InputIsolation.setControlState("swim", "forward", true);
         }
         // 15 秒仍没起色：说明本地反射解决不了，松手交给后端（它可用 control 精确操作，
         // 也可读 air_supply 做更高级的决策）——不能让本能一直霸占输入。
@@ -89,7 +89,7 @@ public final class SwimReflex {
 
     /** 水里按住冲刺 = 原版加速游泳。 */
     private static void holdFastSwim(LivingEntity player) {
-        ActionExecutor.setInput("sprint", true);
+        InputIsolation.setControlState("swim", "sprint", true);
     }
 
     /** 最近一次游泳反射动作（排错用）。 */
@@ -103,9 +103,9 @@ public final class SwimReflex {
 
     private static void release() {
         if (active) {
-            ActionExecutor.setInput("jump", false);
-            ActionExecutor.setInput("sprint", false);
-            ActionExecutor.setInput("forward", false);
+            InputIsolation.setControlState("swim", "jump", false);
+            InputIsolation.setControlState("swim", "sprint", false);
+            InputIsolation.setControlState("swim", "forward", false);
             active = false;
         }
         // 非 active 时也要清（可能上一次是"只加速游泳"分支置的 active）

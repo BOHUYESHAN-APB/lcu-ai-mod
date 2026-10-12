@@ -104,9 +104,23 @@ public class InputIsolation {
     }
 
     /**
+     * 带**所有权**的 AI 控制位写入：只有当前写入者能把它清掉（见 {@link InputOwnership}）。
+     *
+     * <p>真机事故：战斗反射在"没交战"时每 tick 清 {@code forward}，把导航刚按下的前进键一起清了
+     * ⇒ 有路、{@code navigating=true}、却一步不动。这个入口让那种写法在结构上无效。
+     */
+    public static void setControlState(String writer, String control, boolean state) {
+        if (!InputOwnership.allows(writer, control, state)) {
+            return;
+        }
+        setAiControlState(control, state);
+    }
+
+    /**
      * Clear all AI control states.
      */
     public static void clearAiControls() {
+        InputOwnership.clear();
         aiForward = false;
         aiBack = false;
         aiLeft = false;

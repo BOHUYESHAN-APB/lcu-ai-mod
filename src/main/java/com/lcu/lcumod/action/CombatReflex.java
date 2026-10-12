@@ -150,14 +150,17 @@ public final class CombatReflex {
         // 但**寻路中不接管位移**：那会跟 Pathfinder 抢同一个 forward 键（谁后写谁赢），
         // 表现就是"有任务却卡在原地"。寻路时只写朝向 + 出手。
         if (Pathfinder.isNavigating()) {
+            // 寻路中不接管位移（那会跟 Pathfinder 抢同一个 forward 键）。
+            // 注意：**只清自己拥有的**（见 InputOwnership）—— 顺手清掉导航刚按下的前进键，
+            // 表现就是"有任务却一步不动"（用户报的"老问题不移动"就是这么来的）。
             releaseMovement();
         } else {
             // 贴上去 / 后撤。苦力怕 / 幻翼**不贴脸**：策略表要求保持 ≥4 格
             // （{@link MobPolicy#preferDistance}），所以不往它身上凑，站着等它进攻击距离。
             double standoff = Math.max(APPROACH_DISTANCE,
                     MobPolicy.preferDistance(AttackRules.entityTypeId(attacker)));
-            ActionExecutor.setInput("forward", distance > standoff);
-            ActionExecutor.setInput("back", distance < BACK_OFF_DISTANCE);
+            InputIsolation.setControlState("combat", "forward", distance > standoff);
+            InputIsolation.setControlState("combat", "back", distance < BACK_OFF_DISTANCE);
         }
 
         if (distance <= REACH && weaponReady && cooldown == 0 && aimed) {
@@ -213,10 +216,16 @@ public final class CombatReflex {
         return lastAction;
     }
 
-    /** 解除交战时松开位移键（否则会出现"打完了还在后退/前冲"）。 */
+    /**
+     * 解除交战时松开位移键（否则会出现"打完了还在后退/前冲"）。
+     *
+     * <p>**只清自己拥有的**（{@link InputOwnership}）：反射每 tick 都会被调用，而它绝大多数 tick
+     * 并不在交战 —— 早先这里无条件写 false，于是把导航刚按下的前进键也一起清了，
+     * 真机表现就是"有路、navigating=true、却一步不动"。所有权就是这个 bug 的结构性修复。
+     */
     private static void releaseMovement() {
-        ActionExecutor.setInput("forward", false);
-        ActionExecutor.setInput("back", false);
+        InputIsolation.setControlState("combat", "forward", false);
+        InputIsolation.setControlState("combat", "back", false);
     }
 
     /**

@@ -43,6 +43,7 @@ public final class WalkCheck {
         autonomousJitterChecks();
         deathPointChecks();
         autonomousDefaultChecks();
+        inputOwnershipChecks();
 
         System.out.println("[WalkCheck] " + passed + " checks passed, " + failed + " failed");
         if (failed > 0) {
@@ -729,6 +730,66 @@ public final class WalkCheck {
         check("auton: turning it off does not touch the P0 survival reflexes",
                 !read(Path.of("src", "main", "java", "com", "lcu", "lcumod", "action",
                         "CombatReflex.java")).contains("AUTONOMOUS_FALLBACK"));
+    }
+
+    // ── 11. 输入所有权（真机"不移动"事故的结构性修复）──
+
+    /**
+     * 用户口径："CI 测试 … 就得先模拟这个逻辑，尽可能在测试阶段发现这类显著性问题。"
+     *
+     * <p>真机事故：`Pathfinder` 每 tick 按前进，`CombatReflex` **没交战时也每 tick** 清前进
+     * ⇒ 有路、navigating=true、却一步不动。这里对**零依赖的 `InputOwnership` 直接做行为断言**
+     * （最短复现就在下面），再扫源码确认三个写入者都走所有权入口。
+     */
+    private static void inputOwnershipChecks() {
+        InputOwnership.clear();
+        check("input-ownership: a stranger cannot clear someone else's input",
+                !InputOwnership.allows("combat", "forward", false));
+        check("input-ownership: writing true claims the key",
+                InputOwnership.allows("navigation", "forward", true)
+                        && InputOwnership.owns("navigation", "forward"));
+        check("input-ownership: the owner may clear it, and then no longer owns it",
+                InputOwnership.allows("navigation", "forward", false)
+                        && !InputOwnership.owns("navigation", "forward"));
+
+        // 真机 bug 的最短复现：导航按下前进 → 旁人来清 → 必须被拒。
+        InputOwnership.clear();
+        InputOwnership.allows("navigation", "forward", true);
+        check("input-ownership: the combat reflex cannot wipe navigation's forward key (the live bug)",
+                !InputOwnership.allows("combat", "forward", false)
+                        && InputOwnership.owns("navigation", "forward"));
+
+        // 换人接管：写 true 就是接管，之后原来那位也清不掉了。
+        InputOwnership.clear();
+        InputOwnership.allows("navigation", "forward", true);
+        InputOwnership.allows("swim", "forward", true);
+        check("input-ownership: the newest writer takes over",
+                InputOwnership.owns("swim", "forward")
+                        && !InputOwnership.allows("navigation", "forward", false));
+
+        check("input-ownership: blank writer or key is refused",
+                !InputOwnership.allows("", "forward", true) && !InputOwnership.allows("x", "", true));
+        InputOwnership.clear();
+        check("input-ownership: clear() drops every claim", InputOwnership.snapshot().isEmpty());
+
+        Path root = Path.of("src", "main", "java", "com", "lcu", "lcumod", "action");
+        String combat = read(root.resolve("CombatReflex.java"));
+        String pathfinder = read(root.resolve("Pathfinder.java"));
+        String swim = read(root.resolve("SwimReflex.java"));
+        String isolation = read(root.resolve("InputIsolation.java"));
+
+        check("input-ownership: the combat reflex only releases what it owns",
+                combat.contains("setControlState(\"combat\", \"forward\", false)")
+                        && !combat.contains("setInput(\"forward\""));
+        check("input-ownership: navigation claims movement before pressing it",
+                pathfinder.contains("setControlState(\"navigation\", \"forward\"")
+                        && !pathfinder.contains("setAiControlState(\"forward\""));
+        check("input-ownership: the swim reflex no longer writes input behind the other writers' backs",
+                !swim.contains("setInput("));
+        check("input-ownership: clearing AI controls also drops ownership",
+                isolation.contains("InputOwnership.clear()"));
+        check("input-ownership: the policy itself is zero dependency (no Minecraft imports)",
+                !read(root.resolve("InputOwnership.java")).contains("import net.minecraft"));
     }
 
     /** 取某个成员（含签名行）到下一个成员声明之间的源码片段（静态扫描用）。 */

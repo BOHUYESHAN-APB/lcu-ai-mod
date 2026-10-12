@@ -272,9 +272,10 @@ public class Pathfinder {
         ALIGNMENT.reset();
         // 交还视角：导航结束后，后端的 look（若有）从下一 tick 起重新生效（见 LookArbiter）。
         InputIsolation.clearNavigationLookTarget();
-        InputIsolation.setAiControlState("forward", false);
-        InputIsolation.setAiControlState("sprint", false);
-        InputIsolation.setAiControlState("jump", false);
+        // 收工：只交还**导航自己拥有**的位移（不能顺手清掉别人的 —— 所有权见 InputOwnership）。
+        InputIsolation.setControlState("navigation", "forward", false);
+        InputIsolation.setControlState("navigation", "sprint", false);
+        InputIsolation.setControlState("navigation", "jump", false);
     }
 
     public static void tick(Minecraft mc) {
@@ -685,8 +686,8 @@ public class Pathfinder {
             return;
         }
 
-        InputIsolation.setAiControlState("forward", alignedEnoughToWalk);
-        InputIsolation.setAiControlState("sprint",
+        InputIsolation.setControlState("navigation", "forward", alignedEnoughToWalk);
+        InputIsolation.setControlState("navigation", "sprint",
                 alignedEnoughToSprint && horizontalDistance > 4.0 && Math.abs(dy) < 0.2);
 
         boolean shouldJump = dy > STEP_UP_HEIGHT || (dy > 0.18 && horizontalDistance < 1.2);
@@ -694,7 +695,7 @@ public class Pathfinder {
             Vec3 probe = current.add(dx / horizontalDistance * 0.35, 0, dz / horizontalDistance * 0.35);
             shouldJump = !hasHeadroom(mc.level, mc.player, new Vec3(probe.x, Math.max(current.y, target.y), probe.z));
         }
-        InputIsolation.setAiControlState("jump", alignedEnoughToWalk && shouldJump);
+        InputIsolation.setControlState("navigation", "jump", alignedEnoughToWalk && shouldJump);
     }
 
     /** 目标的整数格键（退避/去重都用它，避免浮点抖动造成"看起来是新目标"）。 */
