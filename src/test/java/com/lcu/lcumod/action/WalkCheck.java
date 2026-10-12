@@ -61,6 +61,7 @@ public final class WalkCheck {
         perceptionTieringChecks();
         entityScanChecks();
         wireTokenArmedChecks();
+        dropChannelChecks();
 
         System.out.println("[WalkCheck] " + passed + " checks passed, " + failed + " failed");
         if (failed > 0) {
@@ -1895,6 +1896,157 @@ public final class WalkCheck {
         check("mouse: only the three real buttons are touched",
                 mouseSource.contains("BUTTON_LEFT") && mouseSource.contains("BUTTON_RIGHT")
                         && mouseSource.contains("BUTTON_MIDDLE"));
+    }
+
+    // ── 21. 丢物品必须走原版“丢出”通道（服务端真执行） ────────────────
+
+    /**
+     * 用户实机根因（2026-10-12）：后端 {@code drop_item -> ok}，但"地上没有掉落物"。
+     * {@code mc.player.drop(stack, false, Prediction.PREDICTED)} 是**世界逻辑**那一层，
+     * {@code LivingEntity.drop} 第一句就是 {@code if (this.level().isClientSide()) return null;}
+     * ⇒ 客户端只删了本地背包（预测"东西没了"），**一个包都没发**，服务器不知道。
+     *
+     * <p>这里钉三件事：
+     * <ol>
+     *   <li><b>背包索引 → 菜单槽位</b>的纯逻辑（{@link ActionExecutor.Pure#inventoryIndexToMenuSlot}）
+     *       含边界：0、8、9、35、盔甲 36..39、副手 40、以及**没有菜单槽**的 41/42 与越界；</li>
+     *   <li><b>数量语义</b>（{@link ActionExecutor.Pure#dropCountFor}）：该丢几个丢几个，不因 API 限制丢整叠；</li>
+     *   <li><b>静态扫描</b>：{@code ActionExecutor} 里不许再出现客户端本地丢弃
+     *       （{@code .drop(} / {@code Prediction.PREDICTED}），两个处理函数都必须走
+     *       {@code handleContainerInput(..., ContainerInput.THROW, ...)} 这条原版通道；
+     *       且该通道只允许出现在那一个丢东西的辅助方法里。</li>
+     *   <li><b>创造模式不许复制物品</b>：菜单 THROW 在客户端会额外发创造模式丢弃包
+     *       （服务端多丢一份），创造模式因此改走"按 Q"的玩家动作包。</li>
+     * </ol>
+     */
+    private static void dropChannelChecks() {
+        Path root = Path.of("src", "main", "java", "com", "lcu", "lcumod", "action");
+        String ae = read(root.resolve("ActionExecutor.java"));
+        if (ae.isEmpty()) {
+            check("drop: ActionExecutor source found", false);
+            return;
+        }
+
+        // ── 纯逻辑：背包索引 → InventoryMenu 菜单槽位 ──
+        int missing = ActionExecutor.Pure.MENU_NOT_FOUND;
+        check("drop/map: hotbar 0 -> menu 36", ActionExecutor.Pure.inventoryIndexToMenuSlot(0) == 36);
+        check("drop/map: hotbar 8 -> menu 44", ActionExecutor.Pure.inventoryIndexToMenuSlot(8) == 44);
+        check("drop/map: inv 9 -> menu 9", ActionExecutor.Pure.inventoryIndexToMenuSlot(9) == 9);
+        check("drop/map: inv 35 -> menu 35", ActionExecutor.Pure.inventoryIndexToMenuSlot(35) == 35);
+        check("drop/map: helmet 39 -> menu 5", ActionExecutor.Pure.inventoryIndexToMenuSlot(39) == 5);
+        check("drop/map: boots 36 -> menu 8", ActionExecutor.Pure.inventoryIndexToMenuSlot(36) == 8);
+        check("drop/map: offhand 40 -> menu 45", ActionExecutor.Pure.inventoryIndexToMenuSlot(40) == 45);
+        check("drop/map: body armor 41 has no menu slot", ActionExecutor.Pure.inventoryIndexToMenuSlot(41) == missing);
+        check("drop/map: saddle 42 has no menu slot", ActionExecutor.Pure.inventoryIndexToMenuSlot(42) == missing);
+        check("drop/map: -1 is refused", ActionExecutor.Pure.inventoryIndexToMenuSlot(-1) == missing);
+        check("drop/map: 43 (container size) is refused", ActionExecutor.Pure.inventoryIndexToMenuSlot(43) == missing);
+
+        boolean allInMenu = true;
+        boolean distinct = true;
+        java.util.Set<Integer> seen = new java.util.HashSet<>();
+        for (int i = 0; i < 36; i++) {
+            int menu = ActionExecutor.Pure.inventoryIndexToMenuSlot(i);
+            if (menu < 0 || menu > 45) {
+                allInMenu = false;
+            }
+            if (!seen.add(menu)) {
+                distinct = false;
+            }
+        }
+        check("drop/map: every inventory slot 0..35 lands in the menu 0..45", allInMenu);
+        check("drop/map: the 36 inventory slots map to 36 distinct menu slots", distinct);
+        check("drop/map: menu 45 is the offhand and nothing else",
+                ActionExecutor.Pure.inventoryIndexToMenuSlot(40) == ActionExecutor.Pure.SHIELD_SLOT
+                        && ActionExecutor.Pure.SHIELD_SLOT == 45);
+        check("drop/map: the hotbar band starts where InventoryMenu says (36)",
+                ActionExecutor.Pure.USE_ROW_SLOT_START == 36);
+        check("drop/map: the armor band starts where InventoryMenu says (5)",
+                ActionExecutor.Pure.ARMOR_SLOT_START == 5);
+
+        // ── 纯逻辑：数量语义 ──
+        check("drop/count: 1 of 64 asks for exactly 1", ActionExecutor.Pure.dropCountFor(1, 64) == 1);
+        check("drop/count: 32 of 64 asks for 32, not the whole stack", ActionExecutor.Pure.dropCountFor(32, 64) == 32);
+        check("drop/count: asking more than held caps at the stack", ActionExecutor.Pure.dropCountFor(99, 64) == 64);
+        check("drop/count: 0 still means one, never zero", ActionExecutor.Pure.dropCountFor(0, 64) == 1);
+        check("drop/count: a negative count still means one", ActionExecutor.Pure.dropCountFor(-5, 64) == 1);
+        check("drop/count: nothing held drops nothing", ActionExecutor.Pure.dropCountFor(3, 0) == 0);
+
+        // ── 静态扫描（只看代码，注释里提旧写法不算犯规） ──
+        String code = codeOnly(ae);
+        check("drop/scan: the client-local Player.drop call is gone", !code.contains(".drop("));
+        check("drop/scan: no Prediction.PREDICTED left in code", !code.contains("Prediction.PREDICTED"));
+
+        String dropItemBody = methodBody(ae, "private void handleDropItem(WireServer.WireCommand cmd)");
+        String dropBody = methodBody(ae, "private void handleDrop(WireServer.WireCommand cmd)");
+        String throwBody = methodBody(ae,
+                "private static String throwInventorySlot(Minecraft mc, int invSlot, int count)");
+        check("drop/scan: handleDropItem found", !dropItemBody.isEmpty());
+        check("drop/scan: handleDrop found", !dropBody.isEmpty());
+        check("drop/scan: the throw helper found", !throwBody.isEmpty());
+
+        check("drop: handleDropItem fails honestly when the throw is refused",
+                dropItemBody.contains("refused != null") && dropItemBody.contains("false, refused"));
+        check("drop: handleDrop fails honestly when the throw is refused",
+                dropBody.contains("refused != null") && dropBody.contains("false, refused"));
+        check("drop/scan: the vanilla THROW channel lives in exactly one place (the helper)",
+                countOf(code, "ContainerInput.THROW") == 2);
+        check("drop: both handlers share the one throw helper",
+                dropItemBody.contains("throwInventorySlot(") && dropBody.contains("throwInventorySlot("));
+        check("drop: both handlers report the real count, not the request",
+                dropItemBody.contains("dropCountFor(") && dropBody.contains("dropCountFor("));
+        check("drop: a not-found item is an honest failure",
+                dropItemBody.contains("not found") && dropItemBody.contains("false"));
+        check("drop: the helper only claims success by sending",
+                throwBody.contains("return null;") && !throwBody.contains(".drop("));
+
+        check("drop: the helper uses the pure mapping",
+                throwBody.contains("Pure.inventoryIndexToMenuSlot("));
+        check("drop: the helper double-checks the mapping against the live menu",
+                throwBody.contains("getContainerSlot() != invSlot"));
+        check("drop: button 1 throws the whole stack",
+                throwBody.contains(", 1, ContainerInput.THROW"));
+        check("drop: button 0 is repeated for partial counts",
+                throwBody.contains(", 0, ContainerInput.THROW") && throwBody.contains("i < want; i++"));
+        check("drop: the helper refuses while another container is open",
+                throwBody.contains("Another container is open"));
+        check("drop: the helper refuses when something sits on the cursor",
+                throwBody.contains("getCarried().isEmpty()"));
+        check("drop: the helper refuses an empty or unknown slot",
+                throwBody.contains("is empty") && throwBody.contains("Invalid slot "));
+        check("drop: creative mode never uses the click path (it would duplicate)",
+                throwBody.contains("hasInfiniteMaterials()") && throwBody.contains("Creative mode: only the selected slot"));
+        check("drop: creative mode drops the selected slot through the Q action packets",
+                throwBody.contains("gameMode.dropItem(player, true)") && throwBody.contains("gameMode.dropItem(player, false)"));
+
+        int pureStart = ae.indexOf("public static final class Pure {");
+        int pureEnd = ae.indexOf("public static int dropCountFor(");
+        check("drop: the pure mapping half is really pure (no game classes)",
+                pureStart >= 0 && pureEnd > pureStart
+                        && !ae.substring(pureStart, pureEnd).contains("net.minecraft"));
+    }
+
+    /** 去掉 {@code //} 行注释与块注释：静态扫描只看代码。 */
+    private static String codeOnly(String source) {
+        StringBuilder out = new StringBuilder(source.length());
+        int i = 0;
+        while (i < source.length()) {
+            char c = source.charAt(i);
+            if (c == '/' && i + 1 < source.length() && source.charAt(i + 1) == '/') {
+                while (i < source.length() && source.charAt(i) != '\n') {
+                    i++;
+                }
+            } else if (c == '/' && i + 1 < source.length() && source.charAt(i + 1) == '*') {
+                i += 2;
+                while (i + 1 < source.length() && !(source.charAt(i) == '*' && source.charAt(i + 1) == '/')) {
+                    i++;
+                }
+                i = Math.min(source.length(), i + 2);
+            } else {
+                out.append(c);
+                i++;
+            }
+        }
+        return out.toString();
     }
 
     /** 取某个成员（含签名行）到下一个成员声明之间的源码片段（静态扫描用）。 */

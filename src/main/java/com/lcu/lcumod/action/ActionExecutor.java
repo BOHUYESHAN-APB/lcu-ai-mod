@@ -14,7 +14,6 @@ import net.minecraft.resources.Identifier;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.protocol.game.ServerboundClientCommandPacket;
 import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
-import net.minecraft.util.Prediction;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
@@ -3801,6 +3800,155 @@ public class ActionExecutor {
         sendResponse(cmd.id(), true, "Eating food");
     }
 
+    // ── 丢物品：必须走原版“丢出”通道，让**服务端**真丢 ──────────────────
+
+    /**
+     * 纯逻辑（**零游戏依赖**）：背包索引 → {@code InventoryMenu} 菜单槽位。
+     *
+     * <p>布局来自 javap / 反编译源码实证（26.3，不是凭记忆）：
+     * <ul>
+     *   <li>{@code InventoryMenu.addStandardInventorySlots}（{@code addInventoryExtendedSlots} +
+     *       {@code addInventoryHotbarSlots}）：菜单 9..35 ↔ 背包 9..35、菜单 36..44 ↔ 快捷栏 0..8；</li>
+     *   <li>{@code new ArmorSlot(inventory, owner, slot, 39 - i, ...)}，{@code SLOT_IDS} =
+     *       HEAD,CHEST,LEGS,FEET ⇒ 菜单 5..8 ↔ 背包 39..36；</li>
+     *   <li>{@code new Slot(inventory, 40, 77, 62)} ⇒ 菜单 45 ↔ 副手 40。</li>
+     * </ul>
+     * {@code 41}（背甲）/ {@code 42}（鞍）在 {@code InventoryMenu} 里**没有**槽位，
+     * 一律返回 {@link #MENU_NOT_FOUND}，调用方必须如实失败而不是瞎点别的槽。
+     */
+    public static final class Pure {
+        /** {@code InventoryMenu.ARMOR_SLOT_START}（javap -constants：5）。 */
+        public static final int ARMOR_SLOT_START = 5;
+        /** {@code InventoryMenu.USE_ROW_SLOT_START}（javap -constants：36）：快捷栏菜单槽起点。 */
+        public static final int USE_ROW_SLOT_START = 36;
+        /** {@code InventoryMenu.SHIELD_SLOT}（javap -constants：45）：副手槽。 */
+        public static final int SHIELD_SLOT = 45;
+        /** 该背包索引在背包菜单里没有对应槽位（越界、或背甲/鞍这类无菜单槽的装备位）。 */
+        public static final int MENU_NOT_FOUND = -1;
+
+        private Pure() {
+        }
+
+        /** 背包索引 → 菜单槽位；没有对应槽 ⇒ {@link #MENU_NOT_FOUND}。 */
+        public static int inventoryIndexToMenuSlot(int invIndex) {
+            if (invIndex >= 0 && invIndex < 9) {
+                return USE_ROW_SLOT_START + invIndex;            // 快捷栏 0..8  -> 菜单 36..44
+            }
+            if (invIndex >= 9 && invIndex < 36) {
+                return invIndex;                                  // 主背包 9..35 -> 菜单 9..35
+            }
+            if (invIndex >= 36 && invIndex < 40) {
+                return ARMOR_SLOT_START + (39 - invIndex);        // 盔甲 39..36 -> 菜单 5..8
+            }
+            if (invIndex == 40) {
+                return SHIELD_SLOT;                               // 副手 40    -> 菜单 45
+            }
+            return MENU_NOT_FOUND;
+        }
+
+        /** 这一单**实际**要丢几个：至少 1、最多手里有的（请求超过整叠就丢整叠）。 */
+        public static int dropCountFor(int requested, int available) {
+            if (available <= 0) {
+                return 0;
+            }
+            return Math.max(1, Math.min(requested, available));
+        }
+    }
+
+    /**
+     * 把背包第 {@code invSlot} 个索引里的 {@code count} 个物品**真的发到服务端**去丢。
+     *
+     * <p>根因（2026-10-12 实机：后端日志 {@code drop_item -> ok}，但"地上没有掉落物"）：
+     * {@code mc.player.drop(stack, ..., Prediction.PREDICTED)} 是**世界逻辑**那一层，
+     * 而 {@code LivingEntity.drop} 第一件事就是
+     * {@code if (this.level().isClientSide()) return null;} ⇒ 客户端只删了本地背包
+     * （预测里"东西没了"），**一个包都没发**，服务器根本不知道 ⇒ 地上没有实体，重同步后物品回来。
+     *
+     * <p>原版通道 = "在背包界面里按 Q"：客户端
+     * {@code MultiPlayerGameMode.handleContainerInput(containerId, menuSlot, button,
+     * ContainerInput.THROW, player)} 发 {@code ServerboundContainerClickPacket}，服务端
+     * {@code AbstractContainerMenu.clicked} 的 {@code ContainerInput.THROW} 分支真丢并广播
+     * {@code ItemEntity}。按源码实证：{@code button=0} 丢 1 个、{@code button=1} 丢**整叠**
+     * （{@code int amount = buttonNum == 0 ? 1 : slot.getItem().getCount();}）
+     * ⇒ 要丢 N 个而**不是**整叠时，只能发 N 次 {@code button=0}（原版没有"丢 N 个"的别的入口）。
+     *
+     * <p>客户端 {@code clicked} 会把同一次点击**同步应用到本地菜单**（≙ 服务端将要做的），
+     * 所以"发出去"和"本地预测"一致；但**成功回执以"包真的发出去了"为前提**，
+     * 只调一个本地方法就报成功正是这次 bug 的形态。
+     *
+     * <p>创造模式例外：同一次菜单 THROW 在客户端还会走
+     * {@code LocalPlayer.handleCreativeModeItemDrop} → 发 {@code ServerboundSetCreativeModeSlotPacket(-1, x)}，
+     * 服务端会**再丢一份**（复制）。原版只在"开着界面按 Q"时才可能同时走这两条，
+     * 而我们不打开任何界面 ⇒ {@code hasOtherInventoryOpen=false} 挡不住。
+     * 因此创造模式改走"按 Q"的 {@code MultiPlayerGameMode.dropItem(LocalPlayer, boolean)}
+     * （只作用于**选中槽**），别的槽位**如实拒绝**而不是复制物品。
+     *
+     * @return {@code null} = 已经把包发出去；非 {@code null} = **没发出去**的原因
+     */
+    private static String throwInventorySlot(Minecraft mc, int invSlot, int count) {
+        var player = mc.player;
+        if (player == null || mc.gameMode == null) {
+            return "No player";
+        }
+        // 点的是**当前打开的菜单**：背包菜单不是活动菜单时（开着箱子等），服务端 containerId 对不上，
+        // 点了也白点 ⇒ 如实失败。
+        if (player.containerMenu != player.inventoryMenu) {
+            return "Another container is open";
+        }
+        var inv = player.getInventory();
+        if (invSlot < 0 || invSlot >= inv.getContainerSize()) {
+            return "Invalid slot " + invSlot;
+        }
+        var stack = inv.getItem(invSlot);
+        if (stack.isEmpty()) {
+            return "Slot " + invSlot + " is empty";
+        }
+        // 创造模式：客户端点菜单 THROW 时会**额外**走一次 LocalPlayer.handleCreativeModeItemDrop
+        // （原版只在"开着界面按 Q"时两者才会一起走，且创造模式界面自己处理 THROW；我们没开界面 ⇒
+        // hasOtherInventoryOpen=false 挡不住那次额外包）⇒ 服务端会凭空**多丢一份** = 复制物品。
+        // 所以创造模式改用"按 Q"的玩家动作包（只作用于选中槽），其余槽位**如实拒绝**，绝不复制。
+        if (player.hasInfiniteMaterials()) {
+            if (invSlot != inv.getSelectedSlot()) {
+                return "Creative mode: only the selected slot can be dropped";
+            }
+            int creativeWant = Pure.dropCountFor(count, stack.getCount());
+            if (creativeWant <= 0) {
+                return "Slot " + invSlot + " is empty";
+            }
+            if (creativeWant >= stack.getCount()) {
+                mc.gameMode.dropItem(player, true);
+            } else {
+                for (int i = 0; i < creativeWant; i++) {
+                    mc.gameMode.dropItem(player, false);
+                }
+            }
+            return null;
+        }
+        var menu = player.inventoryMenu;
+        int menuSlot = Pure.inventoryIndexToMenuSlot(invSlot);
+        // 公式还要和**真菜单**对一次：不对就当场失败，绝不把东西丢到别的槽里去。
+        if (menuSlot < 0 || menuSlot >= menu.slots.size()
+                || menu.slots.get(menuSlot).container != inv
+                || menu.slots.get(menuSlot).getContainerSlot() != invSlot) {
+            return "No menu slot for inventory index " + invSlot;
+        }
+        if (!menu.getCarried().isEmpty()) {
+            return "Something is on the cursor";
+        }
+        int want = Pure.dropCountFor(count, stack.getCount());
+        if (want <= 0) {
+            return "Slot " + invSlot + " is empty";
+        }
+        if (want >= stack.getCount()) {
+            mc.gameMode.handleContainerInput(menu.containerId, menuSlot, 1, ContainerInput.THROW, player);
+        } else {
+            for (int i = 0; i < want; i++) {
+                mc.gameMode.handleContainerInput(menu.containerId, menuSlot, 0, ContainerInput.THROW, player);
+            }
+        }
+        return null;
+    }
+
     private void handleDropItem(WireServer.WireCommand cmd) {
         var args = cmd.args();
         if (args == null || !args.has("item")) {
@@ -3815,18 +3963,22 @@ public class ActionExecutor {
         String itemName = args.get("item").getAsString();
         int count = args.has("count") ? args.get("count").getAsInt() : 1;
 
-        // Find item in inventory and drop
+        // Find item in inventory and throw it for real (server-side)
         var inv = mc.player.getInventory();
         for (int i = 0; i < inv.getContainerSize(); i++) {
             var stack = inv.getItem(i);
             if (stack.isEmpty()) continue;
-            if (stack.getItem().toString().contains(itemName)) {
-                // Drop item
-                mc.player.drop(stack.split(count), false, Prediction.PREDICTED);
-                StateCollector.requestRefresh();
-                sendResponse(cmd.id(), true, "Dropped " + itemName);
+            if (!stack.getItem().toString().contains(itemName)) continue;
+            var item = stack.getItem();
+            int want = Pure.dropCountFor(count, stack.getCount());
+            String refused = throwInventorySlot(mc, i, count);
+            if (refused != null) {
+                sendResponse(cmd.id(), false, refused);
                 return;
             }
+            StateCollector.requestRefresh();
+            sendResponse(cmd.id(), true, "Dropped " + want + " x " + item);
+            return;
         }
         sendResponse(cmd.id(), false, "Item " + itemName + " not found");
     }
@@ -3856,11 +4008,15 @@ public class ActionExecutor {
             sendResponse(cmd.id(), false, "Slot " + slot + " is empty");
             return;
         }
-        int dropCount = Math.max(1, Math.min(count, stack.getCount()));
-        var dropped = stack.split(dropCount);
-        mc.player.drop(dropped, true, Prediction.PREDICTED);
+        var item = stack.getItem();
+        int want = Pure.dropCountFor(count, stack.getCount());
+        String refused = throwInventorySlot(mc, invSlot, count);
+        if (refused != null) {
+            sendResponse(cmd.id(), false, refused);
+            return;
+        }
         StateCollector.requestRefresh();
-        sendResponse(cmd.id(), true, "Dropped " + dropped.getCount() + " x " + dropped.getItem());
+        sendResponse(cmd.id(), true, "Dropped " + want + " x " + item);
     }
 
     private void handleEquip(WireServer.WireCommand cmd) {

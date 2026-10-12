@@ -1,6 +1,6 @@
 # LCUMod 完整测试表
 
-> 基线（2026-10-12 本机实测）：后端 `cd backend && python -m unittest discover -s tests` → **1733 tests OK，零 skip**；Java `gradlew.bat check` → **BUILD SUCCESSFUL**，18 个零依赖 `verifyXxx` 自检共 **1307 项**全绿。
+> 基线（2026-10-12 本机实测）：后端 `cd backend && python -m unittest discover -s tests` → **1745 tests OK，零 skip**；Java `gradlew.bat check` → **BUILD SUCCESSFUL**，18 个零依赖 `verifyXxx` 自检共 **1351 项**全绿。
 > 本表按 **26.3 线的实际代码**写；标为「当前不适用」的小节是上一版从另一条血缘（master 1.21.1）抄来的验收项，本仓库没有对应实现，**不要照它们验收**。
 
 ## 启动准备
@@ -179,9 +179,9 @@
 15. **落地水自检** — `gradlew verifyMlg` → **91 checks passed**；已接入 `check`。
 16. **跨语言线协议集成测试（真 Java ⇄ 真 Python，仓库里唯一一条）** — `cd backend && python -m unittest discover -s tests/integration -t tests/integration -v` → **7 tests OK**。它自己起 `gradlew runWireFixture`：headless 夹具 `WireServerFixtureMain`（在 **test sourceset**，`unzip -l build/libs/lcumod-0.1.0.jar` 里没有它）跑的是**生产** `WireServer`；Python 侧走**真** `protocol/wire_client.py`。端口随机（`-PwireFixturePort=0`）。夹具起不来 ⇒ 整个测试类 error（真失败，绝不是 skip）。
     - **没覆盖**：游戏侧消费方 —— `ActionExecutor` 的命令执行、`StateCollector` 的真实状态内容、tick 驱动的输入/动作。
-    - 它**不进** `check`/`build`（长驻服务）；默认 `discover -s tests` 也**不会**递归进 `tests/integration`（该目录**故意没有 `__init__.py`**），所以单测基线是 **1733 零 skip**（2026-10-12 实测）。CI 有独立 `integration` job 跑上一条命令。
-17. **行走/视角自检 + 感知分级/按需扫描 + wireToken 武装** — `gradlew verifyWalk` → **427 checks passed**（导航中后端 `look` **不覆盖**路径朝向 / 无导航时后端 `look` 作为**绝对值**生效 / 每 tick 角速度有上限且角加速度有限（**缓动**，不再恒定 10°·6°）不越界不抖 / 转不过去 ⇒ **如实停步上报** / 重算退避且相同结果只报一次 / **脚印碰撞剖面**：半砖 0.5、地毯 1/16、上半砖 1.0=JUMP_UP、楼梯上行 WALK 下行 DROP_DOWN、闭合活板门 0.1875=WALK、立起活板门与净空不足 ⇒ REFUSE **带机器可读原因**、梯子/藤蔓/脚手架=CLIMB（竖直边可爬）、够不到柱顶与"脚下没支撑面"一律拒绝且**绝不搭方块**、卡住报"哪一格为什么" / **曲线行为**：缓动端点/单调/有界/对称、角速度饱和与制动不越过目标、速度曲线随偏差与距离变化、前视取点随范围夹紧 / **静态扫描**：`Pathfinder` 里不许出现 `setYRot`·`setXRot`·`setBlock`，`InputIsolation` 是唯一视角写者 / 感知摘要 + `scan_entities` 的档位边界与上限 / **启动时真的把 `wireToken` 武装上**且空值要 WARN）；已接入 `check`。
+    - 它**不进** `check`/`build`（长驻服务）；默认 `discover -s tests` 也**不会**递归进 `tests/integration`（该目录**故意没有 `__init__.py`**），所以单测基线是 **1745 零 skip**（2026-10-12 实测）。CI 有独立 `integration` job 跑上一条命令。
+17. **行走/视角自检 + 感知分级/按需扫描 + wireToken 武装 + 丢物品通道** — `gradlew verifyWalk` → **471 checks passed**（导航中后端 `look` **不覆盖**路径朝向 / 无导航时后端 `look` 作为**绝对值**生效 / 每 tick 角速度有上限且角加速度有限（**缓动**，不再恒定 10°·6°）不越界不抖 / 转不过去 ⇒ **如实停步上报** / 重算退避且相同结果只报一次 / **脚印碰撞剖面**：半砖 0.5、地毯 1/16、上半砖 1.0=JUMP_UP、楼梯上行 WALK 下行 DROP_DOWN、闭合活板门 0.1875=WALK、立起活板门与净空不足 ⇒ REFUSE **带机器可读原因**、梯子/藤蔓/脚手架=CLIMB（竖直边可爬）、够不到柱顶与"脚下没支撑面"一律拒绝且**绝不搭方块**、卡住报"哪一格为什么" / **曲线行为**：缓动端点/单调/有界/对称、角速度饱和与制动不越过目标、速度曲线随偏差与距离变化、前视取点随范围夹紧 / **静态扫描**：`Pathfinder` 里不许出现 `setYRot`·`setXRot`·`setBlock`，`InputIsolation` 是唯一视角写者 / 感知摘要 + `scan_entities` 的档位边界与上限 / **启动时真的把 `wireToken` 武装上**且空值要 WARN / **丢物品必须发到服务端**：`ActionExecutor` 里不许再出现客户端本地的 `player.drop(`·`Prediction.PREDICTED`，`drop_item`/`drop` 统一走 `handleContainerInput(..., ContainerInput.THROW, ...)`（button=0 丢 1 个、button=1 丢整叠），背包索引→`InventoryMenu` 菜单槽位映射含边界 0/8/9/35/36/39/40/41/42/越界、创造模式改走"按 Q"的玩家动作包——菜单 THROW 在创造模式会凭空**多丢一份**）；已接入 `check`。
 18. **村民交易自检** — `gradlew verifyTrade` → **27 checks passed**；已接入 `check`。
 19. **真建造自检** — `gradlew verifyBuild` → **22 checks passed**；已接入 `check`。
 
-> 零依赖自检共 **18 套 1307 项**（`verifyLogic 21`、`verifyTitle 11`、`verifyChat 59`、`verifyFinder 18`、`verifyPhrase 16`、`verifyGate 12`、`verifyHold 43`、`verifyContainer 98`、`verifyRoute 132`、`verifyRecipe 106`、`verifyGuard 109`、`verifyProto 49`、`verifyMlg 91`、`verifyWalk 427`、`verifyTrade 27`、`verifyBuild 22`、`verifyMixin 53`、`verifyLang 13`）。跑单个任务**必须加 `--rerun` 且逐个跑**（一次跑多个会被判 UP-TO-DATE 静默跳过）。
+> 零依赖自检共 **18 套 1351 项**（`verifyLogic 21`、`verifyTitle 11`、`verifyChat 59`、`verifyFinder 18`、`verifyPhrase 16`、`verifyGate 12`、`verifyHold 43`、`verifyContainer 98`、`verifyRoute 132`、`verifyRecipe 106`、`verifyGuard 109`、`verifyProto 49`、`verifyMlg 91`、`verifyWalk 471`、`verifyTrade 27`、`verifyBuild 22`、`verifyMixin 53`、`verifyLang 13`）。跑单个任务**必须加 `--rerun` 且逐个跑**（一次跑多个会被判 UP-TO-DATE 静默跳过）。
