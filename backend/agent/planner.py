@@ -77,6 +77,7 @@ from .territory import (ACTION_FARM, POLICY_BORROW_ONLY, POLICY_FREE, POLICY_NO_
 from .tool_registry import (ACTION_GROUPS as _ACTION_GROUPS,
                             PHASE_GROUPS as _PHASE_GROUPS, TOOL_BY_NAME, ToolSpec,
                             _actions_for_phase, build_tool_schemas, tool_schema)
+from . import home_bed
 from .use_on import MODE_ENTITY as USE_ON_ENTITY
 from .use_on import describe as use_on_note
 from .use_on import plan as plan_use_on
@@ -645,6 +646,7 @@ class Planner:
         if self._composite_runs:
             try:
                 self.resume_composites(context)
+                self.home_bed_step(context)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[Planner] 复合体续跑失败: %s", exc)
 
@@ -1724,6 +1726,42 @@ passive 被动=能猎的肉、unknown 认不出=先别当敌人）：
             return str(run.job_id)
         self._composite_seq += 1
         return f"{run.composite.name}#{self._composite_seq}"
+
+    def home_bed_step(self, context: Optional[dict] = None) -> bool:
+        """推进"把床绑成家"的链路（走过去 → 右键 → 用原版重生点核对）。
+
+        用户纠正的语义：**右键一次床就会绑重生点**（任何时候都行，白天晴天一样）；
+        "现在不能睡"只是不睡、不影响绑定。所以"记下床位"不算数，右键 + 核对才算数。
+        结论只有两种：`home_bed_bound` 说重生点就是这张床（真的绑上了），或者如实报失败。
+        """
+        state = getattr(self, "_home_bed", None)
+        if not isinstance(state, dict):
+            return False
+
+        outcome = home_bed.step(state, context or {})
+        action = str(outcome.get("action") or "")
+        skills = getattr(self, "skills", None)
+        if skills is not None and action == "move_to":
+            move = getattr(skills, "move_to", None)
+            if callable(move):
+                move(float(state["x"]), float(state["y"]), float(state["z"]))
+        elif skills is not None and action == "use_on":
+            look = getattr(skills, "look_at", None)
+            if callable(look):
+                look(float(state["x"]), float(state["y"]) + 0.5, float(state["z"]))
+            use = getattr(skills, "use_on", None)
+            if callable(use):
+                use()
+
+        note = str(outcome.get("note") or "")
+        if outcome.get("done"):
+            self._home_bed = None                     # 一次性账：结论出来就清
+            self._territory_note = note
+            logger.info("[Planner] 绑定床位结论：%s", note)
+            return True
+        if note:
+            self._territory_note = note               # 中途也让模型看到"正在走过去/正在右键"
+        return False
 
     def resume_composites(self, context: Optional[dict] = None) -> list[str]:
         """把**挂起**的复合体往前推（跨轮推进；**不加线程/定时器** ✗）。
@@ -3324,8 +3362,13 @@ passive 被动=能猎的肉、unknown 认不出=先别当敌人）：
         bed = self._bed_in_base(base, (context or {}).get("nearby_beds"))
         if bed is not None:
             store.set_home_bed(base["name"], {"x": bed[0], "y": bed[1], "z": bed[2]})
-            self._territory_note = (f"（在基地「{base['name']}」里找到床 "
-                                    f"({bed[0]:.0f},{bed[1]:.0f},{bed[2]:.0f})，记成床位）")
+            # 只记坐标**不等于**绑上了：原版要**右键一次**才会把重生点绑到这张床
+            # （用户纠正的语义：白天/晴天也行，"现在不能睡"只是不睡、不影响绑定）。
+            # 所以这里起一条"走过去 → 右键 → 用重生点核对"的链路，成功了才算家。
+            self._home_bed = home_bed.start(bed, base=str(base["name"]))
+            self._territory_note = (f"（基地「{base['name']}」里找到床 "
+                                    f"({bed[0]:.0f},{bed[1]:.0f},{bed[2]:.0f})；现在走过去**右键一次**"
+                                    "把重生点绑到它 —— 不绑的话死了还是回世界出生点）")
             return True
         decision = bed_attempt((context or {}).get("inventory"), (context or {}).get("entities"))
         if decision.get("action") == "craft":

@@ -218,6 +218,11 @@ async def startup():
         heartbeat_seconds=config_store.get_log_heartbeat_seconds(),
     )
     orchestrator = Orchestrator(wire)
+    # 原版贴图缓存（`item_icons` 事件）：模组事件统一走 `Session.handle_event`，而
+    # `agent/session.py` 不在本批改动范围 —— 所以只在这个实例上**包一层旁听**（见 api/overlay.py）。
+    from api import overlay as overlay_api  # noqa: PLC0415
+
+    overlay_api.install_icon_capture(orchestrator)
     _apply_config_to_llm_services()
     _apply_persona_to_session()
     _seed_local_stores()
@@ -288,6 +293,21 @@ async def get_contacts_page():
 async def get_contacts_thread_page(uuid: str):
     """同一页，深链到某个人（前端从路径里取 uuid）。`uuid` 只是展示用，不落库。"""
     return _static_html("contacts.html", "<h1>Contacts</h1>")
+
+
+# 单页叠加层 + 可视化编辑器（用户口径：OBS 里只叠**一个**网页，参数在一个统一页面里调）。
+# 必须**注册在 `/overlay/{component}` 之前** —— Starlette 按注册顺序匹配，否则 `/overlay/editor`
+# 会被那个组件页吞掉（当成未知组件 404）。老组件页 `/overlay/<component>` 行为一字不改。
+@app.get("/overlay", response_class=HTMLResponse)
+async def get_overlay_stage_page():
+    """单页叠加层：OBS 里加**一个**浏览器源即可；透明走既有 `?bg=transparent` 约定。"""
+    return _static_html("stage.html", "<h1>Overlay</h1>")
+
+
+@app.get("/overlay/editor", response_class=HTMLResponse)
+async def get_overlay_editor_page():
+    """可视化布局编辑器（拖组件、调缩放/透明度，存 `/api/overlay/layout`）。"""
+    return _static_html("overlay_editor.html", "<h1>Overlay editor</h1>")
 
 
 @app.get("/overlay/{component}", response_class=HTMLResponse)
@@ -1112,5 +1132,7 @@ async def cancel_job(data: dict):
 # 这里只多做一件"挂上去"的事，上面任何既有路由/启动/鉴权/静态文件逻辑都不动。
 # 缺口与逐条理由见 `docs/dev/PORT_LIST.md` §4 的结项清单。
 from api import http_surface  # noqa: E402
+from api import overlay as overlay_api  # noqa: E402
 
 http_surface.install(app)
+overlay_api.install(app)
