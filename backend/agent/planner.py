@@ -4066,11 +4066,16 @@ passive 被动=能猎的肉、unknown 认不出=先别当敌人）：
         except Exception:  # noqa: BLE001 —— 锚点坏了不影响找床
             center = None
         if center is None:
-            # 退一步：离**我自己**最近的那张（模组上报的本就是"我附近"）
-            try:
-                center = point_of(self._player_pos(context or {}))
-            except Exception:  # noqa: BLE001
-                center = None
+            # 退一步：离**我自己**最近的那张（模组上报的本就是"我附近"）。
+            # 注意 `point_of` 只吃字典行 —— `_player_pos` 给的是元组，别喂错。
+            pos = self._player_pos(context or {})
+            if isinstance(pos, (list, tuple)) and len(pos) >= 3:
+                center = (float(pos[0]), float(pos[1]), float(pos[2]))
+            else:
+                try:
+                    center = point_of(pos)
+                except Exception:  # noqa: BLE001
+                    center = None
         if center is None:
             return rows[0]
         return min(rows, key=lambda p: (p[0] - center[0]) ** 2 + (p[1] - center[1]) ** 2
