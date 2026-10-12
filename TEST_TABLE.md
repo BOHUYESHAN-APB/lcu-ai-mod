@@ -1,6 +1,6 @@
 # LCUMod 完整测试表
 
-> 基线（2026-10-12 本机实测）：后端 `cd backend && python -m unittest discover -s tests` → **1745 tests OK，零 skip**；Java `gradlew.bat check` → **BUILD SUCCESSFUL**，18 个零依赖 `verifyXxx` 自检共 **1351 项**全绿。
+> 基线（2026-10-12 本机实测）：后端 `cd backend && python -m unittest discover -s tests` → **1745 tests OK，零 skip**；Java `gradlew.bat check` → **BUILD SUCCESSFUL**，18 个零依赖 `verifyXxx` 自检共 **1459 项**全绿。
 > 本表按 **26.3 线的实际代码**写；标为「当前不适用」的小节是上一版从另一条血缘（master 1.21.1）抄来的验收项，本仓库没有对应实现，**不要照它们验收**。
 
 ## 启动准备
@@ -172,7 +172,7 @@
 8. **按住类动作自检** — `gradlew verifyHold` → **43 checks passed**（hold N tick 到期松开 / 条件命中即松开 / 超时带原因 / AI 关闭·玩家接管·反射覆盖立即释放 / eat 幂等 / `reflex_eat`）；已接入 `check`，随 `build` 跑。
 9. **安全/防护自检** — `gradlew verifyGuard` → **109 checks passed**（出站文本清洗 / 指令硬黑名单 / 区域保护球·长方体命中与"保护优先、多区取最保守、无保护项不拦" / `click_screen_button` 的 `no_screen`·`no_match`·让路 / `place_block` 物品不在背包即失败不替换 / 导航不搭方块的静态扫描）；已接入 `check`。
 10. **线协议预留自检** — `gradlew verifyProto` → **49 checks passed**（`{v,type,seq,ts,payload}` 封装 / 未知字段与未知 `type` 忽略 / 坏 JSON 返回 null / `Body` 抽象 0 处 `net.minecraft` / `PROTOCOL_VERSION` + 6 个能力位 / token 鉴权若干项 / `WireServer` 委托 `WireAuth` / 有闸门且闸门在命令分发**之前** / 未鉴权连接有读超时 / 配置键 `wireToken` 默认空）；已接入 `check`。
-11. **聊天分类自检** — `gradlew verifyChat` → **59 checks passed**；已接入 `check`。
+11. **聊天分类自检** — `gradlew verifyChat` → **167 checks passed**；已接入 `check`。
 12. **容器 UI 自检** — `gradlew verifyContainer` → **98 checks passed**；已接入 `check`。
 13. **站点与路径自检** — `gradlew verifyRoute` → **132 checks passed**；已接入 `check`。
 14. **配方检索自检** — `gradlew verifyRecipe` → **106 checks passed**；已接入 `check`。
@@ -184,4 +184,4 @@
 18. **村民交易自检** — `gradlew verifyTrade` → **27 checks passed**；已接入 `check`。
 19. **真建造自检** — `gradlew verifyBuild` → **22 checks passed**；已接入 `check`。
 
-> 零依赖自检共 **18 套 1351 项**（`verifyLogic 21`、`verifyTitle 11`、`verifyChat 59`、`verifyFinder 18`、`verifyPhrase 16`、`verifyGate 12`、`verifyHold 43`、`verifyContainer 98`、`verifyRoute 132`、`verifyRecipe 106`、`verifyGuard 109`、`verifyProto 49`、`verifyMlg 91`、`verifyWalk 471`、`verifyTrade 27`、`verifyBuild 22`、`verifyMixin 53`、`verifyLang 13`）。跑单个任务**必须加 `--rerun` 且逐个跑**（一次跑多个会被判 UP-TO-DATE 静默跳过）。
+> 零依赖自检共 **18 套 1459 项**（`verifyLogic 21`、`verifyTitle 11`、`verifyChat 167`、`verifyFinder 18`、`verifyPhrase 16`、`verifyGate 12`、`verifyHold 43`、`verifyContainer 98`、`verifyRoute 132`、`verifyRecipe 106`、`verifyGuard 109`、`verifyProto 49`、`verifyMlg 91`、`verifyWalk 471`、`verifyTrade 27`、`verifyBuild 22`、`verifyMixin 53`、`verifyLang 13`）。跑单个任务**必须加 `--rerun` 且逐个跑**（一次跑多个会被判 UP-TO-DATE 静默跳过）。

@@ -740,13 +740,24 @@ public class ActionExecutor {
             com.lcu.lcumod.chat.TextSanitizer.Result sanitized =
                     com.lcu.lcumod.chat.TextSanitizer.sanitize(msg);
             msg = sanitized.text();
+            // 最后一道**字符防线**（真机事故 2026-10-12：换行符把玩家从服务器踢了）：聊天通道到不了的
+            // 字符一律不许出网。口径与后端 chat_sanitize.py 一致 —— 换行/制表/行分隔符 → 一个空格，
+            // 控制字符/零宽/双向控制/软连字符/孤立代理项/§ → 删除，压空白，200 字符上限（不切代理对）。
+            com.lcu.lcumod.chat.ChatText.Result text = com.lcu.lcumod.chat.ChatText.sanitize(msg);
+            if (text.dirty()) {
+                LCUMod.LOGGER.warn("[Safety] send_chat 已清洗（字符防线：删 {} 字符，{} 字符 -> {} 字符）：{}",
+                        text.droppedChars(), msg.length(), text.text().length(),
+                        com.lcu.lcumod.chat.ChatText.preview(text.text(), 60));
+            }
+            msg = text.text();
             if (msg.isBlank()) {
                 sendResponse(cmd.id(), false, "Empty message after sanitize");
                 return;
             }
             if (sanitized.sanitized()) {
                 LCUMod.LOGGER.warn("[Safety] send_chat 已清洗（剥掉行首空白/斜杠 {} 字符，行首斜杠={}）：{}",
-                        sanitized.removedChars(), sanitized.hadLeadingSlash(), msg);
+                        sanitized.removedChars(), sanitized.hadLeadingSlash(),
+                        com.lcu.lcumod.chat.ChatText.preview(msg, 60));
             }
             mc.player.connection.sendChat(msg);
             // 记下我们自己发的这条，供 ChatListener 去重（不要按玩家名整类过滤用户的话）
@@ -754,7 +765,7 @@ public class ActionExecutor {
             JsonObject data = new JsonObject();
             data.addProperty("message", "Chat sent");
             data.addProperty("text", msg);
-            data.addProperty("sanitized", sanitized.sanitized());
+            data.addProperty("sanitized", sanitized.sanitized() || text.dirty());
             sendResponse(cmd.id(), true, data);
         } catch (Exception e) {
             LCUMod.LOGGER.error("[Action] sendChat error: {}", e.getMessage());
@@ -3360,9 +3371,30 @@ public class ActionExecutor {
             sendResponse(cmd.id(), false, data, CommandBlacklist.REASON + ": " + verdict.family());
             return;
         }
+        // 最后一道**字符防线**（与聊天同一套口径）：指令串里一个换行/控制字符同样足以被服务器踢，
+        // 而且指令**改一个字就是另一条指令** —— 所以这里比聊天严：字符防线一个字都没改、清洗后仍是
+        // 指令形（非空、不以 `/` 开头）才发；否则**如实拒绝**，绝不把一条被削过的指令硬发出去。
+        com.lcu.lcumod.chat.ChatText.CommandVerdict text =
+                com.lcu.lcumod.chat.ChatText.sanitizeCommand(command);
+        if (text.dirty()) {
+            LCUMod.LOGGER.warn("[Safety] run_command 已清洗（字符防线：删 {} 字符，{} 字符 -> {} 字符）：{}",
+                    text.droppedChars(), command.length(), text.text().length(),
+                    com.lcu.lcumod.chat.ChatText.preview(text.text(), 60));
+        }
+        if (!text.sendable()) {
+            JsonObject data = new JsonObject();
+            data.addProperty("blocked", true);
+            data.addProperty("reason", "chat_chars");
+            data.addProperty("detail", text.reason());
+            LCUMod.LOGGER.warn("[Safety] run_command 字符防线拒发（{}）：{}", text.reason(),
+                    com.lcu.lcumod.chat.ChatText.preview(command, 60));
+            sendResponse(cmd.id(), false, data,
+                    "Command refused: the chat char filter would alter it (" + text.reason() + ")");
+            return;
+        }
         followTargetName = null;
-        mc.player.connection.sendCommand(command);
-        sendResponse(cmd.id(), true, "Ran /" + command);
+        mc.player.connection.sendCommand(text.text());
+        sendResponse(cmd.id(), true, "Ran /" + text.text());
     }
 
     /**
