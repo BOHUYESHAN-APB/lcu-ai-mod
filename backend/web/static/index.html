@@ -508,23 +508,15 @@ textarea{width:100%;min-height:68px;resize:vertical;background:var(--ov-bg,#0d11
         <h4>生成与上下文预算</h4>
         <div class="field-grid">
           <div class="compact-field"><label for="temperature">温度</label><input type="number" id="temperature" min="0" max="2" step="0.1"></div>
-          <div class="compact-field"><label for="contextWindowTokens">上下文窗口</label><input type="number" id="contextWindowTokens" min="1" step="1"></div>
-          <div class="compact-field"><label for="maxInputTokens">最大输入</label><input type="number" id="maxInputTokens" min="1" step="1"></div>
-          <div class="compact-field"><label for="maxOutputTokens">最大输出</label><input type="number" id="maxOutputTokens" min="1" step="1"></div>
-          <div class="compact-field"><label for="reservedOutputTokens">输出预留</label><input type="number" id="reservedOutputTokens" min="1" step="1"></div>
-          <div class="compact-field"><label for="maxRequestBytes">请求字节上限</label><input type="number" id="maxRequestBytes" min="1" step="1"></div>
+          <div class="compact-field"><label for="budgetWindow">上下文窗口（token）</label><input type="number" id="budgetWindow" min="512" step="1" placeholder="未设置"></div>
+          <div class="compact-field"><label for="budgetReserve">输出预留（token）</label><input type="number" id="budgetReserve" min="0" step="1" placeholder="未设置"></div>
+          <div class="compact-field"><label for="budgetCompressAt">触发比例</label><input type="number" id="budgetCompressAt" min="0.05" max="1" step="0.05" placeholder="未设置"></div>
+          <div class="compact-field"><label for="budgetHysteresis">压缩迟滞</label><input type="number" id="budgetHysteresis" min="0" max="0.5" step="0.01" placeholder="未设置"></div>
+          <div class="compact-field"><label for="budgetKeepRecent">保留最近轮数</label><input type="number" id="budgetKeepRecent" min="0" step="1" placeholder="未设置"></div>
         </div>
-      </div>
-      <div class="settings-section">
-        <h4>自动上下文压缩</h4>
-        <label class="toggle-field" for="compressionEnabled"><span>启用压缩</span><input type="checkbox" id="compressionEnabled"></label>
-        <div class="field-grid">
-          <div class="compact-field"><label for="compressionTriggerTokens">触发阈值</label><input type="number" id="compressionTriggerTokens" min="1" step="1"></div>
-          <div class="compact-field"><label for="compressionTargetTokens">压缩目标</label><input type="number" id="compressionTargetTokens" min="1" step="1"></div>
-          <div class="compact-field"><label for="recentMessagesToKeep">保留最近消息</label><input type="number" id="recentMessagesToKeep" min="1" step="1"></div>
-          <div class="compact-field"><label for="summaryModelAgent">摘要 Agent</label><select id="summaryModelAgent"></select></div>
-          <div class="compact-field"><label for="summaryMaxOutputTokens">摘要最大输出</label><input type="number" id="summaryMaxOutputTokens" min="1" step="1"></div>
-        </div>
+        <label class="toggle-field" for="budgetEnabled"><span>主动压缩（占用过触发线才压，带迟滞）</span><input type="checkbox" id="budgetEnabled"></label>
+        <div class="hint">窗口是<b>配置值</b>，不是这个模型被证实的窗口（provider 不返回窗口）；估算也只是估算，
+        真实用量看下面「运行用量」。留空 = 不改这一项。压缩事件同时会写进后端日志（<code>[Context] 压缩：…</code>）。</div>
       </div>
       <div class="form-actions">
         <button class="btn" onclick="fetchModels()">获取模型列表</button>
@@ -540,11 +532,8 @@ textarea{width:100%;min-height:68px;resize:vertical;background:var(--ov-bg,#0d11
           <div class="usage-item"><div class="label">请求</div><div class="value" id="llmUsageRequestCount">0</div></div>
           <div class="usage-item"><div class="label">输入 Token</div><div class="value" id="llmUsagePromptTokens">0</div></div>
           <div class="usage-item"><div class="label">输出 Token</div><div class="value" id="llmUsageCompletionTokens">0</div></div>
-          <div class="usage-item"><div class="label">拒绝</div><div class="value" id="llmUsageRejected">0</div></div>
         </div>
-        <div id="llmContextAllocation" class="hint">等待预算配置</div>
-        <div id="llmLatestRejection" class="hint">最近拒绝：无</div>
-        <div id="llmLatestCompression" class="hint">最近压缩：无</div>
+        <div id="llmBudgetStatus" class="hint">预算状态：读取中…</div>
       </div>
     </div>
     
@@ -1089,10 +1078,7 @@ function updateDashboard(data) {
   document.getElementById('taskQueue').textContent = task.status && task.status !== 'idle'
     ? `${task.kind || 'task'} · ${task.status} · ${Math.round((task.progress || 0) * 100)}%`
     : action.label ? `${action.label} · ${action.state || 'running'}` : '暂无任务';
-  if (data.llm_usage) {
-    if (llmConfig) llmConfig.usage = data.llm_usage;
-    renderLLMTelemetry(document.getElementById('agentSelect')?.value || 'default', data.llm_usage);
-  }
+  if (data.llm_usage) applyLLMStatus(data);
   if (data.equipment || data.inventory) renderEquipment(data.equipment || {}, data.inventory || []);
 
   // 最近一次决策（两阶段决策的第二阶段结果），便于调参
@@ -1393,17 +1379,6 @@ async function saveLLMConfig() {
     const config = {
       agent, provider,
       temperature: numericValue('temperature'),
-      context_window_tokens: numericValue('contextWindowTokens'),
-      max_input_tokens: numericValue('maxInputTokens'),
-      max_output_tokens: numericValue('maxOutputTokens'),
-      reserved_output_tokens: numericValue('reservedOutputTokens'),
-      max_request_bytes: numericValue('maxRequestBytes'),
-      compression_enabled: document.getElementById('compressionEnabled').checked,
-      compression_trigger_tokens: numericValue('compressionTriggerTokens'),
-      compression_target_tokens: numericValue('compressionTargetTokens'),
-      recent_messages_to_keep: numericValue('recentMessagesToKeep'),
-      summary_model_agent: document.getElementById('summaryModelAgent').value || 'default',
-      summary_max_output_tokens: numericValue('summaryMaxOutputTokens')
     };
     config.single_model = document.getElementById('singleModel').value === 'true';
     if (baseUrl) config.base_url = baseUrl;
@@ -1416,6 +1391,10 @@ async function saveLLMConfig() {
     const d = await apiFetch('/api/llm/config', {
       method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(config)
     });
+    // 上下文预算**不走** LLM 配置接口（那边是 `/api/llm/config`，没有这一段），
+    // 单独发到 `/api/config` 的 `context_budget` 段 —— 以前 UI 把两种键混发到 LLM 接口，
+    // 后端收到一堆不认识的键就丢掉，等于用户改了设置但什么都没发生。
+    await saveBudgetSettings();
     document.getElementById('llmStatus').textContent = `${agent} 已保存：${d.config?.model || model || '-'}`;
     document.getElementById('apiKey').value = '';
     dbgLog(`LLM 配置已保存: ${agent}`);
@@ -1424,6 +1403,58 @@ async function saveLLMConfig() {
     document.getElementById('llmStatus').textContent = `保存失败：${error.message}`;
     dbgLog(`LLM 配置保存失败: ${error.message}`);
   }
+}
+
+// ── 上下文预算：真来源是 `/api/config` 顶层的 `context_budget` 段（不是 `/api/llm/config`）──
+let appConfigCache = null;
+
+// 留空 = 这一项不发 ⇒ 保留后端里已有的值，绝不用 null 把别人的设置抹掉。
+function budgetPayload() {
+  const budget = { enabled: document.getElementById('budgetEnabled').checked };
+  const put = (key, id) => {
+    const raw = document.getElementById(id).value;
+    if (raw === '' || raw === null || raw === undefined) return;
+    const value = Number(raw);
+    if (Number.isFinite(value)) budget[key] = value;
+  };
+  put('context_window', 'budgetWindow');
+  put('reserve_output', 'budgetReserve');
+  put('compress_at', 'budgetCompressAt');
+  put('hysteresis', 'budgetHysteresis');
+  put('keep_recent', 'budgetKeepRecent');
+  return budget;
+}
+
+async function saveBudgetSettings() {
+  const res = await fetch('/api/config', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ context_budget: budgetPayload() }),
+  });
+  if (!res.ok) throw new Error(`预算保存失败：HTTP ${res.status}`);
+  appConfigCache = await res.json().catch(() => null);
+  return appConfigCache;
+}
+
+function fillBudgetFields(cfg) {
+  const budget = (cfg && cfg.context_budget) || {};
+  const setNumber = (id, value) => {
+    const el = document.getElementById(id);
+    if (el) el.value = (value === null || value === undefined) ? '' : String(value);
+  };
+  setNumber('budgetWindow', budget.context_window);
+  setNumber('budgetReserve', budget.reserve_output);
+  setNumber('budgetCompressAt', budget.compress_at);
+  setNumber('budgetHysteresis', budget.hysteresis);
+  setNumber('budgetKeepRecent', budget.keep_recent);
+  const enabled = document.getElementById('budgetEnabled');
+  if (enabled) enabled.checked = budget.enabled !== false;
+}
+
+function loadBudgetFields() {
+  if (appConfigCache) { fillBudgetFields(appConfigCache); return Promise.resolve(); }
+  return fetch('/api/config').then(r => r.json())
+    .then(cfg => { appConfigCache = cfg; fillBudgetFields(cfg); })
+    .catch(() => {});
 }
 
 function loadProviders() {
@@ -1473,41 +1504,61 @@ function loadAgentLLMConfig() {
   document.getElementById('baseUrl').value = cfg.base_url || '';
   document.getElementById('modelInput').value = cfg.model || '';
   document.getElementById('temperature').value = cfg.temperature ?? 0.7;
-  document.getElementById('contextWindowTokens').value = cfg.context_window_tokens ?? 200000;
-  document.getElementById('maxInputTokens').value = cfg.max_input_tokens ?? 180000;
-  document.getElementById('maxOutputTokens').value = cfg.max_output_tokens ?? 16384;
-  document.getElementById('reservedOutputTokens').value = cfg.reserved_output_tokens ?? 16384;
-  document.getElementById('maxRequestBytes').value = cfg.max_request_bytes ?? 4194304;
-  document.getElementById('compressionEnabled').checked = cfg.compression_enabled !== false;
-  document.getElementById('compressionTriggerTokens').value = cfg.compression_trigger_tokens ?? 160000;
-  document.getElementById('compressionTargetTokens').value = cfg.compression_target_tokens ?? 120000;
-  document.getElementById('recentMessagesToKeep').value = cfg.recent_messages_to_keep ?? 24;
-  document.getElementById('summaryMaxOutputTokens').value = cfg.summary_max_output_tokens ?? 4096;
-  const summarySelect = document.getElementById('summaryModelAgent');
-  const agents = Object.keys(llmConfig?.agents || {default:{}});
-  summarySelect.replaceChildren(...agents.map(name => new Option(name, name)));
-  summarySelect.value = cfg.summary_model_agent || 'default';
+  loadBudgetFields();
   const preset = providerPresets.find(item => item.id === provider);
   document.getElementById('llmStatus').textContent = cfg.api_key || preset?.api_key_required === false
     ? `${agent} 已配置` : `${agent} 缺少 API Key`;
-  renderLLMTelemetry(agent, llmConfig?.usage || {});
+  renderLLMTelemetry();
 }
 
-function renderLLMTelemetry(agent, usage = {}) {
-  const perAgent = usage.by_agent?.[agent] || {};
-  document.getElementById('llmUsageRequestCount').textContent = perAgent.request_count ?? 0;
-  document.getElementById('llmUsagePromptTokens').textContent = perAgent.prompt_tokens ?? 0;
-  document.getElementById('llmUsageCompletionTokens').textContent = perAgent.completion_tokens ?? 0;
-  document.getElementById('llmUsageRejected').textContent = perAgent.rejected_requests ?? 0;
-  const cfg = llmConfig?.agents?.[agent] || llmConfig?.agents?.default || {};
-  document.getElementById('llmContextAllocation').textContent =
-    `预算：输入 ${cfg.max_input_tokens ?? '-'} + 输出预留 ${cfg.reserved_output_tokens ?? '-'} / 上下文 ${cfg.context_window_tokens ?? '-'}`;
-  const rejection = usage.latest_rejection;
-  document.getElementById('llmLatestRejection').textContent = rejection && rejection.agent === agent
-    ? `最近拒绝：${rejection.code} · ${rejection.error}` : '最近拒绝：无';
-  const compression = usage.latest_compression;
-  document.getElementById('llmLatestCompression').textContent = compression && compression.agent === agent
-    ? `最近压缩：移除 ${compression.removed_messages || 0} 条旧消息` : '最近压缩：无';
+function renderLLMTelemetry() {
+  loadLLMStatus();
+}
+
+// 用量与预算的**真实**状态都来自 `/api/status` 的 `session`：
+//   `llm_usage`      = provider 报的用量（全局；后端不按 agent 拆分，也没有"拒绝"计数）
+//   `context_budget` = 窗口/触发线/`last_decision`（每轮都有）/
+//                      `last_compression`（**只有真压过才有**，没有就如实说没有）
+function loadLLMStatus() {
+  const el = document.getElementById('llmBudgetStatus');
+  if (el) el.textContent = '预算状态：读取中…';
+  return fetch('/api/status').then(r => r.json())
+    .then(status => applyLLMStatus((status && status.session) || {}))
+    .catch(() => { if (el) el.textContent = '预算状态：读取失败'; });
+}
+
+// 主轮询里已经拿到同一份 session 时直接喂进来，别再多发一个请求。
+function applyLLMStatus(s) {
+  const el = document.getElementById('llmBudgetStatus');
+  const usage = (s && s.llm_usage) || {};
+  document.getElementById('llmUsageRequestCount').textContent = usage.request_count ?? 0;
+  document.getElementById('llmUsagePromptTokens').textContent = usage.total_prompt_tokens ?? 0;
+  document.getElementById('llmUsageCompletionTokens').textContent = usage.total_completion_tokens ?? 0;
+  if (!el) return;
+  const b = s && s.context_budget;
+  if (!b) { el.textContent = '预算状态：后端没有报（新版本才有这个字段）'; return; }
+  const parts = [];
+  parts.push(`窗口 ${b.context_window ?? '-'}（${b.window_source || '配置'}）+ 输出预留 ${b.reserve_output ?? '-'}`
+    + `，可用输入 ${b.available_input ?? '-'}，触发线 ${b.compress_at ?? '-'}`);
+  parts.push(b.enabled === false ? '主动压缩：已关' : '主动压缩：开');
+  const decision = b.last_decision;
+  if (decision && typeof decision === 'object') {
+    const ratio = (typeof decision.ratio === 'number') ? decision.ratio.toFixed(3) : '-';
+    parts.push(`本轮估算 ${decision.estimated ?? '-'}（占比 ${ratio}）`
+      + (decision.compress ? ' · 已触发压缩' : ' · 未过线'));
+  }
+  const compression = b.last_compression;
+  if (compression && typeof compression === 'object') {
+    parts.push(`最近压缩：移除 ${compression.removed ?? 0} 条旧消息`
+      + `（估算 ${compression.estimated_before ?? '-'} → ${compression.estimated_after ?? '-'} token）`);
+  } else {
+    parts.push('最近压缩：无');
+  }
+  const vs = b.last_estimate_vs_actual;
+  if (vs && vs.actual_prompt_tokens != null) {
+    parts.push(`估算 ${vs.estimated_prompt_tokens ?? '-'} vs 实测输入 ${vs.actual_prompt_tokens} token`);
+  }
+  el.textContent = parts.join(' · ');
 }
 
 function fetchModels() {

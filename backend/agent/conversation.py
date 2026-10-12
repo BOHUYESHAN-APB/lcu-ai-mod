@@ -371,6 +371,8 @@ class ConversationStore:
             "namespace": self.namespace,
             "window": len(self._window),
             "window_limit": self.window_limit(),
+            # 已被挤出窗口、还没压成 L3 的条目（被动裁切 + 主动压缩都会往这里堆）。
+            "pending": len(self._pending),
             "events_logged": self._events_logged,
             "summaries": self._summaries,
             "last_summary": self.latest_summary(),
@@ -423,6 +425,34 @@ class ConversationStore:
         except Exception as exc:
             logger.warning("[Conversation] 摘要失败，保留 pending: %s", exc)
             return None
+
+    def compact_window(self, keep_recent: int = 6, llm=None) -> dict:
+        """**主动压缩**：把窗口里最旧的一批事件挪进 pending，再**复用** `summarize_pending`
+        把它们压成一段 L3 摘要。
+
+        与「等窗口裁切溢出」的被动摘要只差**触发时机**：由调用方（session 的上下文预算）
+        判定"prompt 快满了"，提前把最旧的往外挪。规矩：
+
+        * 只挪到"窗口里还剩 keep_recent 条"为止 —— 最近几轮永远留在原文里；
+        * 摘要**失败**（没有 LLM / 模型报错 / JSON 解析不出）时 pending 保留待下次，
+          但已经挪出窗口的条目**不回滚**（它们仍在 L1 文件里，只是这轮不进 prompt）——
+          返回 `summarized=False` 让调用方**如实上报降级**，绝不静默；
+        * 绝不抛。
+
+        返回 `{summarized, removed, kept, summary, keywords}`。
+        """
+        keep = max(0, int(keep_recent))
+        removed = max(0, len(self._window) - keep)
+        for _ in range(removed):
+            self._pending.append(self._window.pop(0))
+        result = self.summarize_pending(llm) if removed else None
+        return {
+            "summarized": bool(result),
+            "removed": removed,
+            "kept": len(self._window),
+            "summary": str((result or {}).get("summary") or ""),
+            "keywords": list((result or {}).get("keywords") or []),
+        }
 
     @staticmethod
     def _build_summary_prompt(items: list[dict]) -> str:

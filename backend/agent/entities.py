@@ -4,11 +4,13 @@
 （`commands/queries.js:148`）；本模块把那两条合成**一个**查询工具。
 
 用户口径（硬）：
-  - **数据只从已有 state 快照取**（`context["entities"]`，Java 每帧上报的"周围 16 格内
-    实体"，`StateCollector.java:352` `p.getBoundingBox().inflate(16)`）；
-    本模块**不自己扫描**任何方块/实体；
+  - **数据只从已有 state 快照取**（`context["entities"]`，形状由 `perception.entities_rows`
+    统一读，**本模块不自己嗅探形状**）；本模块**不自己扫描**任何方块/实体；
   - **诚实优先**：快照里没有 ⇒ 如实说"当前快照里没有"，并说明它只覆盖周围约 16 格
     （更远的看不见，不装知道）；**绝不编坐标**——候选的 x/y/z 逐字来自快照行；
+  - **部分视图照样说清**：模组报的是**分级摘要**时（只有威胁 / 玩家带坐标，被动生物等档位
+    只报计数），"摘要里没有"**绝不等于**"附近没有" —— 结果带 `partial` 字段，`note` 里
+    把这一点说白（要细节走按需扫描 `scan_entities`）；
   - **只读**：本模块只看、只答；要过去是模型**另外**调 `move_to`/`go_to_block`/`follow`。
 
 候选形状与 `where.py` **完全一致**（`{kind,name,x,y,z,distance,source}` + `truncated` +
@@ -21,6 +23,7 @@ import logging
 import math
 from typing import Any, Iterable, Optional
 
+from . import perception
 from . import where
 from .borrow import normalize_item
 
@@ -238,23 +241,31 @@ def _limit(value: Any) -> int:
 
 
 def gather(context: Any) -> list[dict]:
-    """这一轮的实体快照（state 里那一份，**只读**，不扫描）。"""
-    rows = (context or {}).get("entities") if isinstance(context, dict) else None
-    if not isinstance(rows, (list, tuple)):
-        return []
-    return [row for row in rows if isinstance(row, dict)]
+    """这一轮的实体快照（state 里那一份，**只读**，不扫描）。
+
+    形状交给 `perception.entities_rows` 统一（**唯一读法**）：模组报的是**分级摘要**时，
+    这里只会拿到"带坐标的档位（威胁 / 玩家）" + "只有距离的最近一条 / 最近一件掉落物"；
+    模组报的还是**逐条清单**（旧客户端）时，行**原样**透传（本来就带坐标）。
+    摘要行带 `perception.PARTIAL_KEY` 标记 —— 下游据此如实说"这是部分视图"，**绝不**把
+    "摘要里看不到"当成"附近没有"。
+    """
+    return perception.entities_rows(context)["rows"]
 
 
 def find(kind: Any = "", *, limit: Any = DEFAULT_LIMIT,
          player_pos: Optional[tuple[float, float, float]] = None,
-         entities: Iterable[Any] = ()) -> dict:
+         entities: Iterable[Any] = (),
+         partial: Optional[bool] = None) -> dict:
     """把快照里匹配 `kind` 的实体折成候选清单（纯函数，**不发帧、不移动、不扫描**）。
 
-    返回 `{"kind", "candidates", "truncated", "skipped", "found", "note"}`：
+    返回 `{"kind", "candidates", "truncated", "skipped", "found", "partial", "note"}`：
       - 每条候选 `{kind, name, x, y, z, distance?, source, id?}`；
-      - 名字/类别对上但**快照没给坐标**（在线玩家只有距离）⇒ 只计数（`skipped`），
-        不进候选（如实说缺，不编坐标）；
+      - 名字/类别对上但**快照没给坐标**（在线玩家只有距离、摘要里的最近一条/掉落物）⇒ 只计数
+        （`skipped`），不进候选（如实说缺，不编坐标）；
       - `truncated=True` 表示候选超过 `limit`，只保留了最近的一批；
+      - `partial=True` 表示输入是**分级摘要**（= 模组只上报了带坐标的那几个档位）：这时
+        "没找到"**不等于**"附近没有"，`note` 会把这一点说清。显式传 `partial` 优先，
+        否则按行上的 `perception.PARTIAL_KEY` 标记判（`perception.rows_are_partial`）；
       - `note` 是给模型看的**如实**说明（`describe()` 的产物）。
     """
     cap = _limit(limit)
@@ -284,6 +295,7 @@ def find(kind: Any = "", *, limit: Any = DEFAULT_LIMIT,
         "truncated": len(found) > cap,
         "skipped": skipped,
         "found": bool(found),
+        "partial": perception.rows_are_partial(rows) if partial is None else bool(partial),
     }
     result["note"] = describe(result)
     return result
@@ -316,6 +328,8 @@ def describe(result: Any) -> str:
                     f"16 格内的实体，更远的我看不到，也不装知道）")
         else:
             note = "（find_entity：当前快照里（周围约 16 格内）一个实体都没有）"
+        if data.get("partial"):
+            note += perception.partial_note("实体")
         if data.get("skipped"):
             note += (f"（另有 {data['skipped']} 条名字对上了但快照只给了距离、没给坐标，"
                      f"报不了 —— 找在线玩家用 where_is kind=player）")
@@ -338,5 +352,7 @@ def describe(result: Any) -> str:
     if data.get("skipped"):
         note += (f"（另有 {data['skipped']} 条只有距离没有坐标，报不了 —— "
                  f"找在线玩家用 where_is kind=player）")
+    if data.get("partial"):
+        note += perception.partial_note("实体")
     note += "（挑一个后用 move_to/go_to_block/follow 过去；我只查位置，不会自己走）"
     return note

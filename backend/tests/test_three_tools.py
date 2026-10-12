@@ -314,7 +314,10 @@ class UseOnTests(unittest.TestCase):
         self.assertEqual(result["code"], use_on.NO_TARGET)
         note = use_on.describe(result)
         self.assertIn("code=no_target", note)
-        self.assertIn("find_entity", note)
+        # 指到**唯一的坐标出口**：分级摘要里被动生物没有坐标，find_entity 也拿不到，
+        # 只有按需扫描能取回来；而且要说明"摘要里没有 ≠ 附近没有"。
+        self.assertIn("scan_entities", note)
+        self.assertIn("不等于", note)
 
     def test_bad_target_without_entity_or_coordinates(self):
         result = use_on.plan({}, context={"player": dict(PLAYER)})

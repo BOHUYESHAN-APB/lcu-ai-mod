@@ -18,6 +18,7 @@ import time
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 
+from . import perception
 from .control_lease import (HOLDER_REFLEX_EAT, REASON_SURVIVAL_EAT, ControlLease,
                             register_reflex_preemption)
 from .resource_lease import MODE_RESOURCES, PRIORITY_DEFAULT, PRIORITY_SURVIVAL
@@ -233,12 +234,20 @@ class SelfPreservationMode(Mode):
 
     @staticmethod
     def _find_water(state: dict) -> dict | None:
-        """Nearest water source within perception range, if any."""
-        water = [b for b in state.get("nearby_blocks", [])
-                 if "water" in str(b.get("block_id", ""))]
+        """Nearest water source within perception range, if any.
+
+        行来自 `perception.blocks_rows`（**唯一读法**）：旧**逐条清单**形状里方块带坐标，
+        照旧挑最近的水；**分级摘要**形状里方块没有逐条坐标（只有计数 + 最近一种的距离）
+        ⇒ 这里**看不出**水在哪，如实返回 None（**不按 `by_block` 里的计数编一个位置**）。
+        要真拿坐标得走按需扫描（`find_block`）—— 那是模型的活，不是反射层每 tick 的活。
+        """
+        view = perception.blocks_rows(state)
+        water = [row for row in view["rows"]
+                 if "water" in str(row.get("block_id") or row.get("name") or "")
+                 and perception.point_of(row) is not None]
         if not water:
             return None
-        return min(water, key=lambda b: b.get("distance", 999))
+        return min(water, key=lambda row: _distance(row, default=999.0))
 
 
 # ── 生物对待策略的读法（与 Java `MobPolicy` / `territory` 同一张表）────
@@ -303,9 +312,18 @@ class CowardiceMode(Mode):
         super().__init__("cowardice", priority=2, interrupts=True, cooldown=5.0)
 
     def should_activate(self, state: dict) -> bool:
-        entities = state.get("entities", [])
+        # 实体只从 `perception.entities_rows` 读（**唯一读法**）：旧逐条清单 ⇒ 全量；
+        # 分级摘要 ⇒ 带坐标的威胁 / 玩家 + 计数（`by_kind`）。
+        view = perception.entities_rows(state)
+        entities = view["rows"]
         # 高危险：不看血量，先进后退（"优先拉开距离"）。
         if any(_is_dangerous(e) and _distance(e) < self.DANGEROUS_STANDOFF for e in entities):
+            return True
+        # 摘要只列**最近的 3 条**威胁：高危险那只可能被截掉（`by_kind.dangerous` 还数得到它）。
+        # 它确实在 16 格内 ⇒ 按"可能贴脸"保守处理（tick 朝最近那条威胁的**反方向**退，
+        # 不会因为"没这条行"就当作没有高危险）。
+        if (view["partial"] and (view["by_kind"].get("dangerous") or 0) > 0
+                and not any(_is_dangerous(e) for e in entities)):
             return True
         player = state.get("player", {})
         health = player.get("health", 20)
@@ -319,7 +337,7 @@ class CowardiceMode(Mode):
         px = player.get("x", 0)
         py = player.get("y", 0)
         pz = player.get("z", 0)
-        threats = _threats(state.get("entities", []), 16.0)
+        threats = _threats(perception.entities_rows(state)["rows"], 16.0)
         if not threats:
             return None
         nearest = threats[0]
@@ -348,12 +366,12 @@ class SelfDefenseMode(Mode):
         if state.get("reflex_combat"):
             return False
         return any(tier_of(e) == TIER_HOSTILE and _distance(e) < 8
-                   for e in state.get("entities", []))
+                   for e in perception.entities_rows(state)["rows"])
 
     def tick(self, skills, state: dict) -> str | None:
         if state.get("reflex_combat"):
             return None
-        entities = state.get("entities", [])
+        entities = perception.entities_rows(state)["rows"]
         hostiles = [e for e in entities if tier_of(e) == TIER_HOSTILE and _distance(e) < 8]
         if hostiles:
             nearest = hostiles[0]

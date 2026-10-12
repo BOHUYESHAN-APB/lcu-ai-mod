@@ -12,6 +12,11 @@ import csv
 import time
 from dataclasses import dataclass, field
 
+# 估算口径**只有一份**：`agent/context_budget.estimate_tokens`（CJK 感知）。
+# ⚠️ 这里记的都是**估算**，不是真实用量 —— 真实用量以 provider 返回的 usage 为准
+# （`agent/llm_service.py::_track_usage`），两者在日志里分开标注、不许互相冒充。
+from .context_budget import estimate_tokens
+
 
 @dataclass
 class PlayerTokenRecord:
@@ -73,9 +78,9 @@ class TokenTracker:
         rec.message_count += 1
         rec.last_seen = time.time()
 
-        # Rough estimate: 1 token ≈ 4 characters for English, ~2 for CJK
+        # 估算**统一口径**（`estimate_tokens`）：CJK 1 token/字、ASCII 1 token/4 字符。
         if estimated_input_tokens is None:
-            estimated_input_tokens = len(message) // 2
+            estimated_input_tokens = estimate_tokens(message)
 
         rec.input_tokens += estimated_input_tokens
 
@@ -91,10 +96,10 @@ class TokenTracker:
             )
 
     def record_output(self, player_uuid: str, output_text: str):
-        """Record AI response tokens attributed to a player."""
+        """Record AI response tokens attributed to a player（同样是**估算**）。"""
         rec = self.records.get(player_uuid)
         if rec:
-            rec.output_tokens += len(output_text) // 2
+            rec.output_tokens += estimate_tokens(output_text)
 
     def record_task(self, player_uuid: str, completed: bool = False):
         """Record that a player requested a task."""

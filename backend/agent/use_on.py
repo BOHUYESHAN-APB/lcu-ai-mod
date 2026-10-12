@@ -23,6 +23,7 @@ import logging
 from typing import Any, Iterable, Optional
 
 from . import entities
+from . import perception
 from .borrow import normalize_item
 from .craft import inventory_counts
 
@@ -180,8 +181,11 @@ def describe(result: Any) -> str:
     held = data.get("held") if isinstance(data.get("held"), dict) else {}
     reason = str(data.get("reason") or "")
     if code == NO_TARGET:
-        return (f"（use_on：code=no_target —— 快照里没有「{reason}」这个目标（这份快照只覆盖"
-                f"我周围约 16 格的实体），**我没动手**；先用 find_entity 看看附近有什么）")
+        return (f"（use_on：code=no_target —— 我在**这一轮看得到的目标**里没找到「{reason}」，"
+                f"**我没动手**。注意：默认快照是**分级摘要**，被动生物/普通方块**不带坐标**，"
+                f"所以摘要里没有**不等于**附近没有 —— 要具体某一只就先用 "
+                f"{perception.SCAN_ENTITY_TOOL}（只读、有界）扫一趟，扫回来的结果会并进候选；"
+                f"或者你直接给坐标，我自己走过去用（约 3 格内）、不猜）")
     if code == BAD_TARGET:
         return f"（use_on：code=bad_target —— {reason}）"
     if code == OUT_OF_RANGE:

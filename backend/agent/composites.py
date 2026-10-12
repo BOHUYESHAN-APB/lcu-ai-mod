@@ -36,6 +36,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional
 
+from . import perception
 from .craft import inventory_counts, normalize_item
 from .farm import cycle_step, hold_index  # 逐步账 / 热栏槽位解析：沿用既有口径，不另造
 from .territory import bed_attempt, bed_note  # 造床判定：既有纯函数，不重写一份
@@ -351,12 +352,19 @@ def evaluate(check: Optional[Check], context: Mapping[str, Any]) -> tuple[bool, 
         counts = inventory_counts(ctx.get("inventory"))
         if family_count(counts, "bed") > 0:
             return False, CODE_SKIPPED, "（背包里已经有床了，不用再合成）", WHEN_SKIP
-        decision = bed_attempt(ctx.get("inventory"), ctx.get("entities"))
+        # 造床安全判定：快照是**分级摘要**时（`partial`：没有坐标的档位根本不上报），
+        # "没看到怪"**不等于**"没有怪" ⇒ 保守处理（`conservative_bed_decision`），
+        # 说清朝向按需扫描（`perception.bed_caution_note`）。
+        view = perception.entities_rows(ctx)
+        decision = perception.conservative_bed_decision(
+            bed_attempt(ctx.get("inventory"), view["rows"]), view)
         action = str((decision or {}).get("action") or "")
         if action == "craft":
             return True, "", "", ""
         code = "bed_unsafe" if action == "unsafe" else "bed_missing"
-        return False, code, bed_note(decision), WHEN_FAIL
+        note = (perception.bed_caution_note(hostiles=(decision or {}).get("hostiles"))
+                if (decision or {}).get("partial") else bed_note(decision))
+        return False, code, note, WHEN_FAIL
     logger.warning("[Composites] 认不出的前置条件：%s", check.kind)
     return False, CODE_CONDITION, f"（认不出的前置条件「{check.kind}」）", WHEN_FAIL
 

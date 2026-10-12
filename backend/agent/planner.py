@@ -19,6 +19,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from . import perception
 from . import where
 from .borrow import BorrowLedger
 from .container_view import describe as container_view_note
@@ -38,7 +39,6 @@ from .craft import (ContainerPick, armor_in_containers, clamp_take, describe_mis
                     evaluate_craft, is_armor, normalize_item, route_containers)
 from .entities import describe as entity_note
 from .entities import find as find_entities
-from .entities import gather as gather_entities
 from .farm import (ACTION_HARVEST, ACTION_PLANT, ACTION_REPLANT, ACTION_TILL,
                    choose_action, counts_of, crop_of, hold_index, is_hoe, missing_items,
                    normalize_action)
@@ -156,6 +156,230 @@ def _dropped_by_note(entity: dict) -> str:
     if isinstance(left, (int, float)) and left >= 0:
         parts.append(f"还有{int(left) // 20}秒消失")
     return "（" + "，".join(parts) + "）" if parts else ""
+
+
+# ── 按需扫描（`scan_entities`）：参数口径 + 回执的如实说法 ──────────
+# 与 Java 侧**同一套**：本地先拦一遍（让模型立刻拿到"参数不对"的如实拒绝），回执再兜底
+# （不在世界 / 越界这类只有模组知道）。
+SCAN_KINDS: tuple[str, ...] = ("all", "dangerous", "hostile", "neutral", "passive",
+                               "player", "item", "unknown")
+SCAN_MAX_RADIUS = 32
+SCAN_MAX_LIMIT = 48
+SCAN_DEFAULT_RADIUS = 16
+SCAN_DEFAULT_LIMIT = 24
+
+# Java 回执的失败 code → 人话。**失败绝不写成成功**（没有"近似成功"这种档）。
+SCAN_CODE_TEXT: dict[str, str] = {
+    "radius_too_large": "半径超过上限（最大 32）—— 我没放大，也没扫",
+    "bad_radius": "半径得是 ≥1 的整数",
+    "bad_kind": "kind 只认 all|dangerous|hostile|neutral|passive|player|item|unknown",
+    "bad_limit": "limit 得是 ≥1 的整数（超 48 会钳到 48）",
+    "not_in_world": "我不在世界里，扫不了（**不**拿空列表冒充成功）",
+}
+
+
+def _entity_row_key(row: Any) -> Any:
+    """实体行的身份（用于"快照 + 按需扫描"去重）：实体号优先，没有就退回名字 + 坐标。"""
+    data = row if isinstance(row, dict) else {}
+    entity_id = data.get("id")
+    if isinstance(entity_id, int) and not isinstance(entity_id, bool):
+        return ("id", entity_id)
+
+    def _num(key: str) -> float:
+        value = data.get(key)
+        return round(float(value), 1) if isinstance(value, (int, float)) else 0.0
+
+    return ("pos", str(data.get("name") or data.get("type") or ""),
+            _num("x"), _num("y"), _num("z"))
+
+
+def _scan_code_text(code: Any) -> str:
+    text = str(code or "").strip()
+    if not text:
+        return "没扫成（回执没说为什么）"
+    return SCAN_CODE_TEXT.get(text, f"没扫成（code={text}）")
+
+
+def _scan_args(payload: Any) -> tuple[Optional[dict], str, str]:
+    """扫描参数归一 + 与 Java 同口径的校验：`(args|None, code, 人话)`。
+
+    本地先拦一遍的理由：Java 的回执是异步的，模型等不到 —— 参数不对要**当场**如实说清
+    （code 与 Java 侧逐字同名，不是另造一套）。
+    """
+    data = payload if isinstance(payload, dict) else {}
+
+    raw_radius = data.get("radius")
+    radius = SCAN_DEFAULT_RADIUS
+    if raw_radius not in (None, ""):
+        if isinstance(raw_radius, bool) or not isinstance(raw_radius, (int, float)) \
+                or float(raw_radius) != int(float(raw_radius)):
+            return None, "bad_radius", SCAN_CODE_TEXT["bad_radius"]
+        radius = int(raw_radius)
+        if radius < 1:
+            return None, "bad_radius", SCAN_CODE_TEXT["bad_radius"]
+        if radius > SCAN_MAX_RADIUS:
+            # 超上限**如实拒绝、不放大**（与模组同口径）。
+            return None, "radius_too_large", (f"半径 {radius} 超过上限 {SCAN_MAX_RADIUS} —— "
+                                              f"我没放大，也没扫")
+    raw_kind = str(data.get("kind") or "").strip().lower() or "all"
+    if raw_kind not in SCAN_KINDS:
+        return None, "bad_kind", SCAN_CODE_TEXT["bad_kind"]
+
+    raw_limit = data.get("limit")
+    limit = SCAN_DEFAULT_LIMIT
+    if raw_limit not in (None, ""):
+        if isinstance(raw_limit, bool) or not isinstance(raw_limit, (int, float)) \
+                or float(raw_limit) != int(float(raw_limit)):
+            return None, "bad_limit", SCAN_CODE_TEXT["bad_limit"]
+        limit = int(raw_limit)
+        if limit < 1:
+            return None, "bad_limit", SCAN_CODE_TEXT["bad_limit"]
+        limit = min(limit, SCAN_MAX_LIMIT)      # 超上限**钳到 48**（与模组同口径）
+    return {"radius": radius, "kind": raw_kind, "limit": limit}, "", ""
+
+
+def _scan_receipt_note(data: Any, request: Any) -> str:
+    """扫描回执 → 一句**如实**说明：`total` / `returned` / `truncated` 都说清。"""
+    req = request if isinstance(request, dict) else {}
+    who = f"radius={req.get('radius')} kind={req.get('kind')} limit={req.get('limit')}"
+    if not isinstance(data, dict):
+        return (f"（按需扫描（{who}）：回执读不出来 —— **当没扫成**，"
+                f"别把「没明说」当成「附近没有」）")
+    payload = data.get("data") if isinstance(data.get("data"), dict) else {}
+    ok = bool(data.get("success")) and payload.get("ok", True) is not False
+    if not ok or payload.get("ok") is False:
+        code = payload.get("code") or payload.get("reason") or data.get("error")
+        return f"（按需扫描（{who}）**没扫成**：{_scan_code_text(code)}）"
+    rows = [row for row in (payload.get("entities") or []) if isinstance(row, dict)]
+    total = payload.get("total")
+    returned = payload.get("returned")
+    returned = int(returned) if isinstance(returned, (int, float)) else len(rows)
+    truncated = bool(payload.get("truncated"))
+    listed = "；".join(_render_tier_row(row, with_point=True) +
+                       (f"（id={row.get('id')}）" if row.get("id") is not None else "")
+                       for row in rows[:5])
+    if not rows:
+        if isinstance(total, (int, float)) and int(total) == 0:
+            return f"（按需扫描（{who}）：**这一趟确实一个都没有**（total=0））"
+        return (f"（按需扫描（{who}）：回执里一条明细都没有（total={total}）—— "
+                f"**当没扫成**，别当「附近没有」）")
+    head = f"（按需扫描（{who}）：共 {total if total is not None else '?'} 只"
+    head += f"，这一趟回了 {returned} 只"
+    if truncated:
+        head += "（**truncated=true：这是截断后的前几条，附近不止这些，未列全**）"
+    else:
+        head += "（truncated=false：这一趟就是全部）"
+    return (f"{head}；最近几只是：{listed}。"
+            f"要坐标/实体号就照这个用（move_to / use_on_entity(id) / attack_entity(id)））")
+
+
+def _fmt_point(row: dict) -> str:
+    """一行的坐标文本；**没有坐标就不写**（绝不补 0、不编）。"""
+    point = perception.point_of(row)
+    if point is None:
+        return ""
+    return f"({point[0]:.0f},{point[1]:.0f},{point[2]:.0f})"
+
+
+def _render_tier_row(row: dict, *, with_point: bool = False) -> str:
+    """`tier:名字@距离`（`tier` 缺字段才回落 `type`，与既有 L2 口径一致）。"""
+    tier = str(row.get("tier") or row.get("type") or "?").lower()
+    text = f"{tier}:{row.get('name', '?')}@{row.get('distance', '?')}m"
+    point = _fmt_point(row) if with_point else ""
+    return f"{text}{point}"
+
+
+def _render_nearby_blocks(view: Any) -> str:
+    """附近方块：旧形状照旧逐条渲染；**分级摘要**只渲染计数 + 最近一种（都没有坐标）。"""
+    data = view if isinstance(view, dict) else {}
+    shape = data.get("shape")
+    rows = [row for row in (data.get("rows") or []) if isinstance(row, dict)]
+    if shape == perception.SHAPE_SUMMARY:
+        kinds = data.get("by_block") or {}
+        listed = "、".join(f"{block_id}×{count}" for block_id, count in list(kinds.items())[:8])
+        nearest = rows[0] if rows else None
+        near = ""
+        if nearest is not None:
+            distance = nearest.get("distance")
+            near = (f"；最近一种 {nearest.get('block_id') or nearest.get('name')}"
+                    + (f"@{distance}m" if distance is not None else ""))
+        if not data.get("count") and not listed:
+            return "无（摘要：这一帧附近没有）"
+        return (f"{data.get('count', 0)} 个（{len(kinds)} 种计数：{listed or '无'}）{near}"
+                "【**摘要**：只有计数与最近一种，逐条坐标没上报 —— 要看某一种的具体位置就"
+                f"按需扫描（{perception.SCAN_BLOCK_TOOL}）】")
+    if shape == perception.SHAPE_UNKNOWN:
+        return (f"（形状我认不出，当**部分视图**：要看就按需扫描"
+                f"（{perception.SCAN_BLOCK_TOOL}））")
+    text = ", ".join(f"{row.get('block_id', row.get('name', '?'))}@"
+                     f"{row.get('distance', '?')}m" for row in rows[:8])
+    return text or "无"
+
+
+def _render_nearby_entities(view: Any) -> str:
+    """附近实体：旧形状照旧逐条（`tier:名字@距离`）；摘要渲染计数 + 威胁/玩家（**带坐标**）。"""
+    data = view if isinstance(view, dict) else {}
+    shape = data.get("shape")
+    rows = [row for row in (data.get("rows") or []) if isinstance(row, dict)]
+    if shape == perception.SHAPE_SUMMARY:
+        by_kind = data.get("by_kind") or {}
+        counts = " / ".join(
+            f"{perception.KIND_LABELS[kind]} {by_kind.get(kind, 0)}"
+            for kind in perception.KIND_ORDER if (by_kind.get(kind) or 0) > 0) or "全 0"
+        parts = [f"{data.get('count', 0)} 个（{counts}）"]
+        threats = [row for row in rows
+                   if str(row.get("kind")) in ("dangerous", "hostile")
+                   and perception.point_of(row) is not None]
+        players = [row for row in rows
+                   if str(row.get("kind")) == "player" and perception.point_of(row) is not None]
+        if threats:
+            parts.append("威胁（**带坐标**）："
+                         + "；".join(_render_tier_row(row, with_point=True)
+                                     for row in threats[:3]))
+        if players:
+            parts.append("玩家（**带坐标**）："
+                         + "；".join(_render_tier_row(row, with_point=True)
+                                     for row in players[:8]))
+        nearest = next((row for row in rows if str(row.get("source", "")).endswith("nearest")
+                        and str(row.get("kind")) not in ("item",)), None)
+        if nearest is not None:
+            parts.append(f"最近：{nearest.get('name', '?')}"
+                         f"({nearest.get('type') or nearest.get('kind') or '?'})"
+                         f"@{nearest.get('distance', '?')}m")
+        parts.append("其余档位**只报了计数、默认不给坐标** —— 要看某一只就按需扫描"
+                     f"（{perception.SCAN_ENTITY_TOOL}）")
+        return "；".join(parts)
+    if shape == perception.SHAPE_UNKNOWN:
+        return "（形状我认不出，当**部分视图**：要看某一只就按需扫描" \
+               f"（{perception.SCAN_ENTITY_TOOL}））"
+    text = ", ".join(_render_tier_row(row) for row in rows[:8])
+    return text or "无"
+
+
+def _render_nearby_items(view: Any) -> str:
+    """掉落物：旧形状列逐条；摘要只给"最近一件 + 谁丢的/掉多久了/还有多久消失"。"""
+    data = view if isinstance(view, dict) else {}
+    shape = data.get("shape")
+    rows = [row for row in (data.get("rows") or []) if isinstance(row, dict)]
+    if shape == perception.SHAPE_SUMMARY:
+        items = [row for row in rows if str(row.get("kind")) == "item"]
+        if not items:
+            return "无（摘要：这一帧没有掉落物）"
+        row = items[0]
+        text = (f"{row.get('item_id', row.get('name', '?'))}x{row.get('item_count', 1)}"
+                f"@{row.get('distance', '?')}m{_dropped_by_note(row)}")
+        total = (data.get("items") or {}).get("count")
+        head = f"{total} 件里最近的一件：" if isinstance(total, int) and total > 1 else ""
+        return (f"{head}{text}"
+                "【**摘要**：只报最近一件的事实，逐件坐标没上报 —— 要捡哪一件就说，"
+                f"我按需扫描（{perception.SCAN_ENTITY_TOOL}）】")
+    if shape == perception.SHAPE_UNKNOWN:
+        return f"（形状我认不出，当**部分视图**：要看就按需扫描（{perception.SCAN_ENTITY_TOOL}））"
+    text = ", ".join(
+        f"{row.get('item_id', row.get('name', '?'))}x{row.get('item_count', 1)}"
+        f"@{row.get('distance', '?')}m{_dropped_by_note(row)}"
+        for row in rows if row.get("type") == "item")
+    return text or "无"
 
 
 def _phase_from_task(task: Any) -> str:
@@ -485,7 +709,18 @@ class Planner:
     1. Timing Gate: 是否应该回复？
     2. Planner: 回复什么？做什么？
     """
-    
+
+    # 按需扫描（`scan_entities`）的状态：类级默认值 —— `Planner.__new__(Planner)` 的测试替身
+    # （只塞了 skills 就调 `_build_l2`）也读得到，不必为此在每个替身里补一遍字段。
+    _scan_pending: Optional[dict] = None
+    _scan_note: str = ""
+    _scan_at: float = 0.0
+    # 最近一次按需扫描**拿回来的实体行**（带坐标/实体号/血量）——「需要的时候再取坐标」
+    # 那条路的落点：`find_entity` 与 `use_on` 都从它这里拿到摘要里没有的那些档位。
+    _scan_rows: list = []
+    # 留下来的扫描行上限（Java 侧 limit 上限是 48，这里对齐，免得两处口径不一样）。
+    _SCAN_ROW_CAP: int = 48
+
     def __init__(self, llm_service, memory, skills, threshold_provider=None, chat_inbox=None,
                  permissions=None, borrow_rules=None, server_commands=None,
                  whisper_sender=None, tpa_responder=None, tpa_requester=None,
@@ -536,6 +771,13 @@ class Planner:
         self._action_note: Optional[str] = None
         # 本轮领地/基地/容器/区域/回家的如实说明（没授权、找不到、缺料…）。
         self._territory_note: Optional[str] = None
+        # 按需扫描（`scan_entities`）：等回执的这一次请求（按 req_id 配对）与最近一次**回执**的
+        # 如实说明（进 L2 给模型看 —— 摘要里没有坐标的档位只能靠它拿明细）。**不**每轮清零：
+        # 回执是异步来的，可能落在本轮之后。
+        self._scan_pending: Optional[dict] = None
+        self._scan_note: str = ""
+        self._scan_at: float = 0.0
+        self._scan_rows: list = []
         # "找不到床、正在自己造"的待认领基地名（下一轮看到床边就认成 home_bed）。
         self._pending_home_bed_base: Optional[str] = None
         # 本轮搬运 / 农活的如实说明（没授权、卡在哪一步、缺料…）。
@@ -833,8 +1075,6 @@ class Planner:
             f"{msg.get('sender', '?')}: {msg.get('message', '')}" 
             for msg in recent
         ])
-        nearby_blocks = context.get("nearby_blocks", []) if isinstance(context, dict) else []
-        nearby_entities = context.get("entities", []) if isinstance(context, dict) else []
         inventory = context.get("inventory", []) if isinstance(context, dict) else []
         nearby_workstations = context.get("nearby_workstations", []) if isinstance(context, dict) else []
         nearby_storage = context.get("nearby_storage", []) if isinstance(context, dict) else []
@@ -842,21 +1082,18 @@ class Planner:
             f"{item.get('name', '?')}x{item.get('count', 1)}"
             for item in inventory[:12]
         ) or "无"
-        nearby_block_text = ", ".join(
-            f"{block.get('block_id', block.get('name', '?'))}@{block.get('distance', '?')}m"
-            for block in nearby_blocks[:8]
-        ) or "无"
-        nearby_entity_text = ", ".join(
-            f"{str(entity.get('tier') or entity.get('type') or '?').lower()}"
-            f":{entity.get('name', '?')}@{entity.get('distance', '?')}m"
-            for entity in nearby_entities[:8]
-        ) or "无"
-        nearby_item_text = ", ".join(
-            f"{entity.get('item_id', entity.get('name', '?'))}x{entity.get('item_count', 1)}"
-            f"@{entity.get('distance', '?')}m{_dropped_by_note(entity)}"
-            for entity in nearby_entities
-            if entity.get("type") == "item"
-        ) or "无"
+        # 附近资源/实体：形状（分级摘要 / 旧逐条清单）交给 `perception` 统一读，
+        # 这里只渲染 —— 摘要形状下**不编坐标**，只报计数 + 带坐标的档位 + 最近一条。
+        entity_view = perception.entities_rows(context)
+        block_view = perception.blocks_rows(context)
+        nearby_block_text = _render_nearby_blocks(block_view)
+        nearby_entity_text = _render_nearby_entities(entity_view)
+        nearby_item_text = _render_nearby_items(entity_view)
+        # 按需扫描的真正出口：摘要里没有坐标的档位，靠这行把**回执的事实**带给模型。
+        scan_text = self._scan_note or ("（这一轮还没按需扫描过；要某一只的坐标/血量/实体号就用 "
+                                       f"{perception.SCAN_ENTITY_TOOL}）")
+        if self._scan_note and self._scan_at:
+            scan_text = f"{scan_text}（{max(0, int(time.time() - self._scan_at))} 秒前扫的）"
         nearby_station_text = ", ".join(
             f"{poi.get('block_id', '?')}@{poi.get('distance', '?')}m"
             for poi in nearby_workstations[:8]
@@ -1098,6 +1335,12 @@ class Planner:
   （捡不捡**你自己判断**：走过去踩到就会自动捡起；括号里是模组报的事实 —— 谁丢的、掉多久了、
   还有多久消失。谁丢的通常有意义：主人刚丢给你的就是要你拿的，别人掉的就先问一句；
   背包满了/太远/快消失了就别白跑。）
+  （坐标口径：默认只上报**要处理的（威胁）/ 人（玩家）**的位置，其余档位只报计数 ——
+  **「摘要里没有」不等于「附近没有」**；需要细节就**按需扫描**（实体 `scan_entities`、
+  方块 `find_block`），别自己把"没报"读成"没有"。）
+
+最近一次按需扫描（`scan_entities` 的回执；摘要里没坐标的档位只能这样拿明细）：
+{scan_text}
 
 附近工作站：
 {nearby_station_text}
@@ -1123,7 +1366,7 @@ class Planner:
 {remembered_text}
 
 {death_point_text}
-附近实体（`tier:名字@距离`；tier 是模组按同一张表算的对待档：
+附近实体（`tier:名字@距离`（+带坐标的档位后面跟 `(x,y,z)`）；tier 是模组按同一张表算的对待档：
 dangerous 高危险=不主动打也不还手、hostile 敌对=该处理、neutral 中立=不惹（它先动手才还手）、
 passive 被动=能猎的肉、unknown 认不出=先别当敌人）：
 {nearby_entity_text}
@@ -2109,23 +2352,118 @@ passive 被动=能猎的肉、unknown 认不出=先别当敌人）：
                     target or "(空)", kind, len(result.get("candidates") or []))
         return True
 
+    def _dispatch_scan(self, radius: int, kind: str, limit: int) -> tuple[bool, str]:
+        """发一次按需扫描（**唯一出口**）：记下等回执的请求，如实说明"还没回来"。
+
+        回执回来走 `absorb_command_response`（由 session 的 `command_response` 转过来），
+        落成 L2 里那行"最近一次按需扫描"的**事实**。
+        """
+        scanner = getattr(self.skills, "scan_entities", None)
+        if not callable(scanner):
+            self._scan_pending = None
+            return False, f"（scan_entities 没接上（{perception.SCAN_ENTITY_TOOL} 不可用）：扫不了）"
+        result = scanner(radius=int(radius), kind=str(kind), limit=int(limit))
+        req_id = str((result or {}).get("req_id") or "") if isinstance(result, dict) else ""
+        if not req_id:
+            self._scan_pending = None
+            return False, ("（scan_entities 没发出去（没有连接）：扫不了 —— "
+                           "别把「没发出去」当成「附近没有」）")
+        self._scan_pending = {"req_id": req_id, "radius": int(radius), "kind": str(kind),
+                              "limit": int(limit), "at": time.time()}
+        return True, (f"（已按需扫描附近实体：radius={radius} kind={kind} limit={limit}；"
+                      f"回执回来我再说 total/returned/truncated —— "
+                      f"**回执到之前别当成「附近只有这些」**）")
+
+    def _tool_scan_entities(self, payload: dict, context: dict) -> bool:
+        """按需扫描附近实体（**唯一的坐标出口**）：只读，扫完由回执如实说明。
+
+        为什么需要它：`entities` 快照是**分级摘要**（只有威胁 / 玩家带坐标），被动生物等档位
+        只报计数 —— 要某一只的坐标 / 血量 / 实体号，只能现场扫一趟。参数先本地拦一遍
+        （code 与模组逐字同名），**不许**把"参数不对 / 没发出去"含糊成"附近没有"。
+        """
+        args, code, text = _scan_args(payload)
+        if args is None:
+            self._action_note = f"（scan_entities 没发：{text}）"
+            logger.info("[Planner] scan_entities 参数被拒（%s）：%s", code, payload)
+            return False
+        ok, note = self._dispatch_scan(args["radius"], args["kind"], args["limit"])
+        self._action_note = note
+        logger.info("[Planner] scan_entities radius=%s kind=%s limit=%s → %s",
+                    args["radius"], args["kind"], args["limit"], ok)
+        return ok
+
+    def absorb_command_response(self, data: Any) -> bool:
+        """`command_response` 里属于**按需扫描**的那一条 → 落成 L2 的如实说明。
+
+        返回是否消费了这条回执（接线处据此断言）。**只认按 req_id 配对上的那一次**：
+        别的回执（find_block / 借还 / 路径导出…）一律不碰。
+        """
+        if not isinstance(data, dict):
+            return False
+        pending = self._scan_pending
+        req_id = str(data.get("id") or "")
+        if not isinstance(pending, dict) or not req_id \
+                or str(pending.get("req_id") or "") != req_id:
+            return False
+        self._scan_pending = None
+        self._scan_note = _scan_receipt_note(data, pending)
+        self._scan_at = time.time()
+        # 把**带坐标的行**留下来（「需要的时候再取」的落点）：`find_entity`/`use_on` 之后
+        # 就能对摘要里没有坐标的档位动手了。只认这条配对上的回执，别把别人的负载当实体表；
+        # **扫失败的回执不带实体表**（`ok:false` 只有 code/reason）⇒ 不收它的 entities。
+        rows = data.get("entities")
+        if data.get("ok") is not False and isinstance(rows, list):
+            self._scan_rows = [row for row in rows if isinstance(row, dict)][:self._SCAN_ROW_CAP]
+        logger.info("[Planner] scan_entities 回执：%s", self._scan_note)
+        return True
+
+    def _entity_rows_for_tools(self, context: Any) -> list:
+        """给 `find_entity` / `use_on` 用的实体行：**快照 + 最近一次按需扫描的结果**（按身份去重）。
+
+        快照是分级摘要（只有威胁 / 玩家 / 最近掉落物带坐标）；摘要里没有的档位
+        **不等于附近没有** —— 要它们就先 `scan_entities` 扫一趟，扫回来的行并进来。
+        扫描行**只在配对上的回执里取**（见 `absorb_command_response`），不编、不猜。
+        """
+        rows = list(perception.entities_rows(context).get("rows") or [])
+        seen = {_entity_row_key(row) for row in rows}
+        for row in (self._scan_rows or []):
+            if not isinstance(row, dict):
+                continue
+            key = _entity_row_key(row)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(row)
+        return rows
+
     def _tool_find_entity(self, payload: dict, context: dict) -> bool:
         """找附近实体：**只答候选，绝不移动、绝不扫描**（数据只来自 state 快照）。
 
         快照里没有就如实说没有（并说明它只覆盖周围约 16 格），**绝不编坐标** ——
-        要过去是模型另外调 move_to/go_to_block/follow。
+        要过去是模型另外调 `move_to`/`go_to_block`/`follow`。
+
+        快照是**分级摘要**时（`partial=True`：只有威胁 / 玩家带坐标），"没找到"**绝不等于**
+        "附近没有" —— 结果里带 `partial`，说明文字会把这一点说白，并指向按需扫描
+        `scan_entities`（要是那只/那个档位压根没坐标，**只有扫描能拿到**）。
         """
         kind = str(payload.get("kind") or payload.get("target")
                    or payload.get("name") or "").strip()
+        view = perception.entities_rows(context)
         result = find_entities(kind, limit=payload.get("limit"),
                                player_pos=self._player_pos(context),
-                               entities=gather_entities(context))
+                               entities=self._entity_rows_for_tools(context),
+                               partial=view["partial"])
         self._action_note = str(result.get("note") or entity_note(result))
-        logger.info("[Planner] find_entity %s：%d 个候选",
-                    kind or "(全部)", len(result.get("candidates") or []))
+        logger.info("[Planner] find_entity %s：%d 个候选（partial=%s）",
+                    kind or "(全部)", len(result.get("candidates") or []), view["partial"])
         return True
 
     def _tool_find_block(self, payload: dict, context: dict) -> bool:
+        """扫附近有没有某一种方块（**按需**的方块出口，只查不走）。
+
+        没说扫哪种就不发帧 —— 但**如实说清为什么**（不许沉默地失败）：方块的逐条位置
+        现在默认不进快照（摘要是"哪种几个 + 最近一种的距离"），所以要具体位置只能点名扫。
+        """
         block = payload.get("block") or payload.get("block_type")
         if block and str(block).strip():
             self.skills.find_block(
@@ -2134,6 +2472,10 @@ passive 被动=能猎的肉、unknown 认不出=先别当敌人）：
                 int(payload.get("limit", 8)),
             )
             return True
+        self._action_note = ("（find_block 没发：得点名扫**哪一种**方块（block=…，如 "
+                             "minecraft:chest / *_bed）—— 方块的逐条位置默认不进快照，"
+                             f"要具体位置只能按需扫描（{perception.SCAN_BLOCK_TOOL}），"
+                             "我不会漫无目的地扫一圈）")
         return False
 
     def _tool_go_to_block(self, payload: dict, context: dict) -> bool:
@@ -2255,7 +2597,8 @@ passive 被动=能猎的肉、unknown 认不出=先别当敌人）：
         走 `skills.look_at(...)` + `skills.use_on()`。判定不过（没有目标/够不着/手上不对）
         一律**带 code 如实说**，**一帧都不发**。
         """
-        result = plan_use_on(payload, context=context)
+        result = plan_use_on(payload, context=context,
+                             entities_rows=self._entity_rows_for_tools(context))
         self._action_note = use_on_note(result)
         if not result.get("ok"):
             logger.info("[Planner] use_on 拒绝（%s）：%s", result.get("code"),
@@ -3370,7 +3713,9 @@ passive 被动=能猎的肉、unknown 认不出=先别当敌人）：
                                     f"({bed[0]:.0f},{bed[1]:.0f},{bed[2]:.0f})；现在走过去**右键一次**"
                                     "把重生点绑到它 —— 不绑的话死了还是回世界出生点）")
             return True
-        decision = bed_attempt((context or {}).get("inventory"), (context or {}).get("entities"))
+        entity_view = perception.entities_rows(context)
+        decision = perception.conservative_bed_decision(
+            bed_attempt((context or {}).get("inventory"), entity_view["rows"]), entity_view)
         if decision.get("action") == "craft":
             skills = getattr(self, "skills", None)
             craft = getattr(skills, "craft_via_recipe", None) if skills is not None else None
@@ -3379,7 +3724,8 @@ passive 被动=能猎的肉、unknown 认不出=先别当敌人）：
             self._pending_home_bed_base = str(base["name"])
             self._territory_note = f"（基地「{base['name']}」里没床，材料够，我造一张）"
             return True
-        self._territory_note = bed_note(decision)
+        self._territory_note = (perception.bed_caution_note(hostiles=decision.get("hostiles"))
+                                if decision.get("partial") else bed_note(decision))
         logger.info("[Planner] 造床判定：%s", decision)
         return False
 
@@ -4173,16 +4519,21 @@ passive 被动=能猎的肉、unknown 认不出=先别当敌人）：
             owner = dict(others["owner"])
             plot_label = str((others["land"].get("row") or {}).get("name") or plot_name or "")
         counts = counts_of(ctx.get("inventory"))
-        blocks = ctx.get("nearby_blocks")
+        # 附近方块：形状交给 `perception.blocks_rows` 统一读（摘要只有计数 + 最近一种的距离，
+        # **没有逐条坐标** ⇒ 挑不到具体目标时**必须**说"摘要里没有，得按需扫描"，不许说"附近没有"）。
+        block_view = perception.blocks_rows(ctx)
+        blocks = block_view["rows"]
         requested = str(payload.get("action") or "").strip()
         chosen = choose_action(requested, blocks, counts)
         action = str(chosen.get("action") or "")
         if not action:
             self._farm_note = farm_note(requested, plot_label, None,
                                         reason=str(chosen.get("reason") or "nothing_to_do"),
+                                        partial=block_view["partial"],
                                         missing=missing_items(normalize_action(requested),
                                                               "", counts))
-            logger.info("[Planner] farm 没活干：%s", chosen.get("reason"))
+            logger.info("[Planner] farm 没活干：%s（partial=%s）",
+                        chosen.get("reason"), block_view["partial"])
             return False
         target = chosen.get("target")
         tverdict = may_act(territories, zones, target["x"], target["y"], target["z"], ACTION_FARM)
@@ -4338,10 +4689,18 @@ passive 被动=能猎的肉、unknown 认不出=先别当敌人）：
                                         missing=[f"种子（{seed or '同一作物的种子'}）"])
             self._farm_pending = None
             return
-        farmland = farm_nearest(ctx.get("nearby_blocks"),
+        block_view = perception.blocks_rows(ctx)
+        farmland = farm_nearest(block_view["rows"],
                                 lambda row: str(row.get("block_id") or "").endswith("farmland")
                                 or str(row.get("block_id") or "") == "minecraft:farmland")
         if farmland is None:
+            # 摘要形状里方块没有逐条坐标 ⇒ 这里**看不出来**（≠ 附近没有）：说清、指向按需扫描，
+            # 并且**不**推进 tries（那不是"补种失败"，是"这一帧看不到"）。
+            if block_view["partial"]:
+                self._farm_note = farm_note("plant", pending.get("plot") or "", None,
+                                            reason="no_farmland", partial=True)
+                self._farm_pending = None
+                return
             pending["tries"] = int(pending.get("tries") or 0) + 1
             if pending["tries"] >= 3:
                 self._farm_note = farm_note("plant", pending.get("plot") or "", None,
@@ -4394,7 +4753,8 @@ passive 被动=能猎的肉、unknown 认不出=先别当敌人）：
         if want_feed:
             inventory = ctx.get("inventory")
             counts = counts_of(inventory)
-            targets = farm_feed_targets(ctx.get("entities"), zones, territories)
+            entity_view = perception.entities_rows(ctx)
+            targets = farm_feed_targets(entity_view["rows"], zones, territories)
             if animal_filter:
                 targets["feedable"] = [row for row in targets["feedable"]
                                        if row.get("kind") == animal_filter]
@@ -4425,9 +4785,20 @@ passive 被动=能猎的肉、unknown 认不出=先别当敌人）：
                     kind = str(row.get("kind") or "?")
                     fed[kind] = fed.get(kind, 0) + 1
                     counts[food] = max(0, int(counts.get(food, 0)) - 1)
+            feed_detail = farm_feed_note(targets, fed=fed, missing=missing_food,
+                                         partial=entity_view["partial"])
+            if not fed and entity_view["partial"] and not targets["feedable"]:
+                # 摘要里被动生物**没有坐标** ⇒ 这一轮挑不出要喂的动物。**自己按需扫一趟**
+                # （只读、有界：一次一条命令），回执下一轮把坐标/实体号摆进 L2 给模型 —— 这样
+                # "摘要里看不到"有正规出口，而不是变成"附近没有动物"的假结论。
+                scan_kind = animal_filter or "passive"
+                scanned, _ = self._dispatch_scan(16, scan_kind, SCAN_DEFAULT_LIMIT)
+                if scanned:
+                    feed_detail += (f"（摘要里没有动物坐标：已按需扫描（scan_entities "
+                                    f"kind={scan_kind}）—— 回执（坐标/实体号）下一轮见）")
             steps.append(farm_cycle_step(
                 "feed", bool(fed), reason="" if fed else "no_feed",
-                detail=farm_feed_note(targets, fed=fed, missing=missing_food), items=fed))
+                detail=feed_detail, items=fed))
 
         self._cycle_steps = steps
         self._farm_note = farm_cycle_note(steps)

@@ -14,6 +14,7 @@ import logging
 import re
 from typing import Any, Callable, Optional
 
+from . import perception
 from .craft import describe_missing, evaluate_craft
 
 logger = logging.getLogger("commands")
@@ -170,16 +171,29 @@ class Commands:
         return CommandResult(True, msg)
 
     def _query_nearby(self, args: list[str], state: dict) -> CommandResult:
-        """!nearby [radius] — List nearby blocks."""
+        """!nearby [radius] — List nearby blocks.
+
+        方块行只从 `perception.blocks_rows` 读（**唯一读法**）：模组报的是**分级摘要**时
+        （只有计数 + 最近一种，且**没有逐条坐标**）就如实说明这一点，并指向按需扫描
+        `find_block` —— **不**把"摘要里没有"说成"附近没有"。
+        """
         radius = int(args[0]) if args else 5
-        blocks = state.get("nearby_blocks", [])
-        matched = [b for b in blocks if b.get("distance", 999) <= radius][:20]
+        view = perception.blocks_rows(state)
+        matched = [b for b in view["rows"] if b.get("distance", 999) <= radius][:20]
         if not matched:
+            if view["partial"]:
+                return CommandResult(True, f"Nearby blocks: summary only"
+                                           f"（{view['count']} counted, nearest not within "
+                                           f"{radius}m）— 逐条坐标没上报，要看就按需扫描"
+                                           f"（{perception.SCAN_BLOCK_TOOL}）")
             return CommandResult(True, f"No blocks within {radius}m")
         msg = "Nearby: " + ", ".join(
             f"{b.get('block_id', b.get('name', '?'))} -> {b.get('item_id', '?')} ({b.get('distance', '?')}m)"
             for b in matched
         )
+        if view["partial"]:
+            msg += (f"（**摘要**：只有 {len(matched)} 条带坐标的行，共报 {view['count']} 个；"
+                    f"要看某一种的具体位置就按需扫描（{perception.SCAN_BLOCK_TOOL}））")
         return CommandResult(True, msg)
 
     def _query_position(self, args: list[str], state: dict) -> CommandResult:
@@ -203,15 +217,27 @@ class Commands:
         return CommandResult(True, f"Biome: {w.get('biome', 'unknown')}")
 
     def _query_entities(self, args: list[str], state: dict) -> CommandResult:
-        """!entities [radius] — List nearby entities."""
+        """!entities [radius] — List nearby entities.
+
+        实体行只从 `perception.entities_rows` 读（**唯一读法**）：分级摘要时只有威胁 / 玩家
+        带坐标，其余档位只报了计数 ⇒ 如实说明并指向按需扫描 `scan_entities`。
+        """
         radius = int(args[0]) if args else 10
-        entities = state.get("entities", [])
-        nearby = [e for e in entities if e.get("distance", 999) <= radius]
+        view = perception.entities_rows(state)
+        nearby = [e for e in view["rows"] if e.get("distance", 999) <= radius]
         if not nearby:
+            if view["partial"]:
+                return CommandResult(True, f"Entities: summary only（{view['count']} counted, "
+                                           f"none with coordinates within {radius}m）— "
+                                           f"要看某一只就按需扫描"
+                                           f"（{perception.SCAN_ENTITY_TOOL}）")
             return CommandResult(True, f"No entities within {radius}m")
         msg = "Entities: " + ", ".join(
             f"{e.get('name', '?')} ({e.get('distance', 0):.0f}m)" for e in nearby[:10]
         )
+        if view["partial"]:
+            msg += (f"（**摘要**：只有威胁/玩家带坐标，共报 {view['count']} 个实体；"
+                    f"要看某一只的细节就按需扫描（{perception.SCAN_ENTITY_TOOL}））")
         return CommandResult(True, msg)
 
     # ── Action Handlers ──

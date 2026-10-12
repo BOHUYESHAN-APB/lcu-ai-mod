@@ -15,6 +15,10 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+# 上下文预算的默认值只有**一份来源**：`agent/context_budget.py::Budget`。
+# 这里 import 它是安全的 —— 那个模块不 import 本包任何东西（纯计算）。
+from .context_budget import Budget
+
 
 DEFAULT_AGENT = "default"
 DEFAULT_CONFIG_PATH = Path(__file__).parent.parent / ".local" / "config.json"
@@ -136,7 +140,9 @@ PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
 
 
 # 单模型模式下，非 default 角色里这些"换家相关"字段一律清空（改为继承 default）。
-SINGLE_MODEL_ROLE_KEYS = ("provider", "base_url", "api_key", "model")
+# `context_window` 也算"换家相关"：窗口是**模型的属性**，单模型模式下所有角色只有
+# 一个模型 → 只保留一份窗口（全局 `context_budget` 或 default 角色的覆盖）。
+SINGLE_MODEL_ROLE_KEYS = ("provider", "base_url", "api_key", "model", "context_window")
 
 
 def _normalize_single_model(data: dict[str, Any]) -> dict[str, Any]:
@@ -298,7 +304,18 @@ def _default_config() -> dict[str, Any]:
         # 开（**默认**）→ 复合体作为工具可用，内部**逐步**走各自的权限/区域/容器/借用门；
         # 关 → 复合体调用被**如实拒绝**（一步都不发），行为回到"还没有复合体"之前。
         "composites": {"enabled": True},
+        # 上下文预算 / 主动压缩（`agent/context_budget.py`）。
+        # ⚠️ `context_window` 是**我们假设的默认窗口（128000），不是该模型被证实的事实**：
+        # provider 不返回模型窗口，`deepseek-v4.1-flash` 的窗口未经证实。所以要改就改这里，
+        # 或按模型覆盖 `llm.agents.<角色>.context_window`（角色级优先）；日志一律按"配置"汇报。
+        # 触发线 `compress_at` 是**占用比例**（估算 / 可用输入预算），不是绝对 token 数。
+        "context_budget": _default_budget_section(),
     }
+
+
+def _default_budget_section() -> dict[str, Any]:
+    """`context_budget` 默认段（值来自 `context_budget.Budget` 的默认，避免两处各写一份）。"""
+    return Budget().as_config()
 
 
 class ConfigStore:
@@ -371,7 +388,10 @@ class ConfigStore:
                 if not payload.get("model") and preset.get("default_model"):
                     current["model"] = preset["default_model"]
 
-            for key in ("base_url", "api_key", "model", "temperature", "max_tokens"):
+            # `context_window` 是**按模型的窗口覆盖**（可选）：不填就继承全局
+            # `context_budget.context_window`（见 get_context_budget_config）。
+            for key in ("base_url", "api_key", "model", "temperature", "max_tokens",
+                        "context_window"):
                 if key in payload and payload[key] is not None:
                     current[key] = payload[key]
 
@@ -458,6 +478,16 @@ class ConfigStore:
                 parsed_comp = _parse_bool(payload["composites"].get("enabled"))
                 if parsed_comp is not None:
                     self._data["composites"] = {"enabled": parsed_comp}
+            if isinstance(payload.get("context_budget"), dict):
+                section = self._data.setdefault("context_budget", _default_budget_section())
+                for key, value in payload["context_budget"].items():
+                    # 只收已知键；数值/布尔的越界与类型由 Budget.from_config 在读时夹回。
+                    if key == "enabled":
+                        parsed_enabled = _parse_bool(value)
+                        if parsed_enabled is not None:
+                            section[key] = parsed_enabled
+                    elif key in Budget().as_config():
+                        section[key] = value
             self.save()
             return self.raw(redact=True)
 
@@ -539,6 +569,35 @@ class ConfigStore:
             raw = self._data.get("composites")
         enabled = raw.get("enabled") if isinstance(raw, dict) else None
         return _as_bool(enabled, True)
+
+    def get_context_budget_config(self, agent: str | None = None) -> dict[str, Any]:
+        """上下文预算配置（``config.json`` → ``context_budget``；**按模型可覆盖窗口**）。
+
+        `context_window` 的解析顺序（先命中先用）：
+
+        1. ``llm.agents.<agent>.context_window``（按模型覆盖，角色级优先）；
+        2. ``llm.agents.default.context_window``（单模型模式下角色字段被清空，窗口在 default 上）；
+        3. ``context_budget.context_window``（全局默认）。
+
+        ⚠️ 三个都是**配置值/假设值**，不是该模型被证实的窗口 —— provider 不返回窗口，
+        `deepseek-v4.1-flash` 的窗口未经证实；日志一律按"配置"汇报。
+
+        返回的 dict 直接喂 `context_budget.Budget.from_config()`（由它夹回安全范围）。
+        """
+        with self._lock:
+            raw = self._data.get("context_budget")
+            agents = self._data.get("llm", {}).get("agents")
+            role = agents.get(agent) if isinstance(agents, dict) and agent else None
+            fallback = agents.get(DEFAULT_AGENT) if isinstance(agents, dict) else None
+            override = role.get("context_window") if isinstance(role, dict) else None
+            if override is None and isinstance(fallback, dict):
+                override = fallback.get("context_window")
+        merged = _default_budget_section()
+        if isinstance(raw, dict):
+            merged.update({key: value for key, value in raw.items() if key in merged})
+        if override is not None:
+            merged["context_window"] = override
+        return merged
 
     def get_decision_threshold(self) -> float:
         """decider 置信度阈值；非法值回退默认。"""

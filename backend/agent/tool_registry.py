@@ -172,6 +172,17 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
              "kind,limit", ("locate",), "_tool_find_entity"),
     ToolSpec("find_block", "扫附近有无该方块（只查不走）", "block,radius,limit",
              ("locate",), "_tool_find_block"),
+    ToolSpec("scan_entities", "**按需扫描附近实体**（要坐标就用它 —— 这是唯一的坐标出口）："
+                              "快照里默认只上报**威胁 / 玩家**的坐标，被动生物等档位只报计数；"
+                              "喂动物、找某一只、要血量/实体号时先扫一趟。"
+                              "radius 1..32（默认 16，超上限**如实拒绝、不放大**）；"
+                              "kind=all|dangerous|hostile|neutral|passive|player|item|unknown"
+                              "（默认 all）；limit 1..48（默认 24，超上限钳到 48）。"
+                              "回执带 total（截断前真实总数）/returned（这一趟回来几条）/truncated"
+                              "—— **truncated=true 时绝不等于「附近就这些」**；每条带坐标、距离、"
+                              "生物还带 tier/health、物品带 item_id，可用 use_on_entity/attack_entity"
+                              "（按 id）或 move_to（按坐标）接着办。不在世界 ⇒ 如实失败，不假成功",
+             "radius,kind,limit", ("locate",), "_tool_scan_entities"),
     ToolSpec("go_to_block", "寻路过去，到达后记住", "block,radius,remember",
              ("locate",), "_tool_go_to_block", job=True),
     ToolSpec("locate_structure", "/locate 查结构/群系（kind=structure|biome）", "name,kind",

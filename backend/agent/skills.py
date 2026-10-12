@@ -447,6 +447,20 @@ class Skills:
         """扫描附近是否存在某方块（只查不走），返回命中列表与最近一个。"""
         return self._send_cmd("find_block", {"block": block, "radius": radius, "limit": limit})
 
+    def scan_entities(self, radius: int = 16, kind: str = "all", limit: int = 24) -> dict:
+        """**按需扫描附近实体**（只读，返回带坐标的明细）。
+
+        为什么需要它：`state_update.entities` 现在是**分级摘要**（只有威胁/玩家带坐标），
+        被动生物等档位只报计数 —— 要某一只的坐标/血量/实体号时，用这条命令现场扫一趟。
+        参数与 Java 侧一一对应（`scan_entities`）：`radius` 1..32、`kind` ∈
+        all|dangerous|hostile|neutral|passive|player|item|unknown、`limit` 1..48。
+        回执（`command_response`）带 `total/returned/truncated/entities`；参数非法或不在世界
+        时是 `ok:false` + `code`（**如实拒绝，不假成功**）—— 回执由 planner 如实呈现给模型。
+        """
+        return self._send_cmd("scan_entities", {"radius": int(radius),
+                                                "kind": str(kind or "all"),
+                                                "limit": int(limit)})
+
     def go_to_block(self, block: str, radius: int = 32, remember: bool = True) -> dict:
         """找最近的该方块并自动寻路过去；到达后写入 POI 记忆。"""
         return self._send_cmd(

@@ -35,6 +35,8 @@ from .llm_service import LLMService
 from .self_prompter import SelfPrompter
 from .message_db import MessageDB
 from .conversation import ConversationStore, server_key
+from . import context_budget
+from . import perception
 from .borrow import BorrowRulesStore, parse_borrow_grant, parse_borrow_revoke
 from .person_memory import PersonMemoryStore
 from .world_memory import (WorldMemoryStore, plan_replay, route_args,
@@ -458,6 +460,13 @@ class Session:
                 self._note_zone_block(data)
                 # `route_export` 的回执：拿到点列就补存盘并推回去（拿不到维持 no_geometry）。
                 self._absorb_route_export(data)
+                # 按需扫描（`scan_entities`）的回执：如实落成"最近一次扫描"的说明，进下一轮 L2
+                # —— 这是摘要里没坐标的那些档位**唯一的**明细出口（planner 按 req_id 自己配对，
+                # 别的回执它不会碰）。
+                absorb_scan = getattr(getattr(self, "planner", None),
+                                      "absorb_command_response", None)
+                if callable(absorb_scan):
+                    absorb_scan(data)
                 if req_id in self._manual_action_reqs:
                     if success and self._manual_task_kind in {"follow_player", "craft_item", "eat", "collect_blocks", "move_to", "explore", "build"}:
                         self._manual_command_until = max(self._manual_command_until, time.time() + 30.0)
@@ -2395,12 +2404,23 @@ class Session:
         mentioned = (not event) and self._is_mentioned(message)
         context["persona_blocks"] = self.persona_blocks(self._scene_for("", mentioned))
 
+        # 上下文预算：**调模型之前**判一次（估算 + 迟滞）；过线就压，压法复用既有 L3 摘要。
+        # 放在这里（而不是 planner 里）是因为"要不要花这一次调用"是会话层的事。
+        decision = self._compress_context_if_needed(context, message)
+        estimated_prompt = int(decision["estimated"]) if decision else 0
+        # 实际用量取"这一轮"的 API usage 增量 —— 快照放在压缩之后，摘要那次调用不算进本轮。
+        usage_before = self._usage_snapshot(getattr(self, "llm", None))
+
         # Use Planner to plan and execute
         with self.skills.command_context(command_context):
             response = self.planner.plan_and_execute(
                 sender, message, context, bot_name=self._get_bot_name()
             )
-        
+
+        # 估算 vs 实际：并排打出来，别把估算当用量（拿不到 usage 就如实说未知）。
+        if decision:
+            self._note_actual_usage(usage_before, estimated_prompt)
+
         if response:
             # Record interaction
             self.memory.add_interaction(
@@ -2664,7 +2684,7 @@ class Session:
         if runtime.get("reflex_combat") and isinstance(health, (int, float)) and health <= 10:
             out.append(("besieged", "我正被围攻，血不多了", {"health": health}, lambda: None))
 
-        for entity in runtime.get("entities") or []:
+        for entity in perception.entities_rows(runtime).get("rows") or []:
             if not isinstance(entity, dict) or entity.get("type") != "item":
                 continue
             item_id = str(entity.get("item_id") or entity.get("name") or "")
@@ -2809,6 +2829,193 @@ class Session:
             logger.info("[Session] 对话记忆摘要已生成(%d 条): %s", len(pending),
                         str(result.get("summary") or "")[:60])
         return result
+
+    # ── 上下文预算 / 主动压缩（`agent/context_budget.py`）──
+    #
+    # 为什么要有：原来只有"窗口裁切溢出才被动摘要"这一条路 —— prompt 逼近模型窗口时
+    # 既看不到还差多少，也没有提前压的手段。现在**每次调模型之前**用**估算**判一次：
+    # 过线就把对话层最旧的若干轮挪走、复用既有 L3 摘要压掉，并把事件**如实**打出来。
+    # 三条底线：估算**不是**用量（真实用量只有 provider 的 usage 才算数）；窗口是**配置值**
+    # （provider 不返回窗口，"未经该模型证实"）；压缩**不许静默**。
+
+    # planner 是主脑，窗口按它的角色/模型解析（单模型模式下继承 default）。
+    PLANNER_AGENT = "planner"
+
+    def _context_budget(self, agent: str | None = None) -> "context_budget.Budget":
+        """按（角色）模型的配置造一个预算；配置读不到就用 dataclass 默认（仍是"假设值"）。"""
+        try:
+            config = get_config_store(DEFAULT_CONFIG_PATH).get_context_budget_config(
+                agent or self.PLANNER_AGENT)
+        except Exception as e:  # noqa: BLE001 — 配置读失败绝不能让这一轮对话挂掉
+            logger.debug("[Context] 预算配置读取失败，用默认假设值: %s", e)
+            config = {}
+        return context_budget.Budget.from_config(config)
+
+    @staticmethod
+    def _usage_snapshot(service) -> tuple[int, int]:
+        """`(累计输入 token, 累计请求次数)` —— 走 llm_service 的**公开** `get_usage()`。"""
+        try:
+            usage = service.get_usage() if service is not None else None
+        except Exception:  # noqa: BLE001
+            usage = None
+        usage = usage if isinstance(usage, dict) else {}
+        return (int(usage.get("total_prompt_tokens") or 0),
+                int(usage.get("request_count") or 0))
+
+    def _context_messages_for_estimate(self, context: dict, message: str = "") -> list:
+        """要估算的东西：**对话记忆层**（L3 摘要 + L2 窗口）+ 本轮这条消息。
+
+        明确只估这一层 —— 完整 prompt（人设/状态/工具文档）由 planner 自己拼，
+        它的真实 token 只有 provider 返回的 usage 才算数。日志里照这个口径写。
+        """
+        store = getattr(self, "conversation", None)
+        layer = context.get("conversation") if isinstance(context, dict) else None
+        if not isinstance(layer, dict) or not layer:
+            layer = {}
+            if store is not None:
+                try:
+                    layer = store.describe(self._players_count())
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("[Context] 对话层读取失败: %s", e)
+                    layer = {}
+        items: list = [layer] if layer else []
+        if message:
+            items.append({"role": "user", "text": message})
+        return items
+
+    def _compress_context_if_needed(self, context: dict, message: str = "",
+                                    agent: str | None = None) -> Optional[dict]:
+        """**调模型之前**判一次上下文预算；过线就压（复用 L3 摘要），并如实打事件。
+
+        返回预算决策 dict（含 `compress` / `reason` / `estimated` / `next_marker`），
+        没有对话记忆时返回 None。任何异常都吞掉只 warning —— 压缩失败不能让这一轮挂掉。
+        """
+        store = getattr(self, "conversation", None)
+        if store is None:
+            return None
+        role = agent or self.PLANNER_AGENT
+        budget = self._context_budget(role)
+        estimate = context_budget.describe_messages(
+            self._context_messages_for_estimate(context, message))
+        decision = context_budget.plan(
+            int(estimate["estimated"]), budget,
+            already_compressed_at=getattr(self, "_context_compress_marker", None))
+        if not decision["compress"]:
+            # 不压：只记 debug（每轮 INFO 会把日志刷满），决策本身仍留在 status 里。
+            # 迟滞标记交回下一轮（已回落到下限 ⇒ 清空重新武装）。
+            self._context_compress_marker = decision["next_marker"]
+            self._last_context_decision = decision
+            logger.debug("[Context] %s", decision["reason"])
+            return decision
+
+        try:
+            compact = store.compact_window(budget.keep_recent, llm=getattr(self, "llm", None))
+        except Exception as e:  # noqa: BLE001 — 压缩失败不许拖垮这一轮
+            # 没有**被证明**压成 → 不进迟滞带（下次还可以再试，重判是免费的）。
+            self._context_compress_marker = decision["next_marker_idle"]
+            self._last_context_decision = decision
+            logger.warning("[Context] 压缩失败（这一轮按未压缩的上下文继续）: %s", e)
+            return decision
+
+        if int(compact["removed"]) <= 0:
+            # 过线了但窗口里已经只剩 keep_recent 条：**没真的压** —— 不进迟滞带（重判免费、
+            # 不产生模型调用），并如实说明"没有可挪的旧内容"，不假装压过。
+            self._context_compress_marker = decision["next_marker_idle"]
+            decision["compress"] = False
+            decision["reason"] += "；但窗口里没有可挪的旧内容（只剩 keep_recent 条）"
+            self._last_context_decision = decision
+            logger.info("[Context] 过线但窗口里只有 %d 条（keep_recent=%d），没有可挪的旧内容：%s",
+                        int(compact["kept"]), budget.keep_recent, decision["reason"])
+            return decision
+
+        # **确实挪走了条目** → 记下本次占用比例，进入迟滞带。
+        self._context_compress_marker = decision["next_marker"]
+        self._last_context_decision = decision
+
+        # 真的压了 ⇒ 把这一轮要喂给模型的对话层换成压缩后的（否则压了也白压）。
+        try:
+            context["conversation"] = store.describe(self._players_count())
+            after = int(context_budget.describe_messages(
+                [context["conversation"]])["estimated"])
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[Context] 压缩后重算估算失败: %s", e)
+            after = 0
+        event = context_budget.format_compression_event(
+            before=int(estimate["estimated"]), after=after, budget=budget,
+            removed=int(compact["removed"]), kept=int(compact["kept"]),
+            summarized=bool(compact["summarized"]), heaviest=estimate.get("heaviest"),
+            actual_prompt=getattr(self, "_last_actual_prompt_tokens", None), agent=role)
+        self._last_context_compression = {
+            "agent": role,
+            "removed": int(compact["removed"]),
+            "kept": int(compact["kept"]),
+            "summarized": bool(compact["summarized"]),
+            "estimated_before": int(estimate["estimated"]),
+            "estimated_after": after,
+            "reason": decision["reason"],
+            "event": event,
+        }
+        if not compact["summarized"]:
+            # 移走了旧条目但摘要没成：**如实**告警（不是静默丢弃 —— 条目还在 L1/pending）。
+            logger.warning("%s", event)
+        else:
+            logger.info("%s", event)
+        return decision
+
+    def _note_actual_usage(self, before: tuple[int, int], estimated: int,
+                           agent: str | None = None) -> None:
+        """本轮结束后把**实际**用量（API usage 增量）与**估算**并排打出来。
+
+        模型没返回 usage（或本轮没发生调用）→ 记 None 并如实说"未知"，绝不拿估算冒充实际。
+        """
+        role = agent or self.PLANNER_AGENT
+        prompt_before, requests_before = before
+        prompt_after, requests_after = self._usage_snapshot(getattr(self, "llm", None))
+        requests = max(0, requests_after - requests_before)
+        delta = prompt_after - prompt_before
+        actual = delta if (requests and delta > 0) else None
+        if actual is not None:
+            self._last_actual_prompt_tokens = actual
+        line = context_budget.format_estimate_vs_actual(
+            int(estimated or 0), actual, requests=requests, agent=role)
+        self._last_usage_comparison = {
+            "agent": role,
+            "estimated_prompt_tokens": int(estimated or 0),
+            "actual_prompt_tokens": actual,
+            "requests": requests,
+            "line": line,
+        }
+        if actual is None:
+            logger.debug("%s", line)
+        else:
+            logger.info("%s", line)
+
+    def _context_budget_status(self) -> dict:
+        """给 /api/status：预算配置 + 最近一次压缩/对照（全部防御式取值）。
+
+        窗口与占用都是**估算/配置**，不是被证实的事实 —— 真实用量看 `llm_usage`。
+        """
+        role = self.PLANNER_AGENT
+        rules = self._context_budget(role)
+        return {
+            "enabled": rules.enabled,
+            "agent": role,
+            "context_window": rules.context_window,
+            # 窗口是配置项，不是该模型被证实的事实（provider 不返回窗口）。
+            "window_source": "config（未经该模型证实）",
+            "reserve_output": rules.reserve_output,
+            "available_input": rules.available(),
+            "compress_at": rules.compress_at,
+            "hysteresis": rules.hysteresis,
+            "keep_recent": rules.keep_recent,
+            "marker": getattr(self, "_context_compress_marker", None),
+            # 最近一次"调模型之前"的预算决策（估算/触发线/是否压/理由）——
+            # UI 要的"现在估算多少、压没压"就在这儿，不必等真压缩发生。
+            "last_decision": getattr(self, "_last_context_decision", None),
+            "last_compression": getattr(self, "_last_context_compression", None),
+            "last_estimate_vs_actual": getattr(self, "_last_usage_comparison", None),
+            "note": "这里是**估算**（比例与 token 都是）；真实用量见 llm_usage（provider 的 usage）",
+        }
 
     # ── 任务列表（多任务 + 归属 + 优先级 + 状态 + 进度）──
 
@@ -2958,9 +3165,15 @@ class Session:
             # L2：动态上下文只进当轮 user 消息（与 planner 口径一致，绝不允许混进 system）。
             {"role": "user", "content": self.llm.build_dynamic_context(context, prompt)},
         ]
+        # 同一套上下文预算（self_prompter 是另一个角色，窗口按它自己的模型配置解析）。
+        decision = self._compress_context_if_needed(context, prompt, agent="self_prompter")
+        estimated_prompt = int(decision["estimated"]) if decision else 0
+        usage_before = self._usage_snapshot(getattr(self, "llm", None))
         # Non-blocking LLM call (runs on background thread)
         try:
             result = self.llm.chat(messages, agent="self_prompter")
+            if decision:
+                self._note_actual_usage(usage_before, estimated_prompt, agent="self_prompter")
             response_text = result.get("content", "")
             if response_text:
                 # Parse and execute commands from LLM output
@@ -3092,6 +3305,8 @@ class Session:
             # 分层记忆（global / person / server / world）：world 层的站点/路径 +
             # person 层的稳定事实 + 本 session 已回灌的层标记。
             "memory_layers": self._memory_layers_status(),
+            # 上下文预算：窗口/触发线（**配置值**）+ 最近一次压缩与"估算 vs 实际"（**估算**）。
+            "context_budget": self._context_budget_status(),
             "llm_usage": self.llm.get_usage(),
             # 资源租约（按资源分租）+ 状态治理（卡死即摘掉）：全部防御式取值。
             "resource_lease": (self.resource_lease.snapshot()

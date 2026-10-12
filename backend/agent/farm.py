@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from . import perception
 from .craft import inventory_counts, normalize_item
 from .territory import ACTION_FARM, may_act
 
@@ -123,7 +124,14 @@ def _distance(row: dict) -> float:
 
 
 def nearest(blocks: Any, predicate) -> Optional[dict]:
-    """附近满足条件的**最近**方块（只按 `nearby_blocks` 的真数据；找不到返回 None）。"""
+    """附近满足条件的**最近**方块（只按**真数据**行里报的坐标；找不到返回 None）。
+
+    行来自 `perception.blocks_rows`（**唯一读法**）：模组报**逐条清单**时就是全量；
+    报**分级摘要**时行里通常**没有坐标**（摘要只给"哪种方块几个 + 最近一种"的距离）——
+    这时这里会返回 `None`，调用方**必须**说明"摘要里没有，得按需扫描"，**不许**说成
+    "附近没有"（`note(..., partial=True)` / `perception.block_missing_note` 就是这个说法）。
+    没坐标的行**不编坐标**、也不参与排序。
+    """
     hits = [row for row in _rows(blocks) if predicate(row)]
     if not hits:
         return None
@@ -244,14 +252,24 @@ def counts_of(inventory: Any) -> dict:
 
 
 def note(action: Any, plot: Any, target: Any, *, reason: str = "", missing: Any = None,
-         blocked: Any = None, seed: Any = "") -> str:
-    """一句**如实**的说法（干成了什么 / 为什么没干 / 被哪条规则拦下）。"""
+         blocked: Any = None, seed: Any = "", partial: bool = False) -> str:
+    """一句**如实**的说法（干成了什么 / 为什么没干 / 被哪条规则拦下）。
+
+    `partial=True`（这一帧是**分级摘要**：方块的逐条坐标默认没上报）时，"
+    没找到作物/耕地/土"这类结论**必须**改口：摘要里没有**不等于**附近没有。
+    """
     where = f"「{plot}」" if plot else "授权农田"
     if blocked:
         return (f"（区域「{blocked.get('zone')}」的「{blocked.get('rule')}」规则不许在这儿动手，"
                 f"我没动 —— 那是别人的保护区）")
     if reason == "no_grant":
         return "（这附近没有授权给我的农田/基地，我不在别人的地里干活）"
+    if bool(partial) and reason in ("nothing_to_do", "no_crop", "no_farmland", "no_soil"):
+        subject = {"no_crop": "作物", "no_farmland": "耕地", "no_soil": "能锄的土"}.get(
+            reason, "作物/耕地/土")
+        return (f"（{where}的{subject}：这一帧是**分级摘要**，方块的逐条坐标默认没上报 —— "
+                f"「摘要里没有」**不等于**「附近没有」；要动手先按需扫描"
+                f"（{perception.SCAN_BLOCK_TOOL}）拿到具体位置）")
     if reason == "nothing_to_do":
         return "（这块授权农田附近没有能干的活：没作物、没耕地、也没法锄的土）"
     if reason == "no_crop":
@@ -429,8 +447,13 @@ def feed_targets(entities: Any, zones: Any, territories: Any) -> dict:
     return {"feedable": feedable, "blocked": blocked, "unauthorized": unauthorized}
 
 
-def feed_note(targets: dict, *, fed: Any = None, missing: Any = None) -> str:
-    """喂食这一段的**如实**说法（喂了几只 / 缺什么 / 被哪条规则拦下）。"""
+def feed_note(targets: dict, *, fed: Any = None, missing: Any = None,
+              partial: bool = False) -> str:
+    """喂食这一段的**如实**说法（喂了几只 / 缺什么 / 被哪条规则拦下）。
+
+    `partial=True`（分级摘要：被动生物的逐条坐标默认没上报）时，"没喂成/没有能喂的动物"
+    **不许**说成"附近没有动物"—— 摘要里看不到的档位本来就没上报。
+    """
     blocked = (targets or {}).get("blocked") or []
     if blocked:
         hit = blocked[0]
@@ -446,6 +469,10 @@ def feed_note(targets: dict, *, fed: Any = None, missing: Any = None) -> str:
     unauthorized = (targets or {}).get("unauthorized") or []
     if unauthorized:
         return "（附近没有授权给我的畜栏，别人的牲口我不喂）"
+    if partial:
+        return ("（动物：这一帧是**分级摘要**，被动生物的逐条坐标默认没上报 —— "
+                "「摘要里没有」**不等于**「附近没有」；要喂就先按需扫描"
+                f"（{perception.SCAN_ENTITY_TOOL}）拿到具体位置）")
     return "（附近没有能喂的动物）"
 
 
