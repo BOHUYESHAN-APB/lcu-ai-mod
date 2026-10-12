@@ -66,6 +66,19 @@ public class LCUMod {
         }
         LOGGER.info("[LCUMod] Initializing...");
         WIRE = new WireServer(ModConfig.WIRE_PORT.getAsInt(), ModConfig.WIRE_BIND_ADDRESS.get());
+        // 配置里的 wireToken 必须**真的武装上**：光有 WireAuth 和校验逻辑、却没人调用
+        // setRequiredToken，等于一个什么都不做的安全开关 —— 那比没有更糟（用户以为有鉴权）。
+        // 后端那侧从 `LCU_WIRE_TOKEN` 环境变量 / `.local/wire_token` 文件读同一个值，
+        // 首帧发 hello；两边不一致时连接会被关掉，所以这里如实把状态打出来。
+        String wireToken = ModConfig.WIRE_TOKEN.get();
+        WIRE.setRequiredToken(wireToken == null ? "" : wireToken.trim());
+        if (WIRE.tokenArmed()) {
+            LOGGER.info("[LCUMod] Wire auth armed ({} chars) — the backend must send a matching "
+                    + "hello first (LCU_WIRE_TOKEN or .local/wire_token).", wireToken.trim().length());
+        } else {
+            LOGGER.warn("[LCUMod] No wireToken set: port {} accepts any local process. "
+                    + "For auth, set wireToken here AND the same value for the backend.", ModConfig.WIRE_PORT.getAsInt());
+        }
         WIRE.start();
         LOGGER.info("[LCUMod] Ready. Wire server listening on port {}", ModConfig.WIRE_PORT.getAsInt());
     }

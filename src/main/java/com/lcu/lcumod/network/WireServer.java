@@ -225,6 +225,11 @@ public class WireServer {
         this.requiredToken = token == null ? "" : token.trim();
     }
 
+    /** 现在是否**要求** token：给启动日志用 —— 别让"其实没武装"这件事悄悄过去。 */
+    public boolean tokenArmed() {
+        return !requiredToken.isBlank();
+    }
+
     // token 比对在 WireAuth 里（零依赖，好让零依赖自检直接调用它）。
 
     class Connection {

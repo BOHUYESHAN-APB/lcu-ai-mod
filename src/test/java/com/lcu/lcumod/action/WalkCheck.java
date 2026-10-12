@@ -49,12 +49,50 @@ public final class WalkCheck {
         gearReportChecks();
         perceptionTieringChecks();
         entityScanChecks();
+        wireTokenArmedChecks();
 
         System.out.println("[WalkCheck] " + passed + " checks passed, " + failed + " failed");
         if (failed > 0) {
             System.exit(1);
         }
     }
+
+    // ── 20. 配置里的 wireToken 必须真的武装（别当摆设） ─────────────
+
+    /**
+     * 一个**什么都不做的安全开关**比没有更糟：用户以为有鉴权，其实端口对谁都开着。
+     *
+     * <p>实测（2026-10-12 审计）：{@code WireServer.setRequiredToken} 有定义、{@code WireAuth}
+     * 有比对、hello 握手有校验，但**全仓没有调用者** ⇒ 配置项与代码谎言同谋。这里钉住三件事：
+     * 启动时真的把配置值武装上、武装发生在 {@code start()} **之前**、以及武装与否都**打日志**
+     * （空的要 WARN，不许静默）。
+     */
+    private static void wireTokenArmedChecks() {
+        String mod = read(Path.of("src", "main", "java", "com", "lcu", "lcumod", "LCUMod.java"));
+        String server = read(Path.of("src", "main", "java", "com", "lcu", "lcumod", "network",
+                "WireServer.java"));
+        if (mod.isEmpty() || server.isEmpty()) {
+            check("wire-token: sources found", false);
+            return;
+        }
+
+        int armed = mod.indexOf("setRequiredToken(");
+        int started = mod.indexOf("WIRE.start()");
+        check("wire-token: startup arms the token from config",
+                armed > 0 && mod.contains("ModConfig.WIRE_TOKEN"));
+        check("wire-token: armed before the server starts listening",
+                armed > 0 && started > 0 && armed < started);
+        check("wire-token: an armed token is reported (length only, never the token itself)",
+                mod.contains("tokenArmed()") && mod.contains("Wire auth armed"));
+        check("wire-token: an empty token is warned about, not silently accepted",
+                mod.contains("LOGGER.warn") && mod.contains("No wireToken set"));
+        check("wire-token: the server really has an armed-state accessor",
+                server.contains("setRequiredToken(") && server.contains("tokenArmed()")
+                        && server.contains("requiredToken.isBlank()"));
+        check("wire-token: blank means no auth (old behaviour kept for loopback)",
+                server.contains("volatile boolean authed = requiredToken.isBlank()"));
+    }
+
 
     // ── 1/2. 视角所有权：导航 > 后端 look > 不写 ──────────────────
 
