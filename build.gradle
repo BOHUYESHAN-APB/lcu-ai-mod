@@ -257,9 +257,11 @@ tasks.register('verifyBuild', JavaExec) {
 
 tasks.register('verifyMixin', JavaExec) {
     group = 'verification'
-    description = '纯逻辑自检（lcumod.mixins.json：每个声明的 mixin 存在且能加载 / client 数组非空不再死掉 / MouseHandlerMixin 的 isAiControlled 守卫编译进字节码），零第三方依赖'
+    description = '注入模拟自检（lcumod.mixins.json 登记 + Mixin 结构规则 + @Inject 目标签名存在性 + loader 版本一致性）；跑在运行 classpath 上，因为要真的解析 Minecraft 目标类'
     dependsOn tasks.named('testClasses')
-    classpath = sourceSets.test.output + sourceSets.main.output
+    // 需要 Minecraft/NeoForge（注入模拟要真的加载目标类并查方法签名），所以用运行 classpath；
+    // 只读源码的那几项不受影响。
+    classpath = sourceSets.test.runtimeClasspath
     mainClass = 'com.lcu.lcumod.mixin.MixinCheck'
 }
 

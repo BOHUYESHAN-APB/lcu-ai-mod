@@ -60,8 +60,14 @@ public class KeyboardHandlerMixin {
         ci.cancel();
     }
 
-    /** 控制权开关与安全出口（F12 / ESC，键码与扫描码都认）。 */
-    static boolean isAlwaysAllowed(KeyEvent event) {
+    /**
+     * 控制权开关与安全出口（F12 / ESC，键码与扫描码都认）。
+     *
+     * <p>**必须 private static**：mixin 类里除了注入方法之外的 static 方法如果可见性不是 private，
+     * Mixin 会在加载时直接拒绝整个 mixin（实测报错：{@code contains non-private static method
+     * isAlwaysAllowed(...)}）—— 这次就是在真机启动时才炸的，`verifyMixin` 现在会模拟这条规则。
+     */
+    private static boolean isAlwaysAllowed(KeyEvent event) {
         int key = event.key();
         int scancode = event.keycode();
         return key == SDLKeycode.SDLK_F12
