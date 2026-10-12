@@ -46,6 +46,7 @@ public final class WalkCheck {
         autonomousDefaultChecks();
         inputOwnershipChecks();
         inputBlockingChecks();
+        mixinStaticInitChecks();
         gearReportChecks();
         perceptionTieringChecks();
         entityScanChecks();
@@ -71,12 +72,14 @@ public final class WalkCheck {
         String mod = read(Path.of("src", "main", "java", "com", "lcu", "lcumod", "LCUMod.java"));
         String server = read(Path.of("src", "main", "java", "com", "lcu", "lcumod", "network",
                 "WireServer.java"));
-        if (mod.isEmpty() || server.isEmpty()) {
+        String collector = read(Path.of("src", "main", "java", "com", "lcu", "lcumod", "state",
+                "StateCollector.java"));
+        if (mod.isEmpty() || server.isEmpty() || collector.isEmpty()) {
             check("wire-token: sources found", false);
             return;
         }
 
-        int armed = mod.indexOf("setRequiredToken(");
+        int armed = mod.indexOf("armWireToken();");
         int started = mod.indexOf("WIRE.start()");
         check("wire-token: startup arms the token from config",
                 armed > 0 && mod.contains("ModConfig.WIRE_TOKEN"));
@@ -86,6 +89,11 @@ public final class WalkCheck {
                 mod.contains("tokenArmed()") && mod.contains("Wire auth armed"));
         check("wire-token: an empty token is warned about, not silently accepted",
                 mod.contains("LOGGER.warn") && mod.contains("No wireToken set"));
+        check("wire-token: the config read is guarded (a not-yet-loaded config must not crash startup)",
+                mod.contains("catch (RuntimeException notReady)"));
+        check("wire-token: there is a later retry from our own tick, before any backend connection",
+                mod.contains("armWireTokenIfNeeded()") && collector.contains("armWireTokenIfNeeded()")
+                        && collector.contains("ClientTickEvent"));
         check("wire-token: the server really has an armed-state accessor",
                 server.contains("setRequiredToken(") && server.contains("tokenArmed()")
                         && server.contains("requiredToken.isBlank()"));
@@ -93,6 +101,67 @@ public final class WalkCheck {
                 server.contains("volatile boolean authed = requiredToken.isBlank()"));
     }
 
+
+    // ── 19. mixin 的静态初始化不许炸（真机启动崩溃回归） ────────────
+
+    /**
+     * 真机事故（2026-10-12 15:13，用户实例**启动即崩**）：
+     *
+     * <pre>
+     * java.lang.IllegalArgumentException: duplicate element: 41
+     *   at java.util.Set.of(Set.java:565)
+     *   at net.minecraft.client.KeyboardHandler.&lt;clinit&gt;(KeyboardHandler.java:777)
+     *     {neoforge:mixin[APP:lcumod.mixins.json:KeyboardHandlerMixin from mod lcumod]}
+     * </pre>
+     *
+     * <p>病根：mixin 里的 {@code static final Set<Integer> ALWAYS_ALLOWED = Set.of(…)}。{@code Set.of}
+     * 对**重复元素**是抛异常的，而 mixin 的静态初始化会被**合并进目标类的 {@code <clinit>}** ——
+     * 于是异常发生在 {@code KeyboardHandler.<clinit>}、时间点是 {@code Minecraft.<init>}，
+     * 表现就是"游戏打不开"。而重复是**必然**的：javap 实证
+     * {@code InputConstants.KEY_ESCAPE = SDLScancode.SDL_SCANCODE_ESCAPE = 41}、
+     * {@code InputConstants.KEY_F12 = SDLScancode.SDL_SCANCODE_F12 = 69}
+     * —— 所谓"三种编码都收"里有两组本来就是同一个值。
+     *
+     * <p>所以：① mixin 里不许出现 {@code Set.of}；② 常量集合一律走 {@link KeyShield#allowed}
+     * （去重，永不抛）；③ 重复值要能被 {@link KeyShield#duplicateCodes} 报出来。
+     */
+    private static void mixinStaticInitChecks() {
+        java.util.Set<Integer> deduped = KeyShield.allowed(41, 41, 69, 69, 27);
+        check("key-shield: duplicate key codes are deduped instead of throwing", deduped.size() == 3);
+        check("key-shield: the deduped set still has the real codes",
+                deduped.contains(41) && deduped.contains(69) && deduped.contains(27));
+        check("key-shield: the duplicate report names both real collisions",
+                KeyShield.duplicateCodes(41, 41, 69, 69, 27).equals(java.util.List.of(41, 69)));
+        check("key-shield: nothing duplicated reports nothing",
+                KeyShield.duplicateCodes(256, 41, 301, 69, 27).isEmpty());
+        check("key-shield: an empty set is allowed", KeyShield.allowed().isEmpty());
+        check("key-shield: null input is tolerated", KeyShield.allowed((int[]) null).isEmpty());
+
+        // 静态：mixin 里**不许**再出现 Set.of（那正是这次启动崩溃的写法）
+        Path dir = Path.of("src", "main", "java", "com", "lcu", "lcumod", "mixin");
+        java.util.List<Path> files = new java.util.ArrayList<>();
+        try (java.util.stream.Stream<Path> stream = Files.list(dir)) {
+            stream.filter(path -> path.toString().endsWith(".java")).forEach(files::add);
+        } catch (Exception e) {
+            check("mixin-static: mixin sources listed", false);
+            return;
+        }
+        check("mixin-static: mixin sources listed", !files.isEmpty());
+        boolean anySetOf = false;
+        boolean usesShield = false;
+        for (Path file : files) {
+            String text = read(file);
+            if (text.contains("Set.of(")) {
+                anySetOf = true;
+            }
+            if (text.contains("KeyShield.allowed(")) {
+                usesShield = true;
+            }
+        }
+        check("mixin-static: no mixin builds a set with Set.of (duplicates crash the target's <clinit>)",
+                !anySetOf);
+        check("mixin-static: the always-allowed keys go through KeyShield.allowed", usesShield);
+    }
 
     // ── 1/2. 视角所有权：导航 > 后端 look > 不写 ──────────────────
 

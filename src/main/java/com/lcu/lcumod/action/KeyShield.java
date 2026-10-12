@@ -1,6 +1,9 @@
 package com.lcu.lcumod.action;
 
+import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
+import java.util.TreeSet;
 
 /**
  * 键盘屏蔽的**策略**（零依赖，可被自检直接做行为断言）。
@@ -42,5 +45,42 @@ public final class KeyShield {
             return false;
         }
         return gameplayKeys.contains(key) || gameplayKeys.contains(keycode);
+    }
+
+    /**
+     * 把若干"永不拦"的键码折成一个集合 —— **绝不允许因为常量撞车而炸**。
+     *
+     * <p>真机事故（2026-10-12，用户实例启动即崩）：mixin 里写的是
+     * {@code static final Set<Integer> ALWAYS_ALLOWED = Set.of(InputConstants.KEY_ESCAPE,
+     * SDLScancode.SDL_SCANCODE_ESCAPE, SDLKeycode.SDLK_ESCAPE, …)}，六个常量里有两个**恰好等值**
+     * （崩溃报告：{@code IllegalArgumentException: duplicate element: 41}）。{@code Set.of} 对重复元素
+     * 是**抛异常**的，而 mixin 的静态初始化会**合并进目标类的 {@code <clinit>}**，于是异常出在
+     * {@code KeyboardHandler.<clinit>} ⇒ **游戏在 {@code Minecraft.<init>} 阶段直接打不开**。
+     *
+     * <p>所以这里**去重**而不是 {@code Set.of}：多一个同义编码最多是"少拦一个键"，
+     * 而抛异常是"玩家连世界都进不去"。重复值用 {@link #duplicateCodes(int...)} 报出来（自检断言）。
+     */
+    public static Set<Integer> allowed(int... codes) {
+        Set<Integer> unique = new HashSet<>();
+        if (codes != null) {
+            for (int code : codes) {
+                unique.add(code);
+            }
+        }
+        return Set.copyOf(unique);
+    }
+
+    /** 哪些编码重复了（升序、不重复；给自检与排障用）。 */
+    public static List<Integer> duplicateCodes(int... codes) {
+        Set<Integer> seen = new HashSet<>();
+        Set<Integer> dup = new TreeSet<>();
+        if (codes != null) {
+            for (int code : codes) {
+                if (!seen.add(code)) {
+                    dup.add(code);
+                }
+            }
+        }
+        return List.copyOf(dup);
     }
 }

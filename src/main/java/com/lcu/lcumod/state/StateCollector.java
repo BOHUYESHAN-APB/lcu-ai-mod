@@ -4,6 +4,7 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
+import com.lcu.lcumod.LCUMod;
 import com.lcu.lcumod.action.AttackRules;
 import com.lcu.lcumod.action.BlockFinder;
 import com.lcu.lcumod.action.GearReport;
@@ -211,6 +212,9 @@ public class StateCollector {
 
     @SubscribeEvent
     public static void onClientTick(ClientTickEvent.Post event) {
+        // 第一次 tick 时补一次 wire token 武装：此刻配置必然已加载（启动阶段那次读可能太早）。
+        // 放在这里是因为它是"早于任何后端连接、且不依赖去猜 FML 配置事件类名"的钩子。
+        LCUMod.armWireTokenIfNeeded();
         tickCounter++;
         boolean forceRefresh = refreshRequested;
         refreshRequested = false;

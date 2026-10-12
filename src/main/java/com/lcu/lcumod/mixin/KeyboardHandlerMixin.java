@@ -36,8 +36,12 @@ import java.util.Set;
 @Mixin(KeyboardHandler.class)
 public class KeyboardHandlerMixin {
 
-    /** 永不拦：安全出口（ESC）+ 控制开关（F12）。三种可能的编码都收，避免再因为单位判断错而锁人。 */
-    private static final Set<Integer> ALWAYS_ALLOWED = Set.of(
+    /** 永不拦：安全出口（ESC）+ 控制开关（F12）。三种可能的编码都收，避免再因为单位判断错而锁人。
+     *
+     * <p>**必须**走 {@link KeyShield#allowed}：这些常量里有两个等值（真机实测），
+     * {@code Set.of} 会抛 {@code duplicate element: 41}，而 mixin 的静态初始化是**合并进目标类
+     * `<clinit>`** 的 ⇒ 抛出即游戏启动崩溃。 */
+    private static final Set<Integer> ALWAYS_ALLOWED = KeyShield.allowed(
             InputConstants.KEY_ESCAPE,
             SDLScancode.SDL_SCANCODE_ESCAPE,
             SDLKeycode.SDLK_ESCAPE,

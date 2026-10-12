@@ -43,7 +43,7 @@ description of current architecture.
   `task_preset_registry`, `identity`, and `body_request_diagnostics.py`. The live memory module
   is `world_memory.py` — a different module from the dead `world_model.py`.
 - **Verification baseline (26.3):** 18 `verifyXxx` JavaExec self-check tasks wired into
-  `gradle check` (`build.gradle:205-369`; 1215 checks total), and a 1657-test backend suite.
+  `gradle check` (`build.gradle:205-369`; 1226 checks total), and a 1657-test backend suite.
 
 ## Ownership Boundary
 

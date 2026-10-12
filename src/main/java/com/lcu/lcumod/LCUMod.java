@@ -66,20 +66,56 @@ public class LCUMod {
         }
         LOGGER.info("[LCUMod] Initializing...");
         WIRE = new WireServer(ModConfig.WIRE_PORT.getAsInt(), ModConfig.WIRE_BIND_ADDRESS.get());
-        // 配置里的 wireToken 必须**真的武装上**：光有 WireAuth 和校验逻辑、却没人调用
-        // setRequiredToken，等于一个什么都不做的安全开关 —— 那比没有更糟（用户以为有鉴权）。
-        // 后端那侧从 `LCU_WIRE_TOKEN` 环境变量 / `.local/wire_token` 文件读同一个值，
-        // 首帧发 hello；两边不一致时连接会被关掉，所以这里如实把状态打出来。
-        String wireToken = ModConfig.WIRE_TOKEN.get();
-        WIRE.setRequiredToken(wireToken == null ? "" : wireToken.trim());
-        if (WIRE.tokenArmed()) {
-            LOGGER.info("[LCUMod] Wire auth armed ({} chars) — the backend must send a matching "
-                    + "hello first (LCU_WIRE_TOKEN or .local/wire_token).", wireToken.trim().length());
-        } else {
-            LOGGER.warn("[LCUMod] No wireToken set: port {} accepts any local process. "
-                    + "For auth, set wireToken here AND the same value for the backend.", ModConfig.WIRE_PORT.getAsInt());
-        }
+        // 先把 token 武装上再监听：**空 token = 不鉴权**（旧行为），非空则要求后端首帧 hello。
+        // 读配置值有前提（配置没加载完会抛），所以这里用**防御式**读法；真加载完时
+        // `ModConfigEvent.Loading/Reloading` 会再武装一次（见下两个方法）。
+        armWireToken();
         WIRE.start();
         LOGGER.info("[LCUMod] Ready. Wire server listening on port {}", ModConfig.WIRE_PORT.getAsInt());
     }
+
+    /**
+     * 把配置里的 {@code wireToken} 交给 wire server（**空 = 不鉴权**，即旧行为）。
+     *
+     * <p>读配置值有前提：配置没加载完时 {@code ConfigValue.get()} 会抛 —— 而在启动路径上抛异常
+     * 等于**游戏打不开**。所以这里挡异常、只记一行日志，等 {@link #armWireTokenIfNeeded()} 在
+     * 世界跑起来之后再补。
+     */
+    private static void armWireToken() {
+        if (WIRE == null) {
+            return;
+        }
+        String token;
+        try {
+            token = ModConfig.WIRE_TOKEN.get();
+        } catch (RuntimeException notReady) {
+            LOGGER.info("[LCUMod] wireToken not readable yet ({}); will arm on the first tick.",
+                    notReady.getClass().getSimpleName());
+            return;
+        }
+        WIRE.setRequiredToken(token == null ? "" : token.trim());
+        if (WIRE.tokenArmed()) {
+            LOGGER.info("[LCUMod] Wire auth armed ({} chars) — the backend must send a matching hello "
+                    + "first (LCU_WIRE_TOKEN or .local/wire_token).", token.trim().length());
+        } else {
+            LOGGER.warn("[LCUMod] No wireToken set: port {} accepts any local process. For auth, set "
+                    + "wireToken here AND the same value for the backend.", ModConfig.WIRE_PORT.getAsInt());
+        }
+    }
+
+    /**
+     * 第一次客户端 tick 时补一次（此时配置**必然**已加载）—— 只做一次，之后是空操作。
+     *
+     * <p>为什么挂在这里：我们自己的 {@code @SubscribeEvent} 桥里只有 tick 是"早于任何后端连接、
+     * 且配置一定已加载"的钩子；不去猜 FML 配置事件的类名（本仓库里没有任何先例可查）。
+     */
+    public static void armWireTokenIfNeeded() {
+        if (wireTokenChecked) {
+            return;
+        }
+        wireTokenChecked = true;
+        armWireToken();
+    }
+
+    private static volatile boolean wireTokenChecked = false;
 }
