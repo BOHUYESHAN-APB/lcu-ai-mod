@@ -2,8 +2,6 @@ package com.lcu.lcumod.client;
 
 import com.lcu.lcumod.LCUMod;
 import com.lcu.lcumod.action.ActionExecutor;
-import com.lcu.lcumod.action.InputIsolation;
-import com.lcu.lcumod.action.MovementSystem;
 import com.mojang.blaze3d.platform.InputConstants;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
@@ -51,21 +49,5 @@ public class AIKeyHandler {
             boolean newState = ActionExecutor.isAiControlled();
             LCUMod.LOGGER.info("[Key] AI control toggled: {}", newState);
         }
-    }
-
-    /**
-     * Called from mouse event handler to check if mouse should be captured.
-     * Returns true if the event should be cancelled (AI is controlling).
-     */
-    public static boolean shouldCaptureMouse() {
-        return InputIsolation.isAiControlled();
-    }
-
-    /**
-     * Called from keyboard event handler to check if key should be captured.
-     * Returns true if the event should be cancelled (AI is controlling).
-     */
-    public static boolean shouldCaptureKeyboard() {
-        return InputIsolation.isAiControlled();
     }
 }

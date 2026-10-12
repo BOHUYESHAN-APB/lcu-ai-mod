@@ -80,10 +80,45 @@ public final class MixinCheck {
             "InputIsolation exposes the isAiControlled guard used by the mixin");
         check(isolationBytes.contains("()Z"), "the isAiControlled guard returns boolean");
 
+        // (d) 键盘屏蔽：AI 控制中物理键盘不起作用，但必须留出控制开关与安全出口
+        String keyboardFileName = "/com/lcu/lcumod/mixin/KeyboardHandlerMixin.class";
+        String keyboardBytes = readResourceAsLatin1(keyboardFileName);
+        check(keyboardBytes != null, "KeyboardHandlerMixin.class is on the classpath");
+        check(keyboardBytes.contains("keyPress"), "KeyboardHandlerMixin injects into keyPress");
+        check(keyboardBytes.contains("isAiControlled"),
+            "KeyboardHandlerMixin is guarded by isAiControlled() (never unconditional)");
+        check(keyboardBytes.contains("lcuBlockKeysWhileAiPlays"),
+            "KeyboardHandlerMixin carries the blocking hook");
+        // 放行清单看**源码**：SDL 常量是编译期内联的，字节码里只剩数字，断言不到名字。
+        String keyboardSource = readSource("src/main/java/com/lcu/lcumod/mixin/KeyboardHandlerMixin.java");
+        check(keyboardSource != null, "KeyboardHandlerMixin.java is readable from the project dir");
+        check(keyboardSource != null && keyboardSource.contains("SDL_SCANCODE_F12"),
+            "KeyboardHandlerMixin keeps the F12 control switch working");
+        check(keyboardSource != null && keyboardSource.contains("SDL_SCANCODE_ESCAPE"),
+            "KeyboardHandlerMixin keeps ESC (menu / quit) as a safety exit");
+        check(keyboardSource != null && keyboardSource.contains("isAiControlled()"),
+            "the blocking path stays guarded by isAiControlled()");
+        check(keyboardSource != null && keyboardSource.contains("gui.screen() != null"),
+            "an open screen keeps its own keys (the AI steps aside)");
+
         System.out.println("[verifyMixin] MixinRegistration: " + (checks - failed) + " checks passed"
             + (failed == 0 ? "" : ", " + failed + " FAILED"));
         if (failed > 0) {
             System.exit(1);
+        }
+    }
+
+    /** 读项目目录下的源码文件（verifyMixin 的 CWD = 项目根）。 */
+    static String readSource(String relative) {
+        try {
+            java.nio.file.Path path = java.nio.file.Path.of(relative);
+            if (!path.toFile().isFile()) {
+                return null;
+            }
+            return new String(java.nio.file.Files.readAllBytes(path),
+                java.nio.charset.StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            return null;
         }
     }
 
