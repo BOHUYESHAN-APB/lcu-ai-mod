@@ -63,6 +63,7 @@ public final class WalkCheck {
         wireTokenArmedChecks();
         dropChannelChecks();
         stationHoldChecks();
+        attackInRangeChecks();
 
         System.out.println("[WalkCheck] " + passed + " checks passed, " + failed + " failed");
         if (failed > 0) {
@@ -812,7 +813,8 @@ public final class WalkCheck {
 
         check("combat: reflex logs phase changes only", cr.contains("logPhase(") && cr.contains("loggedPhase"));
         check("combat: reflex does not steal movement while navigating",
-                cr.contains("if (Pathfinder.isNavigating())"));
+                cr.contains("Pathfinder.isNavigating()")
+                        && cr.contains("|| !ActionExecutor.combatRepositionAllowed()"));
         check("combat: eating yields to combat", ae.contains("if (CombatReflex.isEngaged())"));
 
         // 纯逻辑：retarget 的限速就是 ReplanGate（同一 key 在窗口内只放行一次）。
@@ -2205,6 +2207,247 @@ public final class WalkCheck {
                 checkBody.contains("target instanceof Player"));
         check("attack/pure: check() delegates every verdict to decide()",
                 checkBody.contains("return decide(true,") && checkBody.contains("return decide(false,"));
+    }
+
+    // ── 22. 站桩攻击 attack_in_range（半径内持续出手；两 tick 瞄准/出手；不写位移键） ──
+
+    /**
+     * 用户诉求："让他站在刷怪塔底部，他能不能主动去攻击"。
+     *
+     * <p>钉住四件事：
+     * <ol>
+     *   <li><b>档位筛选矩阵</b>（{@link ActionExecutor.Pure#attackTierAllowed}）：默认只打敌对、
+     *       显式 {@code passive} 才连带猎物、NEUTRAL/DANGEROUS 一律拒绝（回 {@code protected_tier}），
+     *       村民/铁傀儡/监守者永远不出手；</li>
+     *   <li><b>两 tick 分离</b>（{@link ActionExecutor.Pure.AttackLoop}）：新目标/刚出手后的下一 tick
+     *       只 AIM、下一 tick 才 FIRE；两次出手间隔 ≥ 阈值；原版冷却未到绝不挥；</li>
+     *   <li><b>站位判据</b>（{@link ActionExecutor.Pure#combatRepositionAllowed}）：驻守且仍在半径内
+     *       时战斗反射的位移让路给 AFK；</li>
+     *   <li><b>静态扫描</b>：循环里真的不出位移键、过了 AttackRules 与档位表、收尾回执带
+     *       hits+reason+stopped、出口齐全（max_seconds / 无目标 / stop_all / 玩家接管 / 新任务）、
+     *       {@code attack} 的 {@code entity_id} 真锁定且不改变既有锥形行为。</li>
+     * </ol>
+     */
+    private static void attackInRangeChecks() {
+        Path root = Path.of("src", "main", "java", "com", "lcu", "lcumod", "action");
+        String ae = codeOnly(read(root.resolve("ActionExecutor.java")));
+        String reflex = read(root.resolve("CombatReflex.java"));
+        if (ae.isEmpty() || reflex.isEmpty()) {
+            check("air: sources found", false);
+            return;
+        }
+
+        // ── ① 档位筛选矩阵（用真实注册名走 MobPolicy 档位表，不编档位）──
+        check("air/tier: the default kind hits a zombie (HOSTILE)",
+                ActionExecutor.Pure.attackTierAllowed("hostile",
+                        MobPolicy.tier("minecraft:zombie").name()));
+        check("air/tier: the default kind never hits a cow (PASSIVE)",
+                !ActionExecutor.Pure.attackTierAllowed("hostile",
+                        MobPolicy.tier("minecraft:cow").name()));
+        check("air/tier: kind=passive may hunt a cow but still hits hostiles",
+                ActionExecutor.Pure.attackTierAllowed("passive", MobPolicy.tier("minecraft:cow").name())
+                        && ActionExecutor.Pure.attackTierAllowed("passive",
+                                MobPolicy.tier("minecraft:zombie").name()));
+        check("air/tier: no kind ever hits a villager (NEUTRAL)",
+                !ActionExecutor.Pure.attackTierAllowed("hostile",
+                        MobPolicy.tier("minecraft:villager").name())
+                        && !ActionExecutor.Pure.attackTierAllowed("passive",
+                                MobPolicy.tier("minecraft:villager").name())
+                        && !ActionExecutor.Pure.attackTierAllowed("any",
+                                MobPolicy.tier("minecraft:villager").name()));
+        check("air/tier: an iron golem is protected under every kind",
+                !ActionExecutor.Pure.attackTierAllowed("hostile",
+                        MobPolicy.tier("minecraft:iron_golem").name())
+                        && !ActionExecutor.Pure.attackTierAllowed("any",
+                                MobPolicy.tier("minecraft:iron_golem").name())
+                        && ActionExecutor.Pure.protectedTier(MobPolicy.tier("minecraft:iron_golem").name()));
+        check("air/tier: warden (DANGEROUS) is protected under every kind",
+                !ActionExecutor.Pure.attackTierAllowed("hostile", MobPolicy.tier("minecraft:warden").name())
+                        && !ActionExecutor.Pure.attackTierAllowed("passive",
+                                MobPolicy.tier("minecraft:warden").name())
+                        && !ActionExecutor.Pure.attackTierAllowed("any", MobPolicy.tier("minecraft:warden").name()));
+        check("air/tier: UNKNOWN is skipped by hostile/passive but allowed by any",
+                !ActionExecutor.Pure.attackTierAllowed("hostile", MobPolicy.Tier.UNKNOWN.name())
+                        && !ActionExecutor.Pure.attackTierAllowed("passive", MobPolicy.Tier.UNKNOWN.name())
+                        && ActionExecutor.Pure.attackTierAllowed("any", MobPolicy.Tier.UNKNOWN.name()));
+        check("air/tier: a blank/unknown kind behaves like the hostile default",
+                ActionExecutor.Pure.attackTierAllowed(null, MobPolicy.Tier.HOSTILE.name())
+                        && ActionExecutor.Pure.attackTierAllowed("", MobPolicy.Tier.HOSTILE.name())
+                        && ActionExecutor.Pure.attackTierAllowed("banana", MobPolicy.Tier.HOSTILE.name())
+                        && !ActionExecutor.Pure.attackTierAllowed("banana", MobPolicy.Tier.PASSIVE.name()));
+        check("air/tier: protectedTier names exactly NEUTRAL/DANGEROUS",
+                ActionExecutor.Pure.protectedTier(MobPolicy.Tier.NEUTRAL.name())
+                        && ActionExecutor.Pure.protectedTier(MobPolicy.Tier.DANGEROUS.name())
+                        && !ActionExecutor.Pure.protectedTier(MobPolicy.Tier.HOSTILE.name())
+                        && !ActionExecutor.Pure.protectedTier(MobPolicy.Tier.PASSIVE.name())
+                        && !ActionExecutor.Pure.protectedTier(MobPolicy.Tier.UNKNOWN.name()));
+        check("air/tier: the refusal code is the machine-readable protected_tier",
+                ActionExecutor.Pure.REASON_PROTECTED_TIER.equals("protected_tier"));
+        check("air/tier: the other four codes are the frozen ones",
+                ActionExecutor.Pure.REASON_NO_TARGET.equals("no_target")
+                        && ActionExecutor.Pure.REASON_TOO_FAR.equals("too_far")
+                        && ActionExecutor.Pure.REASON_NO_LINE_OF_SIGHT.equals("no_line_of_sight")
+                        && ActionExecutor.Pure.REASON_PLAYER_TOO_CLOSE.equals("player_too_close"));
+
+        // ── ② 两 tick 分离：N 只瞄准 / N+1 才出手（断言调用顺序）──
+        ActionExecutor.Pure.AttackLoop seq = new ActionExecutor.Pure.AttackLoop(10);
+        check("air/seq: the first tick locking a target only aims",
+                seq.step(true, 7, true, true) == ActionExecutor.Pure.AttackLoop.Step.AIM);
+        check("air/seq: the very next tick fires (order pinned: AIM then FIRE)",
+                seq.step(true, 7, true, true) == ActionExecutor.Pure.AttackLoop.Step.FIRE);
+        check("air/seq: a hit is counted on FIRE", seq.hits() == 1);
+        check("air/seq: the tick after a hit must aim again",
+                seq.step(true, 7, true, true) == ActionExecutor.Pure.AttackLoop.Step.AIM);
+        check("air/seq: switching target forces a fresh aim",
+                seq.step(true, 9, true, true) == ActionExecutor.Pure.AttackLoop.Step.AIM);
+        check("air/seq: no target yields IDLE",
+                seq.step(false, 0, true, true) == ActionExecutor.Pure.AttackLoop.Step.IDLE);
+
+        ActionExecutor.Pure.AttackLoop unaimed = new ActionExecutor.Pure.AttackLoop(1);
+        unaimed.step(true, 2, true, true); // tick 1: 新目标 ⇒ AIM
+        check("air/seq: not yet aimed keeps aiming, never fires",
+                unaimed.step(true, 2, false, true) == ActionExecutor.Pure.AttackLoop.Step.AIM
+                        && unaimed.step(true, 2, false, true) == ActionExecutor.Pure.AttackLoop.Step.AIM
+                        && unaimed.hits() == 0);
+        check("air/seq: once aimed and ready it fires",
+                unaimed.step(true, 2, true, true) == ActionExecutor.Pure.AttackLoop.Step.FIRE);
+
+        // ── ③ 冷却：两次出手间隔 ≥ 阈值；原版冷却未到不挥 ──
+        ActionExecutor.Pure.AttackLoop cadence = new ActionExecutor.Pure.AttackLoop(10);
+        int lastFireTick = -1;
+        int fires = 0;
+        boolean gapOk = true;
+        for (int t = 1; t <= 100; t++) {
+            if (cadence.step(true, 3, true, true) == ActionExecutor.Pure.AttackLoop.Step.FIRE) {
+                fires++;
+                if (lastFireTick >= 0 && t - lastFireTick < 10) {
+                    gapOk = false;
+                }
+                lastFireTick = t;
+            }
+        }
+        check("air/cool: two fires are at least the min interval apart", gapOk);
+        check("air/cool: the loop really keeps firing while a target stands there", fires >= 5);
+        check("air/cool: hits equal the number of fires", cadence.hits() == fires);
+
+        ActionExecutor.Pure.AttackLoop cold = new ActionExecutor.Pure.AttackLoop(1);
+        cold.step(true, 4, true, false);
+        check("air/cool: a not-ready vanilla cooldown never fires",
+                cold.step(true, 4, true, false) == ActionExecutor.Pure.AttackLoop.Step.AIM
+                        && cold.hits() == 0);
+        check("air/cool: the pure interval constant is 0.5s (10 ticks)",
+                ActionExecutor.Pure.ATTACK_IN_RANGE_MIN_INTERVAL_TICKS == 10);
+
+        // ── ④ 退出 + 回执：原因码记账 / max_seconds 到点 ──
+        ActionExecutor.Pure.AttackLoop report = new ActionExecutor.Pure.AttackLoop(10);
+        check("air/report: an idle loop reports no_target",
+                report.lastReason().equals(ActionExecutor.Pure.REASON_NO_TARGET));
+        report.markReason("protected_tier");
+        check("air/report: the last refusal code is remembered",
+                report.lastReason().equals("protected_tier"));
+        report.step(true, 5, true, true);
+        report.step(true, 5, true, true);
+        check("air/report: a successful hit clears the stale refusal",
+                report.lastReason().isEmpty() && report.hits() == 1);
+
+        ActionExecutor.Pure.AttackLoop expiry = new ActionExecutor.Pure.AttackLoop(10);
+        for (int t = 0; t < 5; t++) {
+            expiry.step(false, 0, false, false);
+        }
+        check("air/exit: expired(N) is false before N ticks", !expiry.expired(6) && expiry.ticks() == 5);
+        expiry.step(false, 0, false, false);
+        check("air/exit: expired(N) is true at exactly N ticks", expiry.expired(6));
+
+        // ── ⑤ 站位判据（C 方案）：驻守且半径内 ⇒ 反射位移让路 ──
+        check("air/station: with no station the reflex may move (survival kept)",
+                ActionExecutor.Pure.combatRepositionAllowed(false, 0.0, 1.0));
+        check("air/station: inside the radius the reflex yields movement to AFK",
+                !ActionExecutor.Pure.combatRepositionAllowed(true, 0.5, 1.0)
+                        && !ActionExecutor.Pure.combatRepositionAllowed(true, 1.0, 1.0));
+        check("air/station: only past the radius may the reflex move again",
+                ActionExecutor.Pure.combatRepositionAllowed(true, 1.0001, 1.0));
+        check("air/station: CombatReflex really consults the station gate",
+                reflex.contains("ActionExecutor.combatRepositionAllowed()"));
+        check("air/station: the navigating guard is still there too",
+                reflex.contains("Pathfinder.isNavigating() ||"));
+
+        // ── ⑥ 静态扫描：循环不写位移键、过 AttackRules/档位表、出口与回执齐全 ──
+        String loopBody = methodBody(ae, "private void tickAttackInRange(Minecraft mc)");
+        String startBody = methodBody(ae, "private void handleAttackInRange(WireServer.WireCommand cmd)");
+        String finishBody = methodBody(ae, "private void finishAttackInRange(String status, String cause)");
+        String stopBody = methodBody(ae, "public static void requestAttackInRangeStop(String cause)");
+        String attackBody = methodBody(ae, "private void handleAttack(WireServer.WireCommand cmd)");
+        check("air/scan: dispatch routes attack_in_range",
+                ae.contains("case \"attack_in_range\" -> handleAttackInRange(cmd);"));
+        check("air/scan: the loop body exists", !loopBody.isEmpty());
+        check("air/scan: the loop really attacks", loopBody.contains("gameMode.attack("));
+        check("air/scan: every hit is gated behind AttackRules",
+                loopBody.contains("AttackRules.check("));
+        check("air/scan: target screening uses the tier table",
+                loopBody.contains("Pure.attackTierAllowed(") && loopBody.contains("Pure.protectedTier("));
+        check("air/scan: the loop drives the pure two-tick machine",
+                loopBody.contains("AttackLoop.Step") && loopBody.contains("attackInRangeLoop.step("));
+        check("air/scan: vanilla attack cooldown is respected",
+                loopBody.contains("getAttackStrengthScale("));
+        check("air/scan: the loop never writes any movement key",
+                !loopBody.contains("setControlState(") && !loopBody.contains("setAiControlState(")
+                        && !loopBody.contains("MovementSystem.") && !loopBody.contains("jumpFromGround")
+                        && !loopBody.contains("setShiftKeyDown"));
+        check("air/scan: the loop never re-navigates the body",
+                !loopBody.contains("navigateTo(") && !loopBody.contains("retarget("));
+        check("air/scan: players are never candidates",
+                loopBody.contains("instanceof Player"));
+        check("air/scan: no legal target stops the loop with no_target/protected_tier",
+                loopBody.contains("finishAttackInRange(")
+                        && loopBody.contains("REASON_NO_TARGET") && loopBody.contains("REASON_PROTECTED_TIER"));
+        check("air/scan: the max_seconds deadline stops the loop",
+                loopBody.contains("expired(attackInRangeMaxTicks)"));
+        check("air/scan: the start handler uses the documented defaults",
+                startBody.contains("ATTACK_IN_RANGE_DEFAULT_RADIUS")
+                        && startBody.contains("ATTACK_IN_RANGE_DEFAULT_SECONDS")
+                        && startBody.contains("\"hostile\""));
+        check("air/scan: the start handler clamps radius and seconds",
+                startBody.contains("ATTACK_IN_RANGE_MIN_RADIUS")
+                        && startBody.contains("ATTACK_IN_RANGE_MAX_RADIUS")
+                        && startBody.contains("ATTACK_IN_RANGE_MAX_SECONDS"));
+        check("air/scan: an unrecognized kind is refused honestly",
+                startBody.contains("Unknown kind"));
+        check("air/scan: the receipt carries hits + reason + stopped",
+                finishBody.contains("hits") && finishBody.contains("reason") && finishBody.contains("stopped")
+                        && ae.contains("sendEvent(\"attack_in_range_result\""));
+        check("air/scan: the static stop defers to the instance tick",
+                stopBody.contains("attackInRangePendingStop = cause"));
+        check("air/scan: stop_all stops the station attack",
+                ae.contains("requestAttackInRangeStop(\"stop_all\")"));
+        check("air/scan: player takeover stops the station attack",
+                ae.contains("requestAttackInRangeStop(\"player_takeover\")"));
+        check("air/scan: a new task stops the station attack",
+                ae.contains("requestAttackInRangeStop(\"new_task\")"));
+
+        // ── ⑦ attack 的 entity_id 真锁定（且不带 id 时既有锥形不变）──
+        check("air/lock: attack/attack_entity accept an optional entity_id",
+                attackBody.contains("entity_id"));
+        check("air/lock: entity_id resolves the entity by id",
+                attackBody.contains("getEntity("));
+        check("air/lock: entity_id aims before swinging", attackBody.contains("aimAt("));
+        check("air/lock: without entity_id the cone search is unchanged",
+                attackBody.contains("findTargetEntity(mc, 6.0)"));
+        check("air/lock: both routes still gate on AttackRules",
+                attackBody.contains("AttackRules.check("));
+        check("air/scan: the pure half declares no game classes",
+                pureHalfHasNoMinecraft());
+    }
+
+    /**
+     * {@code ActionExecutor.Pure} 里 {@code dropCountFor} 之后的**新纯逻辑**（档位筛选 / 两 tick
+     * 状态机 / 站位判据）不许碰任何 Minecraft 类型 —— 截取区间到 Pure 类结束后的第一个成员。
+     */
+    private static boolean pureHalfHasNoMinecraft() {
+        String src = read(Path.of("src", "main", "java", "com", "lcu", "lcumod", "action",
+                "ActionExecutor.java"));
+        int start = src.indexOf("public static int dropCountFor(");
+        int end = src.indexOf("private static String throwInventorySlot(");
+        return start >= 0 && end > start && !src.substring(start, end).contains("net.minecraft");
     }
 
     /** 去掉 {@code //} 行注释与块注释：静态扫描只看代码。 */

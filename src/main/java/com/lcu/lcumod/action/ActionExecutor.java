@@ -152,6 +152,27 @@ public class ActionExecutor {
     private static int guardRadius = 32;
     private static int guardCheckCooldown = 0;
 
+    // ── attack_in_range：站桩持续攻击（半径内筛选 → 两 tick 瞄准/出手）──
+    /** 合法的 kind 值（协议固定这三个；缺省 = hostile）。 */
+    private static final Set<String> ATTACK_IN_RANGE_KINDS = Set.of("hostile", "passive", "any");
+    /** 默认扫描半径（格）—— 评估口径默认 8。 */
+    private static final double ATTACK_IN_RANGE_DEFAULT_RADIUS = 8.0;
+    private static final double ATTACK_IN_RANGE_MIN_RADIUS = 1.0;
+    private static final double ATTACK_IN_RANGE_MAX_RADIUS = 32.0;
+    /** 默认最长站桩时长（秒）：**保守值**，到点如实收尾，不无限站。 */
+    private static final double ATTACK_IN_RANGE_DEFAULT_SECONDS = 30.0;
+    private static final double ATTACK_IN_RANGE_MAX_SECONDS = 300.0;
+    /** "对准了"的容差（与 {@link CombatReflex} 同口径）：两 tick 分离后第 N+1 tick 才出手。 */
+    private static final double ATTACK_IN_RANGE_AIM_YAW_TOLERANCE = 15.0;
+    private static final double ATTACK_IN_RANGE_AIM_PITCH_TOLERANCE = 20.0;
+    /** 进行中的站桩攻击循环（null = 没在站桩攻击）；纯逻辑状态机见 {@link Pure.AttackLoop}。 */
+    private static Pure.AttackLoop attackInRangeLoop = null;
+    private static String attackInRangeKind = "hostile";
+    private static double attackInRangeRadius = ATTACK_IN_RANGE_DEFAULT_RADIUS;
+    private static int attackInRangeMaxTicks = 0;
+    /** 静态入口（AI 关闭 / stop_all / 新任务）只置标志，收尾统一在实例 tick 里做（能写 task_state）。 */
+    private static String attackInRangePendingStop = null;
+
     // ── 站点驻守（go_afk / afk_stop）：到站点后在半径内"钉住"，被撞出去自己走回 ──
     private static final AfkController AFK = new AfkController();
 
@@ -341,6 +362,10 @@ public class ActionExecutor {
         // 否则控制流的视角会覆盖掉"转过去打它"，表现为"不会防御"。
         CombatReflex.tick(mc);
 
+        // ── 站桩持续攻击：放在战斗反射之后 → 站桩任务期间它是朝向的最后写入者（先转身、下一 tick 出手）。
+        // 它**只写朝向 + 出手**，绝不碰位移键（站位由 AFK/站点驻守独占）。
+        tickAttackInRange(mc);
+
         // ── P0 swim reflex: 头在水下按住跳跃上浮 ──
         // 用户实机反馈"它不会游泳，在水里面它会死"。溺水是秒级致死，同样不能让 LLM 参与。
         // 只写 jump 键，不碰 WASD/朝向，因此不会跟寻路/控制流抢横向控制。
@@ -428,6 +453,7 @@ public class ActionExecutor {
             // 玩家接管：驻守与重放立刻让路（"嘴里说停、身体还在走"是明确禁止的）
             afkStopQuiet("ai_off");
             routeStopQuiet("ai_off");
+            requestAttackInRangeStop("player_takeover");
         } else {
             InputIsolation.clearUserControls();
         }
@@ -503,6 +529,8 @@ public class ActionExecutor {
                 if (!"route_follow".equals(cmd.cmd())) {
                     routeStopQuiet("new_task");
                 }
+                // 站桩攻击是"占住出手权"的任务：来了别的新活就让路（它自己再来时会重启循环）。
+                requestAttackInRangeStop("new_task");
             }
             switch (cmd.cmd()) {
                 case "move_to" -> handleMoveTo(cmd);
@@ -571,6 +599,9 @@ public class ActionExecutor {
                 }
                 // Aliases
                 case "attack_entity" -> handleAttack(cmd);
+                // 站桩持续攻击（用户："让他站在刷怪塔底部，他能不能主动去攻击"）：tick 驱动循环，
+                // 半径内按档位筛选 → 两 tick 瞄准/出手，**绝不写位移键**（站位交给 AFK/站点驻守）。
+                case "attack_in_range" -> handleAttackInRange(cmd);
                 case "interact_block", "interact" -> handleInteract(cmd);
                 case "mine_block", "dig_block" -> handleMine(cmd);
                 case "place_block" -> handlePlace(cmd);
@@ -783,6 +814,16 @@ public class ActionExecutor {
         }
     }
 
+    /**
+     * 出手一次（{@code attack} / {@code attack_entity} 共用）。
+     *
+     * <p>目标选择：给了可选参数 {@code entity_id} ⇒ **真锁定**那个实体并按 id 瞄准（不再走 31° 锥，
+     * {@code attack_entity} 的 {@code entity_id} 以前被忽略，这里一并修好）；没给 ⇒ 保持既有行为
+     * （{@link #findTargetEntity} 的视线锥挑最近的活体，**一行都没变**）。
+     *
+     * <p>无论哪条路，真的挥出去之前都必须过 {@link AttackRules#check}（视线 / 够得着 / 不误伤旁边
+     * 玩家 / 禁用武器；**目标是玩家直接拒**），被拒就给机器可读原因码，绝不假装打过了。
+     */
     private void handleAttack(WireServer.WireCommand cmd) {
         var mc = Minecraft.getInstance();
         if (mc.player == null || mc.gameMode == null) {
@@ -790,8 +831,27 @@ public class ActionExecutor {
             return;
         }
 
-        // Find nearest living entity in crosshair direction
-        Entity target = findTargetEntity(mc, 6.0);
+        JsonObject args = cmd.args();
+        Entity target;
+        if (args != null && args.has("entity_id")) {
+            // 真锁定：按实体 id 精确找到它，并**瞄准**（写朝向 + 立刻同步一次旋转包，
+            // 服务端按新朝向裁决这次挥击）——不再走锥形挑选。
+            int wanted = args.get("entity_id").getAsInt();
+            if (mc.level == null) {
+                sendResponse(cmd.id(), false, "No level");
+                return;
+            }
+            target = mc.level.getEntity(wanted);
+            if (target == null) {
+                sendResponse(cmd.id(), false, "Entity " + wanted + " not found");
+                return;
+            }
+            ContainerController.aimAt(mc, target.getBoundingBox().getCenter());
+        } else {
+            // 既有行为（不带 entity_id 时一行都不变）：按视线锥挑最近的活体。
+            target = findTargetEntity(mc, 6.0);
+        }
+
         if (target != null) {
             // 区域硬保护：被保护区域里的动物不许打（喂食/剪毛等交互不在此列）
             ZoneGuard.Block zoneBlock = ZoneGuard.block(target.getX(), target.getY(), target.getZ(),
@@ -815,6 +875,233 @@ public class ActionExecutor {
             mc.player.swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, true);
             sendResponse(cmd.id(), false, "No target found");
         }
+    }
+
+    /**
+     * 站桩持续攻击的**开始**（用户："让他站在刷怪塔的底部，他能不能主动去攻击"）。
+     *
+     * <p>这是一条**长驻任务**（不是一次挥击）：开局立刻回执，之后由 {@link #tickAttackInRange} 每 tick
+     * 推进；到点 / 没合法目标 / 新任务 / {@code stop_all} / 玩家接管都会停下并**如实回执**命中次数与
+     * 最后的原因码，绝不静默、也不假装还在打。
+     *
+     * <p>参数（协议固定）：{@code radius}（默认 8，钳 1..32）、{@code kind}
+     * （{@code hostile|passive|any}，默认 {@code hostile}）、{@code max_seconds}（默认
+     * {@value #ATTACK_IN_RANGE_DEFAULT_SECONDS}，钳 1..{@value #ATTACK_IN_RANGE_MAX_SECONDS}）。
+     * 目标筛选一律走 {@link MobPolicy} 档位表（默认只打 HOSTILE；{@code passive} 才连带猎物；
+     * NEUTRAL/DANGEROUS **一律拒绝**，回 {@code protected_tier}）——与模型、与本地反射同一张表。
+     */
+    private void handleAttackInRange(WireServer.WireCommand cmd) {
+        var mc = Minecraft.getInstance();
+        if (mc.player == null || mc.level == null || mc.gameMode == null) {
+            sendResponse(cmd.id(), false, "No player/level");
+            return;
+        }
+        JsonObject args = cmd.args();
+        double radius = args != null && args.has("radius") ? args.get("radius").getAsDouble()
+                : ATTACK_IN_RANGE_DEFAULT_RADIUS;
+        radius = Math.max(ATTACK_IN_RANGE_MIN_RADIUS, Math.min(ATTACK_IN_RANGE_MAX_RADIUS, radius));
+        String kind = args != null && args.has("kind")
+                ? args.get("kind").getAsString().trim().toLowerCase() : "hostile";
+        if (!ATTACK_IN_RANGE_KINDS.contains(kind)) {
+            // 认不出的 kind 如实拒（别偷偷当成 hostile）——口径固定就是这三个。
+            sendResponse(cmd.id(), false, "Unknown kind: " + kind + " (use hostile|passive|any)");
+            return;
+        }
+        double seconds = args != null && args.has("max_seconds") ? args.get("max_seconds").getAsDouble()
+                : ATTACK_IN_RANGE_DEFAULT_SECONDS;
+        seconds = Math.max(1.0, Math.min(ATTACK_IN_RANGE_MAX_SECONDS, seconds));
+
+        // 站桩攻击只管"出手"，不接管身体：跟随目标会把它带离站位，先清掉；**不动** AFK/路线。
+        followTargetName = null;
+        attackInRangeKind = kind;
+        attackInRangeRadius = radius;
+        attackInRangeMaxTicks = (int) Math.round(seconds * 20.0);
+        attackInRangePendingStop = null;
+        attackInRangeLoop = new Pure.AttackLoop(Pure.ATTACK_IN_RANGE_MIN_INTERVAL_TICKS);
+        setTaskState("attack_in_range", "running", "r=" + round1(radius),
+                "watching " + kind + " within " + round1(radius) + "m for " + (int) seconds + "s", 0.1);
+        StateCollector.requestRefresh();
+
+        JsonObject data = new JsonObject();
+        data.addProperty("radius", radius);
+        data.addProperty("kind", kind);
+        data.addProperty("max_seconds", seconds);
+        sendResponse(cmd.id(), true, data);
+    }
+
+    /**
+     * 站桩攻击的每 tick 推进（唯一出口是 {@link #finishAttackInRange}）。
+     *
+     * <p>两 tick 分离：本 tick 只把朝向写到目标（{@link ContainerController#aimAt} 还立刻同步一次旋转包），
+     * 出手判定里的 {@code aimed} 读的是**上一 tick 写下的**朝向 ⇒ 第 N tick 只瞄准、第 N+1 tick 才出手，
+     * 绝不会"朝着旧朝向挥空"。遵原版攻击冷却（{@code getAttackStrengthScale}）**加**一个
+     * ≥ {@link Pure#ATTACK_IN_RANGE_MIN_INTERVAL_TICKS} tick 的间隔，不刷攻速。
+     *
+     * <p>**绝不写任何位移键**（前进/后退/左右/跳/潜行都不碰）：站位由 AFK/站点驻守独占，
+     * 这里只写朝向 + 出手。
+     */
+    private void tickAttackInRange(Minecraft mc) {
+        if (attackInRangeLoop == null) {
+            return;
+        }
+        // 静态入口（AI 关闭 / stop_all / 新任务）只置了标志：在这里统一收尾（能写 task_state）。
+        if (attackInRangePendingStop != null) {
+            String cause = attackInRangePendingStop;
+            attackInRangePendingStop = null;
+            finishAttackInRange("cancelled", cause);
+            return;
+        }
+        if (!InputIsolation.isAiControlled()) {
+            finishAttackInRange("cancelled", "player_takeover");
+            return;
+        }
+        if (mc.player == null || mc.level == null || mc.gameMode == null) {
+            finishAttackInRange("cancelled", "no_player");
+            return;
+        }
+        if (attackInRangeLoop.expired(attackInRangeMaxTicks)) {
+            finishAttackInRange("done", "max_seconds");
+            return;
+        }
+
+        // 目标筛选：半径内、活着、同世界、非玩家，且过档位表；玩家**永不**作为目标（用户口径）。
+        Entity target = null;
+        double best = Double.MAX_VALUE;
+        boolean sawProtected = false;
+        AABB box = mc.player.getBoundingBox().inflate(attackInRangeRadius);
+        for (Entity entity : mc.level.getEntities(mc.player, box)) {
+            if (!entity.isAlive() || entity.level() != mc.player.level() || entity instanceof Player) {
+                continue;
+            }
+            double distance = mc.player.distanceTo(entity);
+            if (distance > attackInRangeRadius || distance >= best) {
+                continue;
+            }
+            MobPolicy.Tier tier = MobPolicy.tier(AttackRules.entityTypeId(entity));
+            if (Pure.protectedTier(tier.name())) {
+                sawProtected = true;   // 中立 / 高危险：**一律不出手**，如实记 protected_tier
+                continue;
+            }
+            if (!Pure.attackTierAllowed(attackInRangeKind, tier.name())) {
+                continue;
+            }
+            target = entity;
+            best = distance;
+        }
+
+        if (target == null) {
+            String reason = sawProtected ? Pure.REASON_PROTECTED_TIER : Pure.REASON_NO_TARGET;
+            attackInRangeLoop.markReason(reason);
+            attackInRangeLoop.step(false, 0, false, false);
+            finishAttackInRange("done", reason);
+            return;
+        }
+
+        // 第 N tick：只瞄准。朝向写向目标身体中心，并立刻同步旋转包（服务端按新朝向裁决）。
+        float[] aim = attackAimAngles(mc.player, target);
+        boolean aimed = Math.abs(angleDiff(aim[0], mc.player.getYRot()))
+                <= ATTACK_IN_RANGE_AIM_YAW_TOLERANCE
+                && Math.abs(aim[1] - mc.player.getXRot()) <= ATTACK_IN_RANGE_AIM_PITCH_TOLERANCE;
+        ContainerController.aimAt(mc, target.getBoundingBox().getCenter());
+
+        // 出手前的统一安全检查（四道门 + 目标为玩家直接拒）：被拒就**不挥**，如实记原因码。
+        AttackRules.Verdict verdict = AttackRules.check(mc, target);
+        if (verdict != AttackRules.Verdict.OK) {
+            attackInRangeLoop.markReason(verdict.code());
+        }
+        boolean cooldownReady = verdict == AttackRules.Verdict.OK
+                && mc.player.getAttackStrengthScale(0.5f) >= 1.0f;
+
+        Pure.AttackLoop.Step step = attackInRangeLoop.step(true, target.getId(), aimed, cooldownReady);
+        if (step == Pure.AttackLoop.Step.FIRE) {
+            mc.gameMode.attack(mc.player, target);
+            mc.player.swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, true);
+        }
+    }
+
+    /**
+     * 站桩攻击收尾：把**命中次数 + 最后的原因码**如实写进 task_state 与事件，绝不静默。
+     *
+     * @param status {@code done}（跑完/无目标）或 {@code cancelled}（新任务 / stop_all / 玩家接管）
+     * @param cause  退出原因（机器可读：{@code max_seconds} / {@code no_target} / {@code protected_tier}
+     *               / {@code new_task} / {@code stop_all} / {@code player_takeover} …）
+     */
+    private void finishAttackInRange(String status, String cause) {
+        Pure.AttackLoop loop = attackInRangeLoop;
+        attackInRangeLoop = null;
+        attackInRangePendingStop = null;
+        if (loop == null) {
+            return;
+        }
+        int hits = loop.hits();
+        String reason = loop.lastReason();
+        setTaskState("attack_in_range", status, "r=" + round1(attackInRangeRadius),
+                "stopped=" + cause + " hits=" + hits + " reason=" + reason,
+                "done".equals(status) ? 1.0 : 0.0);
+        if (LCUMod.WIRE != null) {
+            JsonObject data = new JsonObject();
+            data.addProperty("hits", hits);
+            data.addProperty("reason", reason);
+            data.addProperty("stopped", cause);
+            data.addProperty("radius", attackInRangeRadius);
+            data.addProperty("kind", attackInRangeKind);
+            LCUMod.WIRE.sendEvent("attack_in_range_result", data);
+        }
+        LCUMod.LOGGER.info("[Attack] attack_in_range 结束（{}）：stopped={} hits={} reason={}",
+                status, cause, hits, reason);
+        StateCollector.requestRefresh();
+    }
+
+    /**
+     * 请求停下站桩攻击（静态入口：AI 关闭 / {@code stop_all} / 新任务）。
+     *
+     * <p>只置标志——收尾要写 task_state，是实例方法；下一个 {@link #tickAttackInRange} 统一做。
+     */
+    public static void requestAttackInRangeStop(String cause) {
+        if (attackInRangeLoop != null) {
+            attackInRangePendingStop = cause;
+        }
+    }
+
+    /** 期望朝向（[yaw, pitch]）——与 {@link ContainerController#aimAt} 同一套算法、同一个瞄准点（身体中心）。 */
+    private static float[] attackAimAngles(Player player, Entity target) {
+        Vec3 aim = target.getBoundingBox().getCenter();
+        double dx = aim.x - player.getX();
+        double dy = aim.y - player.getEyeY();
+        double dz = aim.z - player.getZ();
+        double dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (dist < 1.0E-4) {
+            return new float[]{player.getYRot(), player.getXRot()};
+        }
+        float yaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
+        float pitch = (float) Math.toDegrees(-Math.asin(dy / dist));
+        return new float[]{yaw, pitch};
+    }
+
+    /** 角度差（考虑 360 环绕）。 */
+    private static double angleDiff(float a, float b) {
+        double diff = (a - b) % 360.0;
+        if (diff > 180.0) {
+            diff -= 360.0;
+        }
+        if (diff < -180.0) {
+            diff += 360.0;
+        }
+        return diff;
+    }
+
+    /**
+     * 站位驻守期间，战斗反射的**位移**是否让路（用户："站在刷怪塔底部"时反射不该把它挪出站点）。
+     *
+     * <p>判据（{@link Pure#combatRepositionAllowed}）：没驻守 ⇒ 反射照旧贴上去/后撤（保命不变）；
+     * 驻守且还在站点半径内 ⇒ **让路给 AFK**（反射只转身 + 出手，绝不写前进/后退键）；
+     * 已经漂出半径 ⇒ 允许反射动（AFK 同时在回位，且寻路守卫对位移另有一票）。
+     */
+    public static boolean combatRepositionAllowed() {
+        if (!AFK.isActive() || AFK.station() == null) {
+            return true;
+        }
+        return Pure.combatRepositionAllowed(true, AFK.drift(), AFK.station().radius());
     }
 
     /** 区域硬拦的统一回执：{@code {blocked_by_zone, rule, action}}（后端据此告诉 LLM"这里是农场"）。 */
@@ -1552,6 +1839,7 @@ public class ActionExecutor {
         abortPendingPlace();
         // 驻守 / 重放 / 记录：stop_all 一视同仁全部停下（记录直接丢弃，不留下半条线）
         AFK.stop();
+        requestAttackInRangeStop("stop_all");
         ROUTE.reset();
         resetRouteStall();
         routeRecorder = null;
@@ -3896,6 +4184,139 @@ public class ActionExecutor {
                 return 0;
             }
             return Math.max(1, Math.min(requested, available));
+        }
+
+        // ── attack_in_range（站桩持续攻击）的纯逻辑：档位筛选 + 两 tick 状态机 + 站位判据 ──
+
+        /** 站桩两次出手之间的最小间隔（tick）：0.5s，与"不许连挥"口径一致。 */
+        public static final int ATTACK_IN_RANGE_MIN_INTERVAL_TICKS = 10;
+
+        /** 站桩拒绝原因码（后端照这个分支；与 {@link AttackRules.Verdict#code()} 同名字面量）。 */
+        public static final String REASON_NO_TARGET = "no_target";
+        public static final String REASON_TOO_FAR = "too_far";
+        public static final String REASON_NO_LINE_OF_SIGHT = "no_line_of_sight";
+        public static final String REASON_PLAYER_TOO_CLOSE = "player_too_close";
+        /** 中立 / 高危险档位：**一律拒绝**（{@link MobPolicy} 的口径）。 */
+        public static final String REASON_PROTECTED_TIER = "protected_tier";
+
+        /**
+         * kind × 档位 → 允不允许作为站桩目标。
+         *
+         * <p>固定口径：默认（{@code hostile} / 缺省 / 认不出的 kind）**只打敌对**；显式
+         * {@code passive} 才允许打被动（顺带仍打敌对）；{@code any} 则不按档位再筛。
+         * **NEUTRAL / DANGEROUS 无论 kind 是什么都不打**（村民/铁傀儡/监守者永远不出手）。
+         */
+        public static boolean attackTierAllowed(String kind, String tierName) {
+            MobPolicy.Tier tier = MobPolicy.Tier.named(tierName);
+            if (tier == MobPolicy.Tier.NEUTRAL || tier == MobPolicy.Tier.DANGEROUS) {
+                return false;
+            }
+            String k = kind == null ? "" : kind.trim().toLowerCase();
+            return switch (k) {
+                case "passive" -> tier == MobPolicy.Tier.HOSTILE || tier == MobPolicy.Tier.PASSIVE;
+                case "any" -> true;                        // 除受保护档位外都算候选
+                default -> tier == MobPolicy.Tier.HOSTILE;  // hostile / 缺省 / 认不出
+            };
+        }
+
+        /** 该档位是不是"绝不作为站桩目标"的（中立 / 高危险）——被它挡下时 reason = protected_tier。 */
+        public static boolean protectedTier(String tierName) {
+            MobPolicy.Tier tier = MobPolicy.Tier.named(tierName);
+            return tier == MobPolicy.Tier.NEUTRAL || tier == MobPolicy.Tier.DANGEROUS;
+        }
+
+        /**
+         * 站位驻守期间，战斗反射的**位移**该不该让路（钉住"不破坏站位"）。
+         *
+         * <p>没驻守 ⇒ 随便动（保命不变）；驻守且还在站点半径内 ⇒ 让路给 AFK（反射只转身/出手，
+         * **不写前进后退键**）；已经漂出半径 ⇒ 允许动（AFK 同时在回位，且寻路守卫另有一票）。
+         */
+        public static boolean combatRepositionAllowed(boolean stationed, double drift, double radius) {
+            return !stationed || drift > radius;
+        }
+
+        /**
+         * 站桩出手的**两 tick 状态机**（纯逻辑，可直接断言调用顺序）。
+         *
+         * <p>规则：新目标第一次出现、或刚出手之后的下一 tick ⇒ 只回 {@link Step#AIM}；同一目标、
+         * 已对准、冷却到了才回 {@link Step#FIRE}。再加上 {@code minIntervalTicks} 的出手间隔，
+         * 于是连续出手形如 {@code AIM, FIRE, AIM, FIRE, …}，两次出手间隔 ≥ 该阈值。当帧命中数与
+         * 最后原因码都由它记账（收尾时如实回执）。
+         */
+        public static final class AttackLoop {
+            /** 这一 tick 该做什么：{@code IDLE} 没目标 / {@code AIM} 只瞄准 / {@code FIRE} 出手。 */
+            public enum Step { IDLE, AIM, FIRE }
+
+            private final int minIntervalTicks;
+            private int lastTargetId = Integer.MIN_VALUE;
+            private boolean mustAim;
+            private int tick;
+            private int sinceFire = Integer.MAX_VALUE / 2;
+            private int hits;
+            private String lastReason = REASON_NO_TARGET;
+
+            public AttackLoop(int minIntervalTicks) {
+                this.minIntervalTicks = Math.max(1, minIntervalTicks);
+            }
+
+            /**
+             * 推进一 tick。
+             *
+             * @param hasTarget     这一 tick 锁定的目标存在吗
+             * @param targetId      目标实体 id（换目标会强制重新瞄准）
+             * @param aimed         上一 tick 写下的朝向已经对准目标了吗
+             * @param cooldownReady 原版攻击冷却到了吗（{@code getAttackStrengthScale}）
+             */
+            public Step step(boolean hasTarget, int targetId, boolean aimed, boolean cooldownReady) {
+                tick++;
+                if (!hasTarget) {
+                    lastTargetId = Integer.MIN_VALUE;
+                    mustAim = false;
+                    return Step.IDLE;
+                }
+                sinceFire++;
+                if (targetId != lastTargetId || mustAim) {
+                    // 新目标 / 刚出手完：这一 tick 只瞄准，出手留到下一 tick（两 tick 分离）。
+                    lastTargetId = targetId;
+                    mustAim = false;
+                    return Step.AIM;
+                }
+                if (!aimed) {
+                    return Step.AIM;
+                }
+                if (!cooldownReady || sinceFire < minIntervalTicks) {
+                    return Step.AIM;
+                }
+                sinceFire = 0;
+                mustAim = true;   // 出手后下一 tick 必须重新瞄准
+                hits++;
+                lastReason = "";
+                return Step.FIRE;
+            }
+
+            /** 记下最近一次"没打成"的原因码（进最终回执）。 */
+            public void markReason(String code) {
+                if (code != null && !code.isEmpty()) {
+                    lastReason = code;
+                }
+            }
+
+            public int hits() {
+                return hits;
+            }
+
+            public String lastReason() {
+                return lastReason;
+            }
+
+            public int ticks() {
+                return tick;
+            }
+
+            /** 到点了（调用方给出 max_seconds × 20）。 */
+            public boolean expired(int maxTicks) {
+                return tick >= maxTicks;
+            }
         }
     }
 

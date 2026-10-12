@@ -149,8 +149,10 @@ public final class CombatReflex {
         // 距离 >=4 贴上去、距离 <=2 后撤，中间原地打。
         // 但**寻路中不接管位移**：那会跟 Pathfinder 抢同一个 forward 键（谁后写谁赢），
         // 表现就是"有任务却卡在原地"。寻路时只写朝向 + 出手。
-        if (Pathfinder.isNavigating()) {
+        if (Pathfinder.isNavigating() || !ActionExecutor.combatRepositionAllowed()) {
             // 寻路中不接管位移（那会跟 Pathfinder 抢同一个 forward 键）。
+            // 站位驻守期间也**让路**（用户："站在刷怪塔底部"——反射自己写的前进/后退会把它
+            // 一步步挪出站点半径，正是"破坏站位"；位移交给 AFK，反射只转身 + 出手，保命能力不减）。
             // 注意：**只清自己拥有的**（见 InputOwnership）—— 顺手清掉导航刚按下的前进键，
             // 表现就是"有任务却一步不动"（用户报的"老问题不移动"就是这么来的）。
             releaseMovement();
