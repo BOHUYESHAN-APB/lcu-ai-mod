@@ -3,6 +3,7 @@ package com.lcu.lcumod.action;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 
 /**
  * 零依赖自检（接入 {@code check}）：**视角单一写者 + 寻路收敛/退避**。
@@ -44,6 +45,8 @@ public final class WalkCheck {
         deathPointChecks();
         autonomousDefaultChecks();
         inputOwnershipChecks();
+        inputBlockingChecks();
+        gearReportChecks();
 
         System.out.println("[WalkCheck] " + passed + " checks passed, " + failed + " failed");
         if (failed > 0) {
@@ -398,8 +401,11 @@ public final class WalkCheck {
         check("memory: dropping a tag re-labels the point", poi.contains("void removeTag("));
         check("memory: first bed becomes the home too",
                 poi.contains("remember(pos") && poi.contains("\"home\"") && poi.contains("\"bed\""));
-        check("memory: bed loss is detected from the vanilla respawn point",
-                poi.contains("invalidateBedIfGone") && poi.contains("getRespawnData()"));
+        check("memory: bed loss needs the vanilla respawn point to CONFIRM it is still there",
+                poi.contains("invalidateBedIfGone") && poi.contains("getRespawnData()")
+                        && poi.contains("respawnIsThisBed"));
+        check("memory: 'the respawn point is not this bed' must NOT mean the bed is gone",
+                poi.contains("stillBed") && !poi.contains("respawnElsewhere"));
         check("memory: bed loss only drops the bed tag, home stays",
                 poi.contains("removeTag(\"bed\")") && !poi.contains("removeTag(\"home\")"));
         check("memory: respawn point is remembered proactively", poi.contains("rememberLandmarks("));
@@ -790,6 +796,222 @@ public final class WalkCheck {
                 isolation.contains("InputOwnership.clear()"));
         check("input-ownership: the policy itself is zero dependency (no Minecraft imports)",
                 !read(root.resolve("InputOwnership.java")).contains("import net.minecraft"));
+    }
+
+    // ── 12. 自身装备/耐久 + 原版贴图（用户口径："OBS 叠加页要显示自己的装备、耐久、主要武器"）──
+
+    /**
+     * 两件事必须钉死：
+     * <ol>
+     *   <li><b>取值与自洽</b>：可损坏/不可损坏的边界、{@code durability = max_durability - damage}、
+     *       畸形值钳位、空槽的规范零值、指纹随耐久变化 —— 直接行为断言零依赖的那半（{@link GearReport}）；</li>
+     *   <li><b>形态</b>：四槽固定顺序、空槽也上报（不是缺字段）、贴图**只在装备集合变了**时发一次、
+     *       已发过的 id 不重发、读不到就跳过（不编不占位）、贴图走客户端资源管理器的实证 API。</li>
+     * </ol>
+     */
+    private static void gearReportChecks() {
+        // ① 纯逻辑：全新的剑 = 满载耐久
+        GearReport.Pure.SlotFacts fresh = GearReport.Pure.facts("minecraft:iron_sword", "铁剑", 1, true, 0, 250);
+        check("gear-report: a fresh sword reports full durability",
+                fresh.durability() == 250 && fresh.damage() == 0 && fresh.maxDurability() == 250
+                        && fresh.damageable() && fresh.selfConsistent());
+
+        // ② 三元组自洽：durability = max - damage
+        GearReport.Pure.SlotFacts worn = GearReport.Pure.facts("minecraft:iron_helmet", "铁头盔", 1, true, 45, 165);
+        check("gear-report: durability = max_durability - damage", worn.durability() == 120
+                && worn.damage() == 45 && worn.maxDurability() == 165 && worn.selfConsistent());
+
+        // ③ 快坏了也如实报（剩余 1），不美化
+        GearReport.Pure.SlotFacts nearly = GearReport.Pure.facts("minecraft:iron_pickaxe", "铁镐", 1, true, 249, 250);
+        check("gear-report: a nearly broken tool reports 1 left (no rounding up)",
+                nearly.durability() == 1 && nearly.damage() == 249 && nearly.selfConsistent());
+
+        // ④ 不可损坏（方块/食物）：damageable=false 且三个数全 0 —— 诚实，不编上限
+        GearReport.Pure.SlotFacts block = GearReport.Pure.facts("minecraft:dirt", "泥土", 64, false, 0, 0);
+        check("gear-report: non-damageable items report false with all-zero durability",
+                !block.damageable() && block.durability() == 0 && block.maxDurability() == 0
+                        && block.damage() == 0 && block.count() == 64 && block.selfConsistent());
+
+        // ⑤ 畸形输入不许漏出自相矛盾的数：上限 0 的"可损坏物" ⇒ 按不可损坏报
+        GearReport.Pure.SlotFacts noMax = GearReport.Pure.facts("a:b", "b", 1, true, 5, 0);
+        check("gear-report: damageable with max 0 is reported as non-damageable (no made-up max)",
+                !noMax.damageable() && noMax.selfConsistent());
+
+        // ⑥ 越界 damage / 负数 ⇒ 钳位，三元组仍然自洽
+        GearReport.Pure.SlotFacts over = GearReport.Pure.facts("a:b", "b", 1, true, 999, 100);
+        GearReport.Pure.SlotFacts under = GearReport.Pure.facts("a:b", "b", 1, true, -7, 100);
+        check("gear-report: out-of-range damage is clamped and stays consistent",
+                over.damage() == 100 && over.durability() == 0 && over.selfConsistent()
+                        && under.damage() == 0 && under.durability() == 100 && under.selfConsistent());
+
+        // ⑦ 空槽 = 规范零值对象（**不是**缺字段）
+        check("gear-report: the empty slot is the canonical zero object",
+                GearReport.Pure.EMPTY_SLOT.isEmpty() && GearReport.Pure.EMPTY_SLOT.count() == 0
+                        && GearReport.Pure.EMPTY_SLOT.selfConsistent());
+
+        // ⑧ 四槽顺序固定（web 不许猜）
+        check("gear-report: armor slots are fixed head,chest,legs,feet",
+                GearReport.Pure.ARMOR_SLOTS.length == 4
+                        && "head".equals(GearReport.Pure.ARMOR_SLOTS[0]) && "chest".equals(GearReport.Pure.ARMOR_SLOTS[1])
+                        && "legs".equals(GearReport.Pure.ARMOR_SLOTS[2]) && "feet".equals(GearReport.Pure.ARMOR_SLOTS[3]));
+
+        // ⑨ 指纹：六个空槽也占位（数量固定），且**耐久掉了指纹必须变**（OBS 的耐久条不许停住）
+        List<GearReport.Pure.SlotFacts> emptySlots = List.of(GearReport.Pure.EMPTY_SLOT, GearReport.Pure.EMPTY_SLOT,
+                GearReport.Pure.EMPTY_SLOT, GearReport.Pure.EMPTY_SLOT, GearReport.Pure.EMPTY_SLOT, GearReport.Pure.EMPTY_SLOT);
+        String emptyKey = GearReport.Pure.slotKey(emptySlots);
+        check("gear-report: six empty slots still produce a fixed fingerprint",
+                "-|-|-|-|-|-".equals(emptyKey) && emptyKey.equals(GearReport.Pure.slotKey(emptySlots)));
+
+        GearReport.Pure.SlotFacts swinging = GearReport.Pure.facts("minecraft:iron_sword", "铁剑", 1, true, 1, 250);
+        String fullKey = GearReport.Pure.slotKey(List.of(GearReport.Pure.EMPTY_SLOT, GearReport.Pure.EMPTY_SLOT,
+                GearReport.Pure.EMPTY_SLOT, GearReport.Pure.EMPTY_SLOT, fresh, GearReport.Pure.EMPTY_SLOT));
+        String wornKey = GearReport.Pure.slotKey(List.of(GearReport.Pure.EMPTY_SLOT, GearReport.Pure.EMPTY_SLOT,
+                GearReport.Pure.EMPTY_SLOT, GearReport.Pure.EMPTY_SLOT, swinging, GearReport.Pure.EMPTY_SLOT));
+        check("gear-report: losing durability changes the fingerprint (state must not go stale)",
+                !fullKey.equals(wornKey) && fullKey.contains("minecraft:iron_sword")
+                        && wornKey.contains("minecraft:iron_sword"));
+
+        // ⑩ 静态扫描：状态里真的带 gear、且 gear 变化会触发上报
+        Path collector = Path.of("src", "main", "java", "com", "lcu", "lcumod", "state", "StateCollector.java");
+        String stateSrc = read(collector);
+        String gearSrc = read(Path.of("src", "main", "java", "com", "lcu", "lcumod", "action", "GearReport.java"));
+        check("gear-report: GearReport source found", !gearSrc.isEmpty());
+
+        // 测的那一半**真的**零依赖（自检 JVM 的类路径上没有游戏类，能直接测它全靠这条界线）
+        int pureStart = gearSrc.indexOf("public static final class Pure {");
+        int pureEnd = gearSrc.indexOf("// ── Minecraft 侧");
+        String pureSrc = pureStart >= 0 && pureEnd > pureStart ? gearSrc.substring(pureStart, pureEnd) : "";
+        check("gear-report: the tested half carries no game classes at all",
+                !pureSrc.isEmpty() && !pureSrc.contains("net.minecraft") && !pureSrc.contains("Minecraft")
+                        && !pureSrc.contains("import ")
+                        && pureSrc.contains("EMPTY_SLOT") && pureSrc.contains("selfConsistent()"));
+
+        check("gear-report: state_update carries the gear block",
+                stateSrc.contains("state.add(\"gear\", GearReport.build(mc))"));
+        check("gear-report: a gear change forces a state update",
+                stateSrc.contains("GearReport.slotKey(p)") && stateSrc.contains("lastGearKey"));
+        check("gear-report: icons are published from the tick path, before the throttled send gate",
+                stateSrc.contains("GearReport.publishIcons(mc, p)")
+                        && stateSrc.indexOf("GearReport.publishIcons(mc, p)")
+                            < stateSrc.indexOf("boolean hasChanged = false;"));
+
+        // ⑪ 四槽永远在（循环里无条件 add，空槽给零值对象）
+        check("gear-report: all four armor slots are always reported (empty ones too)",
+                gearSrc.contains("for (int i = 0; i < Pure.ARMOR_SLOTS.length; i++)")
+                        && gearSrc.contains("o.addProperty(\"slot\", Pure.ARMOR_SLOTS[i])")
+                        && gearSrc.contains("armor.add(o)")
+                        && gearSrc.contains("EMPTY_SLOT"));
+
+        // ⑫ 每个槽位对象都带全集字段（web 只按 key 取值）
+        String toJsonBody = methodBody(gearSrc, "public static JsonObject toJson(");
+        check("gear-report: every slot object carries the full key set",
+                toJsonBody.contains("\"item_id\"") && toJsonBody.contains("\"name\"")
+                        && toJsonBody.contains("\"count\"") && toJsonBody.contains("\"durability\"")
+                        && toJsonBody.contains("\"max_durability\"") && toJsonBody.contains("\"damage\"")
+                        && toJsonBody.contains("\"damageable\""));
+        check("gear-report: the durability triple is computed in exactly one place",
+                countOf(gearSrc, "maxDamage - dmg") == 1 && gearSrc.contains("Math.min(Math.max(0, damage), maxDamage)"));
+
+        // ⑬ 贴图：只在装备集合变了时发一次（有已发集合），读不到就跳过
+        String publishBody = methodBody(gearSrc, "public static void publishIcons(");
+        check("gear-report: the icon event only goes out when the gear set changed",
+                publishBody.contains("key.equals(lastIconKey)") && publishBody.contains("lastIconKey = key")
+                        && publishBody.contains("if (icons.size() == 0)"));
+        check("gear-report: ids already sent are never re-sent",
+                publishBody.contains("sentIcons.contains(id)") && publishBody.contains("sentIcons.add(id)"));
+        check("gear-report: an unreadable texture is skipped, never faked or padded",
+                publishBody.contains("unavailableIcons.add(id)")
+                        && countOf(methodBody(gearSrc, "private static String readIconBase64("), "return null") >= 3);
+        check("gear-report: icons are sent as the item_icons event",
+                gearSrc.contains("LCUMod.WIRE.sendEvent(\"item_icons\"") && publishBody.contains("data.add(\"icons\", icons)"));
+
+        // ⑭ 贴图来源：客户端资源管理器 + 实证过的 26.3 API（Identifier.fromNamespaceAndPath / Resource.open）
+        String readIconBody = methodBody(gearSrc, "private static String readIconBase64(");
+        check("gear-report: textures come from the client resource manager (verified 26.3 API)",
+                readIconBody.contains("mc.getResourceManager().getResource(")
+                        && readIconBody.contains("Identifier.fromNamespaceAndPath(")
+                        && readIconBody.contains("resource.get().open()")
+                        && readIconBody.contains("textures/item/")
+                        && readIconBody.contains("Base64.getEncoder()"));
+
+        // ⑮ 只发装备槽 + 主/副手里的东西（不是整个物品栏）
+        check("gear-report: only the equipped slots + hands get icons",
+                gearSrc.contains("private static List<String> equippedIds(Player p)")
+                        && methodBody(gearSrc, "private static List<String> equippedIds(").contains("currentSlots(p)"));
+
+        // ⑯ 只 import 用得上的东西（贴图/耐久这条链不牵扯别的包，更不碰后端）
+        boolean onlyNeededImports = true;
+        for (String line : gearSrc.split("\n")) {
+            String trimmed = line.trim();
+            if (!trimmed.startsWith("import ")) {
+                continue;
+            }
+            if (!(trimmed.startsWith("import com.google.gson.")
+                    || trimmed.startsWith("import com.lcu.lcumod.LCUMod;")
+                    || trimmed.startsWith("import net.minecraft.")
+                    || trimmed.startsWith("import java.io.InputStream;")
+                    || trimmed.startsWith("import java.util."))) {
+                onlyNeededImports = false;
+                System.out.println("       unexpected import: " + trimmed);
+            }
+        }
+        check("gear-report: imports only what the job needs", onlyNeededImports);
+
+        // ⑰ 顺带核对：血/饥饿/饱和度**已经在 player 里**（不重复加第二份）
+        check("gear-report: health/hunger/saturation are reported once (not duplicated)",
+                countOf(stateSrc, "player.addProperty(\"health\"") == 1
+                        && countOf(stateSrc, "player.addProperty(\"hunger\"") == 1
+                        && countOf(stateSrc, "player.addProperty(\"saturation\"") == 1
+                        && stateSrc.contains("p.getFoodData().getSaturationLevel()"));
+    }
+
+    // ── 12. 键盘/鼠标屏蔽（fail-open，ESC/F12 永不拦）──
+
+    /**
+     * 真机事故：上一版键盘屏蔽用"放行清单"，编码没匹配上 ⇒ **把控制开关 F12 和安全出口 ESC 一起吞了**，
+     * 人被困在世界里；同时鼠标左右键还是有效的（点在窗口上等于游戏内点击）。
+     * 这里把策略钉成行为断言 + 源码形状：
+     */
+    private static void inputBlockingChecks() {
+        java.util.Set<Integer> gameplay = java.util.Set.of(87, 65, 83, 68);   // W A S D
+        java.util.Set<Integer> escape = java.util.Set.of(256, 41);            // ESC 的两种可能编码
+        java.util.Set<Integer> f12 = java.util.Set.of(301, 69);               // F12 的两种可能编码
+        java.util.Set<Integer> allowed = new java.util.HashSet<>();
+        allowed.addAll(escape);
+        allowed.addAll(f12);
+
+        check("keys: ESC is never blocked", !KeyShield.blocks(256, 256, gameplay, allowed)
+                && !KeyShield.blocks(41, 41, gameplay, allowed));
+        check("keys: F12 is never blocked", !KeyShield.blocks(301, 301, gameplay, allowed)
+                && !KeyShield.blocks(69, 69, gameplay, allowed));
+        check("keys: an unknown key passes (fail-open, never lock the human out)",
+                !KeyShield.blocks(9999, 9999, gameplay, allowed));
+        check("keys: a gameplay key is blocked", KeyShield.blocks(87, 87, gameplay, allowed));
+        check("keys: matching on either field works", KeyShield.blocks(0, 87, gameplay, allowed));
+        check("keys: no bindings means nothing gets blocked at all",
+                !KeyShield.blocks(87, 87, java.util.Set.of(), allowed));
+        check("keys: exemption beats the gameplay list",
+                !KeyShield.blocks(256, 256, java.util.Set.of(87, 256), allowed));
+
+        String keysSource = read(Path.of("src", "main", "java", "com", "lcu", "lcumod", "mixin",
+                "KeyboardHandlerMixin.java"));
+        String mouseSource = read(Path.of("src", "main", "java", "com", "lcu", "lcumod", "client",
+                "MouseShield.java"));
+        check("keys: the shield consults the policy instead of hardcoding an allow list",
+                keysSource.contains("KeyShield.blocks(") && keysSource.contains("ALWAYS_ALLOWED"));
+        check("keys: ESC and F12 are exempt in more than one encoding",
+                keysSource.contains("SDL_SCANCODE_ESCAPE") && keysSource.contains("SDL_SCANCODE_F12")
+                        && keysSource.contains("KEY_ESCAPE") && keysSource.contains("KEY_F12"));
+        check("keys: the blocked set comes from the player's own bindings",
+                keysSource.contains("options.keyUp") && keysSource.contains("keyHotbarSlots"));
+        check("mouse: buttons are blocked through the cancelable NeoForge event",
+                mouseSource.contains("InputEvent.MouseButton.Pre") && mouseSource.contains("setCanceled(true)"));
+        check("mouse: only while the AI holds control, and never over an open screen",
+                mouseSource.contains("InputIsolation.isAiControlled()")
+                        && mouseSource.contains("mc.gui.screen() != null"));
+        check("mouse: only the three real buttons are touched",
+                mouseSource.contains("BUTTON_LEFT") && mouseSource.contains("BUTTON_RIGHT")
+                        && mouseSource.contains("BUTTON_MIDDLE"));
     }
 
     /** 取某个成员（含签名行）到下一个成员声明之间的源码片段（静态扫描用）。 */

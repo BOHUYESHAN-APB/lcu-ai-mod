@@ -125,7 +125,7 @@ SDK 分为三类接口：
 ### 前置要求
 - Java 21+
 - Python 3.11+
-- Minecraft 26.3 (NeoForge 26.3.0.57-beta)
+- Minecraft 26.3 —— **构建与 API 实证**用 NeoForge **26.3.0.57-beta**（`gradle.properties` 的 `neo_version`）；模组声明的依赖区间下限是**真机验证过的**版本 `neo_version_validated`（当前 `26.3.0.42-beta`，大型整合包常见的就是它）。两者不一致是**有意**的，`verifyMixin` 会拦住"悄悄放宽到一个没人跑过的版本"；要抬下限就同步改这两个值
 
 ### 构建模组
 ```bash

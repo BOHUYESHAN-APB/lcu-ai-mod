@@ -255,15 +255,13 @@ public final class PoiMemory {
     /**
      * 床丢了/被拆了 ⇒ **把 {@code bed} 标签作废**（{@code home} 标签留着 —— 那是"还想去的地方"）。
      *
-     * <p>用户实机口径："他下次复活的时候，它在世界复活点，并且提示床遗失或被破坏，那就应该把这个点
-     * 打标记作为作废；home 的标签没有错，只是床的标签没了，他就得主动往 home 的位置继续走，
-     * 然后重新找床/重新制作床。"
+     * <p><b>判据只用"亲眼看过的方块"</b>：那个位置加载着、且已经不是床方块 ⇒ 床真的没了。
+     * 原版重生点只用来做**正向确认**（等于这张床 ⇒ 确定它还在），**不能用来否定** ——
+     * 玩家没在这张床上睡过，重生点就永远不会是它。
      *
-     * <p>两个独立证据，都当真：
-     * <ol>
-     *   <li>**原版重生点不再是那张床**（复活回到世界出生点）—— 游戏自己说的，最权威；</li>
-     *   <li>那个位置的方块已经**不是床**了（方块被拆/被替换）。</li>
-     * </ol>
+     * <p>教训（真机日志，2026-10-12）：上一版把"复活点不是这张床"也当成"床没了"，于是
+     * `第一次看到床 → 1 秒后作废 bed 标签 → 下次又'第一次看到'` 反复循环（880/852/851 一路重记）。
+     * 用户原话："你再读一下日志，它有刚才有没有找到床" —— 一读就现形。
      */
     public static void invalidateBedIfGone(Minecraft mc, int tickCount) {
         if (mc == null || mc.level == null) {
@@ -274,7 +272,7 @@ public final class PoiMemory {
             var data = mc.level.getRespawnData();
             respawn = data == null ? null : data.pos();
         } catch (Exception ignored) {
-            // 拿不到就只靠方块检查（证据少一条，不瞎判）。
+            // 拿不到重生点就只靠方块检查（少一条正向确认，不影响结论）。
         }
         for (Map.Entry<BlockPos, PoiEntry> entry : MEMORY.entrySet()) {
             PoiEntry poi = entry.getValue();
@@ -282,16 +280,24 @@ public final class PoiMemory {
                 continue;
             }
             BlockPos pos = entry.getKey();
-            boolean respawnElsewhere = respawn != null && !respawn.equals(pos);
-            String currentId = BuiltInRegistries.BLOCK.getKey(mc.level.getBlockState(pos).getBlock()).toString();
-            boolean blockGone = mc.level.isLoaded(pos) && !currentId.endsWith("_bed");
-            if (respawnElsewhere || blockGone) {
-                poi.removeTag("bed");
-                poi.lastSeenTick = tickCount;
-                LCUMod.LOGGER.warn("[PoiMemory] 床没了（{}）→ 作废 bed 标签，保留 home {}"
-                                + "（接下来自己回去找床/重新做一张）",
-                        blockGone ? "位置已不是床" : "复活点已不在那张床", pos.toShortString());
+            if (!mc.level.isLoaded(pos)) {
+                // 区块没加载 ⇒ 看不到就没资格下结论（不猜）。
+                continue;
             }
+            String currentId = BuiltInRegistries.BLOCK.getKey(mc.level.getBlockState(pos).getBlock()).toString();
+            boolean stillBed = currentId.endsWith("_bed");
+            boolean respawnIsThisBed = respawn != null && respawn.equals(pos);
+            if (stillBed || respawnIsThisBed) {
+                if (respawnIsThisBed) {
+                    // 原版说"复活点就是这张床" ⇒ 正向确认它还在。
+                    poi.lastSeenTick = tickCount;
+                }
+                continue;
+            }
+            poi.removeTag("bed");
+            poi.lastSeenTick = tickCount;
+            LCUMod.LOGGER.warn("[PoiMemory] 床没了（那个位置已经不是床方块）→ 作废 bed 标签，保留 home {}"
+                            + "（接下来自己回去找床/重新做一张）", pos.toShortString());
         }
     }
 

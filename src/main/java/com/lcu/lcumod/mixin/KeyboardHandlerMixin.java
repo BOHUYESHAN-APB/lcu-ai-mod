@@ -1,8 +1,12 @@
 package com.lcu.lcumod.mixin;
 
 import com.lcu.lcumod.action.InputIsolation;
+import com.lcu.lcumod.action.KeyShield;
+import com.mojang.blaze3d.platform.InputConstants;
+import net.minecraft.client.KeyMapping;
 import net.minecraft.client.KeyboardHandler;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.Options;
 import net.minecraft.client.input.KeyEvent;
 import org.lwjgl.sdl.SDLKeycode;
 import org.lwjgl.sdl.SDLScancode;
@@ -11,38 +15,39 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
+import java.util.HashSet;
+import java.util.Set;
+
 /**
- * While the AI holds control, the physical keyboard does nothing except the control switch.
+ * While the AI holds control, the AI's own operation keys are its own — everything else still works.
  *
- * <p>用户口径："AI 控制中要屏蔽用户键盘（只留 F12），避免与 AI 打架"——人按 W 的时候
- * {@code InputIsolation} 每 tick 在写自己的 WASD/视角，两方一起写表现为"人一按它就抖/停"。
- * 鼠标那一半早就由 {@link MouseHandlerMixin} 处理（光标保持释放），键盘这一半原来**没有实现**：
- * {@code AIKeyHandler.shouldCaptureKeyboard()} 声明了一直没人调用。这里补上真正的拦截点。
+ * <p>用户口径："AI 控制中要屏蔽用户键盘（只留 F12），避免与 AI 打架"；随后实机反馈
+ * "按 F12 和 ESC 都是无限效果" —— 因为上一版是**放行清单**，编码没匹配上就把开关和安全出口
+ * 一起吞了，人直接被困在世界里。现在策略反过来（见 {@link KeyShield}）：
+ * **只拦"操作类"键位，其余一律放行；ESC / F12 永远放行**。
  *
- * <p>为什么是 mixin 而不是订阅事件：NeoForge 的 {@code InputEvent.Key} **不可取消**
- * （{@code InputEvent$Key extends InputEvent extends Event}，javap 实证），吞不掉按键；
- * 而且事件是在 {@code KeyboardHandler.keyPress} 里发出来的，靠它自己也拦不住后续处理。
+ * <p>名单来源：**玩家自己的按键绑定**（{@code Options.keyUp/keyDown/.../keyHotbarSlots}），
+ * 而不是硬编码键码 —— 这样跟着玩家改键走，也不依赖"vanilla 到底拿哪个字段比较"的推断
+ * （{@code key()} 与 {@code keycode()} 两个都比对）。
  *
- * <p>**放行清单**（不是一句话"只留 F12"，这三条都是刻意的）：
- * <ul>
- *   <li><b>F12</b> —— 唯一的控制权开关，吞掉它人就出不来了；</li>
- *   <li><b>ESC</b> —— 安全出口：要能开菜单/退出/暂停，否则等于把人锁在世界里；</li>
- *   <li><b>有界面开着时全部放行</b> —— 按键归那个界面（聊天框、控制台页面…），
- *       也正好符合另一条硬约束"玩家自己开着界面时 AI 让路"。</li>
- * </ul>
- * 抬起（release）一律放行：按下被吞了就不会有"按下状态"需要抬起，放行能避免按键卡住的老问题。
- *
- * <p>实测要点（26.3）：{@code KeyboardHandler.keyPress(long window, int action, KeyEvent event)}，
- * {@code KeyEvent.key()/keycode()} 分别是平台键码与扫描码，两个都按 F12/ESC 比对
- * （{@code AIKeyHandler} 的 KeyMapping 用的是 {@code SDL_SCANCODE_F12}）。
+ * <p>为什么是 mixin：NeoForge 的 {@code InputEvent.Key} **不可取消**（`InputEvent$Key extends
+ * InputEvent extends Event`，javap 实证），而事件又是在 {@code KeyboardHandler.keyPress} 里发出来的。
  */
 @Mixin(KeyboardHandler.class)
 public class KeyboardHandlerMixin {
 
+    /** 永不拦：安全出口（ESC）+ 控制开关（F12）。三种可能的编码都收，避免再因为单位判断错而锁人。 */
+    private static final Set<Integer> ALWAYS_ALLOWED = Set.of(
+            InputConstants.KEY_ESCAPE,
+            SDLScancode.SDL_SCANCODE_ESCAPE,
+            SDLKeycode.SDLK_ESCAPE,
+            InputConstants.KEY_F12,
+            SDLScancode.SDL_SCANCODE_F12,
+            SDLKeycode.SDLK_F12);
+
     @Inject(method = "keyPress", at = @At("HEAD"), cancellable = true)
     private void lcuBlockKeysWhileAiPlays(long window, int action, KeyEvent event, CallbackInfo ci) {
         if (!InputIsolation.isAiControlled()) {
-            // 玩家控制：一切照旧，人和原版完全一样。
             return;
         }
         Minecraft mc = Minecraft.getInstance();
@@ -50,29 +55,47 @@ public class KeyboardHandlerMixin {
             // 有界面开着：按键归界面（也符合"玩家开着界面 AI 让路"）。
             return;
         }
-        if (isAlwaysAllowed(event)) {
+        if (action == 0) {
+            // 只吞"按下/连发"（GLFW_PRESS=1、GLFW_REPEAT=2）；抬起放行，避免按键卡住。
             return;
         }
-        if (action != 1 && action != 2) {
-            // 只吞"按下/连发"（GLFW_PRESS=1、GLFW_REPEAT=2）；抬起放行，避免按键卡住。
+        if (!KeyShield.blocks(event.key(), event.keycode(), gameplayKeys(mc), ALWAYS_ALLOWED)) {
             return;
         }
         ci.cancel();
     }
 
-    /**
-     * 控制权开关与安全出口（F12 / ESC，键码与扫描码都认）。
-     *
-     * <p>**必须 private static**：mixin 类里除了注入方法之外的 static 方法如果可见性不是 private，
-     * Mixin 会在加载时直接拒绝整个 mixin（实测报错：{@code contains non-private static method
-     * isAlwaysAllowed(...)}）—— 这次就是在真机启动时才炸的，`verifyMixin` 现在会模拟这条规则。
-     */
-    private static boolean isAlwaysAllowed(KeyEvent event) {
-        int key = event.key();
-        int scancode = event.keycode();
-        return key == SDLKeycode.SDLK_F12
-            || scancode == SDLScancode.SDL_SCANCODE_F12
-            || key == SDLKeycode.SDLK_ESCAPE
-            || scancode == SDLScancode.SDL_SCANCODE_ESCAPE;
+    /** 要拦的键位 = 玩家自己绑定的那些"操作键"（移动 / 交互 / 热栏 / 聊天栏…）。 */
+    private static Set<Integer> gameplayKeys(Minecraft mc) {
+        Set<Integer> keys = new HashSet<>();
+        Options options = mc.options;
+        if (options == null) {
+            return keys;
+        }
+        add(keys, options.keyUp);
+        add(keys, options.keyDown);
+        add(keys, options.keyLeft);
+        add(keys, options.keyRight);
+        add(keys, options.keyJump);
+        add(keys, options.keyShift);
+        add(keys, options.keySprint);
+        add(keys, options.keyAttack);
+        add(keys, options.keyUse);
+        add(keys, options.keyInventory);
+        add(keys, options.keyDrop);
+        add(keys, options.keyChat);
+        add(keys, options.keyCommand);
+        if (options.keyHotbarSlots != null) {
+            for (KeyMapping mapping : options.keyHotbarSlots) {
+                add(keys, mapping);
+            }
+        }
+        return keys;
+    }
+
+    private static void add(Set<Integer> keys, KeyMapping mapping) {
+        if (mapping != null && mapping.getKey() != null) {
+            keys.add(mapping.getKey().getValue());
+        }
     }
 }

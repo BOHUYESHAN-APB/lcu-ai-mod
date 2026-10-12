@@ -4,6 +4,7 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.lcu.lcumod.action.AttackRules;
 import com.lcu.lcumod.action.BlockFinder;
+import com.lcu.lcumod.action.GearReport;
 import com.lcu.lcumod.action.MobPolicy;
 import com.lcu.lcumod.action.PoiMemory;
 import com.lcu.lcumod.LCUMod;
@@ -145,6 +146,8 @@ public class StateCollector {
     private static int presenceTicks = 0;
     /** 当前容器内容指纹（-1 = 没开外部容器）；容器开关或内容变化要立刻上报。 */
     private static int lastContainerFingerprint = -1;
+    /** 六槽装备指纹（id/数量/已损）：换装备、掉耐久都要立刻上报（OBS 的装备/耐久面板靠它）。 */
+    private static String lastGearKey = "";
 
     /**
      * 不在世界里时发的最小状态：`in_world=false` + 当前界面名。
@@ -242,7 +245,12 @@ public class StateCollector {
         }
 
         Player p = mc.player;
-        
+
+        // 原版贴图（装备槽 + 主/副手）：**只在装备集合变了**时发一次（内部有已发集合，集合不变
+        // 一个字节都不发）。放在节流门之前：贴图跟屏幕分辨率一样是"换装备才变"的东西，
+        // 没必要等下一次 state_update。读不到的 id 直接跳过，web 退回文字显示。
+        GearReport.publishIcons(mc, p);
+
         // Check if state has changed significantly
         boolean hasChanged = false;
         updateCounter++;
@@ -298,6 +306,15 @@ public class StateCollector {
             if (fingerprintNow != lastContainerFingerprint) {
                 hasChanged = true;
                 lastContainerFingerprint = fingerprintNow;
+            }
+        }
+
+        // 装备变化（换/脱、数量、耐久掉了）必须立刻上报：OBS 的装备与耐久面板读的就是 gear
+        {
+            String gearKeyNow = GearReport.slotKey(p);
+            if (!gearKeyNow.equals(lastGearKey)) {
+                hasChanged = true;
+                lastGearKey = gearKeyNow;
             }
         }
 
@@ -374,6 +391,11 @@ public class StateCollector {
         equipment.add("off_hand", slotItem(p.getItemBySlot(EquipmentSlot.OFFHAND)));
         player.add("equipment", equipment);
         state.add("player", player);
+
+        // 装备与耐久（OBS 叠加页要的"自己的装备 + 耐久 + 主要攻击类武器的耐久"）：
+        // 四槽**固定顺序**且空槽也给零值对象（不让 web 猜）；不可损坏物如实 damageable:false；
+        // 三元组自洽 durability = max_durability - damage。贴图走 item_icons 事件（不在每帧状态里）。
+        state.add("gear", GearReport.build(mc));
 
         // World
         JsonObject world = new JsonObject();
