@@ -933,6 +933,57 @@ let sessionPollInFlight = false;
 let bodyConnected = false;
 let bodyArmed = false;
 
+// ── 可见性 / 页签活动门 ──────────────────────────────────────────────
+// 规矩：**看不见就不干活**（用户口径："web 页面内存占用也高……某些页面用不到情况下
+// 点击关闭，它是不进行渲染的"）。
+//   · document.hidden（标签页切走 / 窗口最小化）⇒ 所有轮询 / setInterval / 动画 / WS DOM 处理降到 0 次；
+//   · 页签被 showPage 切走 ⇒ 只有该页签自己的循环与 DOM 写入停（别的页签照常）；
+//   · 回来（visibilitychange / 切回页签）⇒ 立刻恢复，并**补一次刷新**（不丢状态）。
+// 隐藏期间到达的 WS 消息只入队（有上限），可见后按原顺序补处理 —— 不做"静默丢消息"。
+const PAGE = (() => {
+  const QUEUE_MAX = 500;
+  let hidden = !!document.hidden;
+  let current = 'dashboard';
+  let queue = [];
+  const resumeHooks = [];
+  const timers = [];
+  // 登记的定时器在隐藏时**整个清掉**（不是"醒了再 return"）——真·0 次唤醒。
+  function every(ms, fn) {
+    let id = null, period = ms;
+    const start = () => { if (id === null && !hidden) id = setInterval(fn, period); };
+    const stop = () => { if (id !== null) { clearInterval(id); id = null; } };
+    const slot = { start, stop, set(ms2) { const on = id !== null; stop(); period = ms2; if (on) start(); } };
+    timers.push(slot);
+    start();
+    return slot;
+  }
+  function running(page) {
+    if (hidden) return false;
+    return page ? current === page : true;
+  }
+  function flush() {
+    if (!running()) return;
+    const pending = queue; queue = [];
+    pending.forEach(m => { try { handleMessage(m); } catch (e) { dbgLog('补处理消息失败: ' + e); } });
+    resumeHooks.forEach(fn => { try { fn(); } catch (e) { dbgLog('恢复刷新失败: ' + e); } });
+  }
+  document.addEventListener('visibilitychange', () => {
+    const was = hidden;
+    hidden = !!document.hidden;
+    if (was === hidden) return;
+    if (hidden) { timers.forEach(t => t.stop()); return; }
+    timers.forEach(t => t.start());
+    flush();
+  });
+  return {
+    running,
+    every,
+    setPage(name) { if (current === name) return; current = name; if (!hidden) flush(); },
+    enqueue(msg) { queue.push(msg); if (queue.length > QUEUE_MAX) queue.splice(0, queue.length - QUEUE_MAX); },
+    onResume(fn) { resumeHooks.push(fn); },
+  };
+})();
+
 function connectWS() {
   const protocols = sdkToken ? [`lcu-token.${sdkToken}`] : [];
   ws = new WebSocket(`${wsProto}//${location.host}/ws`, protocols);
@@ -949,22 +1000,44 @@ function connectWS() {
     const ph = document.getElementById('chatEmpty');
     if (ph) ph.textContent = '后端未连接，正在重连…（先确认 python main.py 在跑）';
     setBodyConnection(false);
-    reconnectTimer = setTimeout(connectWS, 3000);
+    scheduleReconnect(3000);
   };
   ws.onmessage = (e) => {
+    let msg;
     try {
-      handleMessage(JSON.parse(e.data));
+      msg = JSON.parse(e.data);
     } catch(err) {
       dbgLog('消息解析错误: ' + err);
+      return;
     }
+    // 看不见（标签页切走 / 最小化）时**一次 DOM 都不碰**：只入队，可见后按序补处理。
+    if (!PAGE.running()) { PAGE.enqueue(msg); return; }
+    try { handleMessage(msg); } catch (err) { dbgLog('消息处理错误: ' + err); }
   };
 }
+
+// 重连计时器：只在**看得见**的时候排；隐藏时排了也不空转。
+function scheduleReconnect(delay) {
+  if (reconnectTimer || !PAGE.running()) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    if (PAGE.running()) connectWS();
+  }, delay);
+}
+// 回到可见 / 切回页签：断了就**立刻**接上（不等 3 秒），并补一次状态刷新。
+PAGE.onResume(() => {
+  if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    connectWS();
+  }
+});
 connectWS();
 
 // ── Page Navigation ──
 // 每个页签都接**当前后端真实存在**的端点（/api/status、/api/llm/*、/api/config、
 // /api/permissions、/api/contacts/*、/api/tasks/* 与 /ws 等）；没有占位页签。
 function showPage(name, tab) {
+  PAGE.setPage(name);   // 切走的页签：它自己的循环/动画到此为止；切回来会补一次刷新
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.getElementById('page-' + name).classList.add('active');
@@ -979,6 +1052,7 @@ function showPage(name, tab) {
   if (name === 'access') loadAccessPage();
   if (name === 'operations') loadOperationsPage();
   if (name === 'settings') loadRuntimeSwitches();
+  if (name === 'debug') renderDbgLog();          // 日志只在调试页签可见时才落到 DOM
   if (name === 'diagnostics') { loadDiagnosticsPage(); loadGovernancePage(); }
 }
 
@@ -1019,7 +1093,7 @@ function handleMessage(msg) {
 function handleEvent(type, data, occurredAt) {
   if (type === 'state_update') {
     setBodyConnection(true);
-    document.getElementById('stateFreshness').textContent = '实时';
+    setText('stateFreshness', '实时');
     updateDashboard(data);
   } else if (type === 'session.snapshot') {
     updateDashboard(data);
@@ -1036,8 +1110,17 @@ function handleEvent(type, data, occurredAt) {
 }
 
 // ── Dashboard ──
+// **只在数据真的变了时才碰 DOM**：模组/轮询会把同一份快照重复送回来（control_state、
+// behavior_state 更是常带同一批字段），以前每来一次就无条件重写十来处文本 + 重建玩家列表。
+// 指纹取整份 payload 的 JSON（后端构造 dict 的字段顺序稳定）——不维护字段白名单，
+// 以后往 payload 里加字段也不会漏刷。
+let dashRenderKey = '';
 function updateDashboard(data) {
   data = data || {};
+  let key = '';
+  try { key = JSON.stringify(data); } catch (err) { key = ''; }
+  if (key && key === dashRenderKey) return;
+  dashRenderKey = key;
   if (data.body) {
     setBodyConnection(data.body.connected === true);
     bodyArmed = data.body.armed === true;
@@ -1153,15 +1236,22 @@ function renderInventoryItems(targetId, items) {
 }
 
 function setBodyConnection(connected) {
+  if (connected && bodyConnected) return;   // 状态没变：一个节点都不碰
   bodyConnected = connected;
   if (!connected) bodyArmed = false;
   const status = document.getElementById('bodyStatus');
   status.className = `status ${connected ? 'online' : 'offline'}`;
-  status.textContent = connected ? '身体在线' : '身体离线';
+  setText(status, connected ? '身体在线' : '身体离线');
   if (!connected) {
-    document.getElementById('stateFreshness').textContent = '离线';
-    document.getElementById('controlMode').textContent = '玩家控制';
+    setText('stateFreshness', '离线');
+    setText('controlMode', '玩家控制');
   }
+}
+
+// 只在文本真的变了时才写：模组/轮询会把同一份状态反复送回，无意义的重写只是白烧 DOM。
+function setText(el, text) {
+  if (typeof el === 'string') el = document.getElementById(el);
+  if (el && el.textContent !== text) el.textContent = text;
 }
 
 // 在场门：不在世界里就别再显示假的动作状态（模组此时只发 ui_screen）。
@@ -1328,6 +1418,8 @@ function renderStatusLine(task, hudNote) {
 }
 
 // ── Chat ──
+// 这个列表**只增不减**：不设上限的话，长跑一晚上就是几千个节点常驻内存。
+const CHAT_MAX = 200;
 function addChatMessage(sender, message) {
   const container = document.getElementById('chatMessages');
   document.getElementById('chatEmpty')?.remove();
@@ -1335,6 +1427,7 @@ function addChatMessage(sender, message) {
   div.className = 'msg';
   div.innerHTML = `<div class="sender">${escapeHtml(sender)}</div><div class="text">${escapeHtml(message)}</div>`;
   container.appendChild(div);
+  while (container.children.length > CHAT_MAX) container.removeChild(container.firstChild);   // 丢最旧
   container.scrollTop = container.scrollHeight;
 }
 
@@ -1698,11 +1791,19 @@ function sendDebugCmd() {
   dbgCmd(cmd, args);
 }
 
+// 调试日志：内存里只留最近 50 条；**只在调试页签可见时才写 DOM**。
+// 以前是"每来一条就全量重写 textContent"——躲在别的页签后面、甚至页面被隐藏时也照写不误。
+const DBG_MAX = 50;
+const dbgLines = [];
 function dbgLog(msg) {
-  const el = document.getElementById('debugLog');
   const time = new Date().toLocaleTimeString('zh-CN');
-  el.textContent = `[${time}] ${msg}\n` + el.textContent;
-  el.textContent = el.textContent.split('\n').slice(0,50).join('\n');
+  dbgLines.unshift(`[${time}] ${msg}`);
+  if (dbgLines.length > DBG_MAX) dbgLines.length = DBG_MAX;   // 丢最旧
+  if (PAGE.running('debug')) renderDbgLog();
+}
+function renderDbgLog() {
+  const el = document.getElementById('debugLog');
+  if (el) el.textContent = dbgLines.join('\n');
 }
 
 // ── Helpers ──
@@ -1894,6 +1995,10 @@ function saveOverlayTheme() {
 // 数据源**只有**自建的 /api/contacts 系列。
 const dmState = { contacts: [], current: null, currentIndex: -1, messages: [], sending: false,
                   atBottom: true, aiName: 'AI', aiNameChecked: false };
+// 两侧列表都只留最近 N 条；并各自带指纹——内容没变就**不重写整段 innerHTML**。
+const DM_MSG_MAX = 300;
+let dmContactsKey = '';
+let dmMessagesKey = '';
 
 const dmPad = x => String(x).padStart(2, '0');
 function dmFmtTime(ts) {
@@ -1961,6 +2066,9 @@ function renderDmContacts() {
   if (!box) return;
   const count = document.getElementById('dmCount');
   if (count) count.textContent = dmState.contacts.length ? `共 ${dmState.contacts.length} 人` : '';
+  const key = dmState.aiName + '|' + JSON.stringify(dmState.contacts);
+  if (key === dmContactsKey) return;   // 没变就不重写（轮询每 5 秒都会走到这儿）
+  dmContactsKey = key;
   if (!dmState.contacts.length) {
     box.innerHTML = '<div class="empty">还没有私下聊过的人。<br>等世界里的玩家先私信它。</div>';
     return;
@@ -2007,7 +2115,7 @@ function selectDmContact(index) {
   renderDmContacts(); renderDmPeerHeader();
   const key = dmState.current;
   return fetch(`/api/contacts/${encodeURIComponent(key)}/messages`).then(r => r.json()).then(d => {
-    dmState.messages = Array.isArray(d.messages) ? d.messages : [];
+    dmState.messages = Array.isArray(d.messages) ? d.messages.slice(-DM_MSG_MAX) : [];
     renderDmMessages(true);
   }).catch(() => {})
     .then(() => fetch(`/api/contacts/${encodeURIComponent(key)}/read`, {method: 'POST'}).catch(() => {}))
@@ -2033,6 +2141,9 @@ function dmDayChanged(prev, m) {
 function renderDmMessages(force) {
   const box = document.getElementById('dmMessages');
   if (!box) return;
+  const key = dmState.current + '|' + JSON.stringify(dmState.messages);
+  if (key === dmMessagesKey) { dmScrollToBottom(force === undefined ? dmState.atBottom : !!force); return; }
+  dmMessagesKey = key;
   if (!dmState.current) {
     box.innerHTML = '<div class="empty">左侧点一个联系人，看你们的来往私信</div>';
     return;
@@ -2564,8 +2675,9 @@ Promise.resolve()
 function setBadge(id, ok, okText, badText) {
   const el = document.getElementById(id);
   if (!el) return;
-  el.textContent = ok ? okText : badText;
-  el.className = 'status ' + (ok ? 'online' : 'offline');
+  const cls = 'status ' + (ok ? 'online' : 'offline');
+  if (el.className !== cls) el.className = cls;
+  setText(el, ok ? okText : badText);
 }
 
 function updateConnection(status) {
@@ -2575,13 +2687,13 @@ function updateConnection(status) {
   if (!hint) return;
   const p = status.session && status.session.player;
   if (!modOk) {
-    hint.textContent = `模组未连接（${status.wire || '127.0.0.1:25568'}）：游戏没在运行，或还没进世界 —— 后端每 5 秒自动重连。`;
+    setText(hint, `模组未连接（${status.wire || '127.0.0.1:25568'}）：游戏没在运行，或还没进世界 —— 后端每 5 秒自动重连。`);
     hint.style.color = '#d29922';
   } else if (!p) {
-    hint.textContent = '模组已连接，但还没有角色状态：进世界后才会同步生命/坐标等。';
+    setText(hint, '模组已连接，但还没有角色状态：进世界后才会同步生命/坐标等。');
     hint.style.color = '#d29922';
   } else {
-    hint.textContent = `已同步：${p.name || '?'} · HP ${p.health ?? '?'} · ${Math.round(p.x)},${Math.round(p.y)},${Math.round(p.z)}`;
+    setText(hint, `已同步：${p.name || '?'} · HP ${p.health ?? '?'} · ${Math.round(p.x)},${Math.round(p.y)},${Math.round(p.z)}`);
     hint.style.color = '#3fb950';
   }
 }
@@ -2618,18 +2730,22 @@ function renderEffective() {
   }).catch(e => { st.textContent = '读取失败: ' + e; });
 }
 
-setInterval(() => {
-  if (sessionPollInFlight || document.hidden) return;
+// 状态轮询：页面隐藏时**一次都不发**；切走的页签只刷顶栏徽标（那两块任何时候都要准），
+// 仪表盘数值只在仪表盘页签显示时才写 DOM。
+function pollStatus() {
+  if (sessionPollInFlight || !PAGE.running()) return;
   sessionPollInFlight = true;
   fetch('/api/status')
     .then(r => r.json())
     .then(d => {
-      updateDashboard(d.session || {});
       updateConnection(d);
+      if (PAGE.running('dashboard')) updateDashboard(d.session || {});
     })
     .catch(() => {})
     .finally(() => { sessionPollInFlight = false; });
-}, 5000);
+}
+PAGE.every(5000, pollStatus);
+PAGE.onResume(pollStatus);   // 回到可见 / 切回仪表盘：立刻补一次，不留空窗
 
 </script>
 </body>

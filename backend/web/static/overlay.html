@@ -117,9 +117,42 @@ const parts = location.pathname.replace(/^\/+|\/+$/g, '').split('/');
 const COMPONENT = parts[parts.length - 1] || '';
 const THEME = params.get('theme') === 'light' ? 'light' : 'dark';
 const SCALE = clampNum(params.get('scale'), 0.25, 8, 1);
-let MAX = clampNum(params.get('max'), 1, 64, 0); // 0 = 不限制
+let MAX = clampNum(params.get('max'), 1, 64, 0); // 0 = 用硬上限
+const PLAYERS_HARD_MAX = 64;   // 玩家行数硬上限（含 max=0 的默认档）
 
 document.documentElement.style.setProperty('--scale', String(SCALE));
+
+/* ── 可见性门 ─────────────────────────────────────────────────────────
+   看不见（浏览器最小化 / OBS 里被切到别的场景）就**不干活**：
+   · 登记的定时器全部 clearInterval（真·0 次唤醒，不是"醒了再 return"）；
+   · /ws 推来的消息直接丢（回来时 refresh() 补一次，画面不会停在旧数据上）。
+   看得见时行为一字不改 —— 该实时就实时。 */
+const VIS = (() => {
+  let hidden = !!document.hidden;
+  const resumeHooks = [], hideHooks = [], timers = [];
+  function every(ms, fn) {
+    let id = null, period = ms;
+    const start = () => { if (id === null && !hidden) id = setInterval(fn, period); };
+    const stop = () => { if (id !== null) { clearInterval(id); id = null; } };
+    const slot = { start, stop, set(ms2) { const running = id !== null; stop(); period = ms2; if (running) start(); } };
+    timers.push(slot);
+    start();
+    return slot;
+  }
+  document.addEventListener('visibilitychange', () => {
+    const was = hidden;
+    hidden = !!document.hidden;
+    if (was === hidden) return;
+    if (hidden) { timers.forEach(t => t.stop()); hideHooks.forEach(fn => { try { fn(); } catch (e) {} }); }
+    else { timers.forEach(t => t.start()); resumeHooks.forEach(fn => { try { fn(); } catch (e) {} }); }
+  });
+  return {
+    running: () => !hidden,
+    onResume(fn) { resumeHooks.push(fn); },
+    onHide(fn) { hideHooks.push(fn); },
+    every,
+  };
+})();
 
 function clampNum(raw, lo, hi, fallback) {
   const n = parseFloat(raw);
@@ -179,6 +212,7 @@ function renderPlayers(s) {
   let players = Array.isArray(s.players) ? s.players.slice() : [];
   const speaker = s.last_speaker && (s.last_speaker.name || s.last_speaker);
   if (MAX) players = players.slice(0, MAX);
+  else players = players.slice(0, PLAYERS_HARD_MAX);   // 不传 max 也要有个上限：DOM 节点数不许随运行时间/人数无界增长
   if (!players.length) {
     return shell(THEME, `<div class="row"><span class="label">在线玩家</span><span class="value">暂无</span></div>`);
   }
@@ -274,36 +308,54 @@ function render(session) {
 }
 
 let lastPayload = null;
+let lastRenderKey = '';
 function apply(payload) {
   lastPayload = payload || {};
+  // 只在**数据真的变了**时才碰 DOM。/ws 每 2 秒推一份 /api/status，轮询也在跑；
+  // 大多数时候两份快照一模一样，以前是无条件重写 innerHTML（OBS 源白烧 CPU）。
+  let key = '';
+  try { key = JSON.stringify(lastPayload); } catch (e) { key = ''; }
+  if (key && key === lastRenderKey) return;
+  lastRenderKey = key;
   // /api/status 的形状是 {running, session:{…}}；`session.snapshot` 直接就是 session。
   render(lastPayload.session || lastPayload);
 }
 
 async function refresh() {
+  if (!VIS.running()) return;   // 隐藏时一次都不拉
   try {
     const r = await fetch('/api/status', {cache: 'no-store'});
     if (r.ok) apply(await r.json());
   } catch (e) { /* 断开/离线：静默，绝不刷屏报错 */ }
 }
 
-/* /ws 优先；连不上或只发不出状态就退化为轻量轮询。全程不 print 错误。 */
-let pollTimer = null;
+/* /ws 优先；连不上或只发不出状态就退化为轻量轮询。全程不 print 错误。
+   轮询登记在可见性门里：页面隐藏时定时器本身就被清掉。 */
 let wsFailures = 0;
-function startPolling(intervalMs) {
-  if (pollTimer) return;
-  pollTimer = setInterval(refresh, intervalMs);
+let reconnectTimer = null;
+let wsRef = null;
+const poll = VIS.every(5000, refresh);
+// 兜底轮询：WS 掉了就提速到 3 秒（沿用原行为）；隐藏时由可见性门统一停表。
+function startPolling(intervalMs) { poll.set(intervalMs); }
+function scheduleReconnect() {
+  if (reconnectTimer || !VIS.running()) return;   // 隐藏时不空转重连
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    if (VIS.running()) connectWS();
+  }, Math.min(30000, 2000 * wsFailures));
 }
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   let ws;
-  try { ws = new WebSocket(`${proto}//${location.host}/ws`); } catch (e) { startPolling(5000); return; }
+  try { ws = new WebSocket(`${proto}//${location.host}/ws`); } catch (e) { startPolling(5000); return null; }
+  wsRef = ws;
   ws.onopen = () => {
     wsFailures = 0;
     refresh();
     try { ws.send(JSON.stringify({type: 'status_subscribe'})); } catch (e) {}
   };
   ws.onmessage = (ev) => {
+    if (!VIS.running()) return;   // 不可见：不解析、不重绘（可见时 refresh() 会补一次）
     let msg;
     try { msg = JSON.parse(ev.data); } catch (e) { return; }
     if (msg && msg.type === 'status' && msg.data) apply(msg.data);
@@ -314,16 +366,23 @@ function connectWS() {
     wsFailures += 1;
     // 服务端不推状态 / 连接掉了 → 轻量轮询兜底；无错误输出。
     startPolling(wsFailures > 3 ? 5000 : 3000);
-    setTimeout(connectWS, Math.min(30000, 2000 * wsFailures));
+    scheduleReconnect();
   };
+  return ws;
 }
+
+// 回到可见：断了就立刻接上（不等退避），并补一次刷新（画面不会停在旧数据上）。
+VIS.onResume(() => {
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (!wsRef || wsRef.readyState === WebSocket.CLOSED || wsRef.readyState === WebSocket.CLOSING) connectWS();
+  refresh();
+});
 
 if (!OVERLAY_RENDERERS[COMPONENT]) {
   render({});
 } else {
   refresh();
-  connectWS();
-  startPolling(5000);
+  if (VIS.running()) connectWS();   // 隐藏着启动就先不连；VIS.onResume 会接上
 }
 </script>
 </body>

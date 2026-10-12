@@ -97,6 +97,37 @@ body.offline #stage{opacity:.32}
   var stage = document.getElementById("stage");
   var noteEl = document.getElementById("note");
 
+  /* ── 可见性门 ─────────────────────────────────────────────────────────
+     OBS 里这个源被切到别的场景 / 浏览器最小化时**不干活**：登记的定时器全部
+     clearInterval（真·0 次唤醒），回来时立刻各补一次 —— 该实时的时候一字不改。 */
+  var VIS = (function () {
+    var hidden = !!document.hidden;
+    var resumeHooks = [], timers = [];
+    function every(ms, fn) {
+      var id = null, period = ms;
+      function start() { if (id === null && !hidden) id = setInterval(fn, period); }
+      function stop() { if (id !== null) { clearInterval(id); id = null; } }
+      var slot = { start: start, stop: stop,
+                   set: function (ms2) { var on = id !== null; stop(); period = ms2; if (on) start(); } };
+      timers.push(slot);
+      start();
+      return slot;
+    }
+    document.addEventListener("visibilitychange", function () {
+      var was = hidden;
+      hidden = !!document.hidden;
+      if (was === hidden) return;
+      if (hidden) { timers.forEach(function (t) { t.stop(); }); }
+      else {
+        timers.forEach(function (t) { t.start(); });
+        resumeHooks.forEach(function (fn) { try { fn(); } catch (e) {} });
+      }
+    });
+    return { running: function () { return !hidden; },
+             onResume: function (fn) { resumeHooks.push(fn); },
+             every: every };
+  })();
+
   var ARMOR = ["head", "chest", "legs", "feet"];
   var SLOT_FB = { head: "头盔", chest: "胸甲", legs: "护腿", feet: "靴子" };
   var STATUS_C = { running: "#58a6ff", queued: "#d29922", pending: "#d29922",
@@ -143,6 +174,12 @@ body.offline #stage{opacity:.32}
      img 初始 hidden，只有 onload 成功才显示；404 记进缓存不再重复请求（免得每 220ms
      刷一串 404）。连接状态从断→通时清缓存，重新给贴图一次机会。 */
   var iconCache = new Map();
+  var ICON_CACHE_MAX = 512;   // 贴图结果缓存不许随"见过的物品"无限涨
+  function cacheIcon(id, v) {
+    iconCache.delete(id);
+    iconCache.set(id, v);
+    while (iconCache.size > ICON_CACHE_MAX) iconCache.delete(iconCache.keys().next().value);
+  }
   function makeIcon() {
     var box = mk("div", "ico"), img = mk("img"), fb = mk("span", "fb");
     img.alt = ""; img.decoding = "async"; img.hidden = true;
@@ -161,9 +198,9 @@ body.offline #stage{opacity:.32}
     if (!id || iconCache.get(id) === "bad") return;
     img.onload = function () {
       if (box._id !== id) return;
-      img.hidden = false; box.classList.add("has"); iconCache.set(id, "ok"); syncName();
+      img.hidden = false; box.classList.add("has"); cacheIcon(id, "ok"); syncName();
     };
-    img.onerror = function () { img.hidden = true; box.classList.remove("has"); iconCache.set(id, "bad"); syncName(); };
+    img.onerror = function () { img.hidden = true; box.classList.remove("has"); cacheIcon(id, "bad"); syncName(); };
     img.src = "/api/icon/" + encodeURIComponent(id);
     /* 有贴图 ⇒ 框里是图、名字在右边；没贴图 ⇒ 框里就是名字（避免和"主手/副手"标签重复）。 */
     function syncName() { if (nameEl) nameEl.hidden = !box.classList.contains("has"); }
@@ -298,7 +335,9 @@ body.offline #stage{opacity:.32}
   function setNote(key, msg) {
     if (msg) notes[key] = msg; else delete notes[key];
     var all = Object.keys(notes).map(function (k) { return notes[k]; });
-    noteEl.textContent = all.join(" · ");
+    var text = all.join(" · ");
+    if (noteEl.textContent === text && noteEl.hidden === (all.length === 0)) return;   // 没变就不写
+    noteEl.textContent = text;
     noteEl.hidden = all.length === 0;
   }
 
@@ -327,17 +366,21 @@ body.offline #stage{opacity:.32}
   }
 
   var busy = false;
+  var lastRaw = null;   // /api/overlay/data 的原始 JSON：一样就一次 DOM 都不碰
   function tick() {
     if (busy) return;
     busy = true;
     fetch("/api/overlay/data", { cache: "no-store" })
-      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
-      .then(function (d) {
+      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.text(); })
+      .then(function (raw) {
         if (offline) { offline = false; document.body.classList.remove("offline"); }
+        var d = JSON.parse(raw);
         var conn = !(d && d.connected === false);
         if (connState === false && conn) iconCache.clear();   // 重新连上：贴图再试一次
         connState = conn;
         setNote("conn", conn ? "" : "未连接游戏 — 显示后端最后快照");
+        if (raw === lastRaw) return;   // 数据没变（后端每 220ms 才轮一次，多半没变）：不重绘
+        lastRaw = raw;
         data = d || {};
         render();
       })
@@ -368,11 +411,9 @@ body.offline #stage{opacity:.32}
 
   tickLayout();
   tick();
-  setInterval(tickLayout, 5000);   // 编辑器保存后，OBS 里的页面自己换上（无需重加源）
-  setInterval(tick, 220);          // ~4.5 次/秒
-  document.addEventListener("visibilitychange", function () {
-    if (!document.hidden) { tick(); tickLayout(); }
-  });
+  VIS.every(5000, tickLayout);   // 编辑器保存后，OBS 里的页面自己换上（无需重加源）
+  VIS.every(220, tick);          // ~4.5 次/秒；隐藏时定时器被停掉
+  VIS.onResume(function () { tick(); tickLayout(); });   // 回来立刻补一次，不留空窗
 })();
 </script>
 </body>

@@ -165,6 +165,34 @@ body{font-family:'Segoe UI','PingFang SC','Microsoft YaHei',system-ui,sans-serif
 "use strict";
 const state = { contacts: [], current: null, currentKey: null, messages: [], sending: false,
                 atBottom: true, aiName: 'AI', aiNameChecked: false };
+// 两个列表都只留最近 N 条；各配一个指纹——内容没变就不重写整段 innerHTML。
+const MSG_MAX = 300;
+let contactsKey = '', messagesKey = '';
+
+/* ── 可见性门 ─────────────────────────────────────────────────────────
+   页面被切走 / 最小化：轮询定时器直接清掉（真·0 次唤醒），/ws 消息不处理；
+   回来时立刻补一次并接回 WS —— 看得见的时候行为一字不改。 */
+const VIS = (() => {
+  let hidden = !!document.hidden;
+  const resumeHooks = [], timers = [];
+  function every(ms, fn) {
+    let id = null, period = ms;
+    const start = () => { if (id === null && !hidden) id = setInterval(fn, period); };
+    const stop = () => { if (id !== null) { clearInterval(id); id = null; } };
+    const slot = { start, stop, set(ms2) { const on = id !== null; stop(); period = ms2; if (on) start(); } };
+    timers.push(slot);
+    start();
+    return slot;
+  }
+  document.addEventListener('visibilitychange', () => {
+    const was = hidden;
+    hidden = !!document.hidden;
+    if (was === hidden) return;
+    if (hidden) { timers.forEach(t => t.stop()); }
+    else { timers.forEach(t => t.start()); resumeHooks.forEach(fn => { try { fn(); } catch (e) {} }); }
+  });
+  return { running: () => !hidden, onResume(fn) { resumeHooks.push(fn); }, every };
+})();
 
 function esc(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
@@ -219,6 +247,9 @@ function sameContact(c) {
 }
 function renderContacts() {
   const box = document.getElementById('contacts');
+  const key = state.aiName + '|' + JSON.stringify(state.contacts);
+  if (key === contactsKey) return;   // 没变就不重写（轮询每 5 秒都会走到这儿）
+  contactsKey = key;
   if (!state.contacts.length) {
     box.innerHTML = '<div class="empty">还没有私下聊过的人。<br>等世界里的玩家先私信它。</div>';
     return;
@@ -267,6 +298,9 @@ function dayChanged(prev, m) {
    跨分钟另起一组并带自己的时间；跨天在组前插一条完整时间条。 */
 function renderMessages(force) {
   const box = document.getElementById('messages');
+  const key = state.current + '|' + JSON.stringify(state.messages);
+  if (key === messagesKey) { scrollBottom(force === undefined ? state.atBottom : !!force); return; }
+  messagesKey = key;
   if (!state.current) {
     box.innerHTML = '<div class="empty">还没有私下聊过 —— 左侧选一个人，看你们的来往私信</div>';
     return;
@@ -342,7 +376,7 @@ async function selectContact(id) {
   state.atBottom = true;
   renderContacts();
   const { ok, data } = await api(`/api/contacts/${encodeURIComponent(id)}/messages`);
-  state.messages = ok && Array.isArray(data.messages) ? data.messages : [];
+  state.messages = ok && Array.isArray(data.messages) ? data.messages.slice(-MSG_MAX) : [];
   renderMessages(true);
   renderPeerHeader();
   // 进页/切换时清未读。
@@ -379,22 +413,42 @@ function initialTarget() {
 }
 
 /* ── WS 优先，断开退化为轮询；断开不刷屏报错 ── */
-let pollTimer = null;
-function startPolling() { if (!pollTimer) pollTimer = setInterval(loadContacts, 5000); }
+let reconnectTimer = null;
+const poll = VIS.every(5000, loadContacts);   // 兜底轮询：隐藏时定时器被可见性门停掉
+function startPolling() { poll.set(5000); }
 function setConn(ok) {
   const el = document.getElementById('conn');
   el.className = 'status ' + (ok ? 'online' : 'offline');
   el.textContent = ok ? '● 已连接' : '● 未连接（轮询中）';
 }
+let wsRef = null;
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   let ws;
   try { ws = new WebSocket(`${proto}//${location.host}/ws`); } catch (e) { setConn(false); startPolling(); return; }
+  wsRef = ws;
   ws.onopen = () => setConn(true);
-  ws.onmessage = () => { loadContacts(); };
+  ws.onmessage = () => { if (VIS.running()) loadContacts(); };
   ws.onerror = () => {};
-  ws.onclose = () => { setConn(false); startPolling(); setTimeout(connectWS, 5000); };
+  ws.onclose = () => {
+    setConn(false);
+    startPolling();
+    scheduleReconnect();
+  };
 }
+function scheduleReconnect() {
+  if (reconnectTimer || !VIS.running()) return;   // 隐藏时不空转重连
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    if (VIS.running()) connectWS();
+  }, 5000);
+}
+// 回到可见：断了就立刻接上（不等 5 秒），并补一次刷新。
+VIS.onResume(() => {
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (!wsRef || wsRef.readyState === WebSocket.CLOSED || wsRef.readyState === WebSocket.CLOSING) connectWS();
+  loadContacts();
+});
 
 /* 回车发送、Shift+回车换行；滚上去看历史时给"回到最新"按钮，不硬拽。 */
 document.getElementById('input').addEventListener('keydown', e => {
@@ -411,7 +465,7 @@ document.getElementById('messages').addEventListener('scroll', () => {
   await loadContacts();
   const target = initialTarget();
   if (target) await selectContact(target);
-  connectWS();
+  if (VIS.running()) connectWS();   // 隐藏着打开就先不连；VIS.onResume 会接上
 })();
 </script>
 </body>
