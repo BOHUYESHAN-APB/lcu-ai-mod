@@ -19,6 +19,18 @@ from typing import Any, Optional
 logger = logging.getLogger("memory")
 
 
+def _tag_list(value: Any) -> list[str]:
+    """标签数组归一化：去空白、小写、保序去重；不是数组或全空 → `[]`。"""
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    rows: list[str] = []
+    for item in value:
+        tag = str(item or "").strip().lower()
+        if tag and tag not in rows:
+            rows.append(tag)
+    return rows
+
+
 class Memory:
     """
     分层记忆系统。
@@ -339,6 +351,11 @@ class WorldPoiMemory:
             "dimension": dimension,
             "last_seen": time.time(),
         }
+        # 带标签的记忆点（模组主动记的地标）：标签原样留着（`home`/`bed`…），
+        # 它是"这个点到底是什么"的真相来源（`category` 只是主标签）。
+        tags = _tag_list(poi.get("tags"))
+        if tags:
+            entry["tags"] = tags
         contents = poi.get("contents")
         if contents:
             entry["contents"] = [
@@ -415,8 +432,15 @@ class WorldPoiMemory:
 
     @staticmethod
     def _same(a: dict, b: dict) -> bool:
+        """同一个点没有变化吗？——**类别与标签一起比**。
+
+        只比 block_id/contents 会让"床被拆了、主标签从 `bed` 退成 `home`"这种变化被吞掉，
+        记忆里就会一直留着一个过期的 `bed`（陈旧读取）。位置变了由 `_key` 负责。
+        """
         return (a.get("block_id") == b.get("block_id")
-                and a.get("contents") == b.get("contents"))
+                and a.get("contents") == b.get("contents")
+                and str(a.get("category") or "") == str(b.get("category") or "")
+                and sorted(a.get("tags") or []) == sorted(b.get("tags") or []))
 
     # ── 持久化 ──
 

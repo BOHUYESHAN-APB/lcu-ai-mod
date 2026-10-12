@@ -39,8 +39,8 @@ from .borrow import BorrowRulesStore, parse_borrow_grant, parse_borrow_revoke
 from .person_memory import PersonMemoryStore
 from .world_memory import (WorldMemoryStore, plan_replay, route_args,
                            route_point_count)
-from .territory import (TerritoryStore, current_base, home_situation, plan_zone_replay,
-                        point_of)
+from .territory import (TerritoryStore, current_base, home_memory_facts, home_situation,
+                        plan_zone_replay, point_of)
 from .permissions import CraftPolicy, PermissionsStore, ReplyGate
 from .persona_store import PersonaStore
 from .task_list import TaskList
@@ -2262,8 +2262,13 @@ class Session:
 
     def _fill_territory_context(self, context: dict) -> None:
         """把领地快照、当前基地、回家事实与刚被拦的记录放进上下文（**只进 L2**）。"""
+        # 家的**记忆事实**来自模组主动上报的带标签 `remembered_pois`（`home`/`bed` 标签）：
+        # 只读这一轮的 runtime 快照 → 每轮现算，绝不缓存（不吃上一轮的陈旧值）。
+        memory_home = home_memory_facts(context.get("remembered_pois"))
         store = getattr(self, "territories", None)
         if store is None:
+            # 没有领地记录：家的记忆事实照报（有就说、没有就是空 dict，不猜）。
+            context["home_status"] = memory_home
             return
         try:
             snapshot = store.snapshot()
@@ -2276,10 +2281,13 @@ class Session:
         bases = snapshot.get("bases") or []
         if position is None or not bases:
             context["current_base"] = None
-            context["home_status"] = {}
+            facts: dict = {}
         else:
             context["current_base"] = current_base(bases, *position)
-            context["home_status"] = self._home_facts(bases, position)
+            facts = self._home_facts(bases, position)
+        # 模组的标签是**现场核对过的最新事实**（床被拆了它会摘标签），压过我们自己的旧记录。
+        facts.update(memory_home)
+        context["home_status"] = facts
         context["zone_blocks"] = self._zone_block_context()
 
     def _home_facts(self, bases: list, position: tuple) -> dict:

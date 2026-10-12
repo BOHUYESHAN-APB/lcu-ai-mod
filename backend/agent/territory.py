@@ -356,6 +356,61 @@ def home_situation(bases: Any, x: Any, y: Any, z: Any, away_since: Optional[floa
     }
 
 
+# ── 家的记忆（模组主动上报的带标签 `remembered_pois`）──
+
+HOME_TAG = "home"
+BED_TAG = "bed"
+# 床没了 → 给模型的是**事实 + 一条可走的路子**（动不动手由模型自己判断，后端绝不自动调用）。
+HOME_BED_MISSING_NOTE = ("床没了：家的位置还在，可以先 go_home 走到家，到了自己找一张床，"
+                         "或 make_bed 做一张再说")
+
+
+def poi_tags(poi: Any) -> set[str]:
+    """一个记忆点的标签集合：新字段 `tags`（数组）∪ 向后兼容的 `category`（主标签）。
+
+    模组新报的点两个都有（`category` 只是 `tags` 里的主标签）；旧数据 / 手写记忆只有
+    `category`。小写归一、去空白；不是 dict 或一个标签都没有 → 空集合。
+    """
+    if not isinstance(poi, dict):
+        return set()
+    rows: list[str] = []
+    tags = poi.get("tags")
+    if isinstance(tags, (list, tuple, set)):
+        rows.extend(str(item) for item in tags)
+    rows.append(str(poi.get("category") or ""))
+    return {item.strip().lower() for item in rows if item and item.strip()}
+
+
+def home_memory_facts(pois: Any) -> dict:
+    """从模组主动上报的带标签 `remembered_pois` 里读出「家 / 床」的**事实**（只读，绝不动手）。
+
+    - 带 `home` + `bed` ⇒ 家完好：`home_point` 是家的位置，`home_bed` = `"present"`。
+    - 带 `home` 不带 `bed` ⇒ **床丢了**（模组按原版重生点 + 方块核对的结果，后端不重复判定）：
+      `home_bed` = `"missing"` + `home_note`（先说清事实，再给一条可走的路子）。
+    - 只带 `bed` 不带 `home` ⇒ **不是家**（旧数据 / 手写记忆照 bed 记着，绝不自动升级成 home）。
+    - 模组从没报过带 `home` 的点 ⇒ `{}`（不知道就说不知道，不猜、不造）。
+
+    多个带 `home` 的点：优先取**还带着 `bed` 的那个**（那才是当前的家）；都掉了床标签时取最先
+    报的那个（正常只有一条 —— `home` 标签由模组跟着新床搬家）。
+    """
+    rows = [poi for poi in (pois if isinstance(pois, (list, tuple)) else [])
+            if isinstance(poi, dict) and HOME_TAG in poi_tags(poi)]
+    if not rows:
+        return {}
+    with_bed = [poi for poi in rows if BED_TAG in poi_tags(poi)]
+    row = with_bed[0] if with_bed else rows[0]
+    point = point_of(row)
+    facts: dict = {}
+    if point is not None:
+        facts["home_point"] = {"x": point[0], "y": point[1], "z": point[2]}
+    if with_bed:
+        facts["home_bed"] = "present"
+    else:
+        facts["home_bed"] = "missing"
+        facts["home_note"] = HOME_BED_MISSING_NOTE
+    return facts
+
+
 # ── 区域回灌（Java 侧 ZoneGuard 是内存态，重启即丢 → 后端必须先存再回灌）──
 
 

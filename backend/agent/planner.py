@@ -3266,25 +3266,47 @@ class Planner:
         logger.info("[Planner] 造床判定：%s", decision)
         return False
 
+    @staticmethod
+    def _memory_home_point(context: Any) -> Optional[tuple[float, float, float]]:
+        """模组报的**家位置**（带 `home` 标签的记忆点，由 session 归一化进 `home_status`）。
+
+        只作 store 没有可用坐标时的兜底；坐标永远取**这一轮**的 L2 上下文（现读，不吃历史值）。
+        """
+        situation = (context or {}).get("home_status") if isinstance(context, dict) else None
+        if not isinstance(situation, dict):
+            return None
+        return point_of(situation.get("home_point"))
+
     def _dispatch_go_home(self, payload: dict, context: dict) -> bool:
-        """回基地：有床位就去床位，没床位就去锚点（普通寻路，不是传送）。"""
+        """回基地：有床位就去床位，没床位就去锚点（**每轮现读 store**，不吃上一轮快照）。
+
+        store 里没有可用坐标（还没设基地 / 锚点坏了）时退到模组报的**家记忆**：家还在的事实
+        由模组核对，位置就是那个 `home` 标签点的坐标（不猜、不造）。
+        """
         store = self._territory_store()
+        base = self._base_by_name(payload.get("base"), context) if store is not None else None
+        if base is not None:
+            bed = point_of(base.get("home_bed"))
+            target = bed or point_of(base.get("anchor"))
+            if target is not None:
+                self.skills.move_to(target[0], target[1], target[2])
+                where = "床位" if bed else "锚点"
+                self._territory_note = (f"（往基地「{base['name']}」的{where}走："
+                                        f"({target[0]:.0f},{target[1]:.0f},{target[2]:.0f})）")
+                return True
+        memory_home = self._memory_home_point(context)
+        if memory_home is not None:
+            self.skills.move_to(memory_home[0], memory_home[1], memory_home[2])
+            self._territory_note = (f"（往记着的家走：({memory_home[0]:.0f},{memory_home[1]:.0f},"
+                                    f"{memory_home[2]:.0f})）")
+            return True
         if store is None:
             self._territory_note = "（没有基地记录，不知道回哪）"
-            return False
-        base = self._base_by_name(payload.get("base"), context)
-        if base is None:
+        elif base is None:
             self._territory_note = "（不知道是哪个基地：先设一个基地，或说清名字）"
-            return False
-        target = point_of(base.get("home_bed")) or point_of(base.get("anchor"))
-        if target is None:
+        else:
             self._territory_note = f"（基地「{base['name']}」没有可用坐标）"
-            return False
-        self.skills.move_to(target[0], target[1], target[2])
-        where = "床位" if base.get("home_bed") else "锚点"
-        self._territory_note = (f"（往基地「{base['name']}」的{where}走："
-                                f"({target[0]:.0f},{target[1]:.0f},{target[2]:.0f})）")
-        return True
+        return False
 
     # ── 搬运 haul（§4）：算量 → 取 → 送 → 两侧对账（跨轮推进）────────
 
@@ -4278,9 +4300,13 @@ class Planner:
             base_line = "- 当前**不在任何基地里**（野外：一切按最低权限，别顺手拿别人的东西）"
         if base_line:
             lines.append(base_line)
+        shown_points: set[tuple[int, int, int]] = set()
         for base in bases:
             anchor = point_of(base.get("anchor")) or (0.0, 0.0, 0.0)
             bed = point_of(base.get("home_bed"))
+            shown_points.add((int(round(anchor[0])), int(round(anchor[1])), int(round(anchor[2]))))
+            if bed is not None:
+                shown_points.add((int(round(bed[0])), int(round(bed[1])), int(round(bed[2]))))
             bed_text = f"床位({bed[0]:.0f},{bed[1]:.0f},{bed[2]:.0f})" if bed else "还没找床"
             lines.append(f"- 基地「{base.get('name')}」({base.get('kind')}) "
                          f"@({anchor[0]:.0f},{anchor[1]:.0f},{anchor[2]:.0f}) "
@@ -4314,6 +4340,25 @@ class Planner:
                     lines.append(f"- 离基地「{situation['base']}」{float(distance):.0f} 格{how_long}{tail}")
                 else:
                     lines.append(f"- 在基地「{situation['base']}」范围内")
+        if situation:
+            # 家的**记忆事实**（模组主动记的 `home`/`bed` 标签）：床没了是事实，不是猜。
+            # 坐标只报一次：上面基地行已经打过的点就不再重复（别让坐标刷屏）。
+            home_point = point_of(situation.get("home_point"))
+            home_bed = str(situation.get("home_bed") or "")
+            if home_bed in {"present", "missing"}:
+                where = "（坐标未知）"
+                if home_point is not None:
+                    key = (int(round(home_point[0])), int(round(home_point[1])),
+                           int(round(home_point[2])))
+                    where = (f"({home_point[0]:.0f},{home_point[1]:.0f},{home_point[2]:.0f})"
+                             if key not in shown_points else "（坐标见上面的基地行）")
+                    shown_points.add(key)
+                if home_bed == "missing":
+                    lines.append(
+                        f"- 家的床没了（模组按原版重生点 + 方块核对过，不是猜的）：家还在{where}"
+                        "，可以先 go_home 走过去，到了自己找一张床，或 make_bed 做一张")
+                else:
+                    lines.append(f"- 家完好（模组刚核对过）：床还在{where}")
         blocks = ctx.get("zone_blocks") if isinstance(ctx.get("zone_blocks"), list) else []
         for row in blocks[-3:]:
             if not isinstance(row, dict):
