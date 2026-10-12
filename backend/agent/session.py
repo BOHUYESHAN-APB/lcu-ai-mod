@@ -426,6 +426,9 @@ class Session:
                 self._apply_presence(data)
                 self.runtime.update(data)
                 self._absorb_poi(data)
+                # 死亡点（world 层记忆）：模组只**报事实**（死在哪、什么时候），这里只**记**；
+                # 旧客户端没有这个字段 ⇒ 什么都不做（绝不凭空编一个死亡点）。
+                self._absorb_death_points(data)
                 self._absorb_conversation_namespace(data)
                 # 站点/路径（world 层）：落盘 + 模组侧空了就回灌。
                 self._absorb_places(data)
@@ -2092,6 +2095,50 @@ class Session:
                                player.get("dimension", ""))
         self.poi.observe_state(data)
 
+    def _absorb_death_points(self, data: dict) -> int:
+        """吸收 state 里的 `death_points`（模组报的死亡事实），落进世界记忆（跨重启还在）。
+
+        契约：**最新在前**，最多 3 条，`at` 是死亡那一刻的墙上时间毫秒。这里只**记**：
+        - 旧客户端没有这个字段 ⇒ 一条都不记（**绝不**凭空编一个死亡点）；
+        - 吸收不改写模组上报的那份数据（只读），也不动任何既有 POI 记忆；
+        - **绝不自动往回走**：回不回去由模型调 `go_to_death_point` 决定。
+        """
+        store = getattr(self, "poi", None)
+        rows = data.get("death_points") if isinstance(data, dict) else None
+        observe = getattr(store, "observe_deaths", None)
+        if not isinstance(rows, list) or not rows or not callable(observe):
+            return 0
+        world = data.get("world") if isinstance(data.get("world"), dict) else {}
+        player = data.get("player") if isinstance(data.get("player"), dict) else {}
+        dimension = str(player.get("dimension") or "")
+        try:
+            # 与 POI 同一套分区（服务器 / 存档 / 维度）：同一部坐标只在这个分区里有效。
+            store.use_namespace(world.get("server", ""), world.get("world_name", ""), dimension)
+            added = int(observe(rows, dimension) or 0)
+            if added:
+                # 死亡是**罕见且重要**的事实：记下就立刻落盘（不赌"两分钟后的自动存盘"，
+                # 否则死了立刻重启这一趟就白记了）。
+                store.save()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[Session] 死亡点吸收失败: %s", e)
+            return 0
+        if added:
+            logger.info("[Session] 记下 %d 个死亡点（%s）", added, store.namespace)
+        return added
+
+    def death_points(self) -> list[dict]:
+        """记着的死亡点（最新在前，最多 3 条；**现读**存盘，吃不到上一轮的陈旧快照）。"""
+        store = getattr(self, "poi", None)
+        reader = getattr(store, "death_points", None)
+        if not callable(reader):
+            return []
+        try:
+            rows = reader()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[Session] 死亡点读取失败: %s", e)
+            return []
+        return [dict(row) for row in rows if isinstance(row, dict)]
+
     def _hud_note(self) -> str:
         """HUD 状态词后面的描述词：以模组上报的为准，旧版模组没有该字段时用本地回声。"""
         reported = self.runtime.get("hud_note")
@@ -2201,6 +2248,9 @@ class Session:
         context["can_sleep"] = self.runtime.get("can_sleep", False)
         context["vision"] = self.vision.latest()
         context["known_poi"] = self.poi.describe()
+        # 死亡点（最新在前，最多 3 条）：读的同一份世界记忆 —— **只摆事实**，
+        # 绝不自动回去（回去由模型自己调 go_to_death_point）。没有记录就是空列表（不编）。
+        context["death_points"] = self.death_points()
         # 结构化容器清单（POI storage）：制作缺料时"先查已知容器决定去哪"看这份。
         try:
             context["known_containers"] = self.poi.find("storage")

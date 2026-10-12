@@ -19,6 +19,47 @@ from typing import Any, Optional
 logger = logging.getLogger("memory")
 
 
+# 死亡点：模组只报"死在哪、什么时候"，后端只**记**（跨重启），最多留最近几次。
+# 绝不自动往回走 —— 回不回去由模型调 `go_to_death_point` 决定（用户口径）。
+DEATH_POINT_LIMIT = 3
+
+
+def _number(value: Any) -> Optional[float]:
+    """数值字段归一化；bool / 字符串 / 缺值一律 None（**不猜**，也不硬转）。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def normalize_death_point(row: Any, dimension: str = "") -> Optional[dict]:
+    """模组上报的一条死亡点 → 归一化的事实条目；坐标缺/非法就 None（绝不编坐标）。
+
+    只留模组报过的四个事实：`x` / `y` / `z` / `dimension`，外加 `at`（死亡那一刻的
+    墙上时间**毫秒**，`System.currentTimeMillis()`）。`at` 报缺就不放这个键 —— 宁可
+    不知道"多久以前"，也不填一个假时间。
+    """
+    if not isinstance(row, dict):
+        return None
+    x, y, z = _number(row.get("x")), _number(row.get("y")), _number(row.get("z"))
+    if x is None or y is None or z is None:
+        return None
+    entry = {"x": x, "y": y, "z": z,
+             "dimension": str(row.get("dimension") or dimension or "")}
+    at = _number(row.get("at"))
+    if at is not None and at > 0:
+        entry["at"] = at
+    return entry
+
+
+def death_point_key(row: dict) -> tuple:
+    """同一次死亡的判据：**死亡时刻**优先（毫秒足够唯一），没有时刻才退回坐标+维度。"""
+    at = _number(row.get("at"))
+    if at is not None:
+        return ("at", at)
+    return ("xyz", str(row.get("dimension") or ""),
+            round(float(row["x"]), 2), round(float(row["y"]), 2), round(float(row["z"]), 2))
+
+
 def _tag_list(value: Any) -> list[str]:
     """标签数组归一化：去空白、小写、保序去重；不是数组或全空 → `[]`。"""
     if not isinstance(value, (list, tuple, set)):
@@ -299,6 +340,8 @@ class WorldPoiMemory:
         self._namespace = ""
         self._legacy_namespace = ""
         self._entries: dict[str, dict] = {}
+        # 死亡点（最新在前，最多 `DEATH_POINT_LIMIT` 条）：与 POI 同一份分区文件。
+        self._deaths: list[dict] = []
         self._dirty = False
 
     # ── 命名空间 ──
@@ -326,6 +369,7 @@ class WorldPoiMemory:
         # 旧版只有「服务器 + 存档」两段：历史文件还能读回来（下次落盘写成三段式）。
         self._legacy_namespace = f"{self._slug(server, 'unknown-server')}__{self._slug(world, 'unknown-world')}"
         self._entries = {}
+        self._deaths = []
         self._dirty = False
         self._load()
         return key
@@ -390,6 +434,42 @@ class WorldPoiMemory:
             if self.observe(category, poi, dimension):
                 changed += 1
         return changed
+
+    def observe_deaths(self, rows: Any, dimension: str = "") -> int:
+        """吸收模组上报的死亡点（契约：**最新在前**，最多 3 条），返回新记下的条数。
+
+        用户口径：模组只报**事实**（死在哪、什么时候），后端只**记** —— 这里不做任何
+        "自动回去"（没有任何定时器/后台动作，回去由模型调 `go_to_death_point`）。
+        同一**次**死亡只留一条（判据见 `death_point_key`），重复/更旧的排在后面，
+        整体按死亡时刻倒序、只留最近 `DEATH_POINT_LIMIT` 条（不无限长）。
+        """
+        if not isinstance(rows, (list, tuple)):
+            return 0
+        fresh = [row for row in (normalize_death_point(item, dimension) for item in rows)
+                 if row is not None]
+        if not fresh:
+            return 0
+        merged: list[dict] = []
+        seen: set = set()
+        # 模组这一轮报的在前（它是真相），旧记忆里没重复的接在后面 —— 顺序即"谁更新"。
+        for row in fresh + [dict(entry) for entry in self._deaths]:
+            key = death_point_key(row)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(row)
+        merged.sort(key=lambda row: _number(row.get("at")) or float("-inf"), reverse=True)
+        merged = merged[:DEATH_POINT_LIMIT]
+        known = {death_point_key(entry) for entry in self._deaths}
+        added = sum(1 for row in merged if death_point_key(row) not in known)
+        if merged != self._deaths:
+            self._deaths = merged
+            self._dirty = True
+        return added
+
+    def death_points(self) -> list[dict]:
+        """记着的死亡点（最新在前，最多 `DEATH_POINT_LIMIT` 条）——返回**副本**。"""
+        return [dict(row) for row in self._deaths]
 
     def find(self, category: Optional[str] = None) -> list[dict]:
         entries = [e for e in self._entries.values()
@@ -458,6 +538,11 @@ class WorldPoiMemory:
             data = json.loads(path.read_text(encoding="utf-8"))
             entries = data.get("entries", {})
             self._entries = entries if isinstance(entries, dict) else {}
+            # 死亡点（跨重启还在）：坏条目一律丢掉（宁可少记，也不留半条假记录）。
+            deaths = data.get("deaths")
+            rows = [row for row in (normalize_death_point(item) for item in deaths or [])
+                    if row is not None]
+            self._deaths = rows[:DEATH_POINT_LIMIT]
             self._dirty = legacy
             logger.info("[PoiMemory] 载入 %s：%d 个 POI%s", self._namespace, len(self._entries),
                         "（旧两段式文件）" if legacy else "")
@@ -471,6 +556,7 @@ class WorldPoiMemory:
             "namespace": self._namespace,
             "saved_at": time.time(),
             "entries": self._entries,
+            "deaths": self._deaths,
         }
         self.path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         self._dirty = False

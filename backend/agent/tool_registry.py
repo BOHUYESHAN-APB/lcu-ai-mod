@@ -331,6 +331,12 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("set_home", "在基地范围内自己找床；找不到就自己造（缺料/不安全如实报）",
              "base", ("territory",), "_dispatch_set_home"),
     ToolSpec("go_home", "回基地的床位（没床就回锚点）", "base", ("territory",), "_dispatch_go_home"),
+    ToolSpec("go_to_death_point",
+             "回**上次死亡点**去捡上次死时掉在那里的东西（**不是回家** —— 回家是 go_home）。"
+             "默认最近一次；index=1/2 可回上上次/上上上次（最多记着 3 次）。"
+             "没有死亡记录时如实拒绝（code=no_death_point）；我**不会**自己往回走，"
+             "只有你（或玩家）叫我才去", "index", ("territory",),
+             "_dispatch_go_to_death_point"),
 ) + composite_specs()
 # ↑ 末尾接上复合体条目（声明在 `agent/composites.py`；顺序＝注册表顺序＝L3 展示顺序）。
 

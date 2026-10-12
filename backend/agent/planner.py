@@ -434,10 +434,52 @@ def looks_like_locate_reply(entry: dict) -> bool:
     return any(hint in lowered for hint in LOCATE_HINTS)
 
 
+def _death_ago(at_ms: Any, now: Optional[float] = None) -> str:
+    """死亡那一刻的墙上时间毫秒 → "多久以前"；值不合法就空串（**不编时间**）。
+
+    `now` 的单位是**秒**（与 `time.time()` 一致），`at_ms` 是毫秒（与 `System.currentTimeMillis()`
+    一致）—— 两者不同单位是模组与后端的既有事实，容易填错，所以在签名里写死这个说明。
+    """
+    if isinstance(at_ms, bool) or not isinstance(at_ms, (int, float)):
+        return ""
+    now_ms = (time.time() if now is None else float(now)) * 1000.0
+    delta = now_ms - float(at_ms)
+    if delta < -60_000:
+        # 模组时钟跑到我们前面去了（对不上表）：说"多久以前"就是编，宁可不说。
+        return ""
+    delta = max(0.0, delta) / 1000.0
+    if delta < 60:
+        return "刚刚"
+    if delta < 3600:
+        return f"{delta / 60:.0f}分钟前"
+    if delta < 86400:
+        return f"{delta / 3600:.0f}小时前"
+    return f"{delta / 86400:.0f}天前"
+
+
+def death_point_line(row: Any, older: int = 0, now: Optional[float] = None) -> str:
+    """L2 里描写死亡点的**那一条**（最新那条）；没有可用事实就空串（拒绝凭空编一个）。
+
+    用户口径：只摆事实（死在哪、维度、多久以前、东西还掉着）+ **模型可调**的回程工具名，
+    不做任何"自动回去"的暗示。坐标只在这一行报一次（别和"已知记录点"重复刷屏）。
+    """
+    point = point_of(row)
+    if point is None:
+        return ""
+    coords = ",".join(where._fmt(value) for value in point)
+    dimension = str(row.get("dimension") or "").strip() if isinstance(row, dict) else ""
+    when = _death_ago(row.get("at") if isinstance(row, dict) else None, now)
+    facts = dimension + ("，" + when if when else "")
+    tail = "，更早的用 index=1/2" if older > 0 else ""
+    return (f"- 上次死亡点：({coords})（{facts}）—— 那里的东西还掉着（走过去会自动捡起），"
+            f"想回去就调 go_to_death_point（省 index＝就这一个{tail}）；回家是 go_home，"
+            f"而且我**不会**自己往回走")
+
+
 class Planner:
     """
     规划器：决定 AI 应该做什么。
-    
+
     设计参考 MaiBot 的两阶段推理：
     1. Timing Gate: 是否应该回复？
     2. Planner: 回复什么？做什么？
@@ -837,6 +879,9 @@ class Planner:
             known_poi_text = "暂无"
 
         territory_text = self._render_territory(context)
+        # 死亡点（模组报的事实 + 后端记的那份，最新在前）：**只摆事实**，绝不自动回去。
+        # 没有任何死亡记录 ⇒ 整段不出现（绝不凭空编一个"上次死在哪"）。
+        death_point_text = self._render_death_point(context)
 
         # 借用授权（L1，见 `_render_borrow_authorization`）+ 当前欠账（L2：每轮都变）。
         borrow_pending_text = (context.get("borrow_pending") or "").strip() if isinstance(context, dict) else ""
@@ -1075,6 +1120,7 @@ class Planner:
 已知记录点（你自己记住的持久记忆，可能在很远的地方）：
 {remembered_text}
 
+{death_point_text}
 附近实体（`tier:名字@距离`；tier 是模组按同一张表算的对待档：
 dangerous 高危险=不主动打也不还手、hostile 敌对=该处理、neutral 中立=不惹（它先动手才还手）、
 passive 被动=能猎的肉、unknown 认不出=先别当敌人）：
@@ -3304,6 +3350,79 @@ passive 被动=能猎的肉、unknown 认不出=先别当敌人）：
         if not isinstance(situation, dict):
             return None
         return point_of(situation.get("home_point"))
+
+    def _death_points(self, context: Any) -> list[dict]:
+        """现读记着的死亡点（最新在前，最多 3 条）——不吃上一轮快照。
+
+        世界记忆（`WorldPoiMemory`）是真相；没注入它时（例如只拿了 L2 上下文的情形）
+        才退到这一轮上下文里那份，**不混用两个来源**。
+        """
+        reader = getattr(getattr(self, "poi", None), "death_points", None)
+        if callable(reader):
+            try:
+                rows = reader()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("[Planner] 死亡点读取失败: %s", e)
+                rows = None
+            if isinstance(rows, list):
+                return [dict(row) for row in rows if isinstance(row, dict)]
+        rows = context.get("death_points") if isinstance(context, dict) else None
+        if not isinstance(rows, list):
+            return []
+        return [dict(row) for row in rows if isinstance(row, dict)]
+
+    def _render_death_point(self, context: Any) -> str:
+        """L2 的死亡点那**一行**；没有记录 ⇒ 空串（整段不出现，绝不编一个）。"""
+        points = self._death_points(context)
+        if not points:
+            return ""
+        return death_point_line(points[0], older=len(points) - 1)
+
+    def _dispatch_go_to_death_point(self, payload: dict, context: dict) -> bool:
+        """回**上次死亡点**（不是回家 —— 回家是 go_home）：走已有 `move_to` 那条路。
+
+        **每轮现读**世界记忆；没有任何死亡记录就**如实拒绝**（code=no_death_point，一帧都
+        不发 —— 绝不假装走了一趟）。纯读：不改写任何记忆，也不自动往回走。
+        """
+        payload = payload if isinstance(payload, dict) else {}
+        points = self._death_points(context)
+        if not points:
+            self._territory_note = ("（go_to_death_point：code=no_death_point —— 我不知道你上次"
+                                    "死在哪（没有任何死亡记录），**我没动**；回家用 go_home）")
+            return False
+        raw = payload.get("index")
+        chosen: Optional[int] = 0
+        if raw not in (None, ""):
+            if isinstance(raw, bool) or (isinstance(raw, float) and not raw.is_integer()):
+                chosen = None
+            else:
+                try:
+                    chosen = int(raw)
+                except (TypeError, ValueError):
+                    chosen = None
+        if chosen is None or not 0 <= chosen < len(points):
+            self._territory_note = (
+                f"（go_to_death_point：code=no_such_death_point —— 只记着最近 {len(points)} 次"
+                f"死亡，没有 index={raw} 这一次；省 index 走最近的那次）")
+            return False
+        target = point_of(points[chosen])
+        if target is None:
+            # 记着的条目坐标不合法（理论上不该有）：宁可如实说不知道，也不乱走。
+            self._territory_note = ("（go_to_death_point：code=no_death_point —— 记着的那次死亡"
+                                    "没有可用坐标，**我没动**）")
+            return False
+        self.skills.move_to(target[0], target[1], target[2])
+        coords = ",".join(where._fmt(value) for value in target)
+        dimension = str(points[chosen].get("dimension") or "").strip()
+        when = _death_ago(points[chosen].get("at"))
+        facts = "，".join(part for part in (dimension, when) if part)
+        label = ("上次死亡点" if chosen == 0
+                 else "上上次死亡点" if chosen == 1
+                 else f"更早的死亡点（index={chosen}）")
+        facts_text = f"（{facts}）" if facts else ""
+        self._territory_note = (f"（往{label}走：({coords}){facts_text} —— "
+                                f"那里的东西走过去就会自动捡）")
+        return True
 
     def _dispatch_go_home(self, payload: dict, context: dict) -> bool:
         """回基地：有床位就去床位，没床位就去锚点（**每轮现读 store**，不吃上一轮快照）。
