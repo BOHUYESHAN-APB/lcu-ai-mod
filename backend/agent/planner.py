@@ -859,6 +859,49 @@ def _afk_line(context: dict) -> str:
             f"（since_ticks={afk.get('since_ticks', '?')}）{tail}")
 
 
+def _command_receipts_section(context: dict, cursor: float = 0.0) -> tuple[str, float]:
+    """**模组回执**（L2）：命令名 / id / 成败 / 原因；返回 (这一段文本, 新的"看过了"游标)。
+
+    只列**还没给模型看过**的那几条（`cursor` = 上次给出去的最大时刻）—— 回执不刷屏，
+    但一定会在下一轮出现一次。
+
+    "命令发出去了"（模组 ack 了）**不等于**"做成了" —— 真机事故（2026-10-12 21:23
+    `come_to_player`）：模组受理了却一步没走，而后端的日志里连"受理了还是拒了"都没有。
+    这一段就是把回执摆到模型面前：下一轮它就知道自己那条命令到底成没成、为什么没成。
+    """
+    ctx = context if isinstance(context, dict) else {}
+    rows = ctx.get("command_receipts")
+    if not isinstance(rows, list):
+        return "", cursor
+    now = time.time()
+    lines: list[str] = []
+    newest = cursor
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        at = row.get("at")
+        at = float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else 0.0
+        if at <= cursor:
+            continue
+        newest = max(newest, at)
+        seconds_ago = max(0.0, now - at)
+        ago = "（刚刚）" if seconds_ago < 2.0 else f"（{seconds_ago:.0f} 秒前）"
+        command = str(row.get("command") or "未登记").strip() or "未登记"
+        req = str(row.get("id") or "?")
+        detail = str(row.get("detail") or "").strip()
+        if row.get("success"):
+            lines.append(f"- {command}（id={req}）{ago}：模组回执**成功**"
+                         + (f"（{detail}）" if detail else ""))
+        else:
+            lines.append(f"- {command}（id={req}）{ago}：**被拒/失败** —— "
+                         + (detail or "模组没给原因"))
+    if not lines:
+        return "", cursor
+    text = ("\n命令回执（模组的原话；「发出去了」不等于「做成了」，被拒就别当自己做成了）：\n"
+            + "\n".join(lines) + "\n")
+    return text, newest
+
+
 def _attack_result_line(context: dict) -> str:
     """站桩攻击的**收尾回执**（L2）：命中数 + 退出原因码；没有回执就整段不出现。
 
@@ -966,8 +1009,12 @@ class Planner:
         self._craft_note: Optional[str] = None
         # 本轮服务器指令/私信/TPA 的如实说明（被白名单拒了、要二次确认…）。
         self._action_note: Optional[str] = None
-        # 本轮领地/基地/容器/区域/回家的如实说明（没授权、找不到、缺料…）。
+        # 绑定床位链的结论 + 上一轮领地/基地的如实说明：链由 session 心跳推进
+        # （见 `home_bed_step`），结论可能落在**没有对话的**那一拍上 —— 攒着，下一轮回复带出去。
         self._territory_note: Optional[str] = None
+        self._home_bed_report: Optional[str] = None
+        # 模组命令回执给模型看过的"时刻游标"：只把**还没给过**的那几条写进 L2（不刷屏）。
+        self._receipt_cursor: float = 0.0
         # 按需扫描（`scan_entities`）：等回执的这一次请求（按 req_id 配对）与最近一次**回执**的
         # 如实说明（进 L2 给模型看 —— 摘要里没有坐标的档位只能靠它拿明细）。**不**每轮清零：
         # 回执是异步来的，可能落在本轮之后。
@@ -1098,9 +1145,19 @@ class Planner:
         if self._composite_runs:
             try:
                 self.resume_composites(context)
-                self.home_bed_step(context)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[Planner] 复合体续跑失败: %s", exc)
+        # 绑定床位链（走过去 → 右键 → 拿原版重生点核对）**绝不能**挂在上面那个条件后面：
+        # 它根本不是复合体（`set_home` 起链时不创建任何复合体运行）⇒ 旧写法让它在
+        # `_composite_runs` 为空时**永远不被调用**，链停在第 0 步、连 `move_to` 都不发。
+        # 真机事故（2026-10-12 21:20）：`set_home({'base': '家'}) -> ok` 之后再没有任何
+        # 导航/移动下发，位置一直 (849,63,-2194)（床在 (851,63,-2191)）。
+        # 现在两处驱动：这里的**既有轮次槽位**，以及 session `tick` 心跳（`_home_bed_step`，
+        # 每份新感知推一步 —— 没有新对话时也照走）。
+        try:
+            self.home_bed_step(context)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[Planner] 绑定床位续跑失败: %s", exc)
 
         try:
             # 第一阶段：planner 结合状态产出候选动作（JSON）。
@@ -1176,8 +1233,13 @@ class Planner:
         与一条"指令被拒/要确认"的说明 —— 都不许编，有什么说什么。
         """
         text = self._with_locate_note(reply)
+        # 绑定床位链的结论只说一次：说出来就清掉（由 session 心跳落下的那次结论
+        # 可能发生在没有对话的一拍上，这里负责把它带出去 —— 绝不静默吞掉）。
+        report = getattr(self, "_home_bed_report", None)
+        if report:
+            self._home_bed_report = None
         for note in (self._craft_note, self._action_note, self._territory_note,
-                     self._haul_note, self._farm_note, self._composite_note):
+                     report, self._haul_note, self._farm_note, self._composite_note):
             if not note:
                 continue
             text = f"{text}\n{note}" if text else note
@@ -1399,6 +1461,9 @@ class Planner:
         # 站桩攻击的**收尾回执**（命中数 / 退出原因）：有才出现。"发出去了"≠"打到了"。
         attack_line = _attack_result_line(context)
         attack_section = f"\n站桩攻击（attack_in_range 的回执）：\n{attack_line}\n" if attack_line else ""
+        # 模组**命令回执**（命令名 / 成败 / 原因）：每条只给模型看一次（游标在 planner 上）。
+        receipt_section, self._receipt_cursor = _command_receipts_section(
+            context, getattr(self, "_receipt_cursor", 0.0))
 
         # 在线玩家 + 最近聊天：判断"他在跟谁说话"靠的是这两块，而不是每次都要喊名字。
         last_speaker = context.get("last_speaker") if isinstance(context, dict) else None
@@ -1642,7 +1707,7 @@ class Planner:
 站点（挂机点：名字（kind）@坐标。要**精准站位**（刷怪塔底部那种）用 go_afk；找某个/看全部用
 where_is；记一个新站点用 remember_station＝照我此刻站位记）：
 {station_text}
-{afk_section}{attack_section}
+{afk_section}{attack_section}{receipt_section}
 {death_point_text}
 附近实体（`tier:名字@距离`（+带坐标的档位后面跟 `(x,y,z)`）；tier 是模组按同一张表算的对待档：
 dangerous 高危险=不主动打也不还手、hostile 敌对=该处理、neutral 中立=不惹（它先动手才还手）、
@@ -2482,6 +2547,7 @@ passive 被动=能猎的肉、unknown 认不出=先别当敌人）：
         if outcome.get("done"):
             self._home_bed = None                     # 一次性账：结论出来就清
             self._territory_note = note
+            self._home_bed_report = note              # 结论只说一次（`_with_notes` 消费）
             logger.info("[Planner] 绑定床位结论：%s", note)
             return True
         if note:

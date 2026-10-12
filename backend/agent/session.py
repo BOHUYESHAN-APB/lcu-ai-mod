@@ -61,6 +61,12 @@ from .tpa import TpaCoordinator, TpaDetector
 logger = logging.getLogger("session")
 
 
+def _clip_text(text: str, cap: int) -> str:
+    """一段人读文本的超长截断（如实写"已截断"，**不**静默丢内容）。"""
+    text = str(text or "")
+    return text if len(text) <= cap else f"{text[:cap]}…（已截断）"
+
+
 def _wake_names_from(persona: dict, bot_name: str) -> list[str]:
     """唤醒名 = 人设里的 wake_names + AI 自己的名字（去重、保序）。
 
@@ -250,6 +256,9 @@ class Session:
         self._route_exported: set[str] = set()
         # 最近被区域硬拦的记录（`blocked_by_zone`）：进 L2 上下文 + 归入任务失败原因。
         self._zone_blocks: list[dict] = []
+        # 模组回执台账（命令名 / 成败 / 原因 / 时刻）：进 L2 —— "发出去了 ≠ 做成了"。
+        # （命令名问 wire 要：它在唯一的发号点记着 `req_id → 命令名`。）
+        self._command_receipts: list[dict] = []
         # "离家多久"的计时（进基地范围就清零；只上报，绝不自己偷跑回去）。
         self._home_away_since: Optional[float] = None
         # person 层：跨服的"同一个人"稳定事实（uuid 优先，名字兜底 + 降级打标）。
@@ -319,6 +328,10 @@ class Session:
         self._seen_drop_ids: set[str] = set()
         self._last_biome = ""
         self._last_task_event: dict = {}
+        # 感知序号：每收到一份 state_update +1。绑定床位链按"每份新感知一步"推进
+        # （见 `_home_bed_step`），这就是"这一份感知推过了没有"的判据。
+        self._state_seq = 0
+        self._home_bed_seq = -1
 
         # Planner (MaiBot-style two-stage reasoning)
         # 阈值走共享 ConfigStore → UI 改完即时生效（同一实例，不会各持副本）。
@@ -434,6 +447,8 @@ class Session:
         """Route an event from the mod."""
         match event_type:
             case "state_update":
+                # 新的一份感知到了（绑定床位链按"每份新感知一步"推进，见 `_home_bed_step`）。
+                self._state_seq = int(getattr(self, "_state_seq", 0)) + 1
                 self._apply_presence(data)
                 self.runtime.update(data)
                 self._absorb_poi(data)
@@ -464,7 +479,12 @@ class Session:
             case "command_response":
                 req_id = data.get("id", "?")
                 success = data.get("success", False)
-                self.action_manager.handle_response(req_id, success)
+                # 回执先落成事实（命令名 + id + 成败 + 原因），再交给在途动作台账：
+                # 命令在回执到达前就被 Stop 掉时，`action_manager` 一个字都不会打 ——
+                # 真机黑洞（2026-10-12 21:23 `come_to_player`）就是这么来的。
+                receipt = self._absorb_command_receipt(data)
+                self.action_manager.handle_response(req_id, success,
+                                                    detail=(receipt or {}).get("detail", ""))
                 # 区域硬拦（`blocked_by_zone`）：如实转达"哪个区域、哪条规则"，并归入任务失败原因。
                 self._note_zone_block(data)
                 # `route_export` 的回执：拿到点列就补存盘并推回去（拿不到维持 no_geometry）。
@@ -758,6 +778,43 @@ class Session:
             logger.warning("[Session] 搬运推进一步失败: %s", e)
             return False
 
+    def _home_bed_context(self) -> dict:
+        """绑定链只看**这一份感知**里的三样：我在哪、记着的床在哪、原版重生点是不是它。"""
+        runtime = self.runtime if isinstance(self.runtime, dict) else {}
+        return {
+            "player": runtime.get("player") or {},
+            "home_bed": runtime.get("home_bed"),
+            "home_bed_bound": runtime.get("home_bed_bound", False),
+            "nearby_beds": runtime.get("nearby_beds") or [],
+        }
+
+    def _home_bed_step(self) -> bool:
+        """把"走过去 → 右键一次 → 拿原版重生点核对"这条绑定链推进一步。
+
+        与搬运 `_haul_step` 同槽位（既有 tick 心跳，20Hz），但**不依赖模型轮次** ——
+        真机事故（2026-10-12 21:20）：`set_home({'base': '家'}) -> ok` 之后玩家没再说话，
+        链一步都没走，表现就是"说要去绑、然后原地罚站"。链的推进点是**每份新感知一步**
+        （state_update 才推，`_state_seq` 判重）⇒ 链的"轮"仍然等于"一次新状态"，
+        与 `home_bed.step` 的轮预算口径一致（不会 20Hz 空转把额度烧光）。
+        返回 True 只在**结论落定**（绑上了 / 如实失败）时 —— 与 `home_bed.step` 同口径。
+        """
+        planner = getattr(self, "planner", None)
+        step = getattr(planner, "home_bed_step", None)
+        if not callable(step):
+            return False
+        if not isinstance(getattr(planner, "_home_bed", None), dict):
+            return False                                  # 没这条链 ⇒ 一次都不碰（零开销）
+        seq = getattr(self, "_state_seq", 0)
+        if seq == getattr(self, "_home_bed_seq", -1):
+            return False                                  # 这一份感知已经推过了
+        self._home_bed_seq = seq
+        try:
+            with self.skills.command_context("mode"):
+                return bool(step(self._home_bed_context()))
+        except Exception as e:
+            logger.warning("[Session] 绑定床位推进失败: %s", e)
+            return False
+
     def _verify_haul(self, snapshot: dict) -> None:
         """新容器快照到了 → 给当前搬运做两侧对账（真的对上才算数）。"""
         planner = getattr(self, "planner", None)
@@ -1006,6 +1063,59 @@ class Session:
         return True
 
     # ── 领地 / 基地 / 容器 / 区域（world 层分区）──────────────────
+
+    #: 回执里可能装"为什么"的字段（模组 `sendResponse(id, ok, msg)` 会同时写 `data.message`
+    #: 与 `error`；安全/区域拦截还会带 `detail` / `reason`）。按这个顺序取第一个非空的。
+    RECEIPT_REASON_KEYS = ("message", "detail", "reason", "note")
+
+    def _receipt_command_name(self, req_id: str) -> str:
+        """这个 `req_id` 是哪条命令 —— 问**发号的那一端**（wire 在 `send_command` 时记的）。
+
+        命令不一定都从 `skills` 走（网页 `/ws` 的 `{"type":"command"}` 直接发号），
+        所以只在唯一的发号点记名字才覆盖得全。拿不到就空串（调用方如实写"未登记"）。
+        """
+        wire = getattr(self, "wire", None)
+        lookup = getattr(wire, "command_name_for", None)
+        if not callable(lookup):
+            return ""
+        try:
+            return str(lookup(req_id) or "")
+        except Exception as e:  # noqa: BLE001 —— 查名字失败绝不拖垮回执处理
+            logger.debug("[Cmd] 回执命令名查询失败: %s", e)
+            return ""
+
+    def _absorb_command_receipt(self, data: dict) -> Optional[dict]:
+        """模组回执 → 进**台账**（`_command_receipts`）并进 L2（"发出去了" ≠ "做成了"）。
+
+        真机黑洞（2026-10-12 21:23，`come_to_player id=req_2`）：日志只有 `← response: req_2`，
+        命令到底被受理还是被拒、为什么被拒，一个字都没有 ⇒ 用户原话"至于为什么没有调用成功，
+        这件事情不好确定"。现在两处都补上（**通用路径**，不是只修某一条命令）：
+
+        - 日志：`← response: <命令名> id=<req> success=<是/否> 原因=<截断>`
+          （wire 在唯一的发号点打的，覆盖 skills / 网页 / 内嵌通道发的所有命令）；
+        - 台账：这一条进 `_command_receipts`（有界 12 条）→ 下一轮 L2 让模型看得见
+          （`_runtime_context["command_receipts"]`，见 planner `_command_receipts_section`）。
+        """
+        payload = data if isinstance(data, dict) else {}
+        req_id = str(payload.get("id") or "?")
+        success = bool(payload.get("success"))
+        label = self._receipt_command_name(req_id)
+        inner = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        reason = str(payload.get("error") or "").strip()
+        if not reason:
+            for key in self.RECEIPT_REASON_KEYS:
+                value = str(inner.get(key) or "").strip()
+                if value:
+                    reason = value
+                    break
+        row = {"command": label or "未登记", "id": req_id, "success": success,
+               "detail": _clip_text(reason, 200), "at": time.time()}
+        rows = getattr(self, "_command_receipts", None)
+        if not isinstance(rows, list):
+            rows = self._command_receipts = []
+        rows.append(row)
+        del rows[:-12]
+        return row
 
     def _note_zone_block(self, data: dict) -> Optional[dict]:
         """被区域硬拦（`blocked_by_zone`）→ 记下"哪个区域、哪条规则"，并归入任务失败原因。
@@ -2328,6 +2438,11 @@ class Session:
         # 站桩攻击的**收尾回执**（模组 `attack_in_range_result` 事件；可能是几秒前那次）：
         # 只进 L2 —— 让模型看到"打到了几次 / 为什么停"，而不是只知道"命令发出去了"。
         context["attack_in_range_result"] = getattr(self, "_attack_result", None)
+        # 模组**命令回执**（命令名 / 成败 / 原因；最近几条）：只进 L2 ——
+        # "发出去了 ≠ 做成了"靠它成立（模型下一轮就能看到"被拒了、为什么被拒"）。
+        receipts = getattr(self, "_command_receipts", None)
+        context["command_receipts"] = [dict(row) for row in receipts[-6:]
+                                       if isinstance(row, dict)] if isinstance(receipts, list) else []
         # 夜晚/睡眠/持久记录点：直接来自 state_update 顶层字段。
         context["nearby_beds"] = self.runtime.get("nearby_beds", [])
         context["remembered_pois"] = self.runtime.get("remembered_pois", [])
@@ -2576,6 +2691,11 @@ class Session:
             self._auto_return_step()
             # 还没搬完的搬运：走到箱边/开箱/取/放各推进一步（对账走 state_update 那条路）。
             self._haul_step()
+        # 绑定床位链（走过去 → 右键 → 核对重生点）：**不看 idle** —— 链自己在走路时
+        # `move_to` 就占着在途动作（is_idle 为假），按 idle 判会把自己的走路掐死。
+        # 所以只要求"由我控制 + 有一份还没推过的新感知"（判重在 `_home_bed_step` 里）。
+        if autonomy_enabled and not manual_override_active:
+            self._home_bed_step()
         mode_action = None
         if autonomy_enabled and not manual_override_active:
             with self.skills.command_context("mode"):

@@ -292,12 +292,17 @@ class WireLoopCompressionTests(unittest.TestCase):
         self.assertIn("与上一条相同 ×1", out[1], "被压掉的那条要在下一行交代")
         self.assertEqual(wire._log_deduper.total_events(), 3)
 
-    def test_non_periodic_lines_are_verbatim(self):
+    def test_non_periodic_lines_are_printed_one_per_message(self):
         lines = [json.dumps({"type": "response", "id": "req_1", "data": {}}),
                  json.dumps({"type": "event", "event": "player_chat",
                              "data": {"message": "hi"}})]
         _wire, out = self._run(lines)
-        self.assertEqual(out, ["← response: req_1", "← event: player_chat"])
+        self.assertEqual(len(out), 2, "非周期消息一条一行，绝不被去重/吞掉")
+        # 回执那一行从"只打一个 req id"改成**如实**打全（命令名/id/成败/原因）——
+        # 见 `test_command_receipts`；这里只钉"没有被压缩/吞掉"。
+        self.assertTrue(out[0].startswith("← response: "), out[0])
+        self.assertIn("id=req_1", out[0])
+        self.assertEqual(out[1], "← event: player_chat")
 
 
 if __name__ == "__main__":

@@ -225,11 +225,16 @@ class ActionManager:
             logger.error("[ActionMgr] Error in %s: %s", cur.label, e)
             self.current = None
 
-    def handle_response(self, req_id: str, success: bool):
-        """Handle a response from the Java mod for a pending action."""
+    def handle_response(self, req_id: str, success: bool, detail: str = ""):
+        """Handle a response from the Java mod for a pending action.
+
+        `detail` = 模组回执里的原因（命令名在同一处由 session 记下并落日志；这里只把
+        "为什么失败"带进在途动作的终态里，免得只留一个 `command failed: req_x`）。
+        """
         cur = self.current
         if cur and cur.req_id == req_id:
-            logger.debug("[ActionMgr] Response for %s: req=%s success=%s", cur.label, req_id, success)
+            logger.debug("[ActionMgr] Response for %s: req=%s success=%s%s", cur.label, req_id,
+                         success, f" detail={detail}" if detail else "")
             if success and not cur.complete_on_response:
                 # Long-running command: this response only queued the task.
                 # Real completion arrives via task_state → complete_current().
@@ -241,7 +246,7 @@ class ActionManager:
                 self._repeat_streak.pop(cur.label, None)
             cur.completed = success
             if not success:
-                cur.error = f"command failed: {req_id}"
+                cur.error = detail or f"command failed: {req_id}"
                 cur.interrupted = True
             self._record_outcome(cur.label, success, cur.error or "")
             self.current = None

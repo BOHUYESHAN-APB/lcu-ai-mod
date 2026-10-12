@@ -59,6 +59,8 @@ MAX_LOG_CONTENT_CHARS = 400
 # 见 `WireClient._trim_state_events`：消费端（接线循环）跑 `session.tick()` 时可能有秒级
 # 同步 LLM 调用，这期间 2Hz 的 `state_update`（每条约 3KB）会无界堆积。
 MAX_QUEUED_STATE_EVENTS = 32
+#: `req_id → 命令名` 的保留条数（回执落日志 / 进 L2 用；有界，绝不无限涨）。
+MAX_REMEMBERED_COMMANDS = 200
 
 # `connect` 的超时（秒）。见 `WireClient.connect`：没有超时的 `connect` 实测要 2 秒才失败，
 # 而它跑在接线线程里 ⇒ 会拖住"关掉后端"。
@@ -564,6 +566,33 @@ def format_event_summary(obj: dict, limit: int = MAX_LOG_SUMMARY_CHARS) -> str:
     return _render_summary(_log_view(obj), limit)
 
 
+def format_response_summary(obj: dict, name: str = "",
+                            limit: int = MAX_LOG_SUMMARY_CHARS) -> str:
+    """模组**回执**的逐字摘要：命令名 / `id` / 成功与否 / 原因 / 其余 data（超长如实截断）。
+
+    回执以前只打 `← response: req_2` —— 命令到底被受理还是被拒、为什么被拒，全在黑洞里
+    （真机原话："至于为什么没有调用成功，这件事情不好确定"）。`name` 由调用方按 `id` 从
+    `req_id → 命令名` 表里取（见 `WireClient.command_name_for`），取不到就如实写"未登记"。
+    """
+    view = obj if isinstance(obj, dict) else {}
+    data = view.get("data") if isinstance(view.get("data"), dict) else {}
+    parts = [f"{str(name or '').strip() or '未登记'}",
+             f"id={view.get('id') or '?'}",
+             f"success={'是' if view.get('success') else '否'}"]
+    reason = str(view.get("error") or data.get("message") or data.get("detail")
+                 or data.get("reason") or "").strip()
+    if reason:
+        parts.append(f"原因={_short(reason, 160)}")
+    elif not view.get("success"):
+        parts.append("原因=（模组没给）")
+    extra = {key: value for key, value in data.items()
+             if key not in {"message", "detail", "reason"}}
+    if extra:
+        parts.append("data=" + _short(json.dumps(extra, ensure_ascii=False,
+                                                 separators=(",", ":")), limit))
+    return " ".join(parts)
+
+
 def _render_summary(view: Any, limit: int) -> str:
     """`_log_view` / `_fingerprint_view` 出来的视图 → 一行摘要（打印与指纹共用这一条）。"""
     fragments = _summary_fragments(view)
@@ -760,6 +789,8 @@ class WireClient:
         self._running = False
         self._reader_thread: threading.Thread | None = None
         self._id_counter = 0
+        # `req_id → 命令名`：回执里只有 id，落日志/进 L2 时靠它对上"是谁回的话"（有界 FIFO）。
+        self._req_commands: dict[str, str] = {}
         # 控制流与命令可能来自不同线程，串行化写入以保证 JSONL 行不被交错破坏
         self._send_lock = threading.Lock()
         # 聊天事件监听器（在**读取线程**里被调用，不走事件队列）。见 add_chat_listener。
@@ -867,7 +898,22 @@ class WireClient:
         }
         self._send_line(json.dumps(msg))
         logger.debug(f"→ {cmd} {args} [{req_id}]")
+        # 回执里**只有 id**，没有命令名 ⇒ 在唯一的发号点记下"这个 req 是哪条命令"
+        # （有界，只留最近若干条）。这样回执那一行才写得出"是谁回的话"
+        # —— 而且不管命令是 skills / 网页 / 别的内嵌通道发的，全都覆盖得到。
+        self._remember_command(req_id, cmd)
         return req_id
+
+    def _remember_command(self, req_id: str, cmd: str) -> None:
+        """`req_id → 命令名`（有界 FIFO）—— 回执落日志/回执进 L2 都要靠它。"""
+        table = self._req_commands
+        table[str(req_id)] = str(cmd)
+        while len(table) > MAX_REMEMBERED_COMMANDS:
+            table.pop(next(iter(table)), None)
+
+    def command_name_for(self, req_id: Any) -> str:
+        """这个 `req_id` 是哪条命令；不知道就返回空串（**绝不猜**）。"""
+        return str(self._req_commands.get(str(req_id)) or "")
 
     def send_control(self, state: dict):
         """Fire-and-forget 控制流下发：无 id、不等回执。
@@ -966,7 +1012,12 @@ class WireClient:
                             else:
                                 # 非周期性消息（命令/回执/错误/决策/聊天）与关闭开关时：
                                 # 逐字沿用旧格式，绝不静音关键信息。
-                                logger.debug(f"← {msg_type}: {label}")
+                                # 回执例外：光打一个 req_id 等于把"受理还是被拒、为什么"吞掉，
+                                # 所以把回执正文（success/原因/data）如实打出来。
+                                if msg_type == "response":
+                                    logger.debug(f"← response: {format_response_summary(obj, self.command_name_for(obj.get('id')))}")
+                                else:
+                                    logger.debug(f"← {msg_type}: {label}")
                             message = WireMessage(type=msg_type, data=obj)
                             self._event_queue.put(message)
                             if periodic:

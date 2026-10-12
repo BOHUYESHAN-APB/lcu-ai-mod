@@ -144,7 +144,9 @@ class WireLogDedupeTests(unittest.TestCase):
 
         _wire, out = self._run(lines, configure=lambda w: w.configure_log_dedupe(enabled=False))
 
-        self.assertEqual(out, ["← response: req_1"] * 2)
+        self.assertEqual(len(out), 2, "关掉开关 → 非周期消息照旧一条一行")
+        self.assertTrue(all(line.startswith("← response: ") and "id=req_1" in line
+                            for line in out), out)
 
     # ── ③ 不许静音关键信息 ───────────────────────────────────────
 
@@ -157,7 +159,8 @@ class WireLogDedupeTests(unittest.TestCase):
         _wire, out = self._run(lines)
 
         self.assertEqual(len(out), 4, "命令回执/死亡/聊天一条都不能被压掉")
-        self.assertEqual(out[0], "← response: req_1")
+        self.assertTrue(out[0].startswith("← response: "), out[0])
+        self.assertIn("id=req_1", out[0])
 
     # ── ④ 信息没丢 ───────────────────────────────────────────────
 
@@ -467,8 +470,9 @@ class PeriodicThrottleSafetyTests(unittest.TestCase):
             wire._read_loop()
         out = [record.getMessage() for record in logs.records]
 
-        for keep in ("← response: req_1", "← response: req_2", "← event: player_chat"):
-            self.assertIn(keep, out, "关键信息一条都不能被限流吃掉")
+        joined = "\n".join(out)
+        for keep in ("id=req_1", "id=req_2", "← event: player_chat"):
+            self.assertIn(keep, joined, "关键信息一条都不能被限流吃掉")
         self.assertEqual(out.count("← event: state_update"), 0,
                          "周期类走变化行，不走旧的逐条行")
 
