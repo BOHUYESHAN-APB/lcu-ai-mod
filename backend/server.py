@@ -19,6 +19,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from agent import LLMService
+from agent import hot_reload
 from agent.command_gate import HARD_BLACKLIST, HIGH_RISK, CommandsStore
 from agent.config_store import get_config_store, DEFAULT_CONFIG_PATH
 from agent.contacts import ContactStore
@@ -216,6 +217,7 @@ async def startup():
     wire.configure_log_dedupe(
         enabled=config_store.get_log_changes_only(),
         heartbeat_seconds=config_store.get_log_heartbeat_seconds(),
+        min_interval_seconds=config_store.get_log_min_interval_seconds(),
     )
     orchestrator = Orchestrator(wire)
     # 原版贴图缓存（`item_icons` 事件）：模组事件统一走 `Session.handle_event`，而
@@ -226,6 +228,8 @@ async def startup():
     _apply_config_to_llm_services()
     _apply_persona_to_session()
     _seed_local_stores()
+    # `LCU_HOT_RELOAD=1` ⇒ 开机即开后端热载看门狗（默认关）。
+    _hot_reload_autostart()
 
     # Store event loop for background thread scheduling
     loop = asyncio.get_event_loop()
@@ -574,6 +578,7 @@ async def set_config(data: dict):
         wire.configure_log_dedupe(
             enabled=config_store.get_log_changes_only(),
             heartbeat_seconds=config_store.get_log_heartbeat_seconds(),
+            min_interval_seconds=config_store.get_log_min_interval_seconds(),
         )
     return {"status": "ok", "config": app_config}
 
@@ -1125,6 +1130,117 @@ async def cancel_job(data: dict):
     ok, why = registry.cancel(job_id, reason=reason)
     return {"status": "ok" if ok else "denied", "reason": why, "job": job_id,
             "jobs": registry.snapshot()}
+
+
+# ── 后端热载（进程内，附加式）───────────────────────────────────────────────────
+# 用户口径："后端服务器改了可以热载" —— **不重启进程、不掉 wire 连接**（`uvicorn --reload`
+# 是重启进程，会掉线并清空运行期状态，本仓不用它）。白/黑名单与机制见
+# `agent/hot_reload.py` 的模块 docstring；这里只做**接线**三件：
+#   ① 忙的判据（读现有状态字段，不另造一套）；
+#   ② 真正干活的那一步（重载 + 重建会话里的 planner）；
+#   ③ 看门狗开关（进程生命周期的东西，放这儿）。
+# 一次性热载口挂在 `api/http_surface.py` 的 `POST /api/reload`（调的就是下面这两个函数）。
+HOT_RELOAD_INTERVAL = float(os.getenv("LCU_HOT_RELOAD_INTERVAL", "2") or 2)
+_hot_reload_watcher: Optional[hot_reload.HotReloadWatcher] = None
+_hot_reload_lock = threading.Lock()
+
+
+def hot_reload_busy() -> Optional[str]:
+    """热载"忙"的判据（**全部读现有状态字段**，不另造一套）：
+
+    * 会话有**未终态**的 job（`session.jobs.active()`）；
+    * `runtime["task_state"]` 既不是 idle 也不是终态（与 `Session.tick` 的 `task_active` 同口径）；
+    * planner 上有**挂起**的复合体（`planner._composite_runs`：在等 await_check 续跑的那些）。
+
+    返回 `None` = 空闲；否则是"现在在跑什么"的人读描述（直接回给前端）。
+    """
+    session = orchestrator.session if orchestrator else None
+    if session is None:
+        return None                     # 还没连模组 / 会话没起来 ⇒ 没有"在跑的东西"
+    running: list[str] = []
+    jobs = getattr(session, "jobs", None)
+    if jobs is not None:
+        try:
+            running += [f"job {getattr(job, 'id', '?')}({getattr(job, 'tool', '?')})"
+                        for job in jobs.active()]
+        except Exception as e:  # noqa: BLE001 —— 判据读不到就当没有，绝不把异常甩出去
+            print(f"[Backend] 热载忙判据：读 jobs 失败 {e}")
+    runtime = getattr(session, "runtime", None)
+    task_state = runtime.get("task_state") if isinstance(runtime, dict) else None
+    if isinstance(task_state, dict):
+        kind = str(task_state.get("kind", "idle")).strip().lower()
+        status = str(task_state.get("status", "idle")).strip().lower()
+        if kind != "idle" and status not in {"", "idle", "done", "failed", "cancelled"}:
+            running.append(f"task_state {kind}={status}")
+    composite_runs = getattr(getattr(session, "planner", None), "_composite_runs", None)
+    if composite_runs:
+        running.append(f"挂起的复合体 x{len(composite_runs)}")
+    return "、".join(running) or None
+
+
+def perform_hot_reload(changed: Optional[list[str]] = None) -> dict:
+    """真正干活的那一步：重载白名单模块 + 用会话**已有**的构件重建 `session.planner`。
+
+    `changed` 只用于"哪些改了要重启"的报告（`None` ⇒ 与进程启动基线比对，自动算）。
+    """
+    report = hot_reload.reload_agent_modules(changed)
+    session = orchestrator.session if orchestrator else None
+    if session is not None and report.get("reloaded") and hasattr(session, "planner"):
+        rebuild = hot_reload.rebuild_session_planner(session)
+        report["planner"] = rebuild
+        if not rebuild.get("ok"):
+            print(f"[Backend] 热载：planner 重建未成功（{rebuild.get('reason')}）")
+    return report
+
+
+def hot_reload_watch(enabled: bool) -> dict:
+    """开/关热载看门狗。开着时**只在空闲时**自动热载（忙则跳过并打一行日志）。"""
+    global _hot_reload_watcher
+    if enabled:
+        with _hot_reload_lock:
+            if _hot_reload_watcher is None:
+                _hot_reload_watcher = hot_reload.HotReloadWatcher(
+                    hot_reload.source_paths(),
+                    busy=hot_reload_busy,
+                    on_reload=perform_hot_reload,
+                    interval=HOT_RELOAD_INTERVAL,
+                )
+            started = _hot_reload_watcher.start()
+        state = _hot_reload_watch_state()
+        state["started"] = started
+        return state
+    watcher = _hot_reload_watcher
+    state: dict = {"stopped": bool(watcher.stop()) if watcher is not None else False}
+    state.update(_hot_reload_watch_state())
+    return state
+
+
+def _hot_reload_watch_state() -> dict:
+    watcher = _hot_reload_watcher
+    return {"enabled": bool(watcher is not None and watcher.running),
+            "interval": HOT_RELOAD_INTERVAL,
+            "status": watcher.status() if watcher is not None else {}}
+
+
+def _hot_reload_autostart() -> None:
+    """`LCU_HOT_RELOAD=1` ⇒ 开机即开看门狗（默认**关**：不替操作者做主）。"""
+    if os.getenv("LCU_HOT_RELOAD", "").strip().lower() in {"1", "true", "yes", "on"}:
+        state = hot_reload_watch(True)
+        print(f"[Backend] 后端热载看门狗已开启（LCU_HOT_RELOAD=1，间隔 "
+              f"{state['interval']:.1f}s）：只在空闲时热载")
+
+
+@app.post("/api/reload/watch")
+async def post_hot_reload_watch(data: dict):
+    """开关热载看门狗：`{"enabled": true|false}`。开着时**只在空闲时**自动热载。"""
+    payload = data if isinstance(data, dict) else {}
+    enabled = payload.get("enabled")
+    if not isinstance(enabled, bool):
+        raise HTTPException(status_code=400, detail="enabled must be a boolean")
+    state = hot_reload_watch(enabled)
+    note = ("看门狗已开启：只在空闲时自动热载（忙则跳过并打日志）" if enabled
+            else "看门狗已关闭：不再自动热载（POST /api/reload 仍可手动热载）")
+    return {"ok": True, "note": note, **state}
 
 
 # ── HTTP 面回捞（附加式）────────────────────────────────────────────────────────

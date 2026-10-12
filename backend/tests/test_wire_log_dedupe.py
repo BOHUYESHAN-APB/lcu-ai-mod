@@ -6,10 +6,13 @@
 
 本文件锁定四条硬约束：
   ① 周期状态事件内容没变 ⇒ 不打行，只在**变化**时打一行并交代"上一条相同了多久"；
-  ② 可配置：`log_changes_only`（默认开）、`log_heartbeat_seconds`（默认 0 = 关）；
+     抖动（`afk.drift`、最近样本距离在 1 格内来回）**单独**出现不算"变了"；
+  ② 可配置：`log_changes_only`（默认开）、`log_heartbeat_seconds`（默认 0 = 关）、
+     `log_min_interval_seconds`（默认 5s = 同类事件两行最小间隔）；
      关掉开关 ⇒ 逐字回到旧行为（`← type: name`，每个事件一行）；
-  ③ **不许静音关键信息**：命令/回执/错误/决策/聊天一律照旧、不去重；
-  ④ **信息没丢**：抑制计数可复原见过的总条数（emitted + suppressed = 总事件数）。
+  ③ **不许静音关键信息**：命令/回执/错误/决策/聊天一律照旧、不去重、也不受限流；
+  ④ **信息没丢**：抑制计数可复原见过的总条数（emitted + suppressed + merged = 总事件数），
+     间隔内被合并的变化条数会写进下一行（"期间另有 N 条变化被合并"）。
 """
 import json
 import tempfile
@@ -18,7 +21,8 @@ from pathlib import Path
 
 from agent.config_store import ConfigStore
 from protocol.wire_client import (
-    WireClient, _LogDeduper, event_fingerprint, is_periodic_event,
+    PERIODIC_MIN_INTERVAL_SECONDS, WireClient, _LogDeduper, event_fingerprint,
+    format_event_content, is_periodic_event,
 )
 
 
@@ -47,12 +51,18 @@ class _Clock:
     def __call__(self):
         return self.value
 
+    def advance(self, seconds):
+        self.value += float(seconds)
+
 
 class WireLogDedupeTests(unittest.TestCase):
     """走真实 `_read_loop`，只抓 `wire` logger 里实际打出的行。"""
 
-    def _run(self, lines, configure=None):
+    def _run(self, lines, configure=None, min_interval=0.0):
         wire = WireClient("127.0.0.1", 25568)
+        # 本类锁的是"**变了才打**"的语义本身，所以把**最小间隔**关掉（默认 5s）；
+        # 最小间隔的语义另有 `LogMinIntervalTests`，用假时钟精确控制时间。
+        wire.configure_log_dedupe(min_interval_seconds=min_interval)
         if configure is not None:
             configure(wire)
         wire.sock = FakeRecvSocket([(line + "\n").encode("utf-8") for line in lines])
@@ -161,8 +171,9 @@ class WireLogDedupeTests(unittest.TestCase):
 
         deduper = wire._log_deduper
         self.assertEqual(deduper.total_events(), len(lines),
-                         "emitted + suppressed 必须等于见过的总事件数")
-        self.assertEqual(deduper.emitted + deduper.suppressed, len(lines))
+                         "emitted + suppressed + merged must equal the total event count")
+        self.assertEqual(deduper.emitted + deduper.suppressed + deduper.merged, len(lines))
+        self.assertEqual(deduper.merged, 0, "min interval is off in this test")
 
         # 变化行里的 ×N 也能把"被压掉的那一段"复原出来。
         last = out[-1]
@@ -176,7 +187,9 @@ class WireLogDedupeTests(unittest.TestCase):
 
         def _configure(wire):
             clock = _Clock(0.0)
-            deduper = _LogDeduper(heartbeat_seconds=1.0, clock=clock)
+            # 心跳也遵守最小间隔（默认 5s 会把 1s 心跳全挡住）⇒ 这条用例专门关心心跳，
+            # 所以把间隔关掉。
+            deduper = _LogDeduper(heartbeat_seconds=1.0, min_interval_seconds=0, clock=clock)
             wire._log_deduper = deduper
             original = deduper.feed
 
@@ -202,7 +215,7 @@ def split_count(line):
 class LogDeduperUnitTests(unittest.TestCase):
     def test_heartbeat_emits_when_unchanged(self):
         clock = _Clock()
-        deduper = _LogDeduper(heartbeat_seconds=2.0, clock=clock)
+        deduper = _LogDeduper(heartbeat_seconds=2.0, min_interval_seconds=0, clock=clock)
 
         self.assertIsNotNone(deduper.feed("behavior_state", "fp", '{"x":1}', now=0.0))
         self.assertIsNone(deduper.feed("behavior_state", "fp", '{"x":1}', now=1.0))
@@ -252,22 +265,210 @@ class WireLogConfigTests(unittest.TestCase):
             store = ConfigStore(Path(tmp) / "config.json")
             self.assertTrue(store.get_log_changes_only(), "默认变化驱动")
             self.assertEqual(store.get_log_heartbeat_seconds(), 0.0, "默认不心跳")
+            self.assertEqual(store.get_log_min_interval_seconds(), 5.0,
+                             "默认同类周期事件两行至少隔 5 秒")
 
     def test_set_app_config_round_trip_and_clamps(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
             store = ConfigStore(path)
 
-            store.set_app_config({"log_changes_only": False, "log_heartbeat_seconds": 5})
+            store.set_app_config({"log_changes_only": False, "log_heartbeat_seconds": 5,
+                                  "log_min_interval_seconds": 2.5})
             self.assertFalse(store.get_log_changes_only())
             self.assertEqual(store.get_log_heartbeat_seconds(), 5.0)
+            self.assertEqual(store.get_log_min_interval_seconds(), 2.5)
             self.assertFalse(ConfigStore(path).get_log_changes_only(), "要落盘")
 
             store.set_app_config({"log_heartbeat_seconds": -3})
             self.assertEqual(store.get_log_heartbeat_seconds(), 0.0, "负值回退 0（关）")
 
+            store.set_app_config({"log_min_interval_seconds": 0})
+            self.assertEqual(store.get_log_min_interval_seconds(), 0.0, "0 = 关最小间隔")
+            store.set_app_config({"log_min_interval_seconds": "看不懂"})
+            self.assertEqual(store.get_log_min_interval_seconds(), 0.0, "认不出 → 保持原值")
+
             store.set_app_config({"log_changes_only": "看不懂"})
             self.assertFalse(store.get_log_changes_only(), "认不出 → 保持原值")
+
+
+class LogJitterTests(unittest.TestCase):
+    """抖动**单独**出现不构成"内容变了"（用户实机：`afk.drift` 与最近样本距离在 1 格内来回）。"""
+
+    @staticmethod
+    def _state_update(drift=0.0, distance=1.1, since_ticks=0, ts=1):
+        return {"type": "event", "event": "state_update", "ts": ts,
+                "data": {"afk": {"drift": drift, "since_ticks": since_ticks},
+                         "entities": [{"name": "绵羊", "distance": distance, "health": 8.0}]}}
+
+    def test_drift_and_sample_distance_jitter_do_not_emit(self):
+        clock = _Clock()
+        # 最小间隔关掉：证明"不打行"是**抖动判据**的结果，不是间隔挡的。
+        deduper = _LogDeduper(min_interval_seconds=0, clock=clock)
+        lines = []
+        for i in range(8):
+            event = self._state_update(drift=0.2 if i % 2 else 0.0,
+                                       distance=1.4 if i % 2 else 1.1,
+                                       since_ticks=i, ts=1000 + i)
+            lines.append(deduper.feed("state_update", event_fingerprint(event),
+                                      format_event_content(event)))
+            clock.advance(0.5)
+
+        printed = [line for line in lines if line]
+        self.assertEqual(len(printed), 1, "只有 drift / 最近样本距离在 1 格内来回 -> 不该再打行")
+        self.assertEqual(deduper.total_events(), 8, "8 条事件一条不少地被数到")
+        self.assertEqual(deduper.merged, 0, "抖动不是'变化'，不该计入被合并的变化数")
+
+    def test_the_jitter_is_still_printed_not_hidden(self):
+        """抖动不触发打行，但**打印内容照旧带原值** —— 信息不许被藏掉。"""
+        quiet = format_event_content(self._state_update(drift=0.0, distance=1.1))
+        jittered = format_event_content(self._state_update(drift=0.2, distance=1.4))
+
+        self.assertNotEqual(quiet, jittered, "打印出来的确实是两个不同的值")
+        self.assertIn('"drift":0.2', jittered)
+        self.assertIn('"distance":1', jittered, "距离按'取整到格'打印")
+        self.assertEqual(event_fingerprint(self._state_update(drift=0.0, distance=1.1)),
+                         event_fingerprint(self._state_update(drift=0.2, distance=1.4)),
+                         "但指纹把它们当同一个状态（同一格）")
+
+    def test_real_count_change_emits_even_though_jitter_field_also_moved(self):
+        """计数 27→23 是真变化 ⇒ 必须打行（抖动字段同时在动也不许掩盖它）。"""
+
+        def state(n_blocks, drift):
+            return {"type": "event", "event": "state_update", "ts": 1,
+                    "data": {"afk": {"drift": drift},
+                             "nearby_blocks": [{"block_id": "stone", "x": i, "y": 64, "z": 0}
+                                               for i in range(n_blocks)]}}
+
+        deduper = _LogDeduper(min_interval_seconds=0, clock=_Clock(0.0))
+        first = state(27, 0.0)
+        second = state(23, 0.4)
+        line1 = deduper.feed("state_update", event_fingerprint(first), format_event_content(first))
+        line2 = deduper.feed("state_update", event_fingerprint(second), format_event_content(second))
+
+        self.assertIsNotNone(line1)
+        self.assertIsNotNone(line2, "计数 27->23 是真变化，必须打一行")
+        self.assertIn('"count":23', line2)
+
+
+class LogMinIntervalTests(unittest.TestCase):
+    """最小间隔：同类周期事件两行至少隔 `PERIODIC_MIN_INTERVAL_SECONDS`，间隔内的变化被合并。"""
+
+    def test_default_interval_constant_and_deduper_default(self):
+        self.assertEqual(PERIODIC_MIN_INTERVAL_SECONDS, 5.0)
+        self.assertEqual(_LogDeduper(clock=_Clock()).min_interval_seconds, 5.0)
+
+    def test_changes_inside_the_interval_are_merged_and_reported(self):
+        clock = _Clock()
+        deduper = _LogDeduper(min_interval_seconds=5.0, clock=clock)
+        lines = []
+        lines.append(deduper.feed("state_update", "fp:27", '{"count":27}', now=0.0))
+        for i, fp in enumerate(("fp:26", "fp:25", "fp:24"), start=1):
+            lines.append(deduper.feed("state_update", fp, '{"count":%d}' % (27 - i),
+                                      now=0.5 * i))
+        lines.append(deduper.feed("state_update", "fp:23", '{"count":23}', now=5.1))
+
+        printed = [line for line in lines if line]
+        self.assertEqual(len(printed), 2, "间隔内一行都不打；到点才打一行")
+        self.assertIn("期间另有 3 条变化被合并", printed[1], "被合并的变化条数要如实交代")
+        self.assertIn('"count":23', printed[1], "打出来的是**最新**内容")
+        self.assertEqual(deduper.merged, 3)
+        self.assertEqual(deduper.total_events(), 5,
+                         "打出来的 + 被合并的 = 见过的总数（信息没丢）")
+
+    def test_jitter_inside_the_interval_never_counts_as_merged_change(self):
+        clock = _Clock()
+        deduper = _LogDeduper(min_interval_seconds=5.0, clock=clock)
+
+        def state(drift, distance):
+            return {"type": "event", "event": "state_update", "ts": 1,
+                    "data": {"afk": {"drift": drift},
+                             "entities": [{"name": "羊", "distance": distance}]}}
+
+        deduper.feed("state_update", event_fingerprint(state(0.0, 1.1)),
+                     format_event_content(state(0.0, 1.1)), now=0.0)
+        for i in range(1, 8):
+            event = state(0.2 if i % 2 else 0.0, 1.4 if i % 2 else 1.1)
+            self.assertIsNone(deduper.feed("state_update", event_fingerprint(event),
+                                           format_event_content(event), now=0.5 * i))
+        # 间隔到了：期间没有**变化**被合并 ⇒ 不该凭空打一行（心跳默认关）。
+        self.assertIsNone(deduper.feed("state_update", event_fingerprint(state(0.0, 1.1)),
+                                       format_event_content(state(0.0, 1.1)), now=5.2))
+        self.assertEqual(deduper.merged, 0, "抖动被合并进'变化'计数就是虚报")
+        self.assertEqual(deduper.total_events(), 9)
+
+    def test_unchanged_stream_stays_silent_after_the_interval(self):
+        clock = _Clock()
+        deduper = _LogDeduper(min_interval_seconds=5.0, clock=clock)
+        printed = [line for line in (
+            deduper.feed("state_update", "fp", "{}", now=0.0),
+            deduper.feed("state_update", "fp", "{}", now=0.5),
+            deduper.feed("state_update", "fp", "{}", now=5.5),
+        ) if line]
+        self.assertEqual(len(printed), 1, "内容一直没变 -> 只有第一行")
+        self.assertEqual(deduper.suppressed, 2)
+        self.assertEqual(deduper.merged, 0)
+
+    def test_repeats_after_a_merged_change_are_not_counted_as_extra_changes(self):
+        clock = _Clock()
+        deduper = _LogDeduper(min_interval_seconds=5.0, clock=clock)
+        self.assertIsNotNone(deduper.feed("state_update", "A", "A", now=0.0))
+        self.assertIsNone(deduper.feed("state_update", "B", "B", now=0.5))
+        for t in (1.0, 1.5, 2.0):
+            self.assertIsNone(deduper.feed("state_update", "B", "B", now=t))
+
+        line = deduper.feed("state_update", "C", "C", now=5.2)
+
+        self.assertIn("期间另有 1 条变化被合并", line, "A->B is one change; the trailing B's are not")
+        self.assertIn("与上一条相同 ×3", line)
+        self.assertEqual(deduper.merged, 1)
+        self.assertEqual(deduper.total_events(), 6, "2 printed + 3 repeats + 1 change = 6 events")
+
+    def test_interval_zero_restores_change_driven_behaviour(self):
+        clock = _Clock()
+        deduper = _LogDeduper(min_interval_seconds=0, clock=clock)
+        printed = [line for line in (
+            deduper.feed("state_update", "a", "A", now=0.0),
+            deduper.feed("state_update", "b", "B", now=0.1),
+            deduper.feed("state_update", "c", "C", now=0.2),
+        ) if line]
+        self.assertEqual(len(printed), 3, "0 = 关最小间隔 -> 变了就打（旧行为）")
+        self.assertEqual(deduper.merged, 0)
+
+    def test_a_line_at_t0_does_not_delay_other_event_types(self):
+        """间隔是**按事件类型**各算各的：一类被限住，不许连累另一类。"""
+        clock = _Clock()
+        deduper = _LogDeduper(min_interval_seconds=5.0, clock=clock)
+        first = deduper.feed("state_update", "a", "A", now=0.0)
+        other = deduper.feed("behavior_state", "b", "B", now=0.5)
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(other, "第一次见的类型立刻打行（没有'上一条'可比）")
+
+
+class PeriodicThrottleSafetyTests(unittest.TestCase):
+    """限流只针对**周期状态**：命令 / 回执 / 错误 / 聊天一条都不许被卷进来。"""
+
+    def test_non_periodic_lines_survive_inside_the_interval(self):
+        wire = WireClient("127.0.0.1", 25568)
+        wire.configure_log_dedupe(min_interval_seconds=5.0)
+        lines = [
+            _event("state_update", {"count": 1}),
+            _event("state_update", {"count": 2}),
+            json.dumps({"type": "response", "id": "req_1", "data": {}}),
+            json.dumps({"type": "event", "event": "player_chat", "data": {}}),
+            json.dumps({"type": "event", "event": "error", "data": {}}),
+            json.dumps({"type": "response", "id": "req_2", "data": {}}),
+        ]
+        wire.sock = FakeRecvSocket([(line + "\n").encode("utf-8") for line in lines])
+        wire._running = True
+        with self.assertLogs("wire", level="DEBUG") as logs:
+            wire._read_loop()
+        out = [record.getMessage() for record in logs.records]
+
+        for keep in ("← response: req_1", "← response: req_2", "← event: player_chat"):
+            self.assertIn(keep, out, "关键信息一条都不能被限流吃掉")
+        self.assertEqual(out.count("← event: state_update"), 0,
+                         "周期类走变化行，不走旧的逐条行")
 
 
 if __name__ == "__main__":

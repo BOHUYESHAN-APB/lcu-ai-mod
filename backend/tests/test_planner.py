@@ -68,32 +68,50 @@ class PlannerTests(unittest.TestCase):
 
         self.assertEqual(skills.calls, [])
 
-    def test_configured_threshold_gates_dispatch(self):
-        """M3-4：阈值可注入并即时生效——0.95 拦下 0.8 的决策，0.5 放行。"""
-        candidates = json.dumps({
-            "reply": "好",
-            "candidates": [
+    def test_the_model_owns_the_decision_and_candidates_go_in_order(self):
+        """用户口径（2026-10-12）："先把**一个模型负责决策**的链路做好，后面再逐步逐步加多个模型。"
+
+        契约：候选**按模型给的顺序**取第一个直接执行；**不叫第二个模型**来打分挑一个
+        （真机事故：一个候选被第二个模型打 0.55 丢掉，而它照样说"记好了"）。
+        """
+        skills = DummySkills()
+        planner, llm = self._planner_with(
+            skills,
+            json.dumps({"reply": "好", "candidates": [
                 {"tool": "collect_blocks", "args": {"block_type": "oak_log", "count": 4}, "why": "缺木头"},
-            ],
-        })
-        decider = '{"choice": 0, "confidence": 0.8}'
+                {"tool": "collect_blocks", "args": {"block_type": "birch_log", "count": 4}, "why": "也行"},
+                {"tool": "collect_blocks", "args": {"block_type": "spruce_log", "count": 4}, "why": "也行"},
+            ]}),
+            '{"choice": 1, "confidence": 0.99}',
+        )
 
-        strict_skills = DummySkills()
-        strict = Planner(
-            llm_service=FakeLLM({"planner": candidates, "decider": decider}),
-            memory=DummyMemory(), skills=strict_skills, threshold_provider=lambda: 0.95)
-        strict.plan_and_execute("Steve", "砍点木头", {})
+        planner.plan_and_execute("Steve", "砍点木头", {})
 
-        self.assertEqual(strict_skills.calls, [])
-        self.assertEqual(strict.get_status()["last_decision"]["threshold"], 0.95)
+        self.assertEqual(skills.calls, [("collect_blocks", "oak_log", 4)])   # 第一个，不是 decider 挑的
+        self.assertNotIn("decider", [c["agent"] for c in llm.calls])
+        decision = planner.get_status()["last_decision"]
+        self.assertEqual(decision["source"], "planner")
+        self.assertEqual(decision["candidate_count"], 3)
 
-        loose_skills = DummySkills()
-        loose = Planner(
-            llm_service=FakeLLM({"planner": candidates, "decider": decider}),
-            memory=DummyMemory(), skills=loose_skills, threshold_provider=lambda: 0.5)
-        loose.plan_and_execute("Steve", "砍点木头", {})
+    def test_the_confidence_threshold_no_longer_gates_anything(self):
+        """阈值现在是**留而未用**（多模型调度后续再启用）—— 这条测试把这个"故意不生效"钉住，
+        免得以后有人以为它还在拦。
+        """
+        skills = DummySkills()
+        planner, llm = self._planner_with(
+            skills,
+            json.dumps({"reply": "好", "candidates": [
+                {"tool": "collect_blocks", "args": {"block_type": "oak_log", "count": 4}, "why": "缺木头"},
+                {"tool": "collect_blocks", "args": {"block_type": "birch_log", "count": 4}, "why": "也行"},
+            ]}),
+            '{"choice": 0, "confidence": 0.01}',          # 极低分也不该拦住
+        )
+        planner._threshold_provider = lambda: 0.99        # 极严阈值同样不该拦住
 
-        self.assertEqual(loose_skills.calls, [("collect_blocks", "oak_log", 4)])
+        planner.plan_and_execute("Steve", "砍点木头", {})
+
+        self.assertEqual(skills.calls, [("collect_blocks", "oak_log", 4)])
+        self.assertNotIn("decider", [c["agent"] for c in llm.calls])
 
     def test_threshold_provider_failure_falls_back_to_default(self):
         def boom():
@@ -109,76 +127,52 @@ class PlannerTests(unittest.TestCase):
         planner = Planner(llm_service=llm, memory=DummyMemory(), skills=skills)
         return planner, llm
 
-    def test_decider_selects_candidate_and_dispatches(self):
+    def test_non_json_output_falls_back_to_legacy_parser(self):
         skills = DummySkills()
-        planner, _ = self._planner_with(
-            skills,
-            json.dumps({
-                "reply": "来了",
-                "candidates": [
-                    {"tool": "collect_blocks", "args": {"block_type": "oak_log", "count": 4}, "why": "缺木头"},
-                    {"tool": "follow", "args": {"player": "Steve"}, "why": "跟随玩家"},
-                ],
-            }),
-            '{"choice": 1, "confidence": 0.91}',
-        )
-
-        reply = planner.plan_and_execute("Steve", "跟着我", {})
-
-        self.assertEqual(reply, "来了")
-        self.assertEqual(skills.calls, [("follow_player", "Steve")])
-        self.assertEqual(planner.get_status()["last_decision"]["choice"], 1)
-
-    def test_low_confidence_does_not_dispatch(self):
-        skills = DummySkills()
-        planner, _ = self._planner_with(
-            skills,
-            json.dumps({
-                "reply": "嗯",
-                "candidates": [{"tool": "follow", "args": {"player": "Steve"}, "why": "跟随"}],
-            }),
-            '{"choice": 0, "confidence": 0.2}',
-        )
-
-        reply = planner.plan_and_execute("Steve", "跟着我", {})
-
-        self.assertEqual(reply, "嗯")
-        self.assertEqual(skills.calls, [])
-        self.assertEqual(planner.get_status()["last_decision"]["confidence"], 0.2)
-
-    def test_decider_failure_does_not_dispatch(self):
-        skills = DummySkills()
-        planner, _ = self._planner_with(
-            skills,
-            json.dumps({
-                "reply": "好",
-                "candidates": [{"tool": "follow", "args": {"player": "Steve"}, "why": "跟随"}],
-            }),
-            TimeoutError("decider timed out"),
-        )
-
-        reply = planner.plan_and_execute("Steve", "跟着我", {})
-
-        self.assertEqual(reply, "好")
-        self.assertEqual(skills.calls, [])
-        self.assertIsNone(planner.get_status()["last_decision"]["choice"])
-
-    def test_decider_is_called_with_short_timeout_and_no_reasoning_budget(self):
-        skills = DummySkills()
-        planner, llm = self._planner_with(
-            skills,
-            json.dumps({"reply": "", "candidates": [
-                {"tool": "follow", "args": {"player": "Steve"}, "why": "跟随"}]}),
-            '{"choice": 0, "confidence": 0.9}',
-        )
+        planner, _ = self._planner_with(skills, 'tool(follow, {"player": "Steve"})', None)
 
         planner.plan_and_execute("Steve", "跟着我", {})
 
-        decider_call = next(c for c in llm.calls if c["agent"] == "decider")
-        self.assertEqual(decider_call["kwargs"]["max_tokens"], 32)
-        self.assertIn("timeout", decider_call["kwargs"])
-        # 零思考：decider 明确不发思考模式/深度，直接要一行 JSON。
-        self.assertIs(decider_call["kwargs"]["thinking"], False)
+        self.assertEqual(skills.calls, [("follow_player", "Steve")])
+
+    def test_one_candidate_is_executed_without_the_decider(self):
+        """用户实机根因（2026-10-12）：模型只给了一个候选，却让**第二个模型**用一个分数把它否掉，
+        而它的话照样发出去说"记好了" —— 报告的是一件没发生的事。
+
+        契约：不叫第二个模型；模型给的候选**顺序就是它的判断**，取第一个执行。
+        """
+        skills = DummySkills()
+        planner, llm = self._planner_with(
+            skills,
+            json.dumps({"reply": "记好了，家和重生点都标在那张床上。",
+                        "candidates": [{"tool": "remember_poi",
+                                        "args": {"name": "重生点", "category": "bed"},
+                                        "why": "用户要求"}]}),
+            '{"choice": 0, "confidence": 0.55}',
+        )
+
+        reply = planner.plan_and_execute("BoHuYeShan", "记录重生点和home", {})
+
+        self.assertEqual([c[0] for c in skills.calls], ["remember_poi"])
+        self.assertNotIn("decider", [c["agent"] for c in llm.calls])
+        self.assertEqual(planner.get_status()["last_decision"]["source"], "planner")
+        self.assertIn("记好了", reply)
+        self.assertNotIn("没有执行", reply)          # 真做了，就不该有那句补充
+
+    def test_a_failed_dispatch_is_not_reported_as_done(self):
+        """说了要做、却没做成 ⇒ 出去的话里必须带一句实话（不许替自己报功）。"""
+        skills = DummySkills()
+        planner, _ = self._planner_with(
+            skills,
+            json.dumps({"reply": "我把它拿出来了。",
+                        "candidates": [{"tool": "totally_unknown_tool", "args": {}, "why": "胡来"}]}),
+            None,
+        )
+
+        reply = planner.plan_and_execute("Steve", "把面包拿出来", {})
+
+        self.assertIn("我把它拿出来了。", reply)
+        self.assertIn("没有执行", reply)
 
     def test_non_json_output_falls_back_to_legacy_parser(self):
         skills = DummySkills()

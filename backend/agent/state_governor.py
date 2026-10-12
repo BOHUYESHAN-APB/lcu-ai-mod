@@ -18,6 +18,12 @@
    或 ``status == "failed"``，或顶层 ``stuck`` 字段；
 4. **超时** —— ``registered``/上次进展起 ``no_progress_seconds`` 到点。
 
+**例外（用户口径，硬）**：**读 LLM 期间进展判定暂停** —— 由 session 在调用前后
+``begin_model_call`` / ``end_model_call``（见 llm_service 的"模型在飞"通知）。用户在等国外
+服务商的大模型时，"位置没变"是**因为我们正在等模型**，不是任务卡住；这期间取消等于
+"自己把正在做的事打断"。等待时长按实际时长补平，恢复后照常判定；若这期间真取消了，
+理由里必须如实写"在等模型"，**绝不**写"位置未变"。
+
 一个**总开关**：``state_governor.enabled``（默认**开**）。关掉 ⇒ 本批行为完全回到现在
 （不注册、不判定、不取消、不占资源）。
 
@@ -160,6 +166,11 @@ class StateGovernor:
         self._backoff: dict[str, float] = {}
         self._events: list[dict] = []
         self._seq = 0
+        # "模型在飞"状态：读 LLM（语义门 / 规划 / decider / 视觉）期间进展判定**暂停**。
+        # 见 `begin_model_call` 的注释（用户口径：等大模型是"正在做的事"，不是"没进展"）。
+        self._model_calls = 0
+        self._model_wait_started_at: Optional[float] = None
+        self._model_wait_labels: list[str] = []
 
     # ── 配置 ──
 
@@ -318,6 +329,73 @@ class StateGovernor:
         except Exception as exc:  # noqa: BLE001 — 资源仲裁失败不拖垮治理
             logger.warning("[StateGovernor] 资源请求失败（%s）: %s", rec.key, exc)
 
+    # ── "模型在飞"：读 LLM 期间暂停进展判定 ──
+
+    def begin_model_call(self, label: str = "") -> None:
+        """标记"开始等模型"（语义门 / 规划 / decider / 视觉的读调用）。
+
+        用户口径（原话）："模型**超时**还是有可能的，所以说得等有些时候不得不等后台，不得不等
+        **大**模型，因为现在我配的服务商是国外的，所以说肯定第一，一方面有网络延迟，另外一方面
+        每轮的**首字延迟**肯定也高。"
+
+        等大模型是**正在做的事**，不是"没进展" —— 若这期间看门狗按"位置未变"把任务掐掉，
+        等于**自己把正在做的事打断**。所以读模型期间进展判定整体暂停；等待时长由
+        `end_model_call` 按**实际等待时长**从"无进展"计时里扣掉（`label` 用于如实交代"在等谁"）。
+        """
+        label = str(label or "")
+        with self._lock:
+            if self._model_calls <= 0:
+                self._model_wait_started_at = self._clock()
+                self._model_wait_labels = []
+            self._model_calls += 1
+            if label and label not in self._model_wait_labels:
+                self._model_wait_labels.append(label)
+
+    def end_model_call(self) -> None:
+        """标记"模型回来了"：把这次等待的时长从"无进展"计时里补平（暂停结束）。"""
+        with self._lock:
+            if self._model_calls <= 0:
+                self._model_calls = 0
+                return
+            self._model_calls -= 1
+            if self._model_calls > 0:
+                return
+            started = self._model_wait_started_at
+            self._model_wait_started_at = None
+            self._model_wait_labels = []
+            if started is None:
+                return
+            now = self._clock()
+            waited = max(0.0, now - started)
+            if waited <= 0:
+                return
+            # 等待时长**不**计进"无进展"：基线整体后移，但绝不超过"现在"
+            # （等待期间才注册的项，其注册时刻之后才算数）。
+            for rec in self._tracked.values():
+                rec.last_progress_at = min(now, rec.last_progress_at + waited)
+
+    def model_in_flight(self) -> bool:
+        """是否有 LLM 调用正在飞（读模型期间不判"卡死"）。"""
+        with self._lock:
+            return self._model_calls > 0
+
+    def model_wait_label(self) -> str:
+        """正在等的是哪个角色的模型（空串 = 没在等）。"""
+        with self._lock:
+            return "、".join(self._model_wait_labels)
+
+    def wait_note(self) -> str:
+        """取消理由里如实交代"当时在等模型"的那一段（没在等 = 空串）。
+
+        只写"在等谁"，**不**写任何"位置未变/无进展"的说法 —— 用户口径：在等大模型期间，
+        "没动"不是任务卡住，不许把"自己打断自己"包装成"任务卡死"。
+        """
+        if not self.model_in_flight():
+            return ""
+        label = self.model_wait_label()
+        who = f"：{label}" if label else ""
+        return f"（在等模型{who}）"
+
     # ── 进展判定 → 取消 ──
 
     def tick(self, state: Mapping[str, Any] | None) -> list[dict]:
@@ -330,6 +408,7 @@ class StateGovernor:
         cancelled: list[dict] = []
         with self._lock:
             keys = list(self._tracked.keys())
+        inflight = self.model_in_flight()
         for key in keys:
             with self._lock:
                 rec = self._tracked.get(key)
@@ -337,7 +416,13 @@ class StateGovernor:
                 continue  # P0 反射永不被取消 ✗
             stuck = self._stuck_reason(rec, state)
             if stuck:
-                cancelled.append(self._cancel(rec, stuck, cfg))
+                # 上游**明确**报了卡住 → 照取消；但若正等着模型，理由里如实说"在等模型"
+                # （绝不写"位置未变"这种"自己打断自己"的说法）。
+                cancelled.append(self._cancel(rec, f"{stuck}{self.wait_note()}", cfg))
+                continue
+            if inflight:
+                # 读模型期间：进展判定**暂停**（等大模型 = 正在做的事，不是没进展）。
+                # 这里既不推进签名、也不取消；等 `end_model_call` 按实际等待时长补平。
                 continue
             signature = self._signature(rec, state)
             if rec.last_signature is None:
@@ -347,6 +432,9 @@ class StateGovernor:
                 rec.last_progress_at = now
                 continue
             if now - rec.last_progress_at >= cfg.no_progress_seconds:
+                if self.model_in_flight():
+                    # 这一拍刚好又进入"等模型" ⇒ 先不取消（等待时长稍后补平）。
+                    continue
                 # 如实说**没用的是哪个信号**：自定义信号 vs 默认的"位置 + 任务状态"。
                 # 老文案一律写"位置未变"，对 `eat`/合成这类**本来就不动**的任务是误导 ——
                 # 用户看到的就是"它明明在饭点上却没动"，而真实原因可能是任务状态也没推进。
@@ -466,6 +554,9 @@ class StateGovernor:
                 "backoff": {t: round(until - now, 1)
                             for t, until in self._backoff.items() if until > now},
                 "events": len(self._events),
+                # "模型在飞"：排障时一眼看出"没进展判定为什么没动手"（用户在等大模型）。
+                "model_in_flight": self._model_calls > 0,
+                "model_waiting_for": "、".join(self._model_wait_labels),
             }
 
 

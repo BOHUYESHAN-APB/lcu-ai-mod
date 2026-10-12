@@ -266,6 +266,9 @@ class WireLoopCompressionTests(unittest.TestCase):
 
     def _run(self, lines):
         wire = WireClient("127.0.0.1", 25568)
+        # 本类锁的是"**变了才打** / 压缩"的语义本身，把**最小间隔**关掉（默认 5s）；
+        # 最小间隔另有 `tests/test_wire_log_dedupe.py::LogMinIntervalTests` 用假时钟精确验证。
+        wire.configure_log_dedupe(min_interval_seconds=0)
         wire.sock = FakeRecvSocket([(line + "\n").encode("utf-8") for line in lines])
         wire._running = True
         with self.assertLogs("wire", level="DEBUG") as logs:

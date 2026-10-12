@@ -15,7 +15,7 @@ import hashlib
 import json
 import logging
 import time
-from typing import Any, Generator, Optional
+from typing import Any, Callable, Generator, Mapping, Optional
 
 import httpx
 
@@ -67,6 +67,9 @@ def render_persona_triple(context: dict) -> Optional[str]:
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-4o-mini"
 DEFAULT_REQUEST_TIMEOUT = 120.0
+# 角色名 → `config.json` 里 `llm_timeouts` 的键。语义门在 session 里以 `agent="gate"` 调用，
+# 但配置键按它的业务名 `semantic_gate` 走（对外更直白）。
+ROLE_TIMEOUT_CONFIG_KEYS: dict[str, str] = {"gate": "semantic_gate"}
 
 
 class LLMService:
@@ -83,6 +86,14 @@ class LLMService:
         self._agent_configs: dict[str, dict[str, Any]] = {}
         # 每个角色最近一次调用失败的原因（UI 直接显示，避免"配了却不知道错在哪"）
         self._last_error: dict[str, str] = {}
+        # 角色级读超时（秒）。用户口径：国外服务商"网络延迟 + 每轮首字延迟"都高，
+        # 本该死得快的语义门也会 `ReadTimeout` ⇒ 超时按角色可配，而不是一个全局常量。
+        # `_timeout_provider` 是个每轮取用的回调（config_store 风格），UI 改完即时生效。
+        self._role_timeouts: dict[str, float] = {}
+        self._timeout_provider: Optional[Callable[[], Mapping[str, Any]]] = None
+        # "模型在飞"回调：请求发出前后各通知一次（供 state_governor 暂停进展判定）。
+        self._inflight_begin: Optional[Callable[[str], None]] = None
+        self._inflight_end: Optional[Callable[[], None]] = None
         # L1 版本键 + 上一次组装出的 L0+L1 字符串（键不变就原样复用，前缀缓存友好）。
         self._system_key: Optional[str] = None
         self._system_cache: str = ""
@@ -91,6 +102,99 @@ class LLMService:
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
         self._usage_history: list[dict] = []
+
+    # ── 按角色读超时 ──
+
+    def set_role_timeout(self, role: str, seconds: float | None) -> None:
+        """固定某角色的读超时（秒）；``None`` 表示移除该角色的覆盖。"""
+        name = str(role or "")
+        if not name:
+            return
+        if seconds is None:
+            self._role_timeouts.pop(name, None)
+            return
+        try:
+            value = float(seconds)
+        except (TypeError, ValueError):
+            return
+        if value > 0:
+            self._role_timeouts[name] = value
+
+    def set_timeout_provider(self, provider: Optional[Callable[[], Mapping[str, Any]]]) -> None:
+        """注册"角色 → 秒"的**每轮取用**回调（例如 config_store 的读取函数）。
+
+        用回调而不是一次性快照：UI 改完超时不必重启、不必重新接线。回调抛异常一律忽略。
+        """
+        self._timeout_provider = provider
+
+    def configured_role_timeout(self, agent: str | None) -> Optional[float]:
+        """该角色**配置**的读超时（秒）：provider → 固定表；没配置返回 ``None``。"""
+        role = str(agent or "default")
+        keys = (ROLE_TIMEOUT_CONFIG_KEYS.get(role, role), role)
+        provider = self._timeout_provider
+        if provider is not None:
+            try:
+                mapping = provider() or {}
+            except Exception as exc:  # noqa: BLE001 — 配置读失败绝不拖垮调用
+                logger.debug("[LLM] 读超时配置读取失败，用默认: %s", exc)
+                mapping = {}
+            if isinstance(mapping, Mapping):
+                for key in keys:
+                    value = mapping.get(key)
+                    try:
+                        value = float(value) if value is not None else 0.0
+                    except (TypeError, ValueError):
+                        value = 0.0
+                    if value > 0:
+                        return value
+        for key in keys:
+            value = self._role_timeouts.get(key)
+            if value and value > 0:
+                return float(value)
+        return None
+
+    def role_timeout(self, agent: str | None, explicit: float | None = None) -> float:
+        """该角色这次请求实际用的读超时（秒）。
+
+        取值顺序：**角色级配置**（`config.json → llm_timeouts`）→ 调用点显式值 → 全局默认。
+
+        为什么角色配置**优先于**调用点：用户口径是"这个角色等得起多久，由我配的算" ——
+        decider 这类调用点在代码里写死 8s 的地方（`planner.DECIDER_TIMEOUT_SECONDS`），
+        对国外服务商的首字延迟只会误杀；配大了能等、配小了照样能收紧，都由配置说了算。
+        """
+        configured = self.configured_role_timeout(agent)
+        if configured is not None:
+            return float(configured)
+        if explicit is not None:
+            try:
+                value = float(explicit)
+            except (TypeError, ValueError):
+                return DEFAULT_REQUEST_TIMEOUT
+            if value > 0:
+                return value
+        return DEFAULT_REQUEST_TIMEOUT
+
+    def set_inflight_callbacks(self, begin: Optional[Callable[[str], None]],
+                               end: Optional[Callable[[], None]]) -> None:
+        """注册"模型在飞"通知（请求发出前 `begin(角色)`、结束后 `end()`）。
+
+        session 把它接到 `state_governor.begin_model_call/end_model_call`：读模型期间进展判定
+        暂停 —— 用户等大模型时任务被看门狗掐掉，等于"自己把正在做的事打断"。
+        """
+        self._inflight_begin = begin
+        self._inflight_end = end
+
+    def _notify_inflight(self, begin: bool, role: str) -> None:
+        callback = self._inflight_begin if begin else self._inflight_end
+        if callback is None:
+            return
+        try:
+            if begin:
+                callback(str(role))
+            else:
+                callback()
+        except Exception as exc:  # noqa: BLE001 — 通知坏掉绝不拖垮调用
+            logger.debug("[LLM] 模型在飞通知失败: %s", exc)
 
     def set_api_key(self, key: str):
         self.api_key = key
@@ -177,27 +281,34 @@ class LLMService:
         data = self._build_payload(messages, stream=True, config=config, **kwargs)
         url = f"{config['base_url']}/chat/completions"
         headers = self._headers(config)
+        role = agent or "default"
         full = ""
         final_usage = {}
 
-        with self._client.stream("POST", url, json=data, headers=headers) as resp:
-            for line in resp.iter_lines():
-                if not line.startswith("data: "):
-                    continue
-                chunk_str = line[6:]
-                if chunk_str == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(chunk_str)
-                    delta = chunk.get("choices", [{}])[0].get("delta", {})
-                    content = delta.get("content", "")
-                    if content:
-                        full += content
-                        yield content
-                    if "usage" in chunk:
-                        final_usage = chunk["usage"]
-                except json.JSONDecodeError:
-                    continue
+        # 流式同样是"模型在飞"：请求期间进展判定暂停（与 `_post` 同一套通知）。
+        self._notify_inflight(True, role)
+        try:
+            with self._client.stream("POST", url, json=data, headers=headers,
+                                     timeout=self.role_timeout(role)) as resp:
+                for line in resp.iter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    chunk_str = line[6:]
+                    if chunk_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(chunk_str)
+                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        content = delta.get("content", "")
+                        if content:
+                            full += content
+                            yield content
+                        if "usage" in chunk:
+                            final_usage = chunk["usage"]
+                    except json.JSONDecodeError:
+                        continue
+        finally:
+            self._notify_inflight(False, role)
 
         if final_usage:
             self._track_usage({"usage": final_usage})
@@ -321,8 +432,11 @@ class LLMService:
         resolved = config or self._resolve_config(None)
         url = f"{resolved['base_url']}/{endpoint}"
         headers = self._headers(resolved)
-        effective_timeout = timeout if timeout is not None else DEFAULT_REQUEST_TIMEOUT
         role = agent or "default"
+        # 角色级配置优先，其次调用点显式值，最后全局默认（见 `role_timeout`）。
+        effective_timeout = self.role_timeout(role, timeout)
+        # "模型在飞"：请求发出前通知（读模型期间进展判定暂停），无论成功/失败都收尾。
+        self._notify_inflight(True, role)
         try:
             resp = self._client.post(url, json=data, headers=headers, timeout=effective_timeout)
             resp.raise_for_status()
@@ -338,6 +452,8 @@ class LLMService:
             logger.error("[LLM] %s -> %s", url, message)
             self._last_error[role] = message
             raise
+        finally:
+            self._notify_inflight(False, role)
 
     def get_last_error(self, agent: str | None = None) -> str:
         """该角色上一次调用失败的原因（空串=最近一次成功），供 UI 直接显示。"""

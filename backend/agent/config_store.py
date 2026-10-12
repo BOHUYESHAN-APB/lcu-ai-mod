@@ -25,6 +25,20 @@ DEFAULT_CONFIG_PATH = Path(__file__).parent.parent / ".local" / "config.json"
 
 # decider 置信度阈值的默认值（可由 config.json 的 decision.confidence_threshold 覆盖）
 DECISION_DEFAULT_CONFIDENCE = 0.6
+
+# 各角色**读超时**默认值（秒），可由 config.json 的 `llm_timeouts` 覆盖。
+# 为什么按角色分开而不是一个全局常量：用户实机"配的服务商是国外的"——网络延迟 + **首字延迟**
+# 都高，一次 `ReadTimeout` 就让语义门误判为"调用失败"。所以：
+#   semantic_gate：语义门本是"廉价一眼判断"，但扛不住国外首字延迟 ⇒ 默认给到 15s；
+#   planner：规划是本轮最重的调用，保持宽松（120s，与 `DEFAULT_REQUEST_TIMEOUT` 一致）；
+#   decider：打分只需一小段 JSON，但调用点原来写死 8s（`planner.DECIDER_TIMEOUT_SECONDS`），
+#     对国外首字延迟太紧 ⇒ 默认 20s。
+# 角色级配置**优先于**调用点的显式超时（见 `LLMService.role_timeout`），所以配大配小都生效。
+LLM_TIMEOUT_DEFAULTS: dict[str, float] = {
+    "semantic_gate": 15.0,
+    "planner": 120.0,
+    "decider": 20.0,
+}
 LEGACY_CONFIG_PATH = Path(__file__).parent.parent / "config.json"
 
 
@@ -271,6 +285,12 @@ def _default_config() -> dict[str, Any]:
             # 关闭后直接进入 planner（省一次小调用，但会更容易"什么话都接"）。
             "semantic_gate": True,
         },
+        # 各角色**读超时**（秒；`agent/llm_service.py` 的按角色超时 + session 里语义门的超时）。
+        # 用户口径（原话）："模型超时还是有可能的，所以说得等有些时候不得不等后台，不得不等
+        # 大模型，因为现在我配的服务商是国外的，所以说肯定第一，一方面有网络延迟，另外一方面
+        # 每轮的首字延迟肯定也高。" ⇒ 超时不许写死，要能按角色放宽；语义门默认 15s 就为了让
+        # 国外的首字延迟不至于被当成"调用失败"。
+        "llm_timeouts": dict(LLM_TIMEOUT_DEFAULTS),
         # 会话树读取开关（新地基 `agent/session_core/`，见 docs/dev/AGENT_ARCH.md §1）。
         # 关闭（默认）→ 「对话历史的读取」走既有链路，路径与字节完全照旧；
         # 打开 → 「对话历史的读取」改走 session_core 纯投影 + 只读适配（写侧仍归旧链路）。
@@ -282,8 +302,13 @@ def _default_config() -> dict[str, Any]:
         #   log_heartbeat_seconds=0（默认关）→ 内容长时间没变时每隔 N 秒强打一行"未变"，
         #     用来区分"链路活着但状态没变"与"链路断了"。用户口径是"没刷新就不刷新"，
         #     所以默认必须是 0；需要时再开。
+        #   log_min_interval_seconds=5（默认）→ 同类周期事件两行之间的**最小间隔**。
+        #     用户实机 `state_update` 每 0.5 秒一行、内容几乎不变，光靠"变了才打"仍会被
+        #     抖动触发；间隔内发生的变化**不丢**，会以"（期间另有 N 条变化被合并）"写进
+        #     下一行。0 = 关（回到"变了就打"）。
         "log_changes_only": True,
         "log_heartbeat_seconds": 0,
+        "log_min_interval_seconds": 5.0,
         # 状态治理（`agent/state_governor.py`）：卡死即摘掉 + 资源分租仲裁。
         # 默认**开**（用户明确要这个行为）；关掉 ⇒ 行为回到现在（不仲裁、不取消）。
         "state_governor": {
@@ -466,6 +491,24 @@ class ConfigStore:
                         0.0, float(payload["log_heartbeat_seconds"]))
                 except (TypeError, ValueError):
                     pass
+            if "log_min_interval_seconds" in payload:
+                try:
+                    self._data["log_min_interval_seconds"] = max(
+                        0.0, float(payload["log_min_interval_seconds"]))
+                except (TypeError, ValueError):
+                    pass
+            if isinstance(payload.get("llm_timeouts"), dict):
+                # 只收**已知角色**的键；非法/非正数一律忽略（保留现值），读侧还有一层兜底。
+                section = self._data.setdefault("llm_timeouts", dict(LLM_TIMEOUT_DEFAULTS))
+                for role in LLM_TIMEOUT_DEFAULTS:
+                    if role not in payload["llm_timeouts"]:
+                        continue
+                    try:
+                        parsed_timeout = float(payload["llm_timeouts"][role])
+                    except (TypeError, ValueError):
+                        continue
+                    if parsed_timeout > 0:
+                        section[role] = parsed_timeout
             if isinstance(payload.get("state_governor"), dict):
                 from .state_governor import GovernorConfig
                 self._data["state_governor"] = GovernorConfig.from_mapping(
@@ -534,6 +577,40 @@ class ConfigStore:
             return max(0.0, float(raw))
         except (TypeError, ValueError):
             return 0.0
+
+    def get_log_min_interval_seconds(self) -> float:
+        """同类周期事件两行之间的**最小间隔**（config.json → log_min_interval_seconds，默认 5）。
+
+        用户实机 `state_update` 每 0.5 秒一行：`log_changes_only` 只管"变了才打"，一两处抖动
+        仍能触发打行 —— 这里再限"最多每 N 秒一行"。间隔内发生的变化**不丢**，会写进下一行的
+        "（期间另有 N 条变化被合并）"。0 = 关。非法/负值回退默认。
+        """
+        with self._lock:
+            raw = self._data.get("log_min_interval_seconds")
+        if raw is None:
+            return 5.0
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return 5.0
+
+    def get_llm_timeouts(self) -> dict[str, float]:
+        """各角色读超时可配置值（``config.json`` → ``llm_timeouts``；非法/非正数回退默认）。
+
+        键：``semantic_gate``（默认 15s）/ ``planner``（默认 120s）/ ``decider``（默认 30s）。
+        默认值见 `LLM_TIMEOUT_DEFAULTS`。读侧**每次取用**，所以 UI 改完即时生效。
+        """
+        with self._lock:
+            raw = self._data.get("llm_timeouts")
+        raw = raw if isinstance(raw, dict) else {}
+        parsed: dict[str, float] = {}
+        for role, default in LLM_TIMEOUT_DEFAULTS.items():
+            try:
+                value = float(raw.get(role, default))
+            except (TypeError, ValueError):
+                value = float(default)
+            parsed[role] = value if value > 0 else float(default)
+        return parsed
 
     def get_state_governor_config(self) -> dict[str, Any]:
         """状态治理开关与阈值（``config.json`` → ``state_governor``，带默认值）。

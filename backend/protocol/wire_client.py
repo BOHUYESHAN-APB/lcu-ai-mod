@@ -13,6 +13,7 @@ Usage:
 import collections
 import hashlib
 import json
+import math
 import socket
 import threading
 import time
@@ -29,9 +30,12 @@ logger = logging.getLogger("wire")
 # ── 周期性入站事件的"变化才打行"日志 ───────────────────────────────
 # 背景（用户实机口径）：`← event: behavior_state` / `← event: control_state` 这类
 # **周期上报、内容却基本不变**的事件会每秒刷好几行，把真正要看的 `→ command` /
-# 错误 / 决策全淹掉。这里只对"周期性状态"事件做去重：内容没变就不打行，只在变化时
-# 打一行并交代"上一条相同了多久"。**绝不静音关键信息**：命令、回执、错误、决策、
-# 聊天一律不走这条路（见 `is_periodic_event`）。
+# 错误 / 决策全淹掉。这里只对"周期性状态"事件做去重，一共三道闸：
+#   ① 内容没变 ⇒ 不打行（只 +1 抑制计数）；
+#   ② **抖动不算变化**（`_JITTER_TOLERANCE`：`afk.drift`、最近样本距离的格内来回）；
+#   ③ **同类事件两行至少隔 `PERIODIC_MIN_INTERVAL_SECONDS`**（默认 5s），间隔内的
+#      变化被合并但**不丢** —— 下一行如实交代"（期间另有 N 条变化被合并）"。
+# **绝不静音关键信息**：命令、回执、错误、决策、聊天一律不走这条路（见 `is_periodic_event`）。
 PERIODIC_EVENT_NAMES = frozenset({
     "state_update", "behavior_state", "control_state", "task_state",
 })
@@ -50,6 +54,23 @@ _VOLATILE_SUFFIXES = ("_ms", "_at", "_ts", "_tick", "_ticks")
 
 # 单行里回显"新内容"的最大长度；超出用 `…(+N 字)` 诚实标注（不隐藏"被截断"这件事）。
 MAX_LOG_CONTENT_CHARS = 400
+
+# **同类**周期事件两行之间的最小间隔（秒）。用户实机：`state_update` 每 0.5 秒一行、
+# 内容几乎不变，一屏就被它刷满 —— 光靠"变了才打"还不够，因为一两处抖动也够触发打行。
+# 这里再兜一层：同一类周期事件**最多**每 N 秒打一行；间隔内发生的变化**不丢**，
+# 到点的那一行会如实带上"（期间另有 N 条变化被合并）"。0 = 关（回到"变了就打"）。
+# 可配置：`config.json` → `log_min_interval_seconds`（见 `configure_log_dedupe`）。
+PERIODIC_MIN_INTERVAL_SECONDS = 5.0
+
+# 抖动的**忽略阈值**表（只作用于**指纹**，打印内容照旧带原值）。
+# 用户实机：`afk.drift` 每帧浮点、最近一条样本的**距离**在 1 格内来回 —— 这类"抖动"
+# **单独**出现时不构成"内容变了"，不该触发打行。
+# 粗化方式 = "落到第几格"（`floor(v / tol)`，见 `_coarsen_jitter`）：同一格内的来回
+# 指纹不变；跨格（真挪出去了）才算变化。信息不丢：真实数值仍在打印内容里。
+_JITTER_TOLERANCE = {
+    "drift": 1.0,      # afk.drift：每帧浮点，±1 以内不算状态变化（用户实机刷屏源）
+    "distance": 1.0,   # 最近一条样本的距离：1 格内的来回不算变化（与"取整到格"同口径）
+}
 
 
 def _is_volatile_key(key: str) -> bool:
@@ -71,8 +92,13 @@ def event_fingerprint(obj: dict) -> str:
 
     以前指纹走**完整负载**：目标挪 0.05 格、视角转 1 度都算"变了"，于是"变化才打"退化成
     每分钟好几行、每行上千字坐标（用户实机："后台频繁在刷这些坐标位置，我们得限定"）。
+
+    现在指纹 = `_log_view`（打印视图）**再按抖动阈值粗化**（`_JITTER_TOLERANCE`）：
+    `afk.drift`、最近样本的 `distance` 这类每帧浮点**单独**变化不再算"内容变了"。
+    打印内容仍走 `_log_view`（原值），所以"判变化时看的东西"和"打出来的东西"只在
+    **抖动幅度内**允许不一致 —— 真跨过阈值时两者一起变，不会自相矛盾。
     """
-    blob = json.dumps(_log_view(obj), ensure_ascii=False, sort_keys=True,
+    blob = json.dumps(_fingerprint_view(obj), ensure_ascii=False, sort_keys=True,
                       separators=(",", ":"), default=str)
     return hashlib.sha1(blob.encode("utf-8", "replace")).hexdigest()
 
@@ -191,6 +217,41 @@ def _log_view(obj: Any) -> Any:
     return _quantize(summarize_periodic_payload(_normalize_for_key(payload)))
 
 
+def _coarsen_jitter(value: Any) -> Any:
+    """按 `_JITTER_TOLERANCE` 把抖动字段粗化成"落到第几格"（**只用于指纹**）。
+
+    用户实机：`afk.drift` 每帧浮点、最近一条样本的距离在 1 格内来回 —— 这类抖动**单独**出现
+    不该触发打行。粗化 = `floor(v / tol)`，所以"同一格内的来回"指纹不变；跨格（真动了）才算
+    变化。**打印内容不粗化**（`_log_view` 原样），信息不会被藏掉。
+    """
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            tolerance = _JITTER_TOLERANCE.get(str(key).lower())
+            if (tolerance and isinstance(item, (int, float))
+                    and not isinstance(item, bool)):
+                out[key] = math.floor(float(item) / tolerance)
+            else:
+                out[key] = _coarsen_jitter(item)
+        return out
+    if isinstance(value, list):
+        return [_coarsen_jitter(v) for v in value]
+    return value
+
+
+def _fingerprint_view(obj: Any) -> Any:
+    """指纹视图 = 打印视图（`_log_view`）→ **抖动粗化**（`_coarsen_jitter`）。
+
+    与打印视图的差别只有"抖动字段按阈值落到第几格"这一处：判"变没变"比打出来的更宽容一点，
+    但真变化（计数 27→23、目标挪出一格…）照样一起变 ⇒ 打出来的行永远对得上判据。
+    """
+    payload = obj.get("data") if isinstance(obj, dict) else None
+    if payload is None:
+        payload = obj
+    return _quantize(_coarsen_jitter(
+        summarize_periodic_payload(_normalize_for_key(payload))))
+
+
 def format_event_content(obj: dict, limit: int = MAX_LOG_CONTENT_CHARS) -> str:
     """把事件负载压成单行（紧凑 JSON），用于变化日志里的"新内容"。
 
@@ -212,21 +273,37 @@ def format_event_content(obj: dict, limit: int = MAX_LOG_CONTENT_CHARS) -> str:
 class _LogDeduper:
     """周期性状态事件的变化驱动日志器。
 
-    每个事件类型**各自**维护一份状态（上次指纹 + 抑制计数），互不串味；内存有上限
-    （只保留最近 `MAX_KEYS` 类，超出按 LRU 淘汰）。`emitted` / `suppressed` 两个计数
-    保证"信息没丢"：即使压掉了行，也能从计数把见过的总条数复原出来。
+    每个事件类型**各自**维护一份状态（上次**打出来的**指纹 + 计数），互不串味；内存有上限
+    （只保留最近 `MAX_KEYS` 类，超出按 LRU 淘汰）。
+
+    三层约束（对**周期状态事件**；命令/回执/错误/聊天根本不进这里）：
+
+    1. **变了才打**：内容与上次打出来的相同 ⇒ 不打行，只 +1 `suppressed`；
+    2. **抖动不算变化**：`event_fingerprint` 已按 `_JITTER_TOLERANCE` 粗化，
+       `afk.drift` / 最近样本距离的"格内来回"不触发（见该函数注释）；
+    3. **最小间隔**（`min_interval_seconds`，默认 `PERIODIC_MIN_INTERVAL_SECONDS`）：
+       同类事件两行至少隔这么久。间隔内的变化**不丢** —— 每一条都记进 `merged`，
+       到点的那一行如实带上"（期间另有 N 条变化被合并）"。
+
+    "信息没丢"的复原等式：`emitted + suppressed + merged == 见过的周期事件总数`
+    （`total_events()`）。心跳行本身不额外占一个事件额度，所以等式照旧成立。
     """
 
     MAX_KEYS = 32
 
-    def __init__(self, enabled: bool = True, heartbeat_seconds: float = 0.0, clock=time.monotonic):
+    def __init__(self, enabled: bool = True, heartbeat_seconds: float = 0.0,
+                 min_interval_seconds: float = PERIODIC_MIN_INTERVAL_SECONDS,
+                 clock=time.monotonic):
         self.enabled = bool(enabled)
         self.heartbeat_seconds = self._as_seconds(heartbeat_seconds)
+        self.min_interval_seconds = self._as_seconds(min_interval_seconds)
         self._clock = clock
         self._states: "collections.OrderedDict[str, dict]" = collections.OrderedDict()
         self.emitted = 0        # 真的打出来的"内容变化"行
-        self.suppressed = 0     # 因内容相同被压掉的行（每压一行 +1）
-        self.heartbeats = 0     # 心跳行（不参与 emitted+suppressed 的复原等式）
+        self.suppressed = 0     # 内容与上次相同（或被间隔压住）而没打行的条数
+        self.merged = 0         # 最小间隔内**变了**、被合并进下一行的条数（信息不丢的凭证）
+        self.heartbeats = 0     # 心跳行（0 间隔下的"未变"强打，默认关）
+        self._merged_by_name: dict[str, int] = {}
 
     @staticmethod
     def _as_seconds(value: Any) -> float:
@@ -236,51 +313,96 @@ class _LogDeduper:
             return 0.0
 
     def total_events(self) -> int:
-        """见过的周期性事件总数（= 变化行 + 被压掉的行）；信息没丢的复原依据。"""
-        return self.emitted + self.suppressed
+        """见过的周期性事件总数（= 打出来的 + 压掉的 + 被合并的）；信息没丢的复原依据。"""
+        return self.emitted + self.suppressed + self.merged
+
+    def merged_count(self, name: str) -> int:
+        """某类事件累计被"最小间隔"合并掉的**变化**条数（快照/排障用）。"""
+        return int(self._merged_by_name.get(str(name), 0))
 
     def feed(self, name: str, fingerprint: str, content: str,
              now: float | None = None) -> str | None:
-        """观察一条事件，返回要打印的一行；内容与上次相同则返回 None（只 +1 抑制计数）。"""
+        """观察一条事件，返回要打印的一行；被压掉/被合并时返回 None（计数照加）。
+
+        两个参照，各司其职，绝不虚报：
+
+        * `delta_printed`（与**上次打出来的**内容比）→ 决定"要不要打行"（相同的没必要打）；
+        * `changed`（与**上一条事件**比）→ 决定"这条算不算一次变化"（连续相同的不算）。
+        """
         if not self.enabled:
             return None
         timestamp = self._clock() if now is None else now
         entry = self._states.get(name)
         if entry is None:
-            self._states[name] = {"fp": fingerprint, "since": timestamp, "seen": timestamp,
-                                  "repeats": 0, "emitted_at": timestamp}
+            self._states[name] = {"fp": fingerprint, "prev_fp": fingerprint, "content": content,
+                                  "since": timestamp, "seen": timestamp, "repeats": 0,
+                                  "merged": 0, "emitted_at": timestamp}
             self._trim()
             self.emitted += 1
             return f"← {name}: {content}"
 
         self._states.move_to_end(name)
-        if entry["fp"] == fingerprint:
+        entry["seen"] = timestamp
+        changed = entry["prev_fp"] != fingerprint
+        delta_printed = entry["fp"] != fingerprint
+        entry["prev_fp"] = fingerprint
+        interval = self.min_interval_seconds
+        gated = interval > 0 and (timestamp - entry["emitted_at"]) < interval
+
+        if gated:
+            # 最小间隔内：一行都不打。真变化记进 `merged`（下一行如实交代"另有 N 条"）；
+            # 连续相同的只是被压掉（不算变化）。
+            if changed:
+                entry["merged"] += 1
+                self.merged += 1
+                self._merged_by_name[name] = self._merged_by_name.get(name, 0) + 1
+            else:
+                entry["repeats"] += 1
+                self.suppressed += 1
+            return None
+
+        if not delta_printed:
+            # 与上次打出来的内容相同 → 这次不该单独占一行。
             entry["repeats"] += 1
-            entry["seen"] = timestamp
-            heartbeat = self.heartbeat_seconds
-            if heartbeat > 0 and (timestamp - entry["emitted_at"]) >= heartbeat:
+            if entry["merged"] <= 0 and self._heartbeat_due(entry, timestamp):
                 entry["emitted_at"] = timestamp
                 self.heartbeats += 1
+                self.suppressed += 1
                 elapsed = timestamp - entry["since"]
                 return (f"← {name}（未变，已持续 {elapsed:.1f} 秒，"
                         f"累计相同 ×{entry['repeats']}）")
-            self.suppressed += 1
-            return None
+            if entry["merged"] <= 0:
+                self.suppressed += 1
+                return None
+            # 间隔已到、且期间有被合并的变化 ⇒ 也必须打一行交代（否则那段变化就丢了）。
 
-        # 内容变了：先交代"上一条相同了多久"，再给新内容。
-        repeats = entry["repeats"]
-        held = max(0.0, entry["seen"] - entry["since"])
-        self._states[name] = {"fp": fingerprint, "since": timestamp, "seen": timestamp,
-                              "repeats": 0, "emitted_at": timestamp}
-        self._states.move_to_end(name)
+        # 到这里就是"内容行"：把这一段（与上一条相同 ×repeats + 被合并的变化 ×merged）交代清楚。
+        if delta_printed:
+            entry["fp"] = fingerprint
+            entry["content"] = content
+        repeats, merged = entry["repeats"], entry["merged"]
+        held = max(0.0, timestamp - entry["since"])
+        shown = entry["content"]
+        entry.update({"since": timestamp, "seen": timestamp, "repeats": 0, "merged": 0,
+                      "emitted_at": timestamp})
         self.emitted += 1
+        notes: list[str] = []
         if repeats > 0:
-            return f"← {name}（与上一条相同 ×{repeats}，持续 {held:.1f} 秒）: {content}"
-        return f"← {name}: {content}"
+            notes.append(f"与上一条相同 ×{repeats}，持续 {held:.1f} 秒")
+        if merged > 0:
+            notes.append(f"期间另有 {merged} 条变化被合并")
+        if notes:
+            return f"← {name}（{'；'.join(notes)}）: {shown}"
+        return f"← {name}: {shown}"
+
+    def _heartbeat_due(self, entry: dict, timestamp: float) -> bool:
+        heartbeat = self.heartbeat_seconds
+        return heartbeat > 0 and (timestamp - entry["emitted_at"]) >= heartbeat
 
     def _trim(self) -> None:
         while len(self._states) > self.MAX_KEYS:
-            self._states.popitem(last=False)
+            key, _ = self._states.popitem(last=False)
+            self._merged_by_name.pop(key, None)
 
 
 @dataclass
@@ -329,18 +451,25 @@ class WireClient:
         self._log_deduper = _LogDeduper()
 
     def configure_log_dedupe(self, enabled: bool | None = None,
-                             heartbeat_seconds: float | None = None) -> None:
+                             heartbeat_seconds: float | None = None,
+                             min_interval_seconds: float | None = None) -> None:
         """配置入站周期性状态日志（对应 config.json 的 `log_*` 键）。
 
         `enabled=False` → 逐字回到旧行为（每个事件一行 `← type: name`）；
         `heartbeat_seconds>0` → 内容长时间没变也每隔 N 秒强打一行"未变"，用于区分
-        "链路还活着但状态没变" 与 "链路断了"。默认两个值都不动。
+        "链路还活着但状态没变" 与 "链路断了"；
+        `min_interval_seconds` → 同类周期事件两行之间的**最小间隔**（默认
+        `PERIODIC_MIN_INTERVAL_SECONDS`=5s；0 = 关）。用户实机 `state_update` 每 0.5 秒一行，
+        间隔内的变化不丢，会以"期间另有 N 条变化被合并"写进下一行。
+        默认三个值都不动。
         """
         deduper = self._log_deduper
         if enabled is not None:
             deduper.enabled = bool(enabled)
         if heartbeat_seconds is not None:
             deduper.heartbeat_seconds = _LogDeduper._as_seconds(heartbeat_seconds)
+        if min_interval_seconds is not None:
+            deduper.min_interval_seconds = _LogDeduper._as_seconds(min_interval_seconds)
 
     def connect(self) -> bool:
         """Connect to the mod's wire server."""

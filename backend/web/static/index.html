@@ -579,10 +579,9 @@ textarea{width:100%;min-height:68px;resize:vertical;background:var(--ov-bg,#0d11
           <option value="3" disabled>L3 决策模型 / VLA（规划中，未接入）</option>
         </select>
       </div>
-      <div class="form-row">
-        <label>决策置信度阈值</label>
-        <input type="number" id="confidenceThreshold" value="0.6" min="0" max="1" step="0.05">
-      </div>
+      <div class="hint">决策置信度阈值**暂时没有作用**（单模型决策：模型给的候选顺序就是它的判断，取第一个执行；
+      第二个模型打分那套留而未用，等多模型调度再启用）—— 所以这里不放旋钮，免得你以为它在拦。
+      按你的口径："先把一个模型负责决策的链路做好"。</div>
       <div class="form-row">
         <label>回复语义门</label>
         <select id="semanticGate">
@@ -591,6 +590,21 @@ textarea{width:100%;min-height:68px;resize:vertical;background:var(--ov-bg,#0d11
         </select>
       </div>
       <button class="btn primary" onclick="savePermissionConfig()">保存权限配置</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>♻️ 后端热载（改完 Python 不用重启）</h3>
+    <div class="hint">改的是后端 <code>agent/</code>、<code>api/</code> 里的 Python ⇒ 点这里就生效：**不重启进程、不掉 wire 连接**。
+      改到连接层那些文件（session / protocol / server / 记忆 / 消息库 ……）时，它会**如实点名"这些要重启"**，
+      不会假装热载成功。忙的时候**明确拒绝**（绝不热一半）。</div>
+    <div style="display:flex;gap:10px;align-items:center;margin:8px 0;flex-wrap:wrap">
+      <button class="btn primary" onclick="hotReloadNow()">立刻热载</button>
+      <label style="font-size:12px;display:flex;gap:6px;align-items:center">
+        <input type="checkbox" id="hotReloadWatch" onchange="toggleHotReloadWatch()">
+        空闲时自动热载（忙则跳过并打日志）
+      </label>
+      <span id="hotReloadStatus" style="font-size:11px;color:#8b949e">等待加载</span>
     </div>
   </div>
   
@@ -1583,12 +1597,12 @@ function fetchModels() {
 
 function savePermissionConfig() {
   const split = id => document.getElementById(id).value.split(',').map(s=>s.trim()).filter(Boolean);
-  const thresholdRaw = parseFloat(document.getElementById('confidenceThreshold').value);
   const config = {
     patrol_radius: parseInt(document.getElementById('patrolRadius').value) || 8,
     capability_level: parseInt(document.getElementById('capabilityLevel').value) || 1,
     decision: {
-      confidence_threshold: isNaN(thresholdRaw) ? 0.6 : thresholdRaw,
+      // 置信度阈值**留而未用**（单模型决策），界面上已经没有这个旋钮；
+      // 这里也**不回传**它，免得把一个还在配置文件里被别处读的值顺手抹掉。
       semantic_gate: document.getElementById('semanticGate').value === 'true'
     }
   };
@@ -1631,8 +1645,6 @@ function loadPermissionConfig() {
     document.getElementById('patrolRadius').value = cfg.patrol_radius || 8;
     document.getElementById('capabilityLevel').value = String(cfg.capability_level || 1);
     const decision = cfg.decision || {};
-    const threshold = decision.confidence_threshold;
-    document.getElementById('confidenceThreshold').value = threshold !== undefined ? threshold : 0.6;
     document.getElementById('semanticGate').value = String(decision.semantic_gate !== false);
   }).catch(()=>{});
   fetch('/api/permissions').then(r=>r.json()).then(p=>{
@@ -2486,6 +2498,57 @@ function saveRuntimeSwitches() {
   }).catch(e => { if (st) st.textContent = '保存失败: ' + e; });
 }
 
+// ── 后端热载（改完 Python 不用重启）──
+function hotReloadLine(text) {
+  const el = document.getElementById('hotReloadStatus');
+  if (el) el.textContent = text;
+}
+
+async function hotReloadNow() {
+  hotReloadLine('热载中…');
+  try {
+    const j = await (await fetch('/api/reload', { method: 'POST' })).json();
+    if (j.ok === false && j.reason === 'busy') {
+      hotReloadLine('没做：会话正忙（' + (j.busy || '在跑任务') + '）—— 拒绝了，绝不热一半');
+      return;
+    }
+    const n = (j.reloaded || []).length;
+    const failed = (j.failed || []).length;
+    const restart = (j.needs_restart || []).map(r => (r && r.module) || r);
+    let s = '已热载 ' + n + ' 个模块';
+    if (failed) s += '；失败 ' + failed + ' 个（看后端日志）';
+    s += restart.length ? '；这些要重启才生效：' + restart.join('、') : '；本次没有需要重启的改动';
+    hotReloadLine(s);
+  } catch (err) {
+    hotReloadLine('失败：' + err);
+  }
+}
+
+async function loadHotReloadWatch() {
+  try {
+    const j = await (await fetch('/api/reload/watch')).json();
+    const box = document.getElementById('hotReloadWatch');
+    if (box) box.checked = !!j.enabled;
+    hotReloadLine(j.enabled ? '看门狗：开（只在空闲时热载，间隔 ' + (j.interval || 2) + 's）'
+                            : '看门狗：关（只有点"立刻热载"才热载）');
+  } catch (err) {
+    hotReloadLine('拿不到状态：' + err);
+  }
+}
+
+async function toggleHotReloadWatch() {
+  const on = document.getElementById('hotReloadWatch').checked;
+  try {
+    const j = await (await fetch('/api/reload/watch', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ enabled: on }),
+    })).json();
+    hotReloadLine(j.note || (on ? '看门狗已开' : '看门狗已关'));
+  } catch (err) {
+    hotReloadLine('失败：' + err);
+  }
+}
+
 // ── Init ──
 Promise.resolve()
   .then(loadProviders)
@@ -2493,6 +2556,7 @@ Promise.resolve()
   .then(loadLLMConfig)
   .then(loadPermissionConfig)
   .then(loadPersonaConfig)
+  .then(loadHotReloadWatch)
   .then(() => { renderEffective(); updateConnection({}); })
   .catch(err => dbgLog('初始化配置失败: ' + err));
 

@@ -31,7 +31,7 @@ from .memory import Memory, WorldPoiMemory
 from .skills import Skills
 from .modes_engine import ModesEngine
 from .commands import Commands
-from .llm_service import LLMService
+from .llm_service import DEFAULT_REQUEST_TIMEOUT, LLMService
 from .self_prompter import SelfPrompter
 from .message_db import MessageDB
 from .conversation import ConversationStore, server_key
@@ -188,6 +188,15 @@ class Session:
                                         resource_lease=self.resource_lease,
                                         enabled_provider=self.state_governor.enabled)
         self.llm = LLMService()
+        # 角色读超时走**每轮取用**的配置回调（`config.json → llm_timeouts`）：国外服务商
+        # 首字延迟高，UI 改完即时生效，不必重启。见 `_llm_role_timeouts`。
+        self.llm.set_timeout_provider(self._llm_role_timeouts)
+        # "模型在飞" → 治理器暂停进展判定：用户等大模型时任务被看门狗掐掉，等于自己把
+        # 正在做的事情打断（见 `state_governor.begin_model_call` 的注释）。
+        self.llm.set_inflight_callbacks(self.state_governor.begin_model_call,
+                                        self.state_governor.end_model_call)
+        # 语义门失败只报一次（同一原因连续失败不刷屏；恢复成功再报一行）。
+        self._semantic_gate_failed = False
 
         # Message database (SQLite persistence)
         self.message_db = MessageDB(db_path=f"data/messages_{self.id}.db")
@@ -521,8 +530,11 @@ class Session:
         "new_biome": 90.0, "task_done": 30.0, "task_failed": 30.0,
     }
     EVENT_MIN_GAP = 15.0
-    # 语义门是"低成本的一眼判断"，给它一个短超时，别让它变成新的延迟瓶颈。
-    SEMANTIC_GATE_TIMEOUT = 6.0
+    # 语义门兜底超时（秒）。用户口径（原话）："模型**超时**还是有可能的…因为现在我配的服务商
+    # 是国外的…每轮的**首字延迟**肯定也高。" 6s 对国外首字延迟太紧（实机就吃过
+    # `ReadTimeout`），默认放宽到 15s；实际取值走 `config.json → llm_timeouts.semantic_gate`
+    # （见 `_llm_timeout`），这里只是读不到配置时的兜底。
+    SEMANTIC_GATE_TIMEOUT = 15.0
     # 语义门说 wait 时的自续窗口与次数上限（设计文档 §5 的第二个入口：wait 超时自续）。
     WAIT_RETRY_SECONDS = 2.0
     WAIT_MAX_RETRIES = 2
@@ -1916,7 +1928,11 @@ class Session:
         """L4 语义门：{continue, wait, no_action} —— "他是在跟我说话还是在跟别人说话"。
 
         - 外部事件注入（`event` 非空）也走这里：**绝不**"事件 → 必发消息"。
-        - 失败/未配置 LLM 一律回 continue（门坏了不该把回话也一起堵死）。
+        - 失败/超时/未配置 LLM 一律回 continue（门坏了不该把回话也一起堵死）。
+        - **超时可配**（`config.json → llm_timeouts.semantic_gate`，默认 15s）：用户配的是
+          国外服务商，"网络延迟 + 每轮首字延迟"都高，短超时会把正常的一次判断误判成失败。
+        - **等待不静默**：调用前打一行"在等模型（语义门）…"。
+        - **失败不刷屏**：同一原因连续失败只在首次打 WARNING，恢复成功打一行 INFO。
         """
         llm = getattr(self, "llm", None)
         if llm is None or not getattr(llm, "api_key", None):
@@ -1942,14 +1958,55 @@ class Session:
             f"最近对话（按时间从早到晚）：\n{history or '（还没人说过话）'}\n\n"
             f"{subject}\n"
         )
+        timeout = self._llm_timeout("gate")
+        # 等待期间不静默：这行先打出来，用户才知道"没动静"是因为在等模型（可能十几秒）。
+        logger.info("[Session] 在等模型（语义门）…（读超时 %.0fs）", timeout)
         try:
             result = llm.chat([{"role": "user", "content": prompt}], agent="gate",
                               temperature=0.2, max_tokens=24, thinking=False,
-                              timeout=self.SEMANTIC_GATE_TIMEOUT)
+                              timeout=timeout)
         except Exception as e:
-            logger.warning("[Session] 语义门调用失败(%s)，按 continue 处理", e)
+            # 同一原因连续失败**只报一次**（否则每轮聊天都刷一行 WARNING，把真日志淹掉）。
+            if not getattr(self, "_semantic_gate_failed", False):
+                logger.warning("[Session] 语义门调用失败(%s)，按 continue 处理"
+                               "（同类失败不再重复刷屏）", e)
+                self._semantic_gate_failed = True
             return "continue"
+        if getattr(self, "_semantic_gate_failed", False):
+            logger.info("[Session] 语义门已恢复正常")
+            self._semantic_gate_failed = False
         return self._parse_semantic_verdict((result or {}).get("content", ""))
+
+    # ── LLM 读超时（按角色，可配）──
+
+    def _llm_role_timeouts(self) -> dict[str, float]:
+        """角色 → 读超时（秒），供 `LLMService.role_timeout` **每次请求前**取用。
+
+        键取自 `config.json → llm_timeouts`（`semantic_gate` / `planner` / `decider`）；
+        非法或读不到就少给几个键，调用侧回落到全局默认。角色名 `gate` 是语义门在 llm 侧的
+        agent 名（见 `_semantic_gate`），配置里按业务名 `semantic_gate` 写。
+        """
+        try:
+            configured = get_config_store(DEFAULT_CONFIG_PATH).get_llm_timeouts()
+        except Exception as e:  # noqa: BLE001 — 配置读失败绝不拖垮调用
+            logger.debug("[Session] 读超时配置读取失败: %s", e)
+            return {}
+        mapping = {"gate": "semantic_gate", "planner": "planner", "decider": "decider"}
+        out: dict[str, float] = {}
+        for role, key in mapping.items():
+            value = configured.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+                out[role] = float(value)
+        return out
+
+    def _llm_timeout(self, role: str) -> float:
+        """该角色本次调用的读超时（秒）；读不到配置就用兜底默认。"""
+        value = self._llm_role_timeouts().get(role)
+        if value:
+            return float(value)
+        if role == "gate":
+            return float(self.SEMANTIC_GATE_TIMEOUT)
+        return float(DEFAULT_REQUEST_TIMEOUT)
 
     @staticmethod
     def _parse_semantic_verdict(text: Any) -> str:

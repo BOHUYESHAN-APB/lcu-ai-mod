@@ -18,7 +18,8 @@
 `POST /api/sdk/chat`     `Orchestrator.handle_chat` → `Session.handle_chat`（人格/记忆/Planner）
 `POST /api/sdk/command`  `Session.skills` 的低层命令出口（真 wire 命令 + 会话指令审计）
 `GET /api/v2/control`    `Planner.control_lease`（活对象，生存反射的抢占登记在这里）
-`GET /api/v2/audit`      `Session` 的安全审计落盘（`data/audit/security.jsonl`）
+`GET /api/v2/audit`     `Session` 的安全审计落盘（`data/audit/security.jsonl`）
+`POST /api/reload`      `agent/hot_reload.py`：白名单模块真热载 + 用会话现有构件重建 planner
 ======================  ==========================================================
 """
 
@@ -337,3 +338,47 @@ async def get_audit_events(
         return {"events": [], "count": 0, "source": str(AUDIT_PATH), "available": False}
     events = store.list(category=category, limit=limit)
     return {"events": events, "count": len(events), "source": str(store.path), "available": True}
+
+
+# ── 后端热载：POST /api/reload ────────────────────────────────────────────────
+
+
+@router.get("/api/reload/watch")
+async def get_hot_reload_watch():
+    """**只读**看门狗状态（`enabled` / `interval` / 累计轮询与热载次数），给界面显示用。
+
+    数据来源：`server._hot_reload_watch_state()`（进程生命周期那一边的唯一事实源）。
+    """
+    return _server_module()._hot_reload_watch_state()
+
+
+@router.post("/api/reload")
+async def post_reload():
+    """**进程内**热载后端 Python：不重启进程、不掉 wire 连接。
+
+    真数据来源（实现都在 `server.py`，这里只挂口）：
+
+    * `server.perform_hot_reload()` → `agent/hot_reload.py` 的 `reload_agent_modules()`
+      （真 `importlib.reload` 白名单模块，按依赖顺序；单个失败不中断其余）
+      + `rebuild_session_planner()`（用会话**已有**的构件重建 `session.planner`，不新造连接/记忆）。
+    * `server.hot_reload_busy()`：忙的判据读**现有**状态字段（未终态 job / `task_state` 非
+      idle 终态 / 挂起的复合体）。
+
+    忙 ⇒ **明确拒绝**（`ok:false` + `reason:"busy"` + 当前在跑什么），**绝不热一半**；
+    空闲 ⇒ `ok:true` + 报告（`reloaded` / `failed` / `needs_restart`：哪些改了要重启，逐条带原因）。
+
+    看门狗开关在 `POST /api/reload/watch`（`server.py`：进程生命周期那一边），
+    `LCU_HOT_RELOAD=1` 可开机即开。
+    """
+    server = _server_module()
+    busy = server.hot_reload_busy()
+    if busy:
+        return {"ok": False, "reason": "busy", "busy": busy,
+                "note": f"会话正忙（{busy}）：已拒绝热载（绝不热一半）。等空闲再来；"
+                        f"或用 POST /api/reload/watch 打开看门狗，让它空闲时自动热载。"}
+    report = await asyncio.to_thread(server.perform_hot_reload, None)
+    restart = [str(row.get("module")) for row in report.get("needs_restart", [])
+               if isinstance(row, dict)]
+    note = "已进程内热载：连接与内存态都还在（没重启、没断 wire）。"
+    note += (f"这些改了要重启：{'、'.join(restart)}。" if restart else "本次没有需要重启的改动。")
+    return {"ok": True, "note": note, **report}

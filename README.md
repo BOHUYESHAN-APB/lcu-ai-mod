@@ -150,6 +150,20 @@ python -m venv .venv
 
 网页控制台有 5 个页面：`/`（控制台）、`/contacts`、`/overlay`（整屏舞台）、`/overlay/editor`、`/overlay/{component}`（OBS 组件单页，见 [overlay/README.md](overlay/README.md)）。
 
+### 后端热载（改完 Python 不用重启）
+
+改完后端 Python 逻辑后**不用重启进程**：进程内 `importlib.reload`，**不掉 wire 连接**、不丢内存态（连接着游戏时尤其重要）。`uvicorn --reload` 是重启进程 —— 会掉线并清空运行期状态，本仓**不用**它。
+
+- `POST /api/reload` —— 立刻热载一次。空闲时回 `{"ok": true, ...}` + 报告：`reloaded`（真重载了的模块）、`failed`（重载抛错、已跳过继续的）、`needs_restart`（**改了要重启**的那些，逐条带原因）；同时用会话**已有**的构件重建 `session.planner`（不新造 wire / 记忆）。
+- `POST /api/reload/watch {"enabled": true|false}` —— 开关后台看门狗：按间隔轮询源文件快照，**只在空闲时**自动热载。开机即开用环境变量 `LCU_HOT_RELOAD=1`（间隔 `LCU_HOT_RELOAD_INTERVAL`，默认 2 秒）。
+- **忙时一律拒绝 / 跳过**：会话有**未终态**的 job、`task_state` 不是 idle/终态、或 planner 上有**挂起的复合体**就算忙 —— `/api/reload` 回 `{"ok": false, "reason": "busy", "busy": "…"}`（**绝不热一半**），看门狗则**跳过 + 打日志**，把这次变化挂起，等空闲再一次性热载（不排队堆叠）。
+
+**能热载（白名单，`agent/hot_reload.py` 的 `HOT_MODULES`，按依赖顺序）**：`planner`、`perception`、`entities`、`farm`、`modes_engine`、`territory`、`use_on`、`anchor`、`context_budget`、`composites`、`home_bed`、`skills`、`tool_registry`、`craft`、`borrow`、`haul`、`where`、`container_view`。
+
+**不能热载（改了要重启，`needs_restart` 会点名）**：`session`、`orchestrator`、`llm_service`、`memory`、`message_db`、`config_store`、`state_governor`、`action_manager`、`protocol`（wire 连接：热载＝断线）、`server`、`api/*`，以及**白名单之外**的任何模块（拿不准就不热载）。
+
+两条诚实边界：① `importlib.reload` 是**原地**重载 —— **已经创建**的实例仍是旧类对象，所以白名单里那几个"活实例握在会话手里"的模块（`skills` / `modes_engine` / `territory` / `borrow`）改了，模块换了新代码、但那个实例要**重启**才换，报告里同样点名；② `session` 里早先 `from x import f` 拿到的老绑定也不会跟着变。因此热载对"重载后重新 import 它们的人"（planner 及白名单内部）立即生效，会话层那种老绑定要重启。
+
 ### 配置
 后端配置文件位于 `backend/.local/config.json`（自动生成，已加入 .gitignore）。
 

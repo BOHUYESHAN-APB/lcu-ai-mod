@@ -1361,6 +1361,19 @@ class Planner:
   所以要围着他找，先 `move_to` 到他那个坐标、再扫；他给了明确坐标就按明确坐标来，
   别拿我自己的位置顶替。）
 
+工具编排（用户一句话常常对应**一串**调用：找 → 走过去 → 交互 → **校验**）：
+- **先看工具表里有没有现成的复合工具**（说明里会写"内部多步/会自己走过去"）——有就直接用它，别自己一步步拼。
+  典型：`set_home` 会自己找床、走过去、**右键绑定重生点**；`remember_poi` **只记坐标**，不走也不点。
+- 没有现成的就按顺序**多次**调用：`find_block`/`scan_entities` → `go_to_block`/`move_to` → `mine_block`/`place_block`/
+  `use_on`/`container_*` → 再看状态**确认成了没有**（"发出去了"不等于"做成了"）。
+- **规则级的对应关系**（别选错近义工具）：「把这里当家 / 帮我设家 / 记一下重生点 / 以后在这儿睡」
+  ⇒ 用 **`set_home`**（它会自己找床、走过去、右键绑定）；**不要**用 `remember_poi`（只记坐标、不走也不点）。
+  只有"单纯记住这个位置"才用 `remember_poi`。
+- **祈使句必须带工具调用**：只要用户是在让你做事（找 / 拿 / 去 / 放 / 设 / 睡 / 挖 / 喂 …），这一轮就**必须**给候选，
+  不许只回一句话、也不许给空数组；**确实不能做**（缺料 / 没授权 / 被保护）才给空数组，并在 reply 里说清为什么不能做。
+- **别只回一句话当完成**：动作没有执行或没有成功时，我这边会自动在你的话后面补一句实话；
+  你自己也不要把没做的事说成做了 —— 说"找好了/绑好了"之前，先看状态确认。
+
 最近一次按需扫描（`scan_entities` 的回执；摘要里没坐标的档位只能这样拿明细）：
 {scan_text}
 
@@ -1424,36 +1437,57 @@ passive 被动=能猎的肉、unknown 认不出=先别当敌人）：
                         reply_text, seen[:300])
             return reply_text
 
-        choice, confidence = self._decide(candidates, context)
-        threshold = self._threshold()
-        self._last_decision = {
-            "source": "decider",
-            "choice": choice,
-            "confidence": round(confidence, 3),
-            "candidate_count": len(candidates),
-            "threshold": threshold,
-        }
+        if len(candidates) == 1:
+            # 只有一个候选：**没有"挑"这件事** ⇒ 直接执行。
+            # 用户口径（原话）："能力=注册的工具，LLM 决定用不用" —— 它已经用出这个工具了；
+            # 真机证据（2026-10-12）：一个 `remember_poi` 候选被**第二个模型**打 0.55 < 0.60 丢掉，
+            # 而它的话照样发出去说"记好了" —— 报告的是一件没发生的事。
+            only_tool = str(candidates[0].get("tool", "")).strip().lower()
+            logger.info("[Planner] 只有一个候选 %s，直接执行", only_tool)
+        else:
+            logger.info("[Planner] %d 个候选，按模型给的顺序取第一个（单模型决策）", len(candidates))
 
-        if choice is None or confidence < threshold:
-            logger.info(
-                "[Planner] 决策置信度不足 (%.2f < %.2f)，不下发动作，交给反射层",
-                confidence, threshold,
-            )
-            return reply_text
-
-        candidate = candidates[choice]
+        # 用户口径（2026-10-12，原话）："我们就是先至少先把**一个模型负责决策**的链路做好，后面再
+        # 逐步逐步加多个模型，不能一上来就做太复杂的东西，这么简单的一个模型调度我们都没做好。"
+        # ⇒ 这一版**不再叫第二个模型来打分挑一个**：planner 给出的候选**顺序就是它的判断**，
+        #    取第一个直接执行。安全闸门照旧在 `_dispatch_tool_call` 里（视线/够得着/不误伤/授权/不搭方块）。
+        # `decider` 那套（`_decide` + `confidence_threshold` 配置）**先留着但不启用**，
+        # 等多模型调度真的做得动再拿出来 —— 现在别让它挡在中间。
+        candidate = candidates[0]
         tool = str(candidate.get("tool", "")).strip().lower()
+        self._last_decision = {
+            "source": "planner",
+            "tool": tool,
+            "candidate_count": len(candidates),
+        }
         args = candidate.get("args") if isinstance(candidate.get("args"), dict) else {}
         executed = self._dispatch_tool_call(tool, args, context)
         # 记进 last_decision，供 /api/status 与前端展示
         self._last_decision["tool"] = tool
         self._last_decision["executed"] = bool(executed)
-        logger.info("[Planner] 决策执行 %s(%s) conf=%.2f -> %s",
-                    tool, args, confidence, executed)
+        logger.info("[Planner] 决策执行 %s(%s) -> %s", tool, args, executed)
+        if not executed:
+            # 说了要做却没做成：同样**不许**让它的话替自己报功。
+            return self._not_done_reply(reply_text, self._action_note or "动作没有成功下发")
         return reply_text
+
+    @staticmethod
+    def _not_done_reply(reply_text: Optional[str], why: str) -> Optional[str]:
+        """动作没执行时，给出去的话里**补一句如实的说明**。
+
+        用户实机（2026-10-12）：选了工具却被置信度门拦下，照样说出"记好了，家和重生点都标在那张床上"——
+        用户看到的是"它压根没去右键"，听到的是"记好了"。**"没发生的事被说成发生了"必须掐掉**，
+        代价是多一句括号补充，收益是它说的话可以被信任。
+        """
+        note = f"（补一句实话：我刚才那句话里的动作**没有执行** —— {why}）"
+        return f"{reply_text}{note}" if reply_text else note
 
     def _decide(self, candidates: list[dict], context: dict) -> tuple[Optional[int], float]:
         """调用 decider 角色选一个候选，返回 (编号, 置信度)。
+
+        **暂不启用**（用户口径 2026-10-12："先把一个模型负责决策的链路做好，后面再逐步逐步加多个
+        模型"）—— `_execute_decision` 现在直接取模型给的第一个候选，不再叫第二个模型打分。
+        这段连同 `debug_confidence_threshold` 的配置一起留着，等多模型调度真做得动再拿出来用。
 
         超时、报错或输出无法解析都视为"没有结论"，返回 (None, 0.0) 由调用方回退。
         """

@@ -299,7 +299,8 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("tpa_request", "主动请求传送到某人（默认只有主人可以）", "player", ("server",),
              "_tool_tpa_request", ToolPermission(note="TPA 策略决定谁能主动发起")),
     # ── memory ──
-    ToolSpec("remember_poi", "记住当前位置", "name,category,x,y,z", ("memory",),
+    ToolSpec("remember_poi", "记住一个位置坐标（**只记，不走过去、不交互**；要设家/绑重生点请用 set_home）",
+             "name,category,x,y,z", ("memory",),
              "_tool_remember_poi"),
     # ── goal（模型的长期目标：写进任务列表，要显式结束）──
     ToolSpec("set_goal", "给自己立一个**长期目标**（会写进任务列表、一直占着，直到你用 "
@@ -339,7 +340,8 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
              ToolPermission(tier="zones", area=True, deny_label="声明区域保护", note="master-only")),
     ToolSpec("clear_zone", "删掉一个区域", "name", ("territory",), "_dispatch_clear_zone",
              ToolPermission(tier="zones", deny_label="删除区域保护", note="master-only")),
-    ToolSpec("set_home", "在基地范围内自己找床；找不到就自己造（缺料/不安全如实报）",
+    ToolSpec("set_home", "把某个地方变成家：自己找床（找不到就造），找到后**走过去右键一次**把重生点绑到它；"
+                        "只记坐标不等于绑上（缺料/不安全/没绑上都会如实报）",
              "base", ("territory",), "_dispatch_set_home"),
     ToolSpec("go_home", "回基地的床位（没床就回锚点）", "base", ("territory",), "_dispatch_go_home"),
     ToolSpec("go_to_death_point",
