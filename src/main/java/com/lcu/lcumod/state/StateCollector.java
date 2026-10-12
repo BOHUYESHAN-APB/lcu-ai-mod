@@ -50,6 +50,12 @@ public class StateCollector {
     // 附近的床：缓存扫描结果（每 40 tick 刷新一次，避免每次上报都扫 27 万方块）
     private static int bedScanCooldown = 0;
     private static JsonArray cachedBeds = new JsonArray();
+
+    // 周边方块感知：**限半径 + 定期探测**（参考项目也是"每轮现算 + 冷却"，不是每 tick 全扫）。
+    private static JsonArray cachedNearbyBlocks = null;
+    private static BlockPos cachedNearbyBlocksOrigin = null;
+    private static int cachedNearbyBlocksTick = 0;
+    private static final int NEARBY_BLOCKS_TTL_TICKS = 20;   // 最长一秒重扫一次；走出一格则立刻重扫
     // Set by requestRefresh() to force the next tick to send a full state_update
     private static volatile boolean refreshRequested = false;
     
@@ -58,6 +64,76 @@ public class StateCollector {
     private static final float ROTATION_THRESHOLD = 1.0f;   // 1 degree
     private static final float HEALTH_THRESHOLD = 0.5f;     // 0.5 hearts
     private static final int FORCE_UPDATE_INTERVAL = 100;   // Force update every 5 seconds
+
+    /**
+     * 周边方块感知：**限半径（配置） + 定期探测（带缓存）**。
+     *
+     * <p>用户口径："感知要限定半径 + 定期探测"；参考项目（mindcraft）也是每轮现算 + prompt 冷却，
+     * 不是每 tick 全扫。这里缓存 {@value #NEARBY_BLOCKS_TTL_TICKS} tick，玩家**走出一格**立刻重扫
+     * （站着不动时就没必要一秒扫几十次）；半径与总开关走 {@code ModConfig}
+     * —— 这两个配置项以前**声明了却没人读**，等于摆设，现在真的生效。
+     */
+    private static JsonArray collectNearbyBlocks(Minecraft mc, Player p, BlockPos origin) {
+        boolean enabled;
+        int radius;
+        try {
+            enabled = ModConfig.COLLECT_SURROUNDINGS.getAsBoolean();
+            radius = Math.max(2, ModConfig.SURROUNDINGS_RADIUS.getAsInt());
+        } catch (IllegalStateException e) {
+            enabled = true;
+            radius = 8;
+        }
+        if (!enabled) {
+            return new JsonArray();
+        }
+        if (cachedNearbyBlocks != null
+                && tickCounter - cachedNearbyBlocksTick < NEARBY_BLOCKS_TTL_TICKS
+                && cachedNearbyBlocksOrigin != null
+                && origin.distSqr(cachedNearbyBlocksOrigin) < 1.0) {
+            return cachedNearbyBlocks;
+        }
+
+        List<JsonObject> nearbyBlocks = new ArrayList<>();
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dy = -2; dy <= 2; dy++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    BlockPos pos = origin.offset(dx, dy, dz);
+                    var blockState = mc.level.getBlockState(pos);
+                    if (blockState.isAir()) continue;
+
+                    double centerX = pos.getX() + 0.5;
+                    double centerY = pos.getY() + 0.5;
+                    double centerZ = pos.getZ() + 0.5;
+                    double distance = Math.sqrt(
+                        Math.pow(centerX - p.getX(), 2)
+                            + Math.pow(centerY - p.getY(), 2)
+                            + Math.pow(centerZ - p.getZ(), 2)
+                    );
+                    if (distance > radius) continue;
+
+                    JsonObject block = new JsonObject();
+                    String blockId = BuiltInRegistries.BLOCK.getKey(blockState.getBlock()).toString();
+                    block.addProperty("name", blockState.getBlock().getName().getString());
+                    block.addProperty("block_id", blockId);
+                    block.addProperty("item_id", BuiltInRegistries.ITEM.getKey(blockState.getBlock().asItem()).toString());
+                    block.addProperty("distance", Math.round(distance * 10.0) / 10.0);
+                    block.addProperty("x", pos.getX());
+                    block.addProperty("y", pos.getY());
+                    block.addProperty("z", pos.getZ());
+                    nearbyBlocks.add(block);
+                }
+            }
+        }
+        nearbyBlocks.sort(Comparator.comparingDouble(block -> block.get("distance").getAsDouble()));
+        JsonArray nearbyBlocksJson = new JsonArray();
+        for (int i = 0; i < Math.min(32, nearbyBlocks.size()); i++) {
+            nearbyBlocksJson.add(nearbyBlocks.get(i));
+        }
+        cachedNearbyBlocks = nearbyBlocksJson;
+        cachedNearbyBlocksOrigin = origin.immutable();
+        cachedNearbyBlocksTick = tickCounter;
+        return nearbyBlocksJson;
+    }
 
     /** Force the next collector tick (next client tick, bypassing the interval and
      *  change detection) to send a full state_update immediately. */
@@ -403,44 +479,7 @@ public class StateCollector {
         state.add("entities", entities);
 
         // Nearby blocks/resources — compact perception map for planning
-        List<JsonObject> nearbyBlocks = new ArrayList<>();
-        BlockPos origin = p.blockPosition();
-        for (int dx = -6; dx <= 6; dx++) {
-            for (int dy = -2; dy <= 2; dy++) {
-                for (int dz = -6; dz <= 6; dz++) {
-                    BlockPos pos = origin.offset(dx, dy, dz);
-                    var blockState = mc.level.getBlockState(pos);
-                    if (blockState.isAir()) continue;
-
-                    double centerX = pos.getX() + 0.5;
-                    double centerY = pos.getY() + 0.5;
-                    double centerZ = pos.getZ() + 0.5;
-                    double distance = Math.sqrt(
-                        Math.pow(centerX - p.getX(), 2)
-                            + Math.pow(centerY - p.getY(), 2)
-                            + Math.pow(centerZ - p.getZ(), 2)
-                    );
-                    if (distance > 8.5) continue;
-
-                    JsonObject block = new JsonObject();
-                    String blockId = BuiltInRegistries.BLOCK.getKey(blockState.getBlock()).toString();
-                    block.addProperty("name", blockState.getBlock().getName().getString());
-                    block.addProperty("block_id", blockId);
-                    block.addProperty("item_id", BuiltInRegistries.ITEM.getKey(blockState.getBlock().asItem()).toString());
-                    block.addProperty("distance", Math.round(distance * 10.0) / 10.0);
-                    block.addProperty("x", pos.getX());
-                    block.addProperty("y", pos.getY());
-                    block.addProperty("z", pos.getZ());
-                    nearbyBlocks.add(block);
-                }
-            }
-        }
-        nearbyBlocks.sort(Comparator.comparingDouble(block -> block.get("distance").getAsDouble()));
-        JsonArray nearbyBlocksJson = new JsonArray();
-        for (int i = 0; i < Math.min(32, nearbyBlocks.size()); i++) {
-            nearbyBlocksJson.add(nearbyBlocks.get(i));
-        }
-        state.add("nearby_blocks", nearbyBlocksJson);
+        state.add("nearby_blocks", collectNearbyBlocks(mc, p, p.blockPosition()));
 
         JsonArray nearbyWorkstations = new JsonArray();
         for (JsonObject item : PoiMemory.snapshot(mc, "workstation", PoiMemory.INTERACTION_RADIUS, 16)) {

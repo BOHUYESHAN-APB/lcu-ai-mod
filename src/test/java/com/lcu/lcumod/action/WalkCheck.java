@@ -398,6 +398,12 @@ public final class WalkCheck {
         check("memory: respawn point is remembered proactively", poi.contains("rememberLandmarks("));
         check("memory: tags are reported in the state", poi.contains("item.add(\"tags\""));
         check("memory: bed is remembered when seen", collector.contains("PoiMemory.rememberBed("));
+        check("perception: nearby sweep is periodic (cached, ttl)",
+                collector.contains("NEARBY_BLOCKS_TTL_TICKS") && collector.contains("cachedNearbyBlocks"));
+        check("perception: moving one block re-scans immediately",
+                collector.contains("distSqr(cachedNearbyBlocksOrigin)"));
+        check("perception: the surroundings config values are actually read",
+                collector.contains("ModConfig.COLLECT_SURROUNDINGS") && collector.contains("ModConfig.SURROUNDINGS_RADIUS"));
     }
 
     /** 取某个成员（含签名行）到下一个成员声明之间的源码片段（静态扫描用）。 */
