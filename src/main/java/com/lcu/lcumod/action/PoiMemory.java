@@ -1,5 +1,7 @@
 package com.lcu.lcumod.action;
 
+import com.lcu.lcumod.LCUMod;
+
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import net.minecraft.client.Minecraft;
@@ -131,6 +133,9 @@ public final class PoiMemory {
             return;
         }
 
+        // 主动记地标（重生点/出生地）—— 不用人类提醒，每局只写一次。
+        rememberLandmarks(mc, tickCount);
+
         BlockPos origin = mc.player.blockPosition();
         for (int dx = -SCAN_RADIUS_XZ; dx <= SCAN_RADIUS_XZ; dx++) {
             for (int dy = -SCAN_RADIUS_Y; dy <= SCAN_RADIUS_Y; dy++) {
@@ -161,6 +166,54 @@ public final class PoiMemory {
             String currentId = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
             return !currentId.equals(poi.blockId);
         });
+    }
+
+    /**
+     * 主动记住"家"这一类地标（**不用人类说**，用户口径："应该主动去保存坐标点，而不是人类说了他才做"）。
+     *
+     * <p>记的是**原版的重生点**（{@code getRespawnData()}）：它默认就是世界出生地，
+     * **睡过床之后自动变成那张床的位置** —— 所以"床的位置默认作为 home"直接用原版语义，
+     * 不需要我们自己去猜哪张床算家（哪张床都不需要判）。
+     *
+     * <p>幂等：同类地标已经记过就不再写（"一般情况下，主动保存 1 次即可"）。
+     */
+    public static void rememberLandmarks(Minecraft mc, int tickCount) {
+        if (mc == null || mc.level == null || mc.player == null) {
+            return;
+        }
+        try {
+            var data = mc.level.getRespawnData();
+            if (data != null && data.pos() != null && !hasCategory("respawn")) {
+                remember(data.pos(), "", "respawn", "重生点（出生地/床）", tickCount);
+                LCUMod.LOGGER.info("[PoiMemory] 主动记住重生点 {}（出生地；睡过床后它自动变成床）",
+                        data.pos().toShortString());
+            }
+        } catch (Exception e) {
+            LCUMod.LOGGER.debug("[PoiMemory] 读取重生点失败: {}", e.toString());
+        }
+    }
+
+    /**
+     * 看到床就主动记一次（"床的位置默认作为 home"、"不用人类说"）。
+     *
+     * <p>只在**第一次**看到床时写；之后要在哪张床安家，交回模型决定（`go_home` / `move_to`）。
+     */
+    public static void rememberBed(BlockPos pos, String blockId, int tickCount) {
+        if (pos == null || hasCategory("bed")) {
+            return;
+        }
+        remember(pos, blockId == null ? "" : blockId, "bed", "床", tickCount);
+        LCUMod.LOGGER.info("[PoiMemory] 主动记住床 {}（默认家的候选位置）", pos.toShortString());
+    }
+
+    /** 记忆里是否已有某个类别（幂等用：主动存一次就够）。 */
+    private static boolean hasCategory(String category) {
+        for (PoiEntry poi : MEMORY.values()) {
+            if (category.equals(poi.category)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     public static BlockPos findNearest(Minecraft mc, Set<String> blockIds, int maxDistance) {

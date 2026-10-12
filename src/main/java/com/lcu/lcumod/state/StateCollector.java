@@ -485,6 +485,15 @@ public class StateCollector {
                 beds.add(bed);
             }
             cachedBeds = beds;
+            // 看到床就**主动**记一次（用户口径："附近有床应该主动去保存坐标点，不用人类说；
+            // 床的位置默认作为 home；一般主动保存 1 次即可"）。
+            if (!beds.isEmpty()) {
+                JsonObject nearest = beds.get(0).getAsJsonObject();
+                PoiMemory.rememberBed(
+                        new net.minecraft.core.BlockPos(nearest.get("x").getAsInt(),
+                                nearest.get("y").getAsInt(), nearest.get("z").getAsInt()),
+                        nearest.get("id").getAsString(), mc.player.tickCount);
+            }
         }
         state.add("nearby_beds", cachedBeds);
 
