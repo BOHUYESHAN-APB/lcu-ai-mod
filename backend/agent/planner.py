@@ -136,6 +136,27 @@ PHASE_GROUPS: dict[str, tuple[str, ...]] = _PHASE_GROUPS
 _TERMINAL_STATUSES = {"", "idle", "done", "failed", "cancelled", "error"}
 
 
+def _dropped_by_note(entity: dict) -> str:
+    """掉落物的「谁丢的 / 掉多久了 / 还有多久消失」。
+
+    用户口径：**捡不捡由模型判断**，模组只把事实报上来。所以这里只做渲染，不做取舍；
+    认不出的字段一律略过（旧客户端没有 owner/age ⇒ 不硬凑一个假的）。
+    """
+    if not isinstance(entity, dict):
+        return ""
+    parts: list[str] = []
+    owner = str(entity.get("owner") or "").strip()
+    if owner:
+        parts.append(f"{owner}丢的" if entity.get("owner_type") == "player" else f"{owner}掉的")
+    age = entity.get("age")
+    if isinstance(age, (int, float)) and age >= 0:
+        parts.append(f"掉了{int(age) // 20}秒")
+    left = entity.get("despawn_in")
+    if isinstance(left, (int, float)) and left >= 0:
+        parts.append(f"还有{int(left) // 20}秒消失")
+    return "（" + "，".join(parts) + "）" if parts else ""
+
+
 def _phase_from_task(task: Any) -> str:
     """从 task_state 推断规划阶段；终态或无任务 → idle。"""
     if not isinstance(task, dict):
@@ -787,7 +808,8 @@ class Planner:
             for entity in nearby_entities[:8]
         ) or "无"
         nearby_item_text = ", ".join(
-            f"{entity.get('item_id', entity.get('name', '?'))}x{entity.get('item_count', 1)}@{entity.get('distance', '?')}m"
+            f"{entity.get('item_id', entity.get('name', '?'))}x{entity.get('item_count', 1)}"
+            f"@{entity.get('distance', '?')}m{_dropped_by_note(entity)}"
             for entity in nearby_entities
             if entity.get("type") == "item"
         ) or "无"
@@ -1026,6 +1048,9 @@ class Planner:
 附近资源：
 - 方块：{nearby_block_text}
 - 掉落物：{nearby_item_text}
+  （捡不捡**你自己判断**：走过去踩到就会自动捡起；括号里是模组报的事实 —— 谁丢的、掉多久了、
+  还有多久消失。谁丢的通常有意义：主人刚丢给你的就是要你拿的，别人掉的就先问一句；
+  背包满了/太远/快消失了就别白跑。）
 
 附近工作站：
 {nearby_station_text}

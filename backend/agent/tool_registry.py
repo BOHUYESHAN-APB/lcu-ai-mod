@@ -142,7 +142,9 @@ def composite_specs() -> tuple[ToolSpec, ...]:
 # 保证阶段过滤后的工具序列（进而 `build_tool_schemas` 的输出）与旧行为逐字节一致。
 TOOL_SPECS: tuple[ToolSpec, ...] = (
     # ── move ──
-    ToolSpec("move_to", "移动到坐标", "x,y,z", ("move",), "_tool_move_to", job=True),
+    ToolSpec("move_to", "移动到坐标（走到掉落物上会**自动捡起**；捡不捡先自己判断：看上下文里的"
+                        "掉落物括号 —— 谁丢的、掉多久了、还有多久消失，背包满了就别去）",
+             "x,y,z", ("move",), "_tool_move_to", job=True),
     ToolSpec("follow", "**只在玩家明确要求跟随**（「跟着我 / 别走开 / 跟我来」）时用：长驻跟住他、"
                        "他走我走（目标会动）。玩家说「过来 / 来我这」是**一次性**走到他那里 ⇒ 用 "
                        "come_to_player（或 move_to 到他的坐标），**不要**用 follow",
