@@ -33,9 +33,10 @@ def mob(name, *, type="mob", tier=None, distance=3.0, entity_id=1):
     return row
 
 
-def state(entities=None, *, health=20, reflex_combat=False):
+def state(entities=None, *, health=20, reflex_combat=False, hurt=False):
     return {"player": {"health": health, "x": 0.0, "y": 64.0, "z": 0.0},
-            "entities": list(entities or []), "reflex_combat": reflex_combat}
+            "entities": list(entities or []), "reflex_combat": reflex_combat,
+            "hurt": hurt}
 
 
 class DummySkills:
@@ -208,10 +209,37 @@ class PolicyLadderTests(unittest.TestCase):
 # ── ⑤ 生存反射按档位走 ──────────────────────────────────────────
 
 class SelfDefenseTierTests(unittest.TestCase):
-    def test_self_defense_attacks_a_hostile(self):
+    """P3 降级后：**被打才还手**，没挨打绝不先动手（用户口径：后台不许自动开战）。"""
+
+    def test_hostile_in_range_without_being_hurt_does_not_attack(self):
+        """(1) 8 格内有敌对、**没挨打** => no frame sent (old code auto-attacked)."""
+        engine, skills = engine_with(SelfDefenseMode())
+        no_hurt = state([mob("僵尸", tier=TIER_HOSTILE, distance=3.0)], hurt=False)
+
+        engine.tick(no_hurt)
+        engine.tick(no_hurt)
+
+        self.assertEqual(skills.calls, [], "must not open fire when not hurt")
+        self.assertIsNone(engine.get_status()["active"])
+
+    def test_recent_hurt_makes_it_retaliate(self):
+        """(2) recently hurt => retaliate against that hostile."""
         engine, skills = engine_with(SelfDefenseMode())
 
-        engine.tick(state([mob("僵尸", tier=TIER_HOSTILE, distance=3.0)]))
+        engine.tick(state([mob("僵尸", tier=TIER_HOSTILE, distance=3.0)], hurt=True))
+
+        self.assertIn("attack", skills.names())
+        self.assertEqual(engine.get_status()["active"], "self_defense")
+
+    def test_health_drop_is_the_proxy_when_no_hurt_field_exists(self):
+        """No hurt field in state => fall back to the health-drop proxy."""
+        engine, skills = engine_with(SelfDefenseMode())
+        hostile = mob("僵尸", tier=TIER_HOSTILE, distance=3.0)
+
+        engine.tick(state([hostile], health=20))      # baseline, no drop -> no attack
+        self.assertEqual(skills.calls, [])
+
+        engine.tick(state([hostile], health=15))      # health dropped -> proxy says hurt
 
         self.assertIn("attack", skills.names())
 
@@ -223,7 +251,7 @@ class SelfDefenseTierTests(unittest.TestCase):
                     mob("iron_golem", distance=1.0)):
             engine, skills = engine_with(SelfDefenseMode())
 
-            engine.tick(state([row]))
+            engine.tick(state([row], hurt=True))
 
             self.assertEqual(skills.calls, [], row["name"])
             self.assertIsNone(engine.get_status()["active"], row["name"])
@@ -231,7 +259,7 @@ class SelfDefenseTierTests(unittest.TestCase):
     def test_self_defense_never_touches_a_dangerous_mob(self):
         engine, skills = engine_with(SelfDefenseMode())
 
-        engine.tick(state([mob("监守者", tier=TIER_DANGEROUS, distance=1.0)]))
+        engine.tick(state([mob("监守者", tier=TIER_DANGEROUS, distance=1.0)], hurt=True))
 
         self.assertEqual(skills.calls, [])
 
@@ -239,14 +267,15 @@ class SelfDefenseTierTests(unittest.TestCase):
         engine, skills = engine_with(SelfDefenseMode())
 
         engine.tick(state([mob("cow", tier=TIER_PASSIVE, distance=1.0),
-                           mob("some_new_mod_mob", distance=1.0)]))
+                           mob("some_new_mod_mob", distance=1.0)], hurt=True))
 
         self.assertEqual(skills.calls, [])
 
-    def test_legacy_client_without_tier_still_defends_against_a_zombie(self):
+    def test_legacy_client_without_tier_still_retaliates_against_a_zombie(self):
         engine, skills = engine_with(SelfDefenseMode())
 
-        engine.tick(state([{"type": "hostile", "name": "僵尸", "distance": 3.0}]))
+        engine.tick(state([{"type": "hostile", "name": "僵尸", "distance": 3.0}],
+                          hurt=True))
 
         self.assertIn("attack", skills.names())
 

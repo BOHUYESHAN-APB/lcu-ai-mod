@@ -112,7 +112,7 @@ class EatBackoffGateTests(unittest.TestCase):
         h.add_mode(SelfDefenseMode())
         h.manager._backoff["look_at"] = (time.time() + 5.0, 1)
 
-        h.engine.tick(_state(entities=[_hostile()]))
+        h.engine.tick(_state(entities=[_hostile()], hurt=True))
 
         self.assertEqual(h.sent_cmds(), ["attack"], "look_at 被退避，attack 不该跟着陪葬")
 

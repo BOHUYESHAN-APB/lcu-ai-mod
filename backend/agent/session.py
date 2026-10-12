@@ -492,6 +492,10 @@ class Session:
                     self._manual_command_until = max(self._manual_command_until, time.time() + 15.0)
                     if progress <= 0.0 or progress >= 1.0:
                         self._manual_action_reqs.discard(req_id)
+            case "attack_in_range_result":
+                # 站桩攻击的**收尾回执**（命中数 / 退出原因码）：只记事实，进 L2 如实呈现 ——
+                # 绝不把"命令已 ack"当成"打到了"就把这份回执丢掉。
+                self._absorb_attack_in_range_result(data)
             case "behavior_state":
                 self.runtime["behavior_state"] = data
                 if self._manual_behavior_active():
@@ -948,6 +952,18 @@ class Session:
         if requested:
             logger.info("[Memory] 路径缺几何，向模组按需取点列：%s", ", ".join(requested))
         return requested
+
+    def _absorb_attack_in_range_result(self, data: dict) -> None:
+        """站桩攻击（`attack_in_range`）的**收尾回执**：命中数 + 退出原因码。
+
+        只记事实（模组事件字段原样留着 + 收到的时间），渲染进 L2 由 planner 负责
+        （`_attack_result_line`）—— 绝不把"命令 ack 成功"当成"打到了"就吞掉这份回执。
+        """
+        payload = data if isinstance(data, dict) else {}
+        self._attack_result = {"data": dict(payload), "at": time.time()}
+        logger.info("[Attack] attack_in_range 回执：hits=%s reason=%s stopped=%s radius=%s kind=%s",
+                    payload.get("hits"), payload.get("reason"), payload.get("stopped"),
+                    payload.get("radius"), payload.get("kind"))
 
     def _absorb_route_export(self, data: dict) -> bool:
         """`route_export` 的回执：拿到点列就存盘并推回模组，拿不到就维持 no_geometry。"""
@@ -2305,6 +2321,13 @@ class Session:
         context["nearby_blocks"] = self.runtime.get("nearby_blocks", [])
         context["nearby_workstations"] = self.runtime.get("nearby_workstations", [])
         context["nearby_storage"] = self.runtime.get("nearby_storage", [])
+        # 站点（挂机点：名字 + kind + 坐标）与**当帧**挂机状态：进 L2 动态层，
+        # 让模型知道"我在哪个塔、有没有在驻守"（L1 一个字节都不动）。
+        context["stations"] = self.runtime.get("stations", [])
+        context["afk"] = self.runtime.get("afk") or {}
+        # 站桩攻击的**收尾回执**（模组 `attack_in_range_result` 事件；可能是几秒前那次）：
+        # 只进 L2 —— 让模型看到"打到了几次 / 为什么停"，而不是只知道"命令发出去了"。
+        context["attack_in_range_result"] = getattr(self, "_attack_result", None)
         # 夜晚/睡眠/持久记录点：直接来自 state_update 顶层字段。
         context["nearby_beds"] = self.runtime.get("nearby_beds", [])
         context["remembered_pois"] = self.runtime.get("remembered_pois", [])

@@ -9,7 +9,7 @@ Priority levels (只剩**生存反射**；自主行为已改为注册表里的�
   0: SelfPreservation — fire, drowning, void
   1: SelfHeal — use healing items when health is low
   2: Cowardice — flee from hostiles when low health
-  3: SelfDefense — attack nearby hostiles
+  3: SelfDefense — 被打才还手（没挨打绝不先动手）
 """
 
 import logging
@@ -355,24 +355,97 @@ class CowardiceMode(Mode):
 
 
 class SelfDefenseMode(Mode):
-    """P3 — 还手：**只打敌对档**（中立不惹、被动不是它的活、高危险不许碰）。"""
+    """P3 — 还手：**只有最近确实挨过打**才还手（打我的那只敌对在范围内就还手它）。
+
+    用户口径：「后台不许有自主开关/自动触发」。旧实现是 `8 格内有敌对就自动打` —— 那是
+    一眼**自主行为**（没挨打也会先动手），跟"能力＝注册表里的工具、用不用由 LLM 决定"
+    直接矛盾，所以降级成**纯反射的还手**：没挨打 ⇒ 一个字节都不发（该打谁由模型调
+    `attack` 决定，不由后台替它开战）。
+
+    「挨打」判据（按优先级）：
+      ① state 里**直接的受伤事实**（`hurt` / `hurt_time` / `last_hurt` / `hurt_by` /
+         `damage_taken`，或 `player.hurt_time` 这类）—— 有就用它；
+      ② **没有**这类字段就用**血量近期下降**当代理判据（记上一帧的血量，掉血即视为挨打）。
+        这是**代理**，不是事实：掉血也可能来自岩浆/坠落/饥饿，而"谁打的"更无从得知；
+        所以它只在 `HURT_WINDOW_SECONDS` 秒内有效，且**只用来对"附近已有的敌对"还手**，
+        绝不先动手。等模组把 `hurt_time` 之类报出来，①就会自动接管（那时不再靠代理）。
+    """
+
+    # 还手的范围：范围内的**敌对档**才还手（中立不惹、被动不是它的活、高危险不许碰）。
+    RETALIATE_RANGE = 8.0
+    # 「近期」挨打的有效期：过这么久没再挨打就收手。
+    HURT_WINDOW_SECONDS = 10.0
 
     def __init__(self):
         super().__init__("self_defense", priority=3, interrupts=True, cooldown=2.0)
+        self._last_health: Optional[float] = None
+        self._last_hurt_at: float = 0.0
+
+    # ── "挨打"判据 ──
+
+    @staticmethod
+    def _explicit_hurt(state: dict) -> bool:
+        """state 里有没有**直接的受伤事实**（有就优先用它，不去猜血量）。"""
+        if not isinstance(state, dict):
+            return False
+        for key in ("hurt", "hurt_time", "last_hurt", "hurt_by", "damage_taken"):
+            value = state.get(key)
+            if isinstance(value, bool):
+                if value:
+                    return True
+            elif isinstance(value, (int, float)):
+                if float(value) > 0:
+                    return True
+            elif value:
+                return True
+        player = state.get("player") if isinstance(state.get("player"), dict) else {}
+        for key in ("hurt", "hurt_time", "last_hurt"):
+            value = player.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) \
+                    and float(value) > 0:
+                return True
+        return False
+
+    def _observe_hurt(self, state: dict) -> bool:
+        """记下"这一帧挨没挨打"并返回结论（显式事实优先，否则看血量是否下降）。"""
+        hurt = self._explicit_hurt(state)
+        if not hurt:
+            player = state.get("player") if isinstance(state, dict) \
+                and isinstance(state.get("player"), dict) else {}
+            health = player.get("health")
+            if isinstance(health, (int, float)) and not isinstance(health, bool):
+                health = float(health)
+                if self._last_health is not None and health < self._last_health - 1e-6:
+                    hurt = True
+                self._last_health = health
+        if hurt:
+            self._last_hurt_at = time.time()
+        return hurt
+
+    def _recently_hurt(self) -> bool:
+        return (time.time() - self._last_hurt_at) <= self.HURT_WINDOW_SECONDS
 
     def should_activate(self, state: dict) -> bool:
         # 本地战斗反射正在交战（毫秒级闭环、已对准才出手）→ 后端别同时出手：
         # 两边一起发 attack/look_at 就是用户实机日志里那个 2 秒一抖的循环。
         if state.get("reflex_combat"):
             return False
-        return any(tier_of(e) == TIER_HOSTILE and _distance(e) < 8
+        self._observe_hurt(state)
+        if not self._recently_hurt():
+            # 8 格内有敌对但**没挨打** ⇒ 不许自动出手（这正是本次降级要挡掉的那条）。
+            return False
+        return any(tier_of(e) == TIER_HOSTILE and _distance(e) < self.RETALIATE_RANGE
                    for e in perception.entities_rows(state)["rows"])
 
     def tick(self, skills, state: dict) -> str | None:
         if state.get("reflex_combat"):
             return None
+        self._observe_hurt(state)
+        if not self._recently_hurt():
+            return None
         entities = perception.entities_rows(state)["rows"]
-        hostiles = [e for e in entities if tier_of(e) == TIER_HOSTILE and _distance(e) < 8]
+        hostiles = [e for e in entities if tier_of(e) == TIER_HOSTILE
+                    and _distance(e) < self.RETALIATE_RANGE]
         if hostiles:
             nearest = hostiles[0]
             # 同一目标（名字 + 位置）在 redispatch_interval 内不重复下发：
@@ -384,7 +457,7 @@ class SelfDefenseMode(Mode):
             # Look at the hostile and attack
             skills.look_at(nearest.get("x", 0), nearest.get("y", 0), nearest.get("z", 0))
             skills.attack()
-            return f"self_defense: attacking {nearest.get('name', 'hostile')}"
+            return f"self_defense: retaliating against {nearest.get('name', 'hostile')}"
         return None
 
 

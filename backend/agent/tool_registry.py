@@ -28,8 +28,10 @@ from .composites import COMPOSITES, validate_composite
 # ── 参数名 → JSON Schema 类型 ────────────────────────────────
 # 工具参数都可有默认值，故 `required` 一律留空；类型按参数名约定推断。
 _NUMERIC_TOOL_ARGS = frozenset({"x", "y", "z", "radius", "limit", "count", "index",
-                                "from_slot", "to_slot", "slot"})
-_BOOLEAN_TOOL_ARGS = frozenset({"remember", "feed", "craft", "mischief", "whole"})
+                                "from_slot", "to_slot", "slot", "yaw", "pitch",
+                                "max_seconds"})
+_BOOLEAN_TOOL_ARGS = frozenset({"remember", "feed", "craft", "mischief", "whole",
+                                "keepalive"})
 # 数组参数：`run_server_command` 的 `args`（字符串表）与 `haul` 的 `items`（物品表）。
 _ARRAY_TOOL_ARGS = frozenset({"args"})
 _ARRAY_OBJECT_ARGS = frozenset({"items"})
@@ -258,6 +260,16 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
                             note="全链只在授权地块/畜栏里动手；缺口如实报，不硬凑")),
     # ── combat ──
     ToolSpec("attack", "攻击附近敌人", "", ("combat",), "_tool_attack"),
+    ToolSpec("attack_in_range",
+             "**站在刷怪塔底部持续打怪**用这个：在半径 radius 内（默认 8，钳 1..32）持续出手，"
+             "最多 max_seconds 秒（默认 30，钳 1..300）。kind=hostile（默认，**只打敌对**）| "
+             "passive（连被动一起打）| any（除受保护档位外都打）—— 中立（村民/铁傀儡）与"
+             "高危险（监守者）**无论 kind 是什么都不打**，玩家永不作为目标。"
+             "**它不会移动、也不寻路**（要站位先用 go_afk，或就走过去站好）；"
+             "拿不准要不要打就先问主人。结束（到点 / 没目标 / 被打断）你会收到回执"
+             "（命中几次 + 退出原因码）—— 「已经发出去了」不等于「打到了」，看命中数。"
+             "**主人专属**：持续出手等于把身体交出去打怪，只有 master 能命令。",
+             "radius,kind,max_seconds", ("combat",), "_dispatch_attack_in_range", job=True),
     # ── items ──
     ToolSpec("equip_armor", "穿背包里的盔甲（没有就去容器找）", "", ("items",),
              "_tool_equip_armor",
@@ -281,9 +293,33 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("sleep_in_bed", "走到最近的床睡到天亮（只能夜里）", "", ("night",),
              "_tool_sleep_in_bed", job=True),
     # ── guard ──
-    ToolSpec("guard", "水平半径内驻守（默认 32；省坐标＝最近发话者位置）",
+    ToolSpec("guard", "水平半径内驻守（默认 32；省坐标＝最近发话者位置）。"
+                      "**要精准站位（刷怪塔底部 / 交易所那种半径 1 格）请用 go_afk** —— "
+                      "guard 最小半径 4、尺度粗，只是「这一片别走远」",
              "x,y,z,radius", ("guard",), "_dispatch_guard", job=True),
     ToolSpec("guard_off", "取消驻守", "", ("guard",), "_tool_guard_off"),
+    # ── guard / 站点（挂机点）──
+    # "什么时候用我"写进描述：记站点 + 挂站点是**主人专属**（见 planner 的 master 门）；
+    # afk_stop 不加门（停下是安全方向，谁都能把它从挂机里拉出来）。
+    ToolSpec("remember_station",
+             "把**现在站的这个位置**记成一个站点（挂机点）：坐标/朝向省略时＝照我此刻的位姿记"
+             "（要精准记下刷怪塔底部就这么用）；kind 是站点类型标签，取 "
+             "mob_farm | enderman_farm | iron_farm | crop | portal | custom（默认 custom）；"
+             "radius 是驻守容差（0.5~16，默认 1 格）。之后用 go_afk 按名字挂上去。"
+             "**主人专属**：站点表是持久的、挂上去还会夺走身体，只有 master 能让我记。",
+             "name,kind,x,y,z,yaw,pitch,radius", ("guard",), "_dispatch_remember_station"),
+    ToolSpec("go_afk",
+             "**站到指定站点并驻守**：先寻路到那个点，然后「漂移超过半径就自己走回」（带滞回，"
+             "不会在边界上一步一停）；需要精准站位（刷怪塔底部 / 交易所）就用它 —— "
+             "guard 半径粗（最小 4），尺度不对。station＝站点名（先用 remember_station 记过或"
+             "用 where_is 查）；keepalive=true 时每 3 秒小幅转头/摆臂防踢，**不移动**。"
+             "站点不存在我**如实拒绝**（不猜、不自动新建）。**主人专属**：驻守期间身体被占住、"
+             "不再响应别人，只有 master 能命令我挂。",
+             "station,keepalive", ("guard",), "_dispatch_go_afk", job=True),
+    ToolSpec("afk_stop",
+             "结束站点驻守（玩家说「别挂了 / 回来吧」）。**不加门**：停下是安全方向，"
+             "任何人都该能把我从挂机里拉出来。",
+             "", ("guard",), "_dispatch_afk_stop"),
     # ── hud ──
     ToolSpec("set_hud_note", "把当前打算写进 HUD 描述词", "text", ("hud",),
              "_tool_set_hud_note"),

@@ -111,6 +111,7 @@ _GROUP_RESOURCES: Mapping[str, frozenset[str]] = {
 _TOOL_RESOURCE_OVERRIDES: Mapping[str, frozenset[str]] = {
     "stop": frozenset(),                                   # 停止不是占用
     "guard_off": frozenset(),
+    "afk_stop": frozenset(),                               # 停止驻守＝释放（用户口径：谁都能停）
     "container_close": frozenset(),                        # 关掉＝释放，不占用
     "drop_item": frozenset(),
     "sort_inventory": frozenset(),

@@ -67,7 +67,7 @@ from .haul import (HAUL_MAX_ATTEMPTS, HAUL_VERIFY_TIMEOUT, HAUL_WALK_TIMEOUT,
                    side_items, success_receipt)
 from .llm_service import prompt_version, render_persona_triple
 from .modes_engine import EatYield
-from .permissions import CraftPolicy, TIER_GUEST
+from .permissions import CraftPolicy, TIER_GUEST, TIER_MASTER
 from .resource_lease import PRIORITY_DEFAULT, ResourceLease, resources_for_tool
 from .territory import (ACTION_FARM, POLICY_BORROW_ONLY, POLICY_FREE, POLICY_NO_TOUCH,
                         bed_attempt, bed_note, current_base, may_act,
@@ -114,11 +114,89 @@ def _clip(text: Any, limit: int = 120) -> str:
     return flat if len(flat) <= limit else flat[:limit] + "…"
 
 
+# ── drop_item 的「宁死不许丢」硬底线（用户拍板，**硬拦**，不进模型可改的配置）──
+# 这里**只列负数清单**：哪些东西宁可死也不许丢。**"什么该丢"是正数判断，全交给 LLM** ——
+# 代码里绝不写"骨粉该丢 / 这东西该留"这类判定（那是模型的活，不是我的）。
+_PROTECTED_ITEMS_EXACT = frozenset({
+    # 铁系
+    "iron_ingot", "raw_iron", "iron_ore", "deepslate_iron_ore", "iron_block",
+    # 钻石系
+    "diamond", "diamond_block",
+})
+# 下界合金系（锭 / 块 / 各件装备，全带这个前缀）。
+_PROTECTED_ITEM_PREFIXES = ("netherite_",)
+# 后缀清单：各材质工具（木/石/铁/金/钻石/下界合金 的镐斧铲剑锄）+ 盒类（潜影盒）。
+# 潜影盒连**里面的东西**一起丢，是这里最贵的一种，单列一条 —— 注意 `shulker_box` 不带下划线：
+# 原版无染色那件 id 就是 `shulker_box`，染色的是 `red_shulker_box`（`*shulker_box` 两种都盖住）。
+_PROTECTED_ITEM_SUFFIXES = ("_pickaxe", "_axe", "_shovel", "_sword", "_hoe",
+                            "shulker_box")
+# 没有材质前缀的工具/装备（剪刀、打火石、鞘翅）。
+_PROTECTED_ITEMS_EXACT_TOOLS = frozenset({"shears", "flint_and_steel", "elytra"})
+
+
+def is_protected_item(item_id: Any) -> bool:
+    """这件东西在不在「宁死不许丢」清单里（只看归一化后的 id，不做任何正数判断）。"""
+    body = normalize_item(item_id)
+    if ":" in body:               # 兜底：再剥一次命名空间（normalize_item 只剥 minecraft:）
+        body = body.split(":")[-1]
+    if not body:
+        return False
+    return (body in _PROTECTED_ITEMS_EXACT
+            or body in _PROTECTED_ITEMS_EXACT_TOOLS
+            or body.startswith(_PROTECTED_ITEM_PREFIXES)
+            or body.endswith(_PROTECTED_ITEM_SUFFIXES))
+
+
+def resolve_inventory_item(requested: Any, inventory: Any) -> tuple[str, list[str]]:
+    """把模型给的物品名按**背包快照**解析成确切的一件：返回 `(精确 id, 候选列表)`。
+
+    为什么必须在这里解析：模组侧那一行是 `stack.getItem().toString().contains(itemName)`
+    —— **子串匹配**，给「iron」会误中 `raw_iron`（甚至在 `iron_ingot`/`iron_ore` 之间赌），
+    等于把"到底丢哪一件"交给运气。所以后端先解析成精确 id 再透传
+    （Java 侧那行 `contains` 的加固是**下一批**的事，这里只保证后端给的是精确 id）。
+
+    解析口径：
+    * 归一化后**精确命中**背包里的一件 ⇒ 返回它，候选为空；
+    * 否则退到**子串**匹配：唯一命中 ⇒ 返回它；命中多件或零件 ⇒ 精确 id 给空串、
+      候选按 id 排序返回（调用方**如实拒绝**并把候选列给模型，绝不替它猜）。
+    """
+    key = normalize_item(requested)
+    if not key:
+        return "", []
+    # 归一化 id → 快照里那个**原样**的注册名（透传给模组时用它，最贴 Java 的 toString()）。
+    by_id: dict[str, str] = {}
+    for row in (inventory if isinstance(inventory, (list, tuple)) else []):
+        if not isinstance(row, dict):
+            continue
+        raw = str(row.get("name") or row.get("item_id") or row.get("item") or "").strip()
+        norm = normalize_item(raw)
+        if norm and norm not in by_id:
+            by_id[norm] = raw
+    if not by_id:
+        return "", []
+    if key in by_id:
+        return by_id[key], []
+    hits = sorted(name for name in by_id if key in name)
+    if len(hits) == 1:
+        return by_id[hits[0]], []
+    return "", hits
+
+
 # /locate 要走一趟"发命令 → 游戏回话 → 解析"，给一个够用但不至于把回合卡死的上限。
 # 超时就**如实说没拿到**（绝不编坐标 —— 编出来的坐标会让它一头扎进错误的方向）。
 LOCATE_TIMEOUT_SECONDS = 6.0
 # 驻守的默认水平半径（用户口径：如 32 格）。
 GUARD_DEFAULT_RADIUS = 32
+
+# `attack_in_range` 的契约（逐字照 Java `ActionExecutor` 的常量）。本地只做**同一套**钳位，
+# 这样 ack 说明里写的数字就是模组实际用的那个（不写"请求了 100 格"而模组其实用 32）。
+ATTACK_IN_RANGE_KINDS = ("hostile", "passive", "any")
+ATTACK_IN_RANGE_DEFAULT_RADIUS = 8.0
+ATTACK_IN_RANGE_MIN_RADIUS = 1.0
+ATTACK_IN_RANGE_MAX_RADIUS = 32.0
+ATTACK_IN_RANGE_DEFAULT_SECONDS = 30.0
+ATTACK_IN_RANGE_MIN_SECONDS = 1.0
+ATTACK_IN_RANGE_MAX_SECONDS = 300.0
 
 # `come_to_player` 是**一次性**动作（走到玩家此刻的位置就结束）：只有"同一格上的紧邻重复请求"
 # 才当重复压掉，隔这么久之后（或玩家挪了位置）再叫一律照发（见 `_tool_come_to_player`）。
@@ -547,6 +625,11 @@ def _as_optional_int(value: Any) -> Optional[int]:
         return None
 
 
+def _clamp(value: float, low: float, high: float) -> float:
+    """把数值夹进 [low, high]（模组侧同一套钳位；本地先钳是为了说明里写的数就是实际用的数）。"""
+    return max(low, min(high, float(value)))
+
+
 # ── /locate 的查询词与回复解析 ────────────────────────────────
 # 目标：模型说"找村庄"时发的是 `locate structure minecraft:village`，而不是被写死成
 # 某一个结构 —— **具体资源名由模型给**，这里只做语言翻译与命名空间规范化。
@@ -720,6 +803,94 @@ def death_point_line(row: Any, older: int = 0, now: Optional[float] = None) -> s
     return (f"- 上次死亡点：({coords})（{facts}）—— 那里的东西还掉着（走过去会自动捡起），"
             f"想回去就调 go_to_death_point（省 index＝就这一个{tail}）；回家是 go_home，"
             f"而且我**不会**自己往回走")
+
+
+def _station_line(row: dict) -> str:
+    """L2 里一个站点的一行：`名字（kind）@(x,y,z) 半径r` —— 只摆模组报的事实。
+
+    坐标缺一个轴就不写那一串（**不编**）；kind/radius 缺就不写（不是空括号糊上去）。
+    """
+    name = str(row.get("name") or "?").strip() or "?"
+    kind = str(row.get("kind") or "").strip()
+    axes = [row.get("x"), row.get("y"), row.get("z")]
+    have_point = all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in axes)
+    coords = "" if not have_point else "@(" + ",".join(where._fmt(v) for v in axes) + ")"
+    radius = row.get("radius")
+    radius_text = ""
+    if isinstance(radius, (int, float)) and not isinstance(radius, bool):
+        radius_text = f" 半径{where._fmt(radius)}"
+    tag = f"（{kind}）" if kind else ""
+    return f"{name}{tag}{coords}{radius_text}"
+
+
+def _station_recency(row: dict) -> float:
+    """站点"有多新"：按模组报的 `saved_at_tick`（缺失按 0，不编一个时间）。"""
+    tick = row.get("saved_at_tick")
+    return float(tick) if isinstance(tick, (int, float)) and not isinstance(tick, bool) else 0.0
+
+
+def _afk_line(context: dict) -> str:
+    """**当帧**挂机状态（进 L2）：驻守中就把模组报的字段如实摆出来；没报 afk 就整段不出现。
+
+    失败/取消的**原因**不在 `afk` 里，而在模组的 `task_state`（kind=afk）——有就一并透出来，
+    没有就不编。返回空串表示"模组没报这一类"，调用方据此整段省略。
+    """
+    ctx = context if isinstance(context, dict) else {}
+    afk = ctx.get("afk") if isinstance(ctx.get("afk"), dict) else {}
+    if not afk:
+        return ""
+    task = ctx.get("task_state") if isinstance(ctx.get("task_state"), dict) else {}
+    afk_task = str(task.get("kind") or "").strip().lower() == "afk"
+    tail = ""
+    if afk_task:
+        tail = f"；任务 {task.get('status') or '?'}"
+        detail = str(task.get("detail") or "").strip()
+        if detail:
+            tail += f"（{detail}）"
+    if not afk.get("active"):
+        return f"没在挂机（afk.active=false）{tail}"
+    drift = afk.get("drift")
+    drift_text = (where._fmt(drift)
+                  if isinstance(drift, (int, float)) and not isinstance(drift, bool) else "?")
+    return (f"正在站点「{afk.get('station') or '?'}」驻守；"
+            f"在容差内={'是' if afk.get('at_target') else '否'}，漂移={drift_text}m，"
+            f"走回中={'是' if afk.get('returning') else '否'}，"
+            f"keepalive={'开' if afk.get('keepalive') else '关'}"
+            f"（since_ticks={afk.get('since_ticks', '?')}）{tail}")
+
+
+def _attack_result_line(context: dict) -> str:
+    """站桩攻击的**收尾回执**（L2）：命中数 + 退出原因码；没有回执就整段不出现。
+
+    "命令已发出（模组 ack 了）"不等于"打到了" —— 所以这一行**必须**把 hits 与 reason 摆出来
+    （模组 `attack_in_range_result` 事件的原样字段），不把它当成功吞掉。
+    """
+    ctx = context if isinstance(context, dict) else {}
+    entry = ctx.get("attack_in_range_result")
+    data = entry.get("data") if isinstance(entry, dict) else None
+    if not isinstance(data, dict):
+        return ""
+    hits = data.get("hits")
+    hits_text = str(hits) if isinstance(hits, int) and not isinstance(hits, bool) else "?"
+    reason = str(data.get("reason") or "?").strip() or "?"
+    facts: list[str] = []
+    radius = data.get("radius")
+    if isinstance(radius, (int, float)) and not isinstance(radius, bool):
+        facts.append(f"半径{where._fmt(radius)}")
+    kind = str(data.get("kind") or "").strip()
+    if kind:
+        facts.append(f"只打 {kind}")
+    stopped = str(data.get("stopped") or "").strip()
+    if stopped:
+        facts.append(f"停止于 {stopped}")
+    ago = ""
+    at = entry.get("at")
+    if isinstance(at, (int, float)) and not isinstance(at, bool):
+        seconds_ago = max(0.0, time.time() - float(at))
+        ago = "（刚刚）" if seconds_ago < 1.0 else f"（{seconds_ago:.0f} 秒前）"
+    detail = f"（{'，'.join(facts)}）" if facts else ""
+    return (f"- 上次站桩攻击{ago}：命中 {hits_text} 次，退出原因 {reason}{detail}"
+            f" —— 「已经发出去了」不等于「打到了」，看命中数")
 
 
 class Planner:
@@ -1210,6 +1381,25 @@ class Planner:
         else:
             remembered_text = "暂无"
 
+        # 站点（挂机点）+ **当帧**挂机状态：进 L2 动态层（L1 一个字节都不动）。
+        # 站点照「已知记录点」的口径收窄：只报**共几个 + 最近记的 3 个**，全量/按名字找走
+        # `where_is`；要挂上去用 `go_afk`（它才能精准站位，见工具说明）。
+        stations = context.get("stations", []) if isinstance(context, dict) else []
+        station_rows = [row for row in stations if isinstance(row, dict)] \
+            if isinstance(stations, (list, tuple)) else []
+        if station_rows:
+            recent = sorted(station_rows, key=_station_recency, reverse=True)[:3]
+            head = "，".join(_station_line(row) for row in recent)
+            station_text = (f"共 {len(station_rows)} 个；最近记的 3 个：{head}"
+                            f"（要全量或按名字找用 where_is）")
+        else:
+            station_text = "暂无"
+        afk_text = _afk_line(context)
+        afk_section = f"\n挂机状态（当帧）：\n{afk_text}\n" if afk_text else ""
+        # 站桩攻击的**收尾回执**（命中数 / 退出原因）：有才出现。"发出去了"≠"打到了"。
+        attack_line = _attack_result_line(context)
+        attack_section = f"\n站桩攻击（attack_in_range 的回执）：\n{attack_line}\n" if attack_line else ""
+
         # 在线玩家 + 最近聊天：判断"他在跟谁说话"靠的是这两块，而不是每次都要喊名字。
         last_speaker = context.get("last_speaker") if isinstance(context, dict) else None
         last_speaker = last_speaker if isinstance(last_speaker, dict) else {}
@@ -1449,6 +1639,10 @@ class Planner:
 已知记录点（你自己记住的持久记忆，可能在很远的地方）：
 {remembered_text}
 
+站点（挂机点：名字（kind）@坐标。要**精准站位**（刷怪塔底部那种）用 go_afk；找某个/看全部用
+where_is；记一个新站点用 remember_station＝照我此刻站位记）：
+{station_text}
+{afk_section}{attack_section}
 {death_point_text}
 附近实体（`tier:名字@距离`（+带坐标的档位后面跟 `(x,y,z)`）；tier 是模组按同一张表算的对待档：
 dangerous 高危险=不主动打也不还手、hostile 敌对=该处理、neutral 中立=不惹（它先动手才还手）、
@@ -1946,16 +2140,17 @@ passive 被动=能猎的肉、unknown 认不出=先别当敌人）：
             logger.info("[Planner] 吃东西")
             executed_any_action = True
         
-        # 丢弃物品
+        # 丢弃物品（旧的文本写法 `drop(名字, 数量)`）：**同一条硬底线**，不许绕过去。
         if "drop(" in plan_lower:
             args = self._extract_between(plan_text, "drop(", ")")
             if args:
                 parts = args.split(",")
                 item = parts[0].strip() if len(parts) > 0 else ""
                 count = int(parts[1].strip()) if len(parts) > 1 else 1
-                self.skills.drop_item(item, count)
-                logger.info("[Planner] 丢弃 %s x%d", item, count)
-                executed_any_action = True
+                # 走注册表那条正路（解析精确 id + 保护清单 + 如实说明），不另开一条旁路。
+                if self._tool_drop_item({"item": item, "count": count}, context):
+                    logger.info("[Planner] 丢弃 %s x%d", item, count)
+                    executed_any_action = True
         
         # 整理背包
         if "sort_inventory()" in plan_lower:
@@ -2798,11 +2993,35 @@ passive 被动=能猎的肉、unknown 认不出=先别当敌人）：
         return False
 
     def _tool_drop_item(self, payload: dict, context: dict) -> bool:
-        item = payload.get("item")
-        if item:
-            self.skills.drop_item(str(item), int(payload.get("count", 1)))
-            return True
-        return False
+        """丢物品：**先按背包解析成精确 id → 再撞「宁死不许丢」硬底线 → 最后才下发**。
+
+        两步都是**硬拦**（模型改不动、不进配置）：
+        ① 解析不出唯一一件（模糊词命中多件 / 背包里没有）⇒ 如实拒绝，把候选列给模型；
+        ② 命中「宁死不许丢」清单（铁/钻石/下界合金/工具/盒类）⇒ `code=protected_item`。
+        """
+        raw = str(payload.get("item") or "").strip()
+        if not raw:
+            self._action_note = "（drop_item：code=need_item —— 得点名丢**哪一件**）"
+            return False
+        inventory = context.get("inventory", []) if isinstance(context, dict) else []
+        item_id, candidates = resolve_inventory_item(raw, inventory)
+        if not item_id:
+            if candidates:
+                self._action_note = (
+                    f"（drop_item：code=ambiguous_item —— 「{raw}」在背包里对不上**唯一一件**"
+                    f"：候选 {'、'.join(candidates)}；说清要丢哪一个（写精确 id）我再动手）")
+            else:
+                self._action_note = (f"（drop_item：code=not_in_inventory —— 背包里没有"
+                                     f"「{raw}」这件东西，没什么可丢的）")
+            return False
+        if is_protected_item(item_id):
+            self._action_note = (
+                f"（drop_item：code=protected_item —— {item_id} 在「宁死不许丢」清单里"
+                f"（铁 / 钻石 / 下界合金 / 工具 / 盒类）：这是**死的底线**，不是我觉得你判断错了；"
+                f"再急也宁可死不许丢，**我没丢**）")
+            return False
+        self.skills.drop_item(item_id, int(payload.get("count", 1)))
+        return True
 
     def _tool_sort_inventory(self, payload: dict, context: dict) -> bool:
         self.skills.sort_inventory()
@@ -2962,6 +3181,141 @@ passive 被动=能猎的肉、unknown 认不出=先别当敌人）：
 
     def _tool_guard_off(self, payload: dict, context: dict) -> bool:
         self.skills.guard_off()
+        return True
+
+    # ── 站点（挂机点）：remember_station / go_afk / afk_stop ────────
+    # 门按「能不能夺走身体」分档（用户口径）：
+    #   remember_station / go_afk ⇒ **master-only**（一个写持久站点表、一个占住身体），
+    #     照 `tpa_request` 的先例在 handler 里用 `_actor_of` 判，**不改 permissions.py**；
+    #   afk_stop ⇒ **不加门**（停下是安全方向：谁都能把我从挂机里拉出来）。
+
+    def _station_rows(self, context: dict) -> list[dict]:
+        """当前**当帧**的站点清单（模组每帧上报的 `stations`）。
+
+        优先读这一轮 context（模组刚说的话）；context 里没有这一类，就退回后端持久化的
+        那份（`WorldMemoryStore.stations()`，它是回灌的来源）。两处都没有 ⇒ 空表（不编）。
+        """
+        ctx = context if isinstance(context, dict) else {}
+        rows = ctx.get("stations")
+        if not isinstance(rows, (list, tuple)) or not rows:
+            store = getattr(self, "places", None)
+            if store is not None:
+                try:
+                    rows = store.stations()
+                except Exception as exc:  # noqa: BLE001 — 读不出来按"没有"处理，绝不编
+                    logger.debug("[Planner] 读站点表失败: %s", exc)
+                    rows = []
+        return [row for row in (rows or []) if isinstance(row, dict)]
+
+    def _station_named(self, name: str, context: dict) -> Optional[dict]:
+        """按名字找站点（首尾空白 / 大小写不敏感）；没有就返回 None（**不编一个**）。"""
+        key = str(name or "").strip().casefold()
+        if not key:
+            return None
+        for row in self._station_rows(context):
+            if str(row.get("name") or "").strip().casefold() == key:
+                return row
+        return None
+
+    def _dispatch_remember_station(self, payload: dict, context: dict) -> bool:
+        """记住站点：坐标/朝向省略时**模组侧回退当帧位姿**（不在这里编坐标）。
+
+        master-only：站点表是**持久**的，而且之后 go_afk 会靠它夺走身体 —— 与 `set_home`
+        同类（公共服上有 guest 时，这条必须只有主人能动）。
+        """
+        tier, actor = self._actor_of(context)
+        if tier != TIER_MASTER:
+            who = f"{actor}（{tier}）" if actor else tier
+            self._action_note = (f"（remember_station：code=master_only —— {who} 没资格让我记站点："
+                                 f"站点是**持久记忆**、挂上去还会占住身体，这条只有主人能让我做；"
+                                 f"**我没动**）")
+            return False
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            self._action_note = ("（remember_station：code=need_name —— 站点得有名字"
+                                 "（之后要按名字用 go_afk 挂上去），没名字我不记）")
+            return False
+        kind = str(payload.get("kind") or "").strip() or None
+        self.skills.remember_station(
+            name, kind=kind,
+            x=_as_optional_float(payload.get("x")), y=_as_optional_float(payload.get("y")),
+            z=_as_optional_float(payload.get("z")),
+            yaw=_as_optional_float(payload.get("yaw")),
+            pitch=_as_optional_float(payload.get("pitch")),
+            radius=_as_optional_float(payload.get("radius")))
+        self._action_note = (f"（记住站点「{name}」{'（' + str(kind) + '）' if kind else ''}："
+                             f"坐标缺省的那几项按我**当帧的位姿**记）")
+        return True
+
+    def _dispatch_go_afk(self, payload: dict, context: dict) -> bool:
+        """站到站点并驻守（master-only）：漂移超半径由模组自己走回。
+
+        站点不存在 ⇒ **如实拒绝**：一帧都不发（`code=unknown_station`），并把模组那边
+        会回的原话 `Unknown station: <名字>` 一并透给模型 —— 不猜、不自动新建站点。
+        """
+        tier, actor = self._actor_of(context)
+        if tier != TIER_MASTER:
+            who = f"{actor}（{tier}）" if actor else tier
+            self._action_note = (f"（go_afk：code=master_only —— {who} 没资格让我去站点驻守："
+                                 f"驻守期间身体被占住、不再响应别人，这条只有主人能命令我；"
+                                 f"**我没动**）")
+            return False
+        name = str(payload.get("station") or payload.get("name") or "").strip()
+        if not name:
+            self._action_note = ("（go_afk：code=need_station —— 得点名挂到**哪个**站点"
+                                 "（先用 remember_station 记一个，或用 where_is 看有哪些站点））")
+            return False
+        if self._station_named(name, context) is None:
+            self._action_note = (
+                f"（go_afk：code=unknown_station —— 我这边没有叫「{name}」的站点"
+                f"（模组那边也会回 `Unknown station: {name}`）；我不猜、也不自动新建，"
+                f"**我没动** —— 先用 where_is 看有哪些站点，或先用 remember_station 把它记下来）")
+            return False
+        keepalive = bool(payload.get("keepalive"))
+        self.skills.go_afk(name, keepalive)
+        self._action_note = (f"（往站点「{name}」去驻守"
+                             f"{'（keepalive：只转头不移动）' if keepalive else ''}："
+                             f"到了之后漂移超半径我自己走回）")
+        return True
+
+    def _dispatch_afk_stop(self, payload: dict, context: dict) -> bool:
+        """结束站点驻守（**不加门**：停下是安全方向，谁都能把它从挂机里拉出来）。"""
+        self.skills.afk_stop()
+        self._action_note = "（已结束站点驻守）"
+        return True
+
+    # ── 站桩持续攻击（attack_in_range）────────────────────────────
+    # master-only：它**持续出手**＝把身体交出去打怪（与 go_afk / remember_station 同一档）。
+    # 它不会移动：站位是 go_afk / 自己走过去的事（Java 侧明说"绝不写位移键、也不寻路"）。
+    # 收尾回执（hits / reason）由模组的 `attack_in_range_result` 事件送来，进 L2 如实呈现 ——
+    # 绝不把它当成"已发出＝成功"就吞掉（见 `_attack_result_line`）。
+
+    def _dispatch_attack_in_range(self, payload: dict, context: dict) -> bool:
+        """站桩持续攻击（master-only）。认不出的 kind 本地先挡（模组的原话一并透出去）。"""
+        tier, actor = self._actor_of(context)
+        if tier != TIER_MASTER:
+            who = f"{actor}（{tier}）" if actor else tier
+            self._action_note = (f"（attack_in_range：code=master_only —— {who} 没资格让我持续打怪："
+                                 f"持续出手等于把身体交出去，只有主人能命令我；**我没动**）")
+            return False
+        kind = str(payload.get("kind") or "").strip().lower() or "hostile"
+        if kind not in ATTACK_IN_RANGE_KINDS:
+            # 本地挡一道：别把一次注定被拒的命令发出去，再让它只留一条异步 false。
+            self._action_note = (
+                f"（attack_in_range：code=unknown_kind —— kind 只认 "
+                f"{'/'.join(ATTACK_IN_RANGE_KINDS)}（默认 hostile）；模组那边也会回 "
+                f"`Unknown kind: {kind}` —— 我不猜，**一帧都没发**）")
+            return False
+        raw_radius = _as_optional_float(payload.get("radius"))
+        radius = _clamp(ATTACK_IN_RANGE_DEFAULT_RADIUS if raw_radius is None else raw_radius,
+                        ATTACK_IN_RANGE_MIN_RADIUS, ATTACK_IN_RANGE_MAX_RADIUS)
+        raw_seconds = _as_optional_float(payload.get("max_seconds"))
+        seconds = _clamp(ATTACK_IN_RANGE_DEFAULT_SECONDS if raw_seconds is None else raw_seconds,
+                         ATTACK_IN_RANGE_MIN_SECONDS, ATTACK_IN_RANGE_MAX_SECONDS)
+        self.skills.attack_in_range(radius, kind, seconds)
+        self._action_note = (f"（开始站桩攻击：{radius:g} 格内只打 {kind}，最多 {seconds:g} 秒 —— "
+                             f"我只出手、**不移动**（要站好位先 go_afk）；"
+                             f"结束时给你命中数与退出原因）")
         return True
 
     def _tool_set_hud_note(self, payload: dict, context: dict) -> bool:

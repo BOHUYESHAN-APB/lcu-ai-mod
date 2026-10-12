@@ -273,9 +273,11 @@ class RepeatDispatchTests(unittest.TestCase):
     def test_same_hostile_is_not_attacked_every_tick(self):
         engine, mode, skills = self._engine_with_defense()
         hostile = _hostile()
+        # 降级后要先**挨打**才还手（`SelfDefenseMode` 的 P3 口径）—— 这里每 tick 都算"近期受伤"。
+        being_hit = _state(entities=[hostile], hurt=True)
 
         for _ in range(5):
-            engine.tick(_state(entities=[hostile]))
+            engine.tick(being_hit)
 
         self.assertEqual(skills.count("attack"), 1, "同一目标不该每 tick 重发")
         self.assertEqual(skills.count("look_at"), 1)
@@ -285,17 +287,17 @@ class RepeatDispatchTests(unittest.TestCase):
         engine, mode, skills = self._engine_with_defense()
         hostile = _hostile()
 
-        engine.tick(_state(entities=[hostile]))
+        engine.tick(_state(entities=[hostile], hurt=True))
         mode._last_dispatch_at = 0.0               # 把上次下发时间推远（等价于"过了一秒"）
-        engine.tick(_state(entities=[hostile]))
+        engine.tick(_state(entities=[hostile], hurt=True))
 
         self.assertEqual(skills.count("attack"), 2)
 
     def test_a_different_hostile_is_attacked_immediately(self):
         engine, mode, skills = self._engine_with_defense()
 
-        engine.tick(_state(entities=[_hostile()]))
-        engine.tick(_state(entities=[_hostile(name="骷髅", entity_id=7)]))
+        engine.tick(_state(entities=[_hostile()], hurt=True))
+        engine.tick(_state(entities=[_hostile(name="骷髅", entity_id=7)], hurt=True))
 
         self.assertEqual(skills.count("attack"), 2)
 
@@ -323,7 +325,7 @@ class ReflexArbitrationTests(unittest.TestCase):
         mode.activate_streak_required = 1
         engine.add_mode(mode)
 
-        engine.tick(_state(entities=[_hostile()], reflex_combat=True))
+        engine.tick(_state(entities=[_hostile()], hurt=True, reflex_combat=True))
 
         self.assertIsNone(engine.get_status()["active"])
         self.assertEqual(skills.calls, [], "本地反射在打，后端一个字节都不该发")
@@ -335,12 +337,12 @@ class ReflexArbitrationTests(unittest.TestCase):
         mode.activate_streak_required = 1
         engine.add_mode(mode)
 
-        engine.tick(_state(entities=[_hostile()]))
+        engine.tick(_state(entities=[_hostile()], hurt=True))
         self.assertEqual(skills.count("attack"), 1)
 
         mode._last_dispatch_at = 0.0
         for _ in range(3):
-            engine.tick(_state(entities=[_hostile()], reflex_combat=True))
+            engine.tick(_state(entities=[_hostile()], hurt=True, reflex_combat=True))
 
         self.assertEqual(skills.count("attack"), 1, "反射接手后不许再发 attack")
         self.assertEqual(skills.count("look_at"), 1)
@@ -512,7 +514,7 @@ class EndToEndThrashRegressionTests(unittest.TestCase):
         mode = SelfDefenseMode()
         mode.activate_streak_required = 1
         engine.add_mode(mode)
-        state = _state(entities=[_hostile()])
+        state = _state(entities=[_hostile()], hurt=True)
 
         records = []
         handler = logging.Handler()

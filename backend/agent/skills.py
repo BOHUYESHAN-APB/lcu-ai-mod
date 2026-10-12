@@ -207,6 +207,19 @@ class Skills:
         """Attack a specific entity by ID."""
         return self._send_cmd("attack_entity", {"entity_id": entity_id})
 
+    def attack_in_range(self, radius: float = 8.0, kind: str = "hostile",
+                        max_seconds: float = 30.0) -> dict:
+        """**站桩持续攻击**（Java 命令 `attack_in_range`；参数名与语义逐字对齐）。
+
+        只出手、**不接管身体**（不写位移键、不寻路）—— 站位是 `go_afk` / 自己走过去的事。
+        默认只打 HOSTILE；中立 / 高危险一律拒绝；玩家永不作为候选。
+        认不出的 kind 模组会如实回 `Unknown kind: …`（后端派发前也会先挡一道）。
+        结束时模组发 `attack_in_range_result` 事件（`hits` / `reason` / `stopped`）。
+        """
+        return self._send_cmd("attack_in_range",
+                              {"radius": float(radius), "kind": str(kind),
+                               "max_seconds": float(max_seconds)})
+
     # ── Block Interaction (mineflayer digging.js) ──────────────
 
     def mine_block(self) -> dict:
@@ -573,6 +586,24 @@ class Skills:
     def guard_off(self) -> dict:
         """取消驻守（Java 侧收到 enabled=false）。"""
         return self._send_cmd("guard", {"enabled": False})
+
+    # ── 站点驻守（挂机）：go_afk / afk_stop ───────────────────
+    # 参数名与 Java `ActionExecutor.handleGoAfk` / `handleAfkStop` **逐字对齐**：
+    #   go_afk   → name（站点名）/ keepalive?
+    #   afk_stop → 无参
+    # 注意：Java 侧读的是 `name`（不是 `station`）——工具层的 `station` 参数到这里改名。
+
+    def go_afk(self, station: str, keepalive: bool = False) -> dict:
+        """寻路到站点并驻守（漂移超半径由模组自己走回；keepalive=只转头不移动）。
+
+        站点名不存在时模组回 `Unknown station: <名字>`（成功位为假），调用方如实转述，
+        **不吞**。这里不做本地猜测（真相在模组那份内存里）。
+        """
+        return self._send_cmd("go_afk", {"name": str(station), "keepalive": bool(keepalive)})
+
+    def afk_stop(self) -> dict:
+        """结束驻守（Java 侧回 `{stopped, was_active, station}`）；没在挂机也照发不误。"""
+        return self._send_cmd("afk_stop", {})
 
     def set_hud_note(self, text: str, seconds: float = 30.0) -> dict:
         """把一句描述词挂到 HUD 状态词后面；seconds<=0 表示留到被替换/清空。
