@@ -94,6 +94,26 @@ DECIDER_TIMEOUT_SECONDS = 8.0
 DECIDER_MAX_TOKENS = 32
 DECIDER_TEMPERATURE = 0.2
 
+# 一轮之内的"失败回灌 + 有界纠错"（用户口径 2026-10-12：把开环变成闭环，不静默丢意图）。
+# 首个动作**下发失败**时，在同一轮里把失败原话当作模型消息回灌**这么多次**，让模型自己
+# 决定"换做法 / 说清不能做"；用满就不再追问（第二次仍失败 ⇒ 如实收尾，**不递归、不无限重试**）。
+MAX_CORRECTION_ROUNDS = 1
+
+
+def _args_text(args: Any) -> str:
+    """候选参数的一行可读文本（进 L2 / 日志 / 失败回执；序列化失败就给 repr，绝不猜参数）。"""
+    try:
+        return json.dumps(args if isinstance(args, dict) else {}, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return repr(args)
+
+
+def _clip(text: Any, limit: int = 120) -> str:
+    """把如实说明压成一行（L2 与日志都只有一行位；超长才截断，截断处明写省略号）。"""
+    flat = str(text or "").replace("\n", " ").strip()
+    return flat if len(flat) <= limit else flat[:limit] + "…"
+
+
 # /locate 要走一趟"发命令 → 游戏回话 → 解析"，给一个够用但不至于把回合卡死的上限。
 # 超时就**如实说没拿到**（绝不编坐标 —— 编出来的坐标会让它一头扎进错误的方向）。
 LOCATE_TIMEOUT_SECONDS = 6.0
@@ -719,6 +739,11 @@ class Planner:
     # 最近一次按需扫描**拿回来的实体行**（带坐标/实体号/血量）——「需要的时候再取坐标」
     # 那条路的落点：`find_entity` 与 `use_on` 都从它这里拿到摘要里没有的那些档位。
     _scan_rows: list = []
+    # "上一轮给了但没做"的那几步 + 事实上下发出去的那一条（见 `__init__`）：同样是类级默认值，
+    # 让 `Planner.__new__(Planner)` 的测试替身也能直接读（它们只读，从不写）。
+    _pending_steps: list = []
+    _last_dispatch_note: str = ""
+    _correction_rounds: int = 0
     # 留下来的扫描行上限（Java 侧 limit 上限是 48，这里对齐，免得两处口径不一样）。
     _SCAN_ROW_CAP: int = 48
 
@@ -810,6 +835,14 @@ class Planner:
         # 最近一次派发**被哪道门拦下**（"" = 没被门拦；permission/container/resource/backoff）：
         # 只给复合体的"卡在第几步 + code"用（如实转发门的原因，不另造一套判定）。
         self._last_tool_gate: str = ""
+        # 一轮里"未做步骤不静默丢失"（用户实机 2026-10-12：多步意图只发了第一步，后一步凭空消失）：
+        # `_pending_steps` = 上一轮模型给了、但**还没做**的那几个候选（只在 L2 里当"你上次的打算"
+        # **提醒**，**绝不**代替新一轮的候选下发 —— 新一轮的候选人永远优先，陈旧候选只作提示）；
+        # `_last_dispatch_note` = 上一轮事实上发出去的那一条（工具 + 结果）的如实一句话。
+        self._pending_steps: list[dict] = []
+        self._last_dispatch_note: str = ""
+        # 本轮已用掉的纠错轮数（每轮从 0 开始；上限 `MAX_CORRECTION_ROUNDS`，不递归）。
+        self._correction_rounds: int = 0
         # `come_to_player` 的"同格紧邻重复"去重记忆：(玩家名@格, 时刻)；一次性动作，只压紧邻重复。
         self._come_to_player_last: Optional[tuple[str, float]] = None
         # 别人家的田：每次动手（含被拒）都留审计 —— "这谁让他动的"必须能查。
@@ -874,6 +907,11 @@ class Planner:
         self._cycle_steps = []
         # 复合体的如实说明同理（免得上一轮的"卡在第几步"串到这一轮）。
         self._composite_note = None
+        # 纠错轮计数每轮从零开始（上一轮用没用的额度不结转到这一轮）—— 这个额度的来源是
+        # "这一轮里模型下发失败了"，别的轮次不该消费它。
+        self._correction_rounds = 0
+        # `_pending_steps` **不**在这里清：它就是"上一轮还没做的那几步"，专门给这一轮的 L2 看。
+
         # 上一轮在造床、这一轮看到床边了 → 认成 home_bed（§8 造 + 放 + 认领）。
         self._claim_pending_home_bed(context)
         # 上一轮收完了、这一轮看到耕地了 → 补种同一作物（同一套"看到才认"的机制）。
@@ -912,7 +950,8 @@ class Planner:
                 if native is None:
                     logger.warning("[Planner] LLM 返回空内容")
                     return None
-                return self._with_notes(self._execute_decision(native, context))
+                return self._with_notes(
+                    self._execute_decision(native, context, layers=layers))
             
             logger.info("[Planner] LLM 规划: %s", plan_text[:100])
             
@@ -923,8 +962,9 @@ class Planner:
                 return self._with_notes(
                     self._execute_plan(plan_text, sender, message, context))
             
-            # 第二阶段：decider 打分并选出一个候选
-            return self._with_notes(self._execute_decision(plan, context))
+            # 第二阶段：单模型从候选里取第一个执行（失败则同一轮内回灌一次让模型自己纠正）
+            return self._with_notes(
+                self._execute_decision(plan, context, layers=layers, plan_text=plan_text))
             
         except Exception as e:
             logger.error("[Planner] 规划失败: %s", e)
@@ -1315,6 +1355,11 @@ class Planner:
         orchestration_text = (context.get("orchestration") or "").strip() if isinstance(context, dict) else ""
         orchestration_section = f"\n{orchestration_text}\n" if orchestration_text else ""
 
+        # 上一轮模型给了、但**还没做**的候选（"多步意图别静默丢失"）：只作提醒进 L2，
+        # 新一轮的候选永远优先 —— 我们**不**替它补发旧单子（见 `_render_pending_steps`）。
+        pending_steps_text = self._render_pending_steps()
+        pending_steps_section = f"\n{pending_steps_text}\n" if pending_steps_text else ""
+
         prompt = f"""当前状态：
 - 发送者：{sender}
 - 消息：{message}
@@ -1373,7 +1418,7 @@ class Planner:
   不许只回一句话、也不许给空数组；**确实不能做**（缺料 / 没授权 / 被保护）才给空数组，并在 reply 里说清为什么不能做。
 - **别只回一句话当完成**：动作没有执行或没有成功时，我这边会自动在你的话后面补一句实话；
   你自己也不要把没做的事说成做了 —— 说"找好了/绑好了"之前，先看状态确认。
-
+{pending_steps_section}
 最近一次按需扫描（`scan_entities` 的回执；摘要里没坐标的档位只能这样拿明细）：
 {scan_text}
 
@@ -1412,20 +1457,60 @@ passive 被动=能猎的肉、unknown 认不出=先别当敌人）：
 
         return prompt
 
-    # ── 两阶段决策：第二阶段（decider 打分选择） ──────────────────
+    # ── 决策：单模型给出候选 → 取第一个下发（失败则同一轮内回灌一次） ──
 
-    def _execute_decision(self, plan: dict, context: dict) -> Optional[str]:
-        """用 decider 从 planner 给出的候选里选一个执行。
+    def _render_pending_steps(self) -> str:
+        """把"上一轮给了、但**还没做**"的候选如实写进 L2（提醒，**不是**补发）。
 
-        只看置信度：低于 DECISION_CONFIDENCE_THRESHOLD 就不下发动作，把这一轮
-        让给 P0/P1 反射层与下一轮规划，避免在没把握时乱动。
+        用户实机（2026-10-12）：说"在这附近找床" ⇒ 模型给的是 `[go_to_block, use_on]` 这类
+        **多步意图**，我们只发了第一步、后一步**静默消失** ⇒ "不找也不右键"。这里只如实告知
+        "你上次还打算做什么"：下一轮继续/改法/放弃**由模型自己定**（决策权还在它手里）。
+        **绝不**把陈旧候选塞回去执行 —— 也不在一轮里盲发（够不着就 `use_on` 必然失败）。
+        """
+        pending = [s for s in self._pending_steps
+                   if isinstance(s, dict) and str(s.get("tool") or "").strip()]
+        if not pending:
+            return ""
+        lines = []
+        for i, step in enumerate(pending, start=2):     # 序号接在"已发/失败"的那一条后面
+            tool = str(step.get("tool", "")).strip()
+            why = _clip(step.get("why") or "", 60)
+            lines.append(f"  {i}) {tool}({_args_text(step.get('args'))})"
+                         + (f" —— 你当时的理由：{why}" if why else ""))
+        first = f"1) {self._last_dispatch_note}；" if self._last_dispatch_note else ""
+        return ("上一轮你给的动作（按你给的顺序）：" + first
+                + f"后面这 {len(pending)} 个**还没做**（我**没有**替你补发，也不会照着旧单子行动 ——"
+                  "这一轮的候选完全由你重新决定）：\n"
+                + "\n".join(lines) + "\n"
+                  "  如果条件现在已经满足（走到了 / 够得着 / 材料齐了）就**现在**给出来；"
+                  "做不了或不用做了就说清为什么（别把没做的事说成做了）。")
+
+    def _execute_decision(self, plan: dict, context: dict,
+                          layers: Optional[PromptLayers] = None,
+                          plan_text: str = "") -> Optional[str]:
+        """执行模型这一轮的决定：候选**按它给的顺序**取第一个下发。
+
+        两条把"开环"补成"闭环"（用户口径 2026-10-12 + 真机现象"不找也不右键 / 时成时败"）：
+        ① 候选 > 1 时**只发第一个**（逐条仍过 `_dispatch_tool_call` 的权限/租约/退避/视线门），
+           其余如实写进 **L2**（`_render_pending_steps`）当"你上次还打算做什么"的提醒 ——
+           **不盲发**（没走到跟前就 `use_on` 一定失败），也**不静默丢弃**；
+        ② 第一个下发**失败**（含被权限/容器/资源/退避门拦下）时，在同一轮里把失败**原话**
+           当模型消息回灌**一次**（上限 `MAX_CORRECTION_ROUNDS`），让模型自己纠正。
+
+        用户原话仍是这一版的地基："先把**一个模型负责决策**的链路做好，后面再逐步逐步加多个
+        模型" ⇒ 这里**不叫第二个模型打分**（`_decide` + 阈值仍**留而未用**）。
         """
         reply_text = plan.get("reply") or None
         candidates = [c for c in plan.get("candidates", [])
                       if isinstance(c, dict) and c.get("tool")]
+        # 这一轮的结果说了算：先清掉上一轮的"还没做"（新一轮候选永远优先；陈旧候选只作提示）。
+        self._pending_steps = []
+        self._last_dispatch_note = ""
 
         if not candidates:
-            self._last_decision = {"source": "planner_only", "reason": "no candidates"}
+            self._last_decision = {"source": "planner_only", "reason": "no candidates",
+                                   "candidate_count": 0, "pending_candidates": 0,
+                                   "correction_rounds": 0}
             # 用户口径："他怎么会觉得自信度不够，然后就不去做了" —— 先说清**是哪一种**：
             # 这条路径是"模型这轮压根没给出工具调用"（不是置信度被拦，那条线在下半段）。
             # 把模型这一轮给的东西原样截断打出来，否则下次还是只能猜。
@@ -1437,39 +1522,173 @@ passive 被动=能猎的肉、unknown 认不出=先别当敌人）：
                         reply_text, seen[:300])
             return reply_text
 
-        if len(candidates) == 1:
-            # 只有一个候选：**没有"挑"这件事** ⇒ 直接执行。
-            # 用户口径（原话）："能力=注册的工具，LLM 决定用不用" —— 它已经用出这个工具了；
-            # 真机证据（2026-10-12）：一个 `remember_poi` 候选被**第二个模型**打 0.55 < 0.60 丢掉，
-            # 而它的话照样发出去说"记好了" —— 报告的是一件没发生的事。
-            only_tool = str(candidates[0].get("tool", "")).strip().lower()
-            logger.info("[Planner] 只有一个候选 %s，直接执行", only_tool)
-        else:
-            logger.info("[Planner] %d 个候选，按模型给的顺序取第一个（单模型决策）", len(candidates))
-
+        # 只有一个候选时**没有"挑"这件事**：直接执行。
+        # 用户口径（原话）："能力=注册的工具，LLM 决定用不用" —— 它已经用出这个工具了；
+        # 真机证据（2026-10-12）：一个 `remember_poi` 候选被**第二个模型**打 0.55 < 0.60 丢掉，
+        # 而它的话照样发出去说"记好了" —— 报告的是一件没发生的事。
         # 用户口径（2026-10-12，原话）："我们就是先至少先把**一个模型负责决策**的链路做好，后面再
         # 逐步逐步加多个模型，不能一上来就做太复杂的东西，这么简单的一个模型调度我们都没做好。"
-        # ⇒ 这一版**不再叫第二个模型来打分挑一个**：planner 给出的候选**顺序就是它的判断**，
-        #    取第一个直接执行。安全闸门照旧在 `_dispatch_tool_call` 里（视线/够得着/不误伤/授权/不搭方块）。
-        # `decider` 那套（`_decide` + `confidence_threshold` 配置）**先留着但不启用**，
-        # 等多模型调度真的做得动再拿出来 —— 现在别让它挡在中间。
+        # ⇒ planner 给出的候选**顺序就是它的判断**，取第一个直接执行；安全闸门照旧在
+        #    `_dispatch_tool_call` 里（视线/够得着/不误伤/授权/不搭方块）。
+        #    `decider` 那套（`_decide` + `confidence_threshold` 配置）**先留着但不启用**。
         candidate = candidates[0]
         tool = str(candidate.get("tool", "")).strip().lower()
+        args = candidate.get("args") if isinstance(candidate.get("args"), dict) else {}
+        # 其余候选**原样留着**进下一轮的 L2（如实说明"还有哪个没做"），本 tick 一条都不发。
+        self._pending_steps = [c for c in candidates[1:]]
         self._last_decision = {
             "source": "planner",
             "tool": tool,
             "candidate_count": len(candidates),
+            "pending_candidates": len(self._pending_steps),
+            "correction_rounds": 0,
         }
-        args = candidate.get("args") if isinstance(candidate.get("args"), dict) else {}
+        before_notes = self._notes_snapshot()
         executed = self._dispatch_tool_call(tool, args, context)
         # 记进 last_decision，供 /api/status 与前端展示
-        self._last_decision["tool"] = tool
         self._last_decision["executed"] = bool(executed)
-        logger.info("[Planner] 决策执行 %s(%s) -> %s", tool, args, executed)
-        if not executed:
-            # 说了要做却没做成：同样**不许**让它的话替自己报功。
-            return self._not_done_reply(reply_text, self._action_note or "动作没有成功下发")
-        return reply_text
+        if executed:
+            logger.info("[Planner] 首轮下发 %s(%s) -> ok（候选 %d 个，未做 %d 个）",
+                        tool, args, len(candidates), len(self._pending_steps))
+            self._last_dispatch_note = f"{tool}({_args_text(args)}) 已下发"
+            return reply_text
+        reason = self._dispatch_failure_reason(before_notes, tool)
+        logger.info("[Planner] 首轮下发 %s(%s) -> 失败（%s；候选 %d 个，未做 %d 个）",
+                    tool, args, _clip(reason, 80), len(candidates), len(self._pending_steps))
+        self._last_dispatch_note = f"{tool}({_args_text(args)}) 下发失败（{_clip(reason, 80)}）"
+        # 失败 ⇒ 同一轮内有界纠错（模型自己决定换做法还是说清不能做）。
+        corrected = self._correct_after_failure(tool, args, reason, context, reply_text,
+                                                layers, plan_text)
+        if corrected is not None:
+            return corrected
+        # 没纠错（没有 LLM / 已用满额度 / 纠错轮本身失败）：说了要做却没做成 ⇒ 补一句实话。
+        return self._not_done_reply(reply_text, reason)
+
+    def _correct_after_failure(self, tool: str, args: dict, reason: str, context: dict,
+                               reply_text: Optional[str], layers: Optional[PromptLayers],
+                               plan_text: str) -> Optional[str]:
+        """把"下发失败"回灌给模型，让它**在同一轮里**自己纠一次（有上限，不递归）。
+
+        - 走**既有** `llm.chat`（没有新通道），agent 仍是 `planner`（还是同一个模型在决策）；
+        - 上限 `MAX_CORRECTION_ROUNDS`：用满就不再追问（第二次仍失败 ⇒ 如实收尾）；
+        - 返回这一轮该说出去的话（需要时已补上实话）；**没能纠错时返回 None**，
+          由调用方走既有的"没做成"收尾 —— 超时/报错/没候选都算"这轮没做成"，绝不假装成功。
+        """
+        if not self.llm or not getattr(self.llm, "api_key", None):
+            logger.info("[Planner] 没有可用的 LLM，跳过纠错轮（%s 下发失败：%s）",
+                        tool, _clip(reason, 60))
+            return None
+        if self._correction_rounds >= MAX_CORRECTION_ROUNDS:
+            logger.info("[Planner] 纠错轮已用满（上限 %d），不再追问", MAX_CORRECTION_ROUNDS)
+            return None
+        self._correction_rounds += 1
+        self._last_decision["correction_rounds"] = self._correction_rounds
+        receipt = self._failure_receipt(tool, args, reason)
+        kwargs = {}
+        tools = layers.tools if layers is not None else None
+        if tools:
+            kwargs["tools"] = tools
+        try:
+            result = self.llm.chat(self._correction_messages(layers, plan_text, receipt),
+                                   agent="planner", **kwargs)
+        except Exception as exc:  # noqa: BLE001 — 纠错轮自己炸了就是"这轮没做成"，不伪装成功
+            logger.warning("[Planner] 纠错轮调用失败/超时（%s 的失败回执没能回灌）: %s", tool, exc)
+            return None
+        result = result if isinstance(result, dict) else {}
+        text = str(result.get("content") or "")
+        plan = self._parse_plan_json(text) if text.strip() else None
+        if plan is None:
+            plan = self._plan_from_tool_calls(result.get("tool_calls"))
+        if plan is None:
+            logger.info('[Planner] 纠错轮 %d/%d：%s 的失败回执回灌后模型没给可用候选，'
+                        '按"这轮没做成"收尾：%s',
+                        self._correction_rounds, MAX_CORRECTION_ROUNDS, tool, _clip(text, 120))
+            return None
+        candidates = [c for c in plan.get("candidates", [])
+                      if isinstance(c, dict) and c.get("tool")]
+        reply2 = plan.get("reply") or None
+        if not candidates:
+            # 模型改口了（换说法 / 说清不能做）⇒ 用它的话收尾，并如实说明那条动作没执行。
+            logger.info("[Planner] 纠错轮 %d/%d：%s 的失败回执回灌后模型改口/不再给动作（reply=%r）",
+                        self._correction_rounds, MAX_CORRECTION_ROUNDS, tool, reply2)
+            return self._not_done_reply(
+                reply2 or reply_text,
+                f"{tool} 那次没有下发（{reason}）；纠错轮模型没有再给动作")
+        tool2 = str(candidates[0].get("tool", "")).strip().lower()
+        args2 = candidates[0].get("args") if isinstance(candidates[0].get("args"), dict) else {}
+        # 纠错轮给的候选也照 ① 走：只发第一个，其余进下一轮 L2（不盲发）。
+        self._pending_steps = [c for c in candidates[1:]]
+        self._last_decision["tool"] = tool2
+        self._last_decision["pending_candidates"] = len(self._pending_steps)
+        before_notes = self._notes_snapshot()
+        executed = self._dispatch_tool_call(tool2, args2, context)
+        self._last_decision["executed"] = bool(executed)
+        if executed:
+            logger.info("[Planner] 纠错轮 %d/%d 下发 %s(%s) -> ok（未做 %d 个）",
+                        self._correction_rounds, MAX_CORRECTION_ROUNDS,
+                        tool2, args2, len(self._pending_steps))
+            self._last_dispatch_note = (f"{tool2}({_args_text(args2)}) 已下发"
+                                       f"（上一轮 {tool} 先失败：{_clip(reason, 60)}）")
+            return reply2 or reply_text
+        reason2 = self._dispatch_failure_reason(before_notes, tool2)
+        logger.info("[Planner] 纠错轮 %d/%d 下发 %s(%s) -> 失败（%s）",
+                    self._correction_rounds, MAX_CORRECTION_ROUNDS,
+                    tool2, args2, _clip(reason2, 80))
+        self._last_dispatch_note = f"{tool2}({_args_text(args2)}) 下发失败（{_clip(reason2, 80)}）"
+        # 纠错轮也失败 ⇒ **到此为止**（上限就是 1，不递归、不无限重试），如实收尾。
+        return self._not_done_reply(reply2 or reply_text,
+                                    f"{tool2} 也没下发成功：{reason2}")
+
+    def _failure_receipt(self, tool: str, args: dict, reason: str) -> str:
+        """失败回执（作为**模型消息**回灌）：工具名 + 参数 + 失败原话 + 要它怎么办。
+
+        "为什么失败"用**派发时写下的原话**（`_action_note` 等如实说明 / 被哪道门拦下），
+        不替它编一个看起来合理的理由。
+        """
+        lines = [
+            "刚才你给的动作**没有下发成功**，这是回执（事实，不是我猜的）：",
+            f"- 工具：{tool}",
+            f"- 参数：{_args_text(args)}",
+            f"- 失败原因：{reason}",
+        ]
+        pending = [s for s in self._pending_steps
+                   if isinstance(s, dict) and str(s.get("tool") or "").strip()]
+        if pending:
+            rest = "、".join(f"{s.get('tool')}({_args_text(s.get('args'))})" for s in pending)
+            lines.append(f"- 你上一轮排在后面的（**还没做**，我一条都没发）：{rest}")
+        lines.append("现在请你**要么换一个做法**（给一条此刻真的做得到的候选），"
+                     "**要么说清为什么不能做**（在 reply 里讲明白）——"
+                     "别把没做的事说成做了。")
+        return "\n".join(lines)
+
+    def _correction_messages(self, layers: Optional[PromptLayers], plan_text: str,
+                             receipt: str) -> list[dict]:
+        """纠错轮的对话：**原样续上**这一轮的 system(L0+L1) → user(L2) → assistant(它的输出)，
+        再补一条 user 的失败回执 —— 没有第二套提示词通道，L0/L1 一个字节都不改。
+        """
+        messages: list[dict] = []
+        system = layers.system if layers is not None else (self._system_cache or "")
+        if system:
+            messages.append({"role": "system", "content": system})
+        if layers is not None and layers.user:
+            messages.append({"role": "user", "content": layers.user})
+        if plan_text:
+            messages.append({"role": "assistant", "content": plan_text})
+        messages.append({"role": "user", "content": receipt})
+        return messages
+
+    def _dispatch_failure_reason(self, before_notes: tuple, tool: str) -> str:
+        """这次派发**为什么**没成：先取这一步自己新写下的如实说明（原话优先）。
+
+        没有被门拦下、也没有原话时，把"工具名根本不在表里"这种可判定的事实说清；
+        其余一律照实说"工具自己回报了失败"，**不编**更细的理由。
+        """
+        delta = self._note_delta(before_notes)
+        if delta:
+            return str(delta).strip("（）")
+        if TOOL_BY_NAME.get(str(tool or "").strip().lower()) is None:
+            return f"工具表里没有 `{tool}` 这个名字（不在注册表里，一步都没发）"
+        return "工具自己回报了失败（没有更细的说明）"
 
     @staticmethod
     def _not_done_reply(reply_text: Optional[str], why: str) -> Optional[str]:
