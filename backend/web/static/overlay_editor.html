@@ -1,0 +1,691 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>LCU 叠加层 · 布局编辑器</title>
+<style>
+/* ── 编辑器外壳（只在浏览器里用，不进 OBS 画面）───────────────────────────── */
+*,*::before,*::after{box-sizing:border-box}
+html,body{margin:0;height:100%;background:#0d1117;color:#c9d1d9;
+  font-family:'Segoe UI','PingFang SC','Microsoft YaHei',system-ui,sans-serif;font-size:13px}
+body{display:flex;flex-direction:column;overflow:hidden}
+.topbar{display:flex;align-items:center;gap:8px;padding:9px 14px;background:#161b22;border-bottom:1px solid #30363d;flex:0 0 auto}
+.topbar h1{margin:0;font-size:15px;font-weight:700;color:#e6edf3}
+.topbar .sp{flex:1}
+.btn{padding:5px 12px;font-size:12px;color:#c9d1d9;background:#21262d;border:1px solid #30363d;border-radius:6px;cursor:pointer}
+.btn:hover{background:#30363d;color:#e6edf3}
+.btn.primary{background:#1f6feb;border-color:#1f6feb;color:#fff;font-weight:600}
+.btn.primary:hover{background:#388bfd}
+.btn[disabled]{opacity:.5;cursor:default}
+.msg{margin:0;padding:7px 14px;font-size:12px;border-bottom:1px solid #30363d;flex:0 0 auto}
+.msg.info{background:#161b22;color:#8b949e}
+.msg.ok{background:#0f2d1a;color:#3fb950}
+.msg.err{background:#3b1114;color:#f85149;font-weight:600}
+.msg[hidden]{display:none}
+main{flex:1;display:flex;min-height:0}
+.canvaswrap{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0}
+.toolrow{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid #21262d;flex:0 0 auto;flex-wrap:wrap}
+.toolrow label{color:#8b949e;font-size:12px}
+.toolrow select,.toolrow input{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:5px;padding:4px 6px;font-size:12px}
+.toolrow .hint{color:#6e7681;font-size:11.5px}
+#surface{flex:1;display:flex;align-items:center;justify-content:center;padding:14px;min-height:0;overflow:hidden}
+aside{width:330px;flex:0 0 auto;border-left:1px solid #30363d;overflow:auto;padding:10px;background:#0d1117}
+.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px 12px;margin-bottom:10px}
+.card h3{margin:0 0 8px;font-size:13px;color:#e6edf3}
+.hint{color:#8b949e;font-size:11.5px;line-height:1.55;margin:6px 0 0}
+.muted{color:#6e7681}
+.frow{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.frow .flab{width:52px;color:#8b949e;font-size:12px;flex:0 0 auto}
+.frow input[type=range]{flex:1;min-width:0;accent-color:#1f6feb}
+.frow input[type=number]{width:66px;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:5px;padding:3px 5px;font-size:12px}
+.chk{display:flex;align-items:center;gap:7px;margin:8px 0 2px;cursor:pointer;font-size:12px}
+.chk input{width:15px;height:15px;accent-color:#1f6feb}
+#list .lrow{display:flex;align-items:center;gap:8px;padding:6px 7px;border:1px solid #21262d;border-radius:6px;margin-bottom:6px;cursor:pointer}
+#list .lrow:hover{background:#21262d}
+#list .lrow.sel{border-color:#1f6feb;background:#132038}
+#list .lkind{font-weight:600;color:#e6edf3}
+#list .lpos{color:#6e7681;font-size:11.5px;flex:1;text-align:right;font-variant-numeric:tabular-nums}
+#list .lrow input{width:14px;height:14px;accent-color:#1f6feb}
+#list .unk{color:#d29922;font-size:11px}
+.urlbox{display:flex;gap:6px;align-items:center}
+.urlbox code{flex:1;min-width:0;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:6px 8px;
+  font-size:11.5px;color:#79c0ff;user-select:all;overflow-wrap:anywhere}
+#dataStatus{font-size:12px}
+#dataStatus.ok{color:#3fb950}
+#dataStatus.warn{color:#d29922}
+#dataStatus.err{color:#f85149}
+
+/* ── 画布 = OBS 舞台（真透明预览 + 与 stage.html 相同的缩放规则）───────────────
+   --u 用 cqmin（画布短边）派生，和 stage.html 的 vmin 同一条规则 ⇒ 比例还原。 */
+#canvas{position:relative;overflow:hidden;container-type:size;touch-action:none;
+  --u:max(9px,1.9cqmin);
+  background-color:#101317;
+  background-image:repeating-conic-gradient(from 0deg,#12161c 0 25%,#161b22 0 50%);
+  background-size:16px 16px;outline:1px solid #30363d}
+
+/* ── 下面这块与 stage.html 完全一致：预览所见即 OBS 所得 ──────────────────── */
+.cmp{position:absolute;font-size:calc(var(--s,1) * var(--u));line-height:1.25;color:#e6edf3;
+  text-shadow:0 1px 2px rgba(0,0,0,.9);white-space:nowrap}
+.panel{display:flex;flex-direction:column;gap:.3em;padding:.4em .55em;border:2px solid #05070a;border-radius:2px;
+  background:linear-gradient(180deg,rgba(22,27,34,.82),rgba(9,11,15,.86));
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.16),inset 0 0 0 1px rgba(255,255,255,.06),3px 3px 0 rgba(0,0,0,.45)}
+.ttl{font-size:.68em;font-weight:700;letter-spacing:.16em;color:#9db2c7;text-transform:uppercase}
+.bar{position:relative;display:block;height:.46em;background:rgba(0,0,0,.62);border:1px solid #05070a;
+  box-shadow:inset 0 0 0 1px rgba(255,255,255,.14);border-radius:1px;overflow:hidden}
+.bar[hidden]{display:none}
+.bar>i{position:absolute;left:0;top:0;bottom:0;width:0;background-color:#5ac54f;transition:width .18s linear;
+  background-image:linear-gradient(180deg,rgba(255,255,255,.32),rgba(255,255,255,0) 55%),
+                   repeating-linear-gradient(90deg,rgba(0,0,0,.3) 0 1px,transparent 1px 4px)}
+.num{font-size:.56em;color:#a9b6c4;font-variant-numeric:tabular-nums;white-space:nowrap}
+.ico{width:2.4em;height:2.4em;display:flex;align-items:center;justify-content:center;overflow:hidden;flex:0 0 auto;
+  background:rgba(0,0,0,.5);border:1px solid rgba(255,255,255,.2);border-radius:2px}
+.ico img{width:100%;height:100%;object-fit:contain;image-rendering:pixelated}
+.ico .fb{font-size:.55em;color:#95a3b3;text-align:center;line-height:1.1;padding:0 .12em;
+  word-break:break-all;white-space:normal;text-shadow:none}
+.ico.has .fb{display:none}
+.slots{display:flex;gap:.5em;align-items:flex-start}
+.slot{display:flex;flex-direction:column;align-items:center;gap:.14em;min-width:2.7em}
+.slot .nm{font-size:.56em;max-width:3.8em;overflow:hidden;text-overflow:ellipsis;color:#cfd9e4}
+.slot .bar{align-self:stretch;width:100%}
+.slot.empty .ico{opacity:.42}
+.slot.empty .nm{color:#7d8794}
+.wrow{display:flex;align-items:center;gap:.45em;min-width:8em}
+.wrow .ico{width:2em;height:2em}
+.wb{display:flex;flex-direction:column;gap:.14em;min-width:5.5em;flex:1 1 auto}
+.whead{display:flex;align-items:baseline;gap:.3em}
+.whead .hand{font-size:.55em;color:#8b949e;letter-spacing:.05em}
+.whead .nm{font-size:.72em}
+.whead .ct{font-size:.6em;color:#8b949e}
+.wrow.empty .wb{opacity:.55}
+.vitals{min-width:11em}
+.vrow{display:flex;align-items:center;gap:.35em}
+.vrow .vlab{font-size:.6em;color:#9db2c7;min-width:2.6em}
+.vrow .bar{flex:1 1 auto;min-width:4.5em}
+.vrow .num{min-width:4.2em;text-align:right}
+.task{min-width:11em}
+.tline{display:flex;align-items:baseline;gap:.35em}
+.tline .tk{font-size:.78em;font-weight:700;color:#e6edf3}
+.tline .ts{font-size:.6em;letter-spacing:.08em;text-transform:uppercase}
+.tdet{font-size:.62em;color:#a9b6c4;white-space:normal;max-width:13em;overflow-wrap:anywhere}
+.task .bar{align-self:stretch}
+
+/* ── 编辑器叠加在选择框上的一层（只有编辑器有）────────────────────────────── */
+#canvas .cmp{cursor:move}
+#canvas .cmp.sel{outline:1px dashed #58a6ff;outline-offset:2px}
+#canvas .cmp.off{outline:1px dashed rgba(110,118,129,.7)}
+#canvas .cmp .hdl{display:none;position:absolute;right:0;bottom:0;width:13px;height:13px;z-index:5;
+  background:#1f6feb;border:1px solid #cfe3ff;cursor:nwse-resize}
+#canvas .cmp.sel .hdl{display:block}
+#canvas .cmp .badge{display:none;position:absolute;left:0;top:-17px;z-index:5;padding:0 5px;
+  font:11px/15px 'Segoe UI','PingFang SC',sans-serif;color:#e6f0ff;background:rgba(31,111,235,.92);white-space:nowrap}
+#canvas .cmp.sel .badge{display:block}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <h1>🧱 叠加层布局编辑器</h1>
+  <span class="sp"></span>
+  <button class="btn" id="btnReload">重新读取</button>
+  <button class="btn" id="btnReset">重置为默认</button>
+  <button class="btn primary" id="btnSave">保存布局</button>
+</div>
+<div class="msg" id="msg" hidden></div>
+<main>
+  <section class="canvaswrap">
+    <div class="toolrow">
+      <label>画布比例
+        <select id="ratio">
+          <option value="16:9" selected>16 : 9（OBS 常用）</option>
+          <option value="4:3">4 : 3</option>
+          <option value="1:1">1 : 1</option>
+          <option value="window">填满窗口</option>
+        </select>
+      </label>
+      <span class="hint">拖动组件 = 改位置（按住 Alt 走 0.1% 细调，默认 0.5% 吸附）；拖右下角蓝色角柄 = 改缩放；方向键微调。<b>虚线框</b>=当前选中，<b>灰虚线</b>=已隐藏组件（仍可拖回去）。</span>
+      <span class="sp" style="flex:1"></span>
+      <span class="hint" id="canvasSize"></span>
+    </div>
+    <div id="surface"><div id="canvas"></div></div>
+  </section>
+  <aside>
+    <div class="card">
+      <h3>组件（点一行也能选中）</h3>
+      <div id="list"></div>
+      <p class="hint">布局按视口百分比定位，与浏览器源分辨率无关；OBS 里拉多大都正常。</p>
+    </div>
+    <div class="card">
+      <h3>选中组件</h3>
+      <div id="inspEmpty" class="muted">在画布上点一个组件。</div>
+      <div id="inspForm" hidden>
+        <div class="frow"><span class="flab">组件</span><b id="inspKind" style="color:#e6edf3"></b></div>
+        <div id="inspFields"></div>
+        <label class="chk"><input type="checkbox" id="inspVis"> 可见（visible）</label>
+      </div>
+    </div>
+    <div class="card">
+      <h3>OBS 地址</h3>
+      <div class="urlbox"><code id="obsUrl"></code><button class="btn" id="btnCopy">复制</button></div>
+      <p class="hint"><b>OBS 里加一个浏览器源就够</b>：装备（四槽盔甲 + 耐久）、武器（主手/副手 + 耐久）、生命/饥饿/饱和度、当前任务都在这一页里，位置、缩放、透明度由本编辑器决定。宽度/高度按舞台填（如 1920×1080），`bg=transparent` 才是真透明底（后端跑在 127.0.0.1:8080 时，地址就是 http://127.0.0.1:8080/overlay?bg=transparent）。保存后 OBS 里的页面会在 ~5 秒内自己套用新布局（不必重加源）。</p>
+    </div>
+    <div class="card">
+      <h3>数据预览</h3>
+      <div id="dataStatus" class="muted">正在读取 /api/overlay/data…</div>
+      <p class="hint">画布里的数值/耐久/任务都来自真实接口；接口没数据时显示 <b>–</b>（不编数据）。贴图走 <code>/api/icon/&lt;item_id&gt;</code>，拿不到就退成槽位文字（<b>不会出现破图</b>）。</p>
+    </div>
+  </aside>
+</main>
+<script>
+"use strict";
+(function () {
+  var canvas = document.getElementById("canvas");
+  var surface = document.getElementById("surface");
+  var msgEl = document.getElementById("msg");
+  var listEl = document.getElementById("list");
+  var inspEmpty = document.getElementById("inspEmpty");
+  var inspForm = document.getElementById("inspForm");
+  var inspKind = document.getElementById("inspKind");
+  var inspFields = document.getElementById("inspFields");
+  var inspVis = document.getElementById("inspVis");
+
+  var KIND_LABEL = { gear: "装备", weapon: "武器", vitals: "状态", task: "任务" };
+  var RATIOS = { "16:9": 16 / 9, "4:3": 4 / 3, "1:1": 1, "window": 0 };
+  var FIELDS = {
+    x: { label: "X %", min: 0, max: 100, step: 0.1 },
+    y: { label: "Y %", min: 0, max: 100, step: 0.1 },
+    scale: { label: "缩放", min: 0.25, max: 4, step: 0.05 },
+    opacity: { label: "不透明", min: 0, max: 1, step: 0.05 }
+  };
+  var DEFAULT_LAYOUT = { version: 1, components: [
+    { kind: "gear", x: 2, y: 3, scale: 1, opacity: 1, visible: true },
+    { kind: "vitals", x: 2, y: 17, scale: 1, opacity: 1, visible: true },
+    { kind: "weapon", x: 2, y: 33, scale: 1, opacity: 1, visible: true },
+    { kind: "task", x: 2, y: 49, scale: 1, opacity: 1, visible: true }
+  ] };
+  var OBS_URL = ((location.protocol === "http:" || location.protocol === "https:")
+    ? location.origin : "http://127.0.0.1:8080") + "/overlay?bg=transparent";
+  document.getElementById("obsUrl").textContent = OBS_URL;
+
+  /* ── 小工具 + 组件渲染（与 stage.html 同一套：预览所见即 OBS 所得）──────────
+     ⚠ mk/num/clamp/ratio/txt/show/durColor/bar/makeIcon/setIcon/fillHand/build*
+     是从 stage.html 里**原样搬来的一份**：两页都要求"单文件、零外部依赖"，
+     所以只能各存一份 —— 改这里务必同步改那边，否则预览和 OBS 输出会不一致。 */
+  function mk(tag, cls, txt) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (txt != null) e.textContent = txt;
+    return e;
+  }
+  function num(v, def) { var x = Number(v); return isFinite(x) ? x : def; }
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function ratio(v, max) {
+    var a = Number(v), b = Number(max);
+    return (isFinite(a) && isFinite(b) && b > 0) ? clamp(a / b, 0, 1) : null;
+  }
+  function txt(v) { var x = Number(v); return isFinite(x) ? String(Math.round(x * 10) / 10) : "–"; }
+  /* 有值才写「当前 / 上限」；字段缺失就只写 "–"（不拿默认值凑成分母）。 */
+  function show(v, max) {
+    var a = Number(v), b = Number(max);
+    return (isFinite(a) && isFinite(b) && b > 0) ? txt(a) + " / " + txt(b) : "–";
+  }
+  function durColor(p) { return "hsl(" + Math.round(120 * p) + ",78%,45%)"; }
+  function bar() {
+    var el = mk("span", "bar"), i = mk("i");
+    el.append(i);
+    return { el: el, set: function (p, c) {
+      if (p == null) { el.hidden = true; i.style.width = "0"; return; }
+      el.hidden = false; i.style.width = (p * 100).toFixed(1) + "%";
+      if (c) i.style.backgroundColor = c;
+    } };
+  }
+  var iconCache = new Map();
+  function makeIcon() {
+    var box = mk("div", "ico"), img = mk("img"), fb = mk("span", "fb");
+    img.alt = ""; img.decoding = "async"; img.hidden = true;
+    box.append(img, fb);
+    box._img = img; box._fb = fb; box._id = null;
+    return box;
+  }
+  function setIcon(box, id, fbLabel, nameEl) {
+    if (box._fb.textContent !== fbLabel) box._fb.textContent = fbLabel;
+    id = id ? String(id) : "";
+    if (box._id === id) { syncName(); return; }
+    box._id = id;
+    var img = box._img;
+    img.hidden = true; img.removeAttribute("src"); box.classList.remove("has");
+    syncName();
+    if (!id || iconCache.get(id) === "bad") return;
+    img.onload = function () {
+      if (box._id !== id) return;
+      img.hidden = false; box.classList.add("has"); iconCache.set(id, "ok"); syncName();
+    };
+    img.onerror = function () { img.hidden = true; box.classList.remove("has"); iconCache.set(id, "bad"); syncName(); };
+    img.src = "/api/icon/" + encodeURIComponent(id);
+    /* 有贴图 ⇒ 框里是图、名字在右边；没贴图 ⇒ 框里就是名字（避免和"主手/副手"标签重复）。 */
+    function syncName() { if (nameEl) nameEl.hidden = !box.classList.contains("has"); }
+  }
+  function fillHand(h, it, fb) {
+    var id = (it && it.item_id) ? String(it.item_id) : "";
+    var nl = id ? String(it.name || id) : "空";
+    setIcon(h.ico, id, nl, h.nm);          // 没贴图时：框里显示名字，右侧名字让位
+    h.nm.textContent = nl;
+    if (!id) {
+      h.row.classList.add("empty"); h.ct.textContent = "";
+      h.bar.set(null); h.num.textContent = "";
+      return;
+    }
+    h.row.classList.remove("empty");
+    var c = num(it.count, 1);
+    h.ct.textContent = c > 1 ? "×" + c : "";
+    var p = (it.damageable === false) ? null : ratio(it.durability, it.max_durability);
+    h.bar.set(p, p == null ? null : durColor(p));
+    h.num.textContent = (p == null) ? "" : txt(it.durability) + "/" + txt(it.max_durability);
+  }
+  function buildGear() {
+    var root = mk("div", "cmp"), panel = mk("div", "panel");
+    panel.append(mk("div", "ttl", "装备"));
+    var row = mk("div", "slots"); panel.append(row); root.append(panel);
+    var slots = {};
+    ["head", "chest", "legs", "feet"].forEach(function (s, k) {
+      var cell = mk("div", "slot"), ico = makeIcon(), b = bar(), nm = mk("span", "nm", ""), nn = mk("b", "num", "");
+      cell.append(ico, nm, b.el, nn); row.append(cell);
+      slots[s] = { cell: cell, ico: ico, nm: nm, bar: b, num: nn, fb: ["头盔", "胸甲", "护腿", "靴子"][k] };
+    });
+    return { el: root, update: function (d) {
+      var armor = (d && d.gear && Array.isArray(d.gear.armor)) ? d.gear.armor : [];
+      ["head", "chest", "legs", "feet"].forEach(function (s) {
+        var r = slots[s], a = null;
+        for (var i = 0; i < armor.length; i++) { if (armor[i] && armor[i].slot === s) { a = armor[i]; break; } }
+        var id = (a && a.item_id) ? String(a.item_id) : "";
+        setIcon(r.ico, id, r.fb);
+        if (!id) {
+          r.cell.classList.add("empty"); r.nm.textContent = "空";
+          r.bar.set(null); r.num.textContent = "";
+          return;
+        }
+        r.cell.classList.remove("empty");
+        var c = num(a.count, 1);
+        r.nm.textContent = (a.name || id) + (c > 1 ? " ×" + c : "");
+        var p = (a.damageable === false) ? null : ratio(a.durability, a.max_durability);
+        r.bar.set(p, p == null ? null : durColor(p));
+        r.num.textContent = (p == null) ? "" : txt(a.durability) + "/" + txt(a.max_durability);
+      });
+    } };
+  }
+  function buildWeapon() {
+    var root = mk("div", "cmp"), panel = mk("div", "panel");
+    panel.append(mk("div", "ttl", "武器"));
+    function hand(label) {
+      var row = mk("div", "wrow"), ico = makeIcon(), wb = mk("div", "wb");
+      var head = mk("div", "whead"), nm = mk("span", "nm", ""), ct = mk("span", "ct", "");
+      head.append(mk("span", "hand", label), nm, ct);
+      var b = bar(), nn = mk("b", "num", "");
+      wb.append(head, b.el, nn); row.append(ico, wb);
+      return { row: row, ico: ico, nm: nm, ct: ct, bar: b, num: nn };
+    }
+    var main = hand("主手"), off = hand("副手");
+    panel.append(main.row, off.row); root.append(panel);
+    return { el: root, update: function (d) {
+      var g = (d && d.gear) || {};
+      fillHand(main, g.main_hand, "主手");
+      fillHand(off, g.off_hand, "副手");
+    } };
+  }
+  function buildVitals() {
+    var root = mk("div", "cmp"), panel = mk("div", "panel vitals");
+    panel.append(mk("div", "ttl", "状态"));
+    var rows = {};
+    [["health", "生命", "#e5484d"], ["food", "饥饿", "#c9822a"], ["sat", "饱和", "#d4b13e"]]
+      .forEach(function (spec) {
+        var r = mk("div", "vrow"), b = bar(), nn = mk("b", "num", "");
+        r.append(mk("span", "vlab", spec[1]), b.el, nn);
+        panel.append(r);
+        rows[spec[0]] = { bar: b, num: nn, color: spec[2] };
+      });
+    root.append(panel);
+    return { el: root, update: function (d) {
+      var v = (d && d.vitals) || {};
+      rows.health.bar.set(ratio(v.health, v.max_health), rows.health.color);
+      rows.health.num.textContent = show(v.health, v.max_health);
+      rows.food.bar.set(ratio(v.food, 20), rows.food.color);
+      rows.food.num.textContent = show(v.food, 20);
+      rows.sat.bar.set(ratio(v.saturation, 20), rows.sat.color);
+      rows.sat.num.textContent = show(v.saturation, 20);
+    } };
+  }
+  var STATUS_C = { running: "#58a6ff", queued: "#d29922", pending: "#d29922",
+                   done: "#3fb950", failed: "#f85149", cancelled: "#8b949e", canceled: "#8b949e" };
+  function buildTask() {
+    var root = mk("div", "cmp"), panel = mk("div", "panel task");
+    panel.append(mk("div", "ttl", "任务"));
+    var line = mk("div", "tline"), tk = mk("span", "tk", ""), ts = mk("span", "ts", "");
+    line.append(tk, ts);
+    var det = mk("div", "tdet", ""), b = bar();
+    panel.append(line, det, b.el); root.append(panel);
+    return { el: root, update: function (d) {
+      var t = (d && d.task) || null;
+      if (!t || (!t.kind && !t.status && !t.detail)) {
+        tk.textContent = "无任务"; ts.textContent = ""; ts.removeAttribute("style"); det.textContent = "";
+        b.set(null);
+        return;
+      }
+      tk.textContent = t.kind || "–";
+      ts.textContent = t.status || "–";
+      ts.style.color = STATUS_C[t.status] || "#8b949e";
+      det.textContent = t.detail || "";
+      var pr = Number(t.progress);
+      b.set(isFinite(pr) ? clamp(pr, 0, 1) : null, "#58a6ff");
+    } };
+  }
+  var BUILD = { gear: buildGear, weapon: buildWeapon, vitals: buildVitals, task: buildTask };
+  function boxFor(kind) {
+    if (BUILD[kind]) return BUILD[kind]();
+    /* 未知 kind：不静默丢掉（会原样回传），画出来让用户看见。 */
+    var root = mk("div", "cmp"), p = mk("div", "panel");
+    p.append(mk("div", "ttl", "未知组件"), mk("div", "tdet", String(kind)));
+    root.append(p);
+    return { el: root, update: function () {} };
+  }
+
+  /* ── 状态 ──────────────────────────────────────────────────────────────── */
+  var layout = { version: 1, components: [] };
+  var boxes = [], sel = -1, drag = null, data = null, msgTimer = null, saving = false;
+
+  function msg(text, cls) {
+    msgEl.textContent = text;
+    msgEl.className = "msg " + (cls || "info");
+    msgEl.hidden = false;
+    clearTimeout(msgTimer);
+    if (cls !== "err") msgTimer = setTimeout(function () { msgEl.hidden = true; }, 9000);
+  }
+
+  /* 越界值收进合法范围（否则 PUT 一定被 out_of_range 打回），并如实报告改了几个。 */
+  function normalize(raw) {
+    var src = (raw && Array.isArray(raw.components)) ? raw : DEFAULT_LAYOUT;
+    var fixed = 0, comps = [];
+    src.components.forEach(function (c) {
+      if (!c || typeof c.kind !== "string" || !c.kind) { fixed++; return; }
+      var o = { kind: c.kind, x: num(c.x, 0), y: num(c.y, 0), scale: num(c.scale, 1),
+                opacity: num(c.opacity, 1), visible: c.visible !== false };
+      [["x", 0, 100], ["y", 0, 100], ["scale", 0.25, 4], ["opacity", 0, 1]].forEach(function (r) {
+        var v = clamp(o[r[0]], r[1], r[2]);
+        if (v !== o[r[0]]) fixed++;
+        o[r[0]] = Math.round(v * 1000) / 1000;
+      });
+      comps.push(o);
+    });
+    return { layout: { version: num(raw && raw.version, 1), components: comps }, fixed: fixed };
+  }
+
+  function lay() {
+    layout.components.forEach(function (c, i) {
+      var b = boxes[i]; if (!b) return;
+      b.el.style.left = c.x + "%";
+      b.el.style.top = c.y + "%";
+      b.el.style.setProperty("--s", String(c.scale));
+      b.el.style.opacity = String(c.visible === false ? c.opacity * 0.22 : c.opacity);
+      b.el.classList.toggle("off", c.visible === false);
+      b.el.classList.toggle("sel", i === sel);
+    });
+  }
+  function renderData() {
+    boxes.forEach(function (b, i) {
+      if (!b || !b.update) return;
+      try { b.update(data || {}); } catch (e) { console.error("update #" + i + " failed", e); }
+    });
+  }
+  function build() {
+    canvas.textContent = "";
+    boxes = [];
+    layout.components.forEach(function (c, i) {
+      var b = boxFor(c.kind);
+      b.el.dataset.idx = String(i);
+      b.badge = mk("span", "badge", (KIND_LABEL[c.kind] || c.kind) + " #" + (i + 1));
+      b.el.append(mk("span", "hdl"), b.badge);
+      canvas.append(b.el);
+      boxes[i] = b;
+    });
+    if (sel >= layout.components.length) sel = -1;
+    lay(); renderData(); renderList(); syncInspector();
+  }
+
+  function renderList() {
+    listEl.textContent = "";
+    layout.components.forEach(function (c, i) {
+      var row = mk("div", "lrow" + (i === sel ? " sel" : ""));
+      row.dataset.idx = String(i);
+      var cb = mk("input"); cb.type = "checkbox"; cb.checked = c.visible !== false;
+      cb.title = "显示/隐藏（visible）";
+      cb.addEventListener("click", function (e) { e.stopPropagation(); });
+      cb.addEventListener("change", function () {
+        c.visible = cb.checked; lay(); syncInspector();
+      });
+      var name = mk("span", "lkind", KIND_LABEL[c.kind] || c.kind);
+      if (!KIND_LABEL[c.kind]) name.append(mk("span", "unk", " · 未知"));
+      row.append(cb, name, mk("span", "lpos", c.x + ", " + c.y));
+      row.addEventListener("click", function () { select(i); });
+      listEl.append(row);
+    });
+  }
+
+  /* ── 选中 + 精调面板 ───────────────────────────────────────────────────── */
+  var fieldCtl = {};
+  Object.keys(FIELDS).forEach(function (k) {
+    var f = FIELDS[k], row = mk("div", "frow");
+    var r = mk("input"); r.type = "range"; r.min = f.min; r.max = f.max; r.step = f.step;
+    var nn = mk("input"); nn.type = "number"; nn.min = f.min; nn.max = f.max; nn.step = f.step;
+    row.append(mk("span", "flab", f.label), r, nn);
+    inspFields.append(row);
+    fieldCtl[k] = { range: r, num: nn };
+    r.addEventListener("input", function () { setField(k, r.value); });
+    nn.addEventListener("change", function () { setField(k, nn.value); });
+  });
+  function setField(k, v) {
+    if (sel < 0) return;
+    var c = layout.components[sel]; if (!c) return;
+    var f = FIELDS[k], x = Number(v);
+    c[k] = isFinite(x) ? Math.round(clamp(x, f.min, f.max) * 1000) / 1000 : c[k];
+    lay(); syncInspector(); renderList();
+  }
+  function select(i) { sel = i; lay(); syncInspector(); renderList(); }
+  function syncInspector() {
+    var c = layout.components[sel];
+    if (!c) { inspEmpty.hidden = false; inspForm.hidden = true; return; }
+    inspEmpty.hidden = true; inspForm.hidden = false;
+    inspKind.textContent = (KIND_LABEL[c.kind] || c.kind) + " · " + c.kind;
+    Object.keys(fieldCtl).forEach(function (k) {
+      var ctl = fieldCtl[k];
+      if (ctl.range.value !== String(c[k])) ctl.range.value = c[k];
+      if (document.activeElement !== ctl.num) ctl.num.value = c[k];
+    });
+    inspVis.checked = c.visible !== false;
+  }
+  inspVis.addEventListener("change", function () {
+    var c = layout.components[sel]; if (!c) return;
+    c.visible = inspVis.checked; lay(); renderList();
+  });
+
+  /* ── 拖动 / 角柄缩放 ───────────────────────────────────────────────────── */
+  function round(v, step) { return Math.round(v / step) * step; }
+  canvas.addEventListener("pointerdown", function (e) {
+    var t = e.target && e.target.closest ? e.target.closest(".cmp") : null;
+    if (!t) { select(-1); return; }
+    var i = Number(t.dataset.idx);
+    if (!(i >= 0) || !layout.components[i]) return;
+    select(i);
+    var c = layout.components[i], b = boxes[i], rc = canvas.getBoundingClientRect();
+    drag = { i: i, resize: e.target.classList.contains("hdl"), rc: rc, sx: e.clientX, sy: e.clientY,
+             x0: c.x, y0: c.y, s0: c.scale, w0: b.el.offsetWidth || 1, h0: b.el.offsetHeight || 1 };
+    try { if (canvas.setPointerCapture) canvas.setPointerCapture(e.pointerId); } catch (_) {}
+    e.preventDefault();
+  });
+  canvas.addEventListener("pointermove", function (e) {
+    if (!drag) return;
+    var c = layout.components[drag.i]; if (!c) return;
+    if (drag.resize) {
+      var nw = Math.max(8, drag.w0 + (e.clientX - drag.sx));
+      c.scale = Math.round(clamp(drag.s0 * nw / drag.w0, 0.25, 4) * 100) / 100;
+    } else {
+      var step = e.altKey ? 0.1 : 0.5;
+      var dx = (e.clientX - drag.sx) / drag.rc.width * 100;
+      var dy = (e.clientY - drag.sy) / drag.rc.height * 100;
+      c.x = Math.round(clamp(round(drag.x0 + dx, step), 0,
+              Math.max(0, 100 - drag.w0 / drag.rc.width * 100)) * 10) / 10;
+      c.y = Math.round(clamp(round(drag.y0 + dy, step), 0,
+              Math.max(0, 100 - drag.h0 / drag.rc.height * 100)) * 10) / 10;
+    }
+    lay(); syncInspector(); renderList();
+  });
+  function endDrag(e) {
+    if (!drag) return;
+    drag = null;
+    try { canvas.releasePointerCapture(e.pointerId); } catch (_) {}
+  }
+  canvas.addEventListener("pointerup", endDrag);
+  canvas.addEventListener("pointercancel", endDrag);
+
+  document.addEventListener("keydown", function (e) {
+    if (sel < 0) return;
+    var tag = (e.target && e.target.tagName) || "";
+    if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
+    var c = layout.components[sel]; if (!c) return;
+    var d = e.shiftKey ? 2 : (e.altKey ? 0.1 : 0.5), hit = true;
+    if (e.key === "ArrowLeft") c.x = clamp(c.x - d, 0, 100);
+    else if (e.key === "ArrowRight") c.x = clamp(c.x + d, 0, 100);
+    else if (e.key === "ArrowUp") c.y = clamp(c.y - d, 0, 100);
+    else if (e.key === "ArrowDown") c.y = clamp(c.y + d, 0, 100);
+    else hit = false;
+    if (!hit) return;
+    e.preventDefault();
+    c.x = Math.round(c.x * 10) / 10; c.y = Math.round(c.y * 10) / 10;
+    lay(); syncInspector(); renderList();
+  });
+
+  /* ── 画布尺寸（比例还原 OBS 舞台）──────────────────────────────────────── */
+  var canvasSizeEl = document.getElementById("canvasSize");
+  function fit() {
+    var box = surface.getBoundingClientRect();
+    var W = Math.max(120, box.width - 28), H = Math.max(80, box.height - 28);
+    var r = RATIOS[document.getElementById("ratio").value] || 0;
+    var w, h;
+    if (!r) { w = W; h = H; }
+    else if (W / H > r) { h = H; w = H * r; }
+    else { w = W; h = W / r; }
+    w = Math.round(w); h = Math.round(h);
+    canvas.style.width = w + "px"; canvas.style.height = h + "px";
+    canvasSizeEl.textContent = "画布 " + w + "×" + h + " px";
+  }
+  document.getElementById("ratio").addEventListener("change", fit);
+  if (window.ResizeObserver) new ResizeObserver(fit).observe(surface);
+  window.addEventListener("resize", fit);
+
+  /* ── 后端交互 ─────────────────────────────────────────────────────────── */
+  function loadLayout() {
+    fetch("/api/overlay/layout", { cache: "no-store" })
+      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+      .then(function (j) {
+        var res = normalize(j);
+        layout = res.layout; sel = -1; drag = null; build();
+        msg(res.fixed ? ("已读取布局（" + res.fixed + " 个越界值已收进合法范围）") : "已读取布局", res.fixed ? "info" : "ok");
+      })
+      .catch(function (e) {
+        if (layout.components.length) { msg("读取布局失败：" + e.message + "（画布保留当前内容）", "err"); return; }
+        layout = normalize(DEFAULT_LAYOUT).layout; sel = -1; build();
+        msg("读取布局失败：" + e.message + " — 已先用内置默认布局；改完点「保存布局」会写入后端", "err");
+      });
+  }
+  /* 从响应体里抠出后端错误码：兼容 {code}/{error}/{detail} 以及 {"detail":{"code":"…"}} 形状。 */
+  function codeOf(o, depth) {
+    if (o == null || (depth || 0) > 3) return null;
+    if (typeof o === "string") return o;
+    if (typeof o !== "object") return null;
+    var keys = ["code", "error", "detail", "reason", "message"];
+    for (var i = 0; i < keys.length; i++) {
+      if (o[keys[i]] == null) continue;
+      if (typeof o[keys[i]] === "string") return o[keys[i]];
+      var inner = codeOf(o[keys[i]], (depth || 0) + 1);
+      if (inner) return inner;
+    }
+    return null;
+  }
+  function errCode(res) {
+    return res.text().then(function (t) {
+      if (!t) return "（后端未返回错误码）";
+      try {
+        var j = JSON.parse(t), c = codeOf(j);
+        return c != null ? c : t.slice(0, 200);
+      } catch (_) { return t.slice(0, 200); }
+    }, function () { return "（无法读取响应体）"; });
+  }
+  function save() {
+    if (saving) return;
+    saving = true;
+    document.getElementById("btnSave").disabled = true;
+    var payload = { version: 1, components: layout.components.map(function (c) {
+      return { kind: c.kind, x: c.x, y: c.y, scale: c.scale, opacity: c.opacity, visible: c.visible !== false };
+    }) };
+    msg("正在保存…", "info");
+    fetch("/api/overlay/layout", { method: "PUT", headers: { "Content-Type": "application/json" },
+                                   body: JSON.stringify(payload) })
+      .then(function (res) {
+        if (res.ok) { msg("已保存（HTTP " + res.status + "）— OBS 里的页面会在 ~5 秒内自动套用", "ok"); return; }
+        return errCode(res).then(function (code) { msg("保存失败：HTTP " + res.status + " · " + code, "err"); });
+      })
+      .catch(function (e) { msg("保存失败：请求未送达（" + e.message + "）", "err"); })
+      .then(function () { saving = false; document.getElementById("btnSave").disabled = false; });
+  }
+  document.getElementById("btnSave").addEventListener("click", save);
+  document.getElementById("btnReload").addEventListener("click", loadLayout);
+  document.getElementById("btnReset").addEventListener("click", function () {
+    layout = normalize(DEFAULT_LAYOUT).layout; sel = -1; drag = null; build();
+    msg("已重置为默认布局（还没保存，点「保存布局」才落盘）", "info");
+  });
+  document.getElementById("btnCopy").addEventListener("click", function () {
+    function ok() { msg("已复制 OBS 地址：" + OBS_URL, "ok"); }
+    function fallback() {
+      var t = mk("textarea"); t.value = OBS_URL;
+      t.style.position = "fixed"; t.style.left = "-1000px";
+      document.body.append(t); t.select();
+      var done = false;
+      try { done = document.execCommand("copy"); } catch (_) {}
+      t.remove();
+      if (done) ok(); else msg("复制失败，请手动选中地址栏里的文本复制", "err");
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(OBS_URL).then(ok, fallback);
+    } else fallback();
+  });
+
+  var dataStatusEl = document.getElementById("dataStatus");
+  var prevConn = null;
+  function tickData() {
+    fetch("/api/overlay/data", { cache: "no-store" })
+      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+      .then(function (d) {
+        data = d || {};
+        var conn = data.connected !== false;
+        if (prevConn === false && conn) iconCache.clear();   // 重新连上：贴图再试一次
+        prevConn = conn;
+        if (!conn) {
+          dataStatusEl.className = "warn";
+          dataStatusEl.textContent = "未连接游戏 — 画布显示后端最后快照（不编数据）";
+        } else {
+          dataStatusEl.className = "ok";
+          dataStatusEl.textContent = "已连接 · 每 0.5 秒刷新";
+        }
+        renderData();
+      })
+      .catch(function (e) {
+        dataStatusEl.className = "err";
+        dataStatusEl.textContent = "后端未响应（" + e.message + "）— 画布数值可能已过期";
+        renderData();
+      });
+  }
+
+  fit();
+  loadLayout();
+  tickData();
+  setInterval(tickData, 500);
+})();
+</script>
+</body>
+</html>

@@ -754,6 +754,17 @@ textarea{width:100%;min-height:68px;resize:vertical;background:var(--ov-bg,#0d11
 <!-- Overlay Page -->
 <div id="page-overlay" class="page">
   <div class="card">
+    <h3>🧱 叠加层布局编辑器</h3>
+    <div class="hint">
+      装备（四槽盔甲 + 耐久）、武器（主手/副手 + 耐久）、生命/饥饿/饱和度、当前任务，全部在<b>同一个网页</b>里：
+      拖动改位置、角柄改缩放、滑块调透明度与显隐，保存后 <b>OBS 里只加一个浏览器源</b>（<code>/overlay?bg=transparent</code>）。
+    </div>
+    <div class="form-actions">
+      <a class="btn primary" href="/overlay/editor" target="_blank" rel="noopener"
+         style="display:inline-block;text-decoration:none">打开叠加层编辑器</a>
+    </div>
+  </div>
+  <div class="card">
     <h3>🎨 OBS 外观默认值</h3>
     <div class="hint">
       这里保存 OBS 页的<b>默认</b>外观（走后端 <code>/api/overlay/theme</code>，持久化）。<b>URL 参数优先于它</b>；
