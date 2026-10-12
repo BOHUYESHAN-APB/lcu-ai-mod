@@ -1698,7 +1698,7 @@ passive 被动=能猎的肉、unknown 认不出=先别当敌人）：
         用户看到的是"它压根没去右键"，听到的是"记好了"。**"没发生的事被说成发生了"必须掐掉**，
         代价是多一句括号补充，收益是它说的话可以被信任。
         """
-        note = f"（补一句实话：我刚才那句话里的动作**没有执行** —— {why}）"
+        note = f"（补一句实话：我刚才那句话里的动作没有执行 —— {why}）"
         return f"{reply_text}{note}" if reply_text else note
 
     def _decide(self, candidates: list[dict], context: dict) -> tuple[Optional[int], float]:
@@ -3976,41 +3976,105 @@ passive 被动=能猎的肉、unknown 认不出=先别当敌人）：
                                     f"({bed[0]:.0f},{bed[1]:.0f},{bed[2]:.0f})，以后回这儿睡）")
 
     def _dispatch_set_home(self, payload: dict, context: dict) -> bool:
-        """在基地范围内**自己找床**；找不到就**自己造**（缺料/不安全如实报，不硬凑）。"""
+        """**就近**找床并走过去右键绑定重生点（不要求先有基地）；实在没有床才自己造。
+
+        用户口径（2026-10-12 真机原话）："这附近有一张床，保存下记录点" ——
+        这句话里根本没有"基地"这个概念，而旧实现要求先有基地 ⇒ 直接 `return False`
+        （真机日志：`首轮下发 set_home({}) -> 失败（不知道是哪个基地…）`，纠错轮改 `base='家'` 仍失败）。
+        ⇒ 现在：**说了基地**就按基地找（半径内、取最近）；**没说或没有基地**就用
+        "这附近那张床"（模组已上报的 `nearby_beds`，按锚点/自身位置取最近的一张），
+        仍然走"走过去 → 右键一次 → 用原版重生点核对"那条链。
+        """
         store = self._territory_store()
-        if store is None:
-            self._territory_note = "（没有基地/领地记录，先给我设一个基地）"
+        base = self._base_by_name(payload.get("base"), context) if store is not None else None
+        beds = (context or {}).get("nearby_beds")
+        base_name = str((base or {}).get("name") or payload.get("base") or "").strip()
+
+        bed: Optional[tuple[float, float, float]] = None
+        if base is not None:
+            bed = self._bed_in_base(base, beds)
+            if bed is None and not base_name:
+                base_name = str(base.get("name") or "")
+        if bed is None:
+            # 没有基地（或基地里没床）⇒ **就地**：用这附近最近的那张床。
+            bed = self._nearest_bed(beds, context)
+            if bed is not None and not base_name:
+                base_name = "就近"
+        if bed is None:
+            # 没有床可绑：材料够就**自己造一张**（用户口径：默认允许 AI 自己造床），
+            # 缺料或周围有威胁就如实报，绝不硬凑。
+            entity_view = perception.entities_rows(context)
+            decision = perception.conservative_bed_decision(
+                bed_attempt((context or {}).get("inventory"), entity_view["rows"]), entity_view)
+            if decision.get("action") == "craft":
+                skills = getattr(self, "skills", None)
+                craft = getattr(skills, "craft_via_recipe", None) if skills is not None else None
+                if callable(craft):
+                    craft("white_bed", 1)
+                if base is not None:
+                    self._pending_home_bed_base = str(base.get("name") or base_name)
+                where = f"基地「{base_name}」里" if base is not None else "这附近"
+                self._territory_note = f"（{where}没床，材料够，我造一张；造好再去右键绑）"
+                return True
+            self._territory_note = (perception.bed_caution_note(hostiles=decision.get("hostiles"))
+                                    if decision.get("partial") else bed_note(decision))
+            if base is None:
+                self._territory_note += ("（另外：没有基地记录；说清哪张床或哪个基地会更准，"
+                                         "也可以让我先在这儿设个基地）")
+            logger.info("[Planner] 造床判定：%s", decision)
             return False
-        base = self._base_by_name(payload.get("base"), context)
-        if base is None:
-            self._territory_note = "（不知道是哪个基地：先设一个基地，或说清名字）"
-            return False
-        bed = self._bed_in_base(base, (context or {}).get("nearby_beds"))
-        if bed is not None:
-            store.set_home_bed(base["name"], {"x": bed[0], "y": bed[1], "z": bed[2]})
-            # 只记坐标**不等于**绑上了：原版要**右键一次**才会把重生点绑到这张床
-            # （用户纠正的语义：白天/晴天也行，"现在不能睡"只是不睡、不影响绑定）。
-            # 所以这里起一条"走过去 → 右键 → 用重生点核对"的链路，成功了才算家。
-            self._home_bed = home_bed.start(bed, base=str(base["name"]))
-            self._territory_note = (f"（基地「{base['name']}」里找到床 "
-                                    f"({bed[0]:.0f},{bed[1]:.0f},{bed[2]:.0f})；现在走过去**右键一次**"
-                                    "把重生点绑到它 —— 不绑的话死了还是回世界出生点）")
-            return True
-        entity_view = perception.entities_rows(context)
-        decision = perception.conservative_bed_decision(
-            bed_attempt((context or {}).get("inventory"), entity_view["rows"]), entity_view)
-        if decision.get("action") == "craft":
-            skills = getattr(self, "skills", None)
-            craft = getattr(skills, "craft_via_recipe", None) if skills is not None else None
-            if callable(craft):
-                craft("white_bed", 1)
-            self._pending_home_bed_base = str(base["name"])
-            self._territory_note = f"（基地「{base['name']}」里没床，材料够，我造一张）"
-            return True
-        self._territory_note = (perception.bed_caution_note(hostiles=decision.get("hostiles"))
-                                if decision.get("partial") else bed_note(decision))
-        logger.info("[Planner] 造床判定：%s", decision)
-        return False
+
+        if store is not None and base is not None:
+            # 基地存在时才写家坐标（写不进去不影响下面的绑定链）。
+            try:
+                store.set_home_bed(str(base.get("name") or base_name), {
+                    "x": bed[0], "y": bed[1], "z": bed[2]})
+            except Exception as exc:  # noqa: BLE001 —— 记账失败不能挡住绑定
+                logger.warning("[Planner] 记录家床坐标失败: %s", exc)
+        # 只记坐标**不等于**绑上了：原版要**右键一次**才会把重生点绑到这张床
+        # （用户纠正的语义：白天/晴天也行，"现在不能睡"只是不睡、不影响绑定）。
+        # 所以这里起一条"走过去 → 右键 → 用重生点核对"的链路，成功了才算家。
+        self._home_bed = home_bed.start(bed, base=base_name or "就近")
+        self._territory_note = (f"（在附近找到床 ({bed[0]:.0f},{bed[1]:.0f},{bed[2]:.0f})；"
+                                "现在走过去**右键一次**把重生点绑到它 —— 不绑的话死了还是回世界出生点）")
+        if store is not None and base is None:
+            self._pending_home_bed_base = None
+        return True
+
+    def _nearest_bed(self, beds: Any, context: dict) -> Optional[tuple[float, float, float]]:
+        """从模组上报的 `nearby_beds` 里取**离锚点（说话者位置）最近**的一张床。
+
+        没有锚点就退回"第一张"（模组上报的本就是"我附近"）。
+        坐标不完整的行一律跳过（不猜坐标）。
+        """
+        rows: list[tuple[float, float, float]] = []
+        for bed in beds or []:
+            if not isinstance(bed, dict):
+                continue
+            x, y, z = bed.get("x"), bed.get("y"), bed.get("z")
+            if any(not isinstance(value, (int, float)) or isinstance(value, bool)
+                   for value in (x, y, z)):
+                continue
+            rows.append((float(x), float(y), float(z)))
+        if not rows:
+            return None
+        center = None
+        try:
+            where_row = anchor.resolve(None, context or {})
+            if isinstance(where_row, dict):
+                center = point_of(where_row.get("center"))
+        except Exception:  # noqa: BLE001 —— 锚点坏了不影响找床
+            center = None
+        if center is None:
+            # 退一步：离**我自己**最近的那张（模组上报的本就是"我附近"）
+            try:
+                center = point_of(self._player_pos(context or {}))
+            except Exception:  # noqa: BLE001
+                center = None
+        if center is None:
+            return rows[0]
+        return min(rows, key=lambda p: (p[0] - center[0]) ** 2 + (p[1] - center[1]) ** 2
+                   + (p[2] - center[2]) ** 2)
 
     @staticmethod
     def _memory_home_point(context: Any) -> Optional[tuple[float, float, float]]:

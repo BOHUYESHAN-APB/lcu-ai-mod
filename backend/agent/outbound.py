@@ -11,8 +11,12 @@
 
 - 剥行首空白（含全角空格 U+3000、零宽字符 —— 它们能藏在 `/` 前面骗过朴素判断）；
 - 剥所有前导 `/`（`//` 同理，Java 侧也会兜底剥一次）；
-- 两者循环执行直到稳定 —— 于是结果**绝不以 `/` 开头**，也绝不以空白开头；
-- 内部内容**一字不动**（不是过滤聊天，只是不让它变成指令）。
+- **字符级净化**（`chat_sanitize.sanitize_chat`）：换行/制表等空白 → 空格，
+  控制字符 / 零宽与双向控制 / 软连字符 / 孤立代理项 / `§` 染色码 → 删除，
+  压缩连续空白并限长。真机事故（2026-10-12 16:22）：AI 回复里带了换行符，
+  被服务器判为"非法聊天字符"**直接把玩家踢出**。
+- 两者都做，于是结果**绝不以 `/` 开头**、也绝不含聊天通道不允许的字符；
+  除上述之外，正文内容**一字不动**（不是内容审查，只是不让它变成指令或非法字符）。
 
 清洗一旦真的发生（原文 ≠ 清洗后），就回调所有已注册的审计 sink（谁 / 原文 /
 清洗后）。sink 抛异常只 warning，绝不拖垮出站链路 —— 这句话是要发出去的。
@@ -23,6 +27,8 @@ from __future__ import annotations
 import logging
 import threading
 from typing import Any, Callable
+
+from .chat_sanitize import find_illegal, sanitize_chat
 
 logger = logging.getLogger("outbound")
 
@@ -83,7 +89,11 @@ def sanitize_outbound(text: Any, *, kind: str = "", actor: str = "",
     并行触发 —— 全局 sink 适合进程级挂载，observer 适合"谁拥有这条出口谁记审计"。
     """
     original = "" if text is None else str(text)
-    cleaned = original
+    # **字符级净化**先做（换行/制表/控制字符/零宽/`§`）——
+    # 真机事故（2026-10-12 16:22）：AI 回复里带了换行符，被服务器判为非法聊天字符**直接踢出**。
+    # 放在"剥行首斜杠"**之前**，这样 `"\n/tp …"` 这种也躲不过（变成行首空白照样被剥）。
+    cleaned = sanitize_chat(original)
+    illegal = find_illegal(original)
     while cleaned and (_is_lead_blank(cleaned[0]) or cleaned[0] in _SLASH_CHARS):
         cleaned = cleaned[1:]
     if cleaned != original:
@@ -93,6 +103,8 @@ def sanitize_outbound(text: Any, *, kind: str = "", actor: str = "",
             "server_key": str(server_key or ""),
             "original": original,
             "cleaned": cleaned,
+            # 诊断用：被处理掉的字符（空列表 = 只剥了行首空白/斜杠）
+            "illegal": illegal,
         }
         if callable(observer):
             try:
