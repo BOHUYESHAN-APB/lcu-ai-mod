@@ -37,6 +37,7 @@ public final class WalkCheck {
         comeVsFollowChecks();
         attackSafetyChecks();
         landmarkMemoryChecks();
+        mobPolicyChecks();
         gearReflexChecks();
 
         System.out.println("[WalkCheck] " + passed + " checks passed, " + failed + " failed");
@@ -429,6 +430,117 @@ public final class WalkCheck {
                 !gear.contains("equipBestWeapon("));   // 注释里提到它是可以的，调用不行
         check("gear: is ticked from the same place as the eat reflex",
                 executor.contains("GearReflex.tick(mc)"));
+    }
+
+    // ── 10. 生物对待策略：高危险 / 敌对 / 中立 / 被动（本地反射与模型同一张表）──
+
+    /**
+     * 用户口径："**高危险的不主动打；中立的不惹；只有该处理的才处理**"。
+     *
+     * <p>表在零依赖的 {@link MobPolicy} 里 ⇒ 直接测逻辑（enderman/wolf/铁傀儡 ⇒ NEUTRAL 且不主动打；
+     * 村民 ⇒ 不当猎物；warden ⇒ 高危险、连还手都不还手；creeper ⇒ 保持 4 格；认不出 ⇒ UNKNOWN 且
+     * **不默认敌对**）；再静态扫描证明"两个本地出手点真的过了这张表、状态真的把 tier 发出去"。
+     */
+    private static void mobPolicyChecks() {
+        Path root = Path.of("src", "main", "java", "com", "lcu", "lcumod", "action");
+        Path collector = Path.of("src", "main", "java", "com", "lcu", "lcumod", "state",
+                "StateCollector.java");
+
+        // ① 中立：不惹（不许主动开打；还手要"它先动手"）
+        check("mob: enderman is NEUTRAL", MobPolicy.tier("minecraft:enderman") == MobPolicy.Tier.NEUTRAL);
+        check("mob: wolf is NEUTRAL", MobPolicy.tier("minecraft:wolf") == MobPolicy.Tier.NEUTRAL);
+        check("mob: iron golem is NEUTRAL", MobPolicy.tier("minecraft:iron_golem") == MobPolicy.Tier.NEUTRAL);
+        check("mob: zombified piglin is NEUTRAL (minecraft-data got this wrong)",
+                MobPolicy.tier("minecraft:zombified_piglin") == MobPolicy.Tier.NEUTRAL);
+        check("mob: neutral tiers are never initiated on",
+                !MobPolicy.mayInitiate(MobPolicy.Tier.NEUTRAL));
+        check("mob: neutral only retaliates after it struck first",
+                !MobPolicy.mayRetaliate(MobPolicy.Tier.NEUTRAL, false)
+                        && MobPolicy.mayRetaliate(MobPolicy.Tier.NEUTRAL, true));
+
+        // ② 村民/流浪商人：**绝不当成猎物**（放在中立档 = 永久不许主动打）
+        check("mob: villagers are not prey",
+                MobPolicy.tier("minecraft:villager") == MobPolicy.Tier.NEUTRAL
+                        && MobPolicy.tier("minecraft:wandering_trader") == MobPolicy.Tier.NEUTRAL
+                        && !MobPolicy.mayInitiate(MobPolicy.tier("minecraft:villager"))
+                        && !MobPolicy.mayInitiate(MobPolicy.tier("minecraft:wandering_trader")));
+
+        // ③ 高危险：不主动打，也**不还手**（交回模型 / 逃生）
+        check("mob: warden is DANGEROUS", MobPolicy.tier("minecraft:warden") == MobPolicy.Tier.DANGEROUS);
+        check("mob: wither is DANGEROUS", MobPolicy.tier("minecraft:wither") == MobPolicy.Tier.DANGEROUS);
+        check("mob: ender dragon is DANGEROUS",
+                MobPolicy.tier("minecraft:ender_dragon") == MobPolicy.Tier.DANGEROUS);
+        check("mob: dangerous is never initiated on",
+                !MobPolicy.mayInitiate(MobPolicy.Tier.DANGEROUS));
+        check("mob: dangerous is never retaliated against either",
+                !MobPolicy.mayRetaliate(MobPolicy.Tier.DANGEROUS, true)
+                        && !MobPolicy.mayRetaliate(MobPolicy.Tier.DANGEROUS, false));
+
+        // ④ 敌对：该处理的（可主动打、被打必还手）
+        check("mob: zombie is HOSTILE", MobPolicy.tier("minecraft:zombie") == MobPolicy.Tier.HOSTILE);
+        check("mob: hostile can be initiated and retaliated",
+                MobPolicy.mayInitiate(MobPolicy.Tier.HOSTILE)
+                        && MobPolicy.mayRetaliate(MobPolicy.Tier.HOSTILE, true));
+
+        // ⑤ 苦力怕/幻翼：敌对但**不贴脸**（mindcraft 规则：保持 4 格）
+        check("mob: creeper is HOSTILE but keeps distance 4",
+                MobPolicy.tier("minecraft:creeper") == MobPolicy.Tier.HOSTILE
+                        && MobPolicy.preferDistance("minecraft:creeper") == 4.0);
+        check("mob: phantom keeps distance 4", MobPolicy.preferDistance("minecraft:phantom") == 4.0);
+        check("mob: ordinary mobs have no standoff", MobPolicy.preferDistance("minecraft:zombie") == 0.0);
+
+        // ⑥ 被动 = 能猎的（"该处理的"）；未知 = 认不出，**绝不默认敌对**
+        check("mob: cow is PASSIVE and huntable",
+                MobPolicy.tier("minecraft:cow") == MobPolicy.Tier.PASSIVE
+                        && MobPolicy.mayInitiate(MobPolicy.Tier.PASSIVE));
+        check("mob: unknown id is UNKNOWN, never HOSTILE",
+                MobPolicy.tier("minecraft:some_new_mod_mob") == MobPolicy.Tier.UNKNOWN
+                        && MobPolicy.tier("") == MobPolicy.Tier.UNKNOWN
+                        && MobPolicy.tier(null) == MobPolicy.Tier.UNKNOWN);
+        check("mob: armor stand is not a target tier",
+                MobPolicy.tier("minecraft:armor_stand") == MobPolicy.Tier.UNKNOWN);
+        check("mob: unknown may be initiated (table is silent) but stays labelled unknown",
+                MobPolicy.mayInitiate(MobPolicy.Tier.UNKNOWN)
+                        && MobPolicy.tier("minecraft:some_new_mod_mob") != MobPolicy.Tier.HOSTILE);
+
+        // ⑦ 命名空间 / 大小写无关（与 WeaponPolicy 同口径）
+        check("mob: namespace and case are ignored",
+                MobPolicy.tier("MINECRAFT:Enderman") == MobPolicy.Tier.NEUTRAL
+                        && MobPolicy.tier(" enderman ") == MobPolicy.Tier.NEUTRAL);
+        check("mob: wither skeleton is HOSTILE not DANGEROUS",
+                MobPolicy.tier("minecraft:wither_skeleton") == MobPolicy.Tier.HOSTILE);
+
+        // ⑧ 既有硬约束没被这次改动碰掉：重锤/矛仍然禁用
+        check("mob: mace and spear stay banned for the AI",
+                WeaponPolicy.isBanned("minecraft:mace") && WeaponPolicy.isBanned("minecraft:iron_spear"));
+
+        String policy = read(root.resolve("MobPolicy.java"));
+        check("mob: policy is zero dependency", !policy.isEmpty() && !policy.contains("net.minecraft"));
+
+        // ⑨ 静态扫描：本地出手点真的过了这张表
+        String reflex = read(root.resolve("CombatReflex.java"));
+        String auton = read(root.resolve("JavaAutonomousBehavior.java"));
+        check("mob: reflex consults mayRetaliate (being hit)", reflex.contains("MobPolicy.mayRetaliate("));
+        check("mob: reflex consults mayInitiate (chasing)", reflex.contains("MobPolicy.mayInitiate("));
+        check("mob: reflex keeps the creeper standoff", reflex.contains("MobPolicy.preferDistance("));
+        check("mob: reflex never fights back at players", reflex.contains("hurtBy instanceof Player"));
+        check("mob: reflex no longer hardcodes Enemy", !reflex.contains("instanceof Enemy"));
+        check("mob: autonomous behavior consults mayInitiate",
+                auton.contains("MobPolicy.mayInitiate(") && auton.contains("worthFighting"));
+        check("mob: autonomous behavior only hunts the HOSTILE tier",
+                auton.contains("tier == MobPolicy.Tier.HOSTILE"));
+        check("mob: autonomous behavior keeps the creeper standoff",
+                auton.contains("MobPolicy.preferDistance("));
+        check("mob: autonomous behavior no longer hardcodes Enemy", !auton.contains("instanceof Enemy"));
+
+        // ⑩ 静态扫描：状态里真的带 tier（后端优先信任它，关键词只是兜底）
+        String state = read(collector);
+        check("mob: state publishes the tier name", state.contains("MobPolicy.tier(AttackRules.entityTypeId(")
+                && state.contains("e.addProperty(\"tier\", tier.name())"));
+        check("mob: state keeps the legacy type field for old readers",
+                state.contains("legacyType(tier)") && state.contains("case DANGEROUS, HOSTILE -> \"hostile\""));
+        check("mob: entity type id comes from the registry (one place)",
+                read(root.resolve("AttackRules.java")).contains("BuiltInRegistries.ENTITY_TYPE"));
     }
 
     /** 取某个成员（含签名行）到下一个成员声明之间的源码片段（静态扫描用）。 */

@@ -3,8 +3,6 @@ package com.lcu.lcumod.action;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.entity.Entity;
-import net.minecraft.world.entity.animal.Animal;
-import net.minecraft.world.entity.monster.Enemy;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.phys.Vec3;
@@ -21,7 +19,8 @@ import java.util.Random;
  * 
  * Features:
  * - Wandering/patrol behavior
- * - Basic combat (attack nearby hostiles)
+ * - Basic combat (attack nearby hostiles) —— **打谁由 {@link MobPolicy} 那张表决定**
+ *   （用户口径："高危险的不主动打；中立的不惹；只有该处理的才处理"）
  * - Basic survival (eat when hungry, flee when low health)
  * - Head tracking of nearby players
  * - Random idle actions
@@ -173,17 +172,19 @@ public class JavaAutonomousBehavior {
     }
     
     private static void flee(Minecraft mc) {
-        // Find nearest hostile and run away from it
-        Entity nearestHostile = findNearestHostile(mc);
-        if (nearestHostile == null) {
+        // Find nearest threat and run away from it.
+        // 逃生只躲**真的会伤害我们**的档（高危险 / 敌对）；中立（末影人/狼）与被动（牛）不躲 ——
+        // 用户口径："中立的不惹"，看见牛就逃反而是坏行为。
+        Entity nearestThreat = findNearest(mc, JavaAutonomousBehavior::threatensUs);
+        if (nearestThreat == null) {
             setState(BehaviorState.IDLE);
             return;
         }
         
-        // Calculate flee direction (opposite of hostile)
+        // Calculate flee direction (opposite of the threat)
         Vec3 playerPos = mc.player.position();
-        Vec3 hostilePos = nearestHostile.position();
-        Vec3 fleeDir = playerPos.subtract(hostilePos).normalize();
+        Vec3 threatPos = nearestThreat.position();
+        Vec3 fleeDir = playerPos.subtract(threatPos).normalize();
         
         // Move away
         double targetX = playerPos.x + fleeDir.x * 10;
@@ -201,8 +202,8 @@ public class JavaAutonomousBehavior {
             return false;
         }
         
-        // Find nearest hostile within 8 blocks
-        attackTarget = findNearestHostile(mc);
+        // Find nearest thing worth fighting within 8 blocks（主动出手 ⇒ 过 mayInitiate）
+        attackTarget = findNearest(mc, JavaAutonomousBehavior::worthFighting);
         return attackTarget != null && mc.player.distanceTo(attackTarget) < 8;
     }
     
@@ -216,8 +217,9 @@ public class JavaAutonomousBehavior {
         // Look at target
         lookAtEntity(mc, attackTarget);
         
+        double distance = mc.player.distanceTo(attackTarget);
         // Attack if close enough —— 且**出手必须干净**：隔墙不打、旁边有别的玩家不打（统一安全检查）。
-        if (mc.player.distanceTo(attackTarget) < 4) {
+        if (distance < 4) {
             AttackRules.Verdict verdict = AttackRules.check(mc, attackTarget);
             if (verdict != AttackRules.Verdict.OK) {
                 // 打不到就退避一个冷却再重扫（否则会每 tick 重选同一个目标空转）。
@@ -231,6 +233,13 @@ public class JavaAutonomousBehavior {
                 mc.player.swing(net.minecraft.world.InteractionHand.MAIN_HAND, net.minecraft.world.item.component.SwingAnimation.DEFAULT, true);
             }
             attackCooldown = ATTACK_COOLDOWN_TICKS;
+        } else if (MobPolicy.preferDistance(AttackRules.entityTypeId(attackTarget)) > 0) {
+            // 苦力怕 / 幻翼：**不贴脸**（mindcraft 规则，保持 ≥4 格）—— 主动凑上去就是吃爆炸。
+            // 这里**不走过去、也不锁着目标空转**（否则会一直占着 FIGHTING 挡后端的命令）；
+            // 退避一个冷却后重扫，它真进了 4 格上面那个分支会接住。
+            attackCooldown = ATTACK_COOLDOWN_TICKS;
+            attackTarget = null;
+            setState(BehaviorState.IDLE);
         } else {
             // Move toward target
             MovementSystem.moveTo(
@@ -242,18 +251,52 @@ public class JavaAutonomousBehavior {
         }
     }
     
-    private static Entity findNearestHostile(Minecraft mc) {
+    /**
+     * 该不该**主动**打它 —— 与后端模型、本地战斗反射**同一张表**（{@link MobPolicy}）。
+     *
+     * <ul>
+     *   <li>玩家：不主动出手（用户口径 + 误伤风险）；</li>
+     *   <li>高危险 / 中立：{@link MobPolicy#mayInitiate} 已经拒绝（"高危险的不主动打、中立的不惹"）；</li>
+     *   <li>被动（牛羊）/ 未知：表里放行，但**生存反射不是猎手** —— 用户口径"只有该处理的才处理"，
+     *       这个反射只处理会伤害我们的**明确敌对**档；猎肉交给模型（它有 attack 工具与领地保护）。</li>
+     * </ul>
+     */
+    private static boolean worthFighting(Entity entity) {
+        if (entity instanceof Player) {
+            return false;
+        }
+        MobPolicy.Tier tier = MobPolicy.tier(AttackRules.entityTypeId(entity));
+        if (!MobPolicy.mayInitiate(tier)) {
+            return false;
+        }
+        return tier == MobPolicy.Tier.HOSTILE;
+    }
+    
+    /** 要不要**躲开**它：高危险与敌对（认不出的不算 —— 认不出就如实不当成威胁）。 */
+    private static boolean threatensUs(Entity entity) {
+        MobPolicy.Tier tier = MobPolicy.tier(AttackRules.entityTypeId(entity));
+        return tier == MobPolicy.Tier.DANGEROUS || tier == MobPolicy.Tier.HOSTILE;
+    }
+    
+    /**
+     * 附近最近的、满足 {@code accept} 的生物（16 格内，与实体半径口径一致）。
+     *
+     * <p>以前这里是"只认 {@code Enemy}"的硬编码二分；现在两个用途（主动出手 / 逃生）各自给一个
+     * 判据 —— 判据都来自 {@link MobPolicy}，与后端模型同一张表。
+     */
+    private static Entity findNearest(Minecraft mc, java.util.function.Predicate<Entity> accept) {
         Entity nearest = null;
         double nearestDist = Double.MAX_VALUE;
         
         var searchBox = mc.player.getBoundingBox().inflate(16);
         for (Entity entity : mc.level.getEntities(mc.player, searchBox)) {
-            if (entity instanceof Enemy && entity.isAlive()) {
-                double dist = mc.player.distanceTo(entity);
-                if (dist < nearestDist) {
-                    nearest = entity;
-                    nearestDist = dist;
-                }
+            if (!entity.isAlive() || !accept.test(entity)) {
+                continue;
+            }
+            double dist = mc.player.distanceTo(entity);
+            if (dist < nearestDist) {
+                nearest = entity;
+                nearestDist = dist;
             }
         }
         return nearest;

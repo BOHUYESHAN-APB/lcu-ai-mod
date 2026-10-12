@@ -55,6 +55,20 @@ public final class AttackRules {
         }
     }
 
+    /**
+     * 实体的**注册名**（`minecraft:zombie`）—— 判断"该不该打"的唯一依据（见 {@link MobPolicy}）。
+     *
+     * <p>查不到注册名就**如实给空串**（自定义实体 / 将来的新版本）：{@link MobPolicy#tier} 会把它
+     * 当 {@link MobPolicy.Tier#UNKNOWN}，绝不默认成敌对。
+     */
+    public static String entityTypeId(Entity entity) {
+        if (entity == null) {
+            return "";
+        }
+        var key = BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType());
+        return key == null ? "" : key.toString();
+    }
+
     /** 能不能对 {@code target} 出手（{@link Verdict#OK} 才允许）。 */
     public static boolean canHit(Minecraft mc, Entity target) {
         return check(mc, target) == Verdict.OK;

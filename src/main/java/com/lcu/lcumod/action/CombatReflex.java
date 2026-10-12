@@ -5,7 +5,7 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
-import net.minecraft.world.entity.monster.Enemy;
+import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.component.SwingAnimation;
 
 /**
@@ -18,7 +18,11 @@ import net.minecraft.world.item.component.SwingAnimation;
  * `player.getLastHurtByMob()` 直接拿到攻击者，当 tick 内转向 + 出手。
  *
  * 安全边界（刻意设计）：
- * - **只还击敌对生物**（`instanceof Enemy`）；玩家（包括服主本人）打你**不会**被打回去。
+ * - **打谁由 {@link MobPolicy} 那张表决定**（与后端模型**同一张表**）：高危险（监守者/凋灵/末影龙）
+ *   **连还手都不还手** —— 如实交回模型 / 逃生；中立（末影人/狼/铁傀儡/村民…）只有**它先动手**
+ *   才还手；认不出的按 UNKNOWN（不预先当敌人）。
+ * - 玩家（包括服主本人）打你**不会**被打回去。
+ * - 苦力怕 / 幻翼**不贴脸**（{@link MobPolicy#preferDistance} = 4 格，mindcraft 规则）。
  * - 只在 AI 控制模式下工作；用户控制模式绝不插手。
  * - 尊重原版攻击冷却（`getAttackStrengthScale`）与出手间隔，不刷攻速。
  * - **寻路中不写 WASD**（移动交给 Pathfinder / 控制流），只写**朝向 + 攻击**；只有在**没有**寻路
@@ -31,6 +35,14 @@ public final class CombatReflex {
 
     /** 出手距离（原版方块/实体交互 3.0，留点余量）。 */
     private static final double REACH = 3.5;
+    /**
+     * "边打边走"的贴合距离（minecraft-agent 的 defendSelf：≥4 贴上去、≤2 后撤）。
+     *
+     * <p>{@link MobPolicy#preferDistance} 只能把这个距离**往上抬**（苦力怕/幻翼 ≥4 不贴脸）。
+     */
+    private static final double APPROACH_DISTANCE = 4.0;
+    /** 后撤距离（比这更近就退开，别贴脸站着挨打）。 */
+    private static final double BACK_OFF_DISTANCE = 1.8;
     /** 两次反射出手的最小间隔（tick），约 0.5s。 */
     private static final int MIN_ATTACK_INTERVAL_TICKS = 10;
     /** 被打一次后持续"还记得谁打我"的时长（tick），约 3s。 */
@@ -68,12 +80,28 @@ public final class CombatReflex {
         LivingEntity attacker;
         LivingEntity hurtBy = player.getLastHurtByMob();
         boolean freshEngagement = false;
-        if (player.hurtTime > 0 && hurtBy instanceof Enemy) {
+        if (player.hurtTime > 0 && hurtBy != null && !(hurtBy instanceof Player)
+                && !mayFight(hurtByTier(hurtBy), true)) {
+            // 它先动手、但策略表说"不许还手"（高危险：监守者/凋灵/末影龙）⇒ **不还手**：
+            // 如实记一条"拒绝"，把这场架交回模型 / 逃生路径（后端 Cowardice 会拉开距离）。
+            lastAttacker = null;
+            memoryTicks = 0;
+            engaged = false;
+            lastAction = "declined:" + hurtByTier(hurtBy).name()
+                    + ":" + hurtBy.getName().getString();
+            logPhase("declined:" + hurtByTier(hurtBy).name());
+            releaseMovement();
+            return false;
+        }
+        if (player.hurtTime > 0 && hurtBy != null && !(hurtBy instanceof Player)) {
             freshEngagement = lastAttacker == null;
             attacker = hurtBy;
             lastAttacker = hurtBy;
             memoryTicks = MEMORY_TICKS;
-        } else if (memoryTicks > 0 && lastAttacker != null && lastAttacker.isAlive()) {
+        } else if (memoryTicks > 0 && lastAttacker != null && lastAttacker.isAlive()
+                && mayFight(hurtByTier(lastAttacker), false)) {
+            // 架还没打完（这一 tick 没被打）：只有策略表放行才继续追 —— 中立怪只在"它先动手"
+            // 的这轮里被追，高危险则立刻松手。
             memoryTicks--;
             attacker = lastAttacker;
         } else {
@@ -124,8 +152,12 @@ public final class CombatReflex {
         if (Pathfinder.isNavigating()) {
             releaseMovement();
         } else {
-            ActionExecutor.setInput("forward", distance > 4.0);
-            ActionExecutor.setInput("back", distance < 1.8);
+            // 贴上去 / 后撤。苦力怕 / 幻翼**不贴脸**：策略表要求保持 ≥4 格
+            // （{@link MobPolicy#preferDistance}），所以不往它身上凑，站着等它进攻击距离。
+            double standoff = Math.max(APPROACH_DISTANCE,
+                    MobPolicy.preferDistance(AttackRules.entityTypeId(attacker)));
+            ActionExecutor.setInput("forward", distance > standoff);
+            ActionExecutor.setInput("back", distance < BACK_OFF_DISTANCE);
         }
 
         if (distance <= REACH && weaponReady && cooldown == 0 && aimed) {
@@ -185,6 +217,34 @@ public final class CombatReflex {
     private static void releaseMovement() {
         ActionExecutor.setInput("forward", false);
         ActionExecutor.setInput("back", false);
+    }
+
+    /**
+     * 它是哪一档（{@link MobPolicy}；注册名认不出 ⇒ UNKNOWN，**绝不默认敌对**）。
+     *
+     * <p>玩家由调用点排除（用户口径：玩家打你不还手）—— 这里拿到的都是非玩家生物。
+     */
+    private static MobPolicy.Tier hurtByTier(Entity entity) {
+        return MobPolicy.tier(AttackRules.entityTypeId(entity));
+    }
+
+    /**
+     * 反射的出手许可 —— **与后端模型同一张表**（{@link MobPolicy}）。两个问题分开问：
+     *
+     * <ul>
+     *   <li>{@code hitThisTick}：这一 tick 是**它打的** ⇒ 问"能不能还手"
+     *       （{@link MobPolicy#mayRetaliate}）。高危险 ⇒ false（不还手，交回模型/逃生）；
+     *       中立 ⇒ 只有它先动手才 true。</li>
+     *   <li>否则（架还没打完、这一 tick 没被打）⇒ 问"能不能主动追"
+     *       （{@link MobPolicy#mayInitiate}）；中立的主动票是 false，但它先动的手这轮还没结束，
+     *       所以再补一票"能还手"——中立怪**只有这一轮**被追，高危险两票都否、立刻松手。</li>
+     * </ul>
+     */
+    private static boolean mayFight(MobPolicy.Tier tier, boolean hitThisTick) {
+        if (hitThisTick) {
+            return MobPolicy.mayRetaliate(tier, true);
+        }
+        return MobPolicy.mayInitiate(tier) || MobPolicy.mayRetaliate(tier, true);
     }
 
     /** 是否正在交战（HUD 显示"跟它干上了"）。 */

@@ -2,7 +2,9 @@ package com.lcu.lcumod.state;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
+import com.lcu.lcumod.action.AttackRules;
 import com.lcu.lcumod.action.BlockFinder;
+import com.lcu.lcumod.action.MobPolicy;
 import com.lcu.lcumod.action.PoiMemory;
 import com.lcu.lcumod.LCUMod;
 import com.lcu.lcumod.config.ModConfig;
@@ -11,8 +13,6 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.*;
-import net.minecraft.world.entity.monster.Enemy;
-import net.minecraft.world.entity.animal.Animal;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.entity.item.ItemEntity;
@@ -460,12 +460,14 @@ public class StateCollector {
                 e.addProperty("item_id", BuiltInRegistries.ITEM.getKey(stack.getItem()).toString());
                 e.addProperty("item_count", stack.getCount());
                 e.addProperty("display", stack.getDisplayName().getString());
-            } else if (entity instanceof Enemy) {
-                e.addProperty("type", "hostile");
-            } else if (entity instanceof Animal) {
-                e.addProperty("type", "animal");
             } else {
-                e.addProperty("type", "mob");
+                // 生物对待档位：**与本地反射 / 后端模型同一张表**（用户口径：高危险的不主动打、
+                // 中立的不惹、只有该处理的才处理）。认不出 ⇒ UNKNOWN，**不默认 hostile**；
+                // 后端优先信任这个字段，认不出/旧客户端才回落到自己的关键词兜底。
+                MobPolicy.Tier tier = MobPolicy.tier(AttackRules.entityTypeId(entity));
+                e.addProperty("tier", tier.name());
+                // 旧字段 `type` 保留（老后端/旧工具还在读），按档位映射回"敌对/动物/其他"。
+                e.addProperty("type", legacyType(tier));
             }
 
             // Health info for living entities
@@ -553,5 +555,20 @@ public class StateCollector {
         state.add("zones", com.lcu.lcumod.action.ActionExecutor.describeZones());
 
         LCUMod.WIRE.sendEvent("state_update", state);
+    }
+
+    /**
+     * 旧字段 `type` 的兼容映射：{@link MobPolicy.Tier} → `hostile` / `animal` / `mob`。
+     *
+     * <p>为什么不直接删掉旧字段：后端别处（`entities.py` 的 kind 归一、prompt 渲染"附近实体"）
+     * 与旧版客户端都在读 `type`。**新字段 `tier` 才是权威**，后端优先信任它；这里只是让老读法
+     * 不至于把中立怪（末影人/狼/铁傀儡）继续当"hostile"。
+     */
+    private static String legacyType(MobPolicy.Tier tier) {
+        return switch (tier) {
+            case DANGEROUS, HOSTILE -> "hostile";
+            case PASSIVE -> "animal";
+            case NEUTRAL, UNKNOWN -> "mob";
+        };
     }
 }
