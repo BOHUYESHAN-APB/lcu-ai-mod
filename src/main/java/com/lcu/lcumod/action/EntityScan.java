@@ -96,22 +96,9 @@ public final class EntityScan {
                           boolean living, double health,
                           String itemId, int itemCount, String owner, int age, int despawnIn) {
 
-            /** 归到 {@code by_kind} 的哪一档（player/item 优先，其余由 tier 名推；认不出 ⇒ unknown）。 */
+            /** 归到 {@code by_kind} 的哪一档（表在 {@link MobPolicy#kindOf}，只有那一份）。 */
             public String kind() {
-                if (player) {
-                    return "player";
-                }
-                if (item) {
-                    return "item";
-                }
-                String t = tier == null ? "" : tier.trim().toUpperCase(Locale.ROOT);
-                return switch (t) {
-                    case "DANGEROUS" -> "dangerous";
-                    case "HOSTILE" -> "hostile";
-                    case "NEUTRAL" -> "neutral";
-                    case "PASSIVE" -> "passive";
-                    default -> "unknown";
-                };
+                return MobPolicy.kindOf(tier, player, item);
             }
         }
 

@@ -36,15 +36,58 @@ public final class MobPolicy {
     /** 对待档位。**认不出 ⇒ UNKNOWN，绝不默认 HOSTILE**。 */
     public enum Tier {
         /** 高危险（监守者/凋灵/末影龙）：不主动打，也不还手 → 交回模型 / 逃生。 */
-        DANGEROUS,
+        DANGEROUS("dangerous"),
         /** 敌对（僵尸/骷髅/苦力怕…）：该处理的目标，可主动打、被打必还手。 */
-        HOSTILE,
+        HOSTILE("hostile"),
         /** 中立（末影人/狼/铁傀儡/村民…）：不惹；**只有它先动手**才还手。 */
-        NEUTRAL,
+        NEUTRAL("neutral"),
         /** 被动（牛羊猪鸡兔鱼…）：能猎的肉与资源（"该处理的"），不还手也照样能打。 */
-        PASSIVE,
+        PASSIVE("passive"),
         /** 表里没有（含自定义/新版本生物）：如实说"不认识"，**不许**当成敌对。 */
-        UNKNOWN
+        UNKNOWN("unknown");
+
+        /** 发给后端/进日志的**档位名**（`entities.by_kind` 的键、`scan_entities` 的 `kind` 过滤器）。 */
+        private final String kind;
+
+        Tier(String kind) {
+            this.kind = kind;
+        }
+
+        /** 对外那套小写名字。**名字就长在这里**，省得别处再抄一份字符串。 */
+        public String kind() {
+            return kind;
+        }
+
+        /** 按名字（枚举名，大小写不敏感）找回档位；认不出 ⇒ {@link #UNKNOWN}，**不猜**。 */
+        public static Tier named(String name) {
+            if (name == null) {
+                return UNKNOWN;
+            }
+            String wanted = name.trim();
+            for (Tier tier : values()) {
+                if (tier.name().equalsIgnoreCase(wanted)) {
+                    return tier;
+                }
+            }
+            return UNKNOWN;
+        }
+    }
+
+    /**
+     * 摘要（{@link PerceptionView}）与按需扫描（{@link EntityScan}）**共用**的归类。
+     *
+     * <p>玩家与掉落物优先（它们不是"档位"）；其余由 {@link Tier#named} 归，认不出 ⇒ {@code unknown}。
+     * **只此一处** —— 两份拷贝迟早会漂移，弄出"摘要把这个怪算敌对、按需扫描算中立"这种自相矛盾的
+     * 报告，而模型会照着其中一份动手。
+     */
+    public static String kindOf(String tierName, boolean player, boolean item) {
+        if (player) {
+            return "player";
+        }
+        if (item) {
+            return "item";
+        }
+        return Tier.named(tierName).kind();
     }
 
     /**
