@@ -213,8 +213,12 @@ class NoDynamicValuesInSystemTests(unittest.TestCase):
         self.assertNotIn("15000", layers.system)
         self.assertNotIn("minecraft:chest@(1,2,3)", layers.system)
         # 反过来：这些动态值确实在当轮 user 里（没有丢能力）。
+        # 交互窗口在 L2 里**只渲染一处**（`最近对话`，源=`get_recent_context`）—— P2 合并后
+        # 曾经重复的 `记忆上下文`（`build_context()['interaction_summary']`）不再单独出现，
+        # 所以这里断言的是那一处真正落地（而不是断言重复的那份）。
         for sentinel in (STATE_SENTINEL, HUD_SENTINEL, DEBT_SENTINEL, TASK_SENTINEL,
-                         MESSAGE_SENTINEL, VISION_SENTINEL):
+                         MESSAGE_SENTINEL, VISION_SENTINEL,
+                         PLAYER_SENTINEL, CHAT_SENTINEL):
             self.assertIn(sentinel, layers.user)
 
     def test_session_system_prompt_carries_no_dynamic_values(self):

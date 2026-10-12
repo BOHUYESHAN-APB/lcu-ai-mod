@@ -1108,9 +1108,9 @@ class Planner:
     def _build_l2(self, sender: str, message: str,
                   context: dict, bot_name: str) -> str:
         """L2：每轮的动态上下文（状态/聊天/任务/HUD/欠账）——**只进当轮 user 消息**。"""
-        memory_context = self.memory.build_context()
-        
-        # 获取最近对话
+        # 获取最近对话（**唯一**一处渲染交互窗口）：以前这里还额外取 `memory.build_context()`
+        # 再渲染一遍 interaction_summary（同一批 5 条、同窗口，跟下面这块重复）——
+        # 已合并掉：同一批事件在 L2 里只出现一次（`对话记忆` 段是另一个存储/另一批事件）。
         recent = self.memory.get_recent_context(5)
         recent_text = "\n".join([
             f"{msg.get('sender', '?')}: {msg.get('message', '')}" 
@@ -1196,12 +1196,19 @@ class Planner:
         ) or "暂无"
 
         remembered_pois = context.get("remembered_pois", []) if isinstance(context, dict) else []
-        remembered_text = ", ".join(
-            f"{poi.get('name') or poi.get('id', '?')}"
-            f"[{poi.get('category') or 'waypoint'}]"
-            f"@({poi.get('x')},{poi.get('y')},{poi.get('z')})"
-            for poi in remembered_pois[:16] if isinstance(poi, dict)
-        ) or "暂无"
+        # 收窄（用户口径：该由工具按需读的别全塞进提示词）：只报**共几个 + 最近 3 个**，
+        # 全量/找某个走已有的 `where_is` 工具。以前把前 16 个全铺开，每轮白占几百字符。
+        remembered_rows = [poi for poi in remembered_pois if isinstance(poi, dict)]
+        if remembered_rows:
+            head = ", ".join(
+                f"{poi.get('name') or poi.get('id', '?')}"
+                f"[{poi.get('category') or 'waypoint'}]"
+                f"@({poi.get('x')},{poi.get('y')},{poi.get('z')})"
+                for poi in remembered_rows[:3]
+            )
+            remembered_text = f"共 {len(remembered_rows)} 个；最近 3 个：{head}（要全量或找某个用 where_is）"
+        else:
+            remembered_text = "暂无"
 
         # 在线玩家 + 最近聊天：判断"他在跟谁说话"靠的是这两块，而不是每次都要喊名字。
         last_speaker = context.get("last_speaker") if isinstance(context, dict) else None
@@ -1373,9 +1380,6 @@ class Planner:
 
 最近对话：
 {recent_text}
-
-记忆上下文：
-{memory_context.get('interaction_summary', '无')}
 
 对话记忆（服务器 {namespace}；L2 窗口 + L3 中期摘要 + 关键词。
 判断"他之前说过什么/这个服务器上发生过什么"看这里）：
