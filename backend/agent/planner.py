@@ -1413,7 +1413,15 @@ passive 被动=能猎的肉、unknown 认不出=先别当敌人）：
 
         if not candidates:
             self._last_decision = {"source": "planner_only", "reason": "no candidates"}
-            logger.info("[Planner] 无候选动作，只回复")
+            # 用户口径："他怎么会觉得自信度不够，然后就不去做了" —— 先说清**是哪一种**：
+            # 这条路径是"模型这轮压根没给出工具调用"（不是置信度被拦，那条线在下半段）。
+            # 把模型这一轮给的东西原样截断打出来，否则下次还是只能猜。
+            try:
+                seen = json.dumps(plan, ensure_ascii=False, default=str)
+            except (TypeError, ValueError):
+                seen = repr(plan)
+            logger.info("[Planner] 无候选动作（模型没给工具调用），只回复；reply=%r plan=%s",
+                        reply_text, seen[:300])
             return reply_text
 
         choice, confidence = self._decide(candidates, context)

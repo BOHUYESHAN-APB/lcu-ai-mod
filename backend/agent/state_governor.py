@@ -347,8 +347,12 @@ class StateGovernor:
                 rec.last_progress_at = now
                 continue
             if now - rec.last_progress_at >= cfg.no_progress_seconds:
+                # 如实说**没用的是哪个信号**：自定义信号 vs 默认的"位置 + 任务状态"。
+                # 老文案一律写"位置未变"，对 `eat`/合成这类**本来就不动**的任务是误导 ——
+                # 用户看到的就是"它明明在饭点上却没动"，而真实原因可能是任务状态也没推进。
+                what = "它自己的进展信号没变" if rec.progress is not None else "位置与任务状态都没变"
                 reason = (f"{now - rec.last_progress_at:.0f}s 无进展"
-                          f"（位置未变，任务 {rec.kind or key}）")
+                          f"（{what}，任务 {rec.kind or key}）")
                 cancelled.append(self._cancel(rec, reason, cfg))
         return cancelled
 
