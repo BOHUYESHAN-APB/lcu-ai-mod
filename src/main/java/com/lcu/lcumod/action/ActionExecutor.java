@@ -271,6 +271,7 @@ public class ActionExecutor {
 
         // ── P0 饥饿反射：饿到一定程度自己吃 ──
         tickHungerReflex(mc);
+        GearReflex.tick(mc);
 
         // ── 守卫：出了半径自己走回去（用户"在这儿守着"）──
         tickGuard(mc);

@@ -37,6 +37,7 @@ public final class WalkCheck {
         comeVsFollowChecks();
         attackSafetyChecks();
         landmarkMemoryChecks();
+        gearReflexChecks();
 
         System.out.println("[WalkCheck] " + passed + " checks passed, " + failed + " failed");
         if (failed > 0) {
@@ -404,6 +405,30 @@ public final class WalkCheck {
                 collector.contains("distSqr(cachedNearbyBlocksOrigin)"));
         check("perception: the surroundings config values are actually read",
                 collector.contains("ModConfig.COLLECT_SURROUNDINGS") && collector.contains("ModConfig.SURROUNDINGS_RADIUS"));
+    }
+
+    // ── 9. 装备反射（用户口径：丢装备给它要自己穿上）──
+
+    /**
+     * 静态钉住装备反射的**形态与边界**：
+     * 走唯一那条"穿上"的路、只在 AI 控制时动手、可被后端关掉、有冷却，且**不许**动画手上的武器。
+     */
+    private static void gearReflexChecks() {
+        String gear = read(Path.of("src", "main", "java", "com", "lcu", "lcumod", "action",
+                "GearReflex.java"));
+        String executor = read(Path.of("src", "main", "java", "com", "lcu", "lcumod", "action",
+                "ActionExecutor.java"));
+
+        check("gear: reuses the one equip path", gear.contains("ContainerController.equipArmor(mc)"));
+        check("gear: only while the AI holds control", gear.contains("InputIsolation.isAiControlled()"));
+        check("gear: can be switched off by the backend", gear.contains("ReflexGate.isSuppressed(GATE)"));
+        check("gear: has a cooldown", gear.contains("GEAR_REFLEX_COOLDOWN_TICKS"));
+        check("gear: silently ignores nothing-to-wear", gear.contains("already_equipped")
+                && gear.contains("ContainerPlan.OK.equals(result.reason())"));
+        check("gear: must not yank the held weapon out of the AI's hands",
+                !gear.contains("equipBestWeapon("));   // 注释里提到它是可以的，调用不行
+        check("gear: is ticked from the same place as the eat reflex",
+                executor.contains("GearReflex.tick(mc)"));
     }
 
     /** 取某个成员（含签名行）到下一个成员声明之间的源码片段（静态扫描用）。 */
