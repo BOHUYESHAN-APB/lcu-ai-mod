@@ -43,7 +43,7 @@ description of current architecture.
   `task_preset_registry`, `identity`, and `body_request_diagnostics.py`. The live memory module
   is `world_memory.py` — a different module from the dead `world_model.py`.
 - **Verification baseline (26.3):** 18 `verifyXxx` JavaExec self-check tasks wired into
-  `gradle check` (`build.gradle:205-369`; 1226 checks total), and a 1657-test backend suite.
+  `gradle check` (`build.gradle:205-369`; 1307 checks total), and a 1733-test backend suite.
 
 ## Ownership Boundary
 
@@ -363,5 +363,5 @@ argument prefix `RESERVED_ARG_PREFIX` (`backend/api/http_surface.py:47`).
 7. Add bounded image artifacts, screen identity, capture, and verified UI input tools.
 
 **What already exists (26.3):** the 18 `verifyXxx` Java self-check tasks wired into `gradle check`
-(`build.gradle:205-369`) and the 1657-test backend suite. These verify the current deterministic
+(`build.gradle:205-369`) and the 1733-test backend suite. These verify the current deterministic
 actuators and backend, not the orchestration design above.

@@ -6,7 +6,7 @@ import java.nio.file.Path;
 import java.util.List;
 
 /**
- * 零依赖自检（接入 {@code check}）：**视角单一写者 + 寻路收敛/退避**。
+ * 零依赖自检（接入 {@code check}）：**视角单一写者 + 寻路收敛/退避 + 非完整方块通行 + 曲线整形**。
  *
  * <p>用户实机根因："AI 在控制中、显示跟着我，但原地罚站"，日志每秒刷
  * {@code Calculated path with 47 waypoints}——后端 look 与寻路转身**两个写者互相覆盖**，
@@ -15,11 +15,18 @@ import java.util.List;
  * <ol>
  *   <li><b>导航中后端 look 不覆盖路径朝向</b>（{@link LookArbiter} 优先级）；</li>
  *   <li><b>无导航时后端 look 生效</b>（绝对值、一次性）；</li>
- *   <li><b>逐步转不会瞬间对齐</b>（限速 10°/6° per tick，且能收敛）；</li>
+ *   <li><b>逐步转是曲线不是跳变</b>：角速度有上限（10°/6° per tick）、角加速度有限
+ *       ⇒ 加速→饱和→刹住，且**绝不越过目标**（不越过就不会在瞄准点附近抖）；</li>
+ *   <li><b>曲线整形的行为断言</b>（{@link MotionCurve}）：缓入缓出端点/单调/有界/对称、
+ *       角速度整形不超上限不抖、速度曲线"转弯降速 / 直线加速"、迟滞开关不来回抖、
+ *       前视取点随距离变化；</li>
+ *   <li><b>非完整方块的通行判据</b>（{@link Pathfinder.Pure#classifyStep}）：半砖(0.5)可迈、
+ *       上半砖(1.0)需跳、楼梯两向、活板门平放可迈/立起来是墙、梯子=可爬、净空不足 ⇒ 拒绝、
+ *       需要垫方块 ⇒ 拒绝（**不搭方块**策略不变）；</li>
  *   <li><b>收敛失败如实停步并回报原因</b>（{@link AlignmentGuard}）；</li>
  *   <li><b>退避期内不重复计算 / 相同结果只报一次</b>（{@link ReplanGate}）；</li>
- *   <li><b>静态扫描</b>：寻路不再直接写视角（{@code setYRot}/{@code setXRot} 只出现在
- *       {@code InputIsolation} 的单一写点）。</li>
+ *   <li><b>静态扫描</b>：寻路按脚印取子形状、攀爬用原版 {@code isLadder} 判据、路点必须能站、
+ *       卡住能说清"哪一格、为什么"、寻路里没有放方块、视角仍只有 {@code InputIsolation} 一个写点。</li>
  * </ol>
  *
  * <p>断言信息用 ASCII（Windows 控制台 GBK）；失败非零退出。
@@ -32,6 +39,9 @@ public final class WalkCheck {
     public static void main(String[] args) {
         lookOwnershipChecks();
         gradualTurnChecks();
+        motionCurveChecks();
+        stepClassifyChecks();
+        nonFullBlockChecks();
         alignmentGuardChecks();
         replanGateChecks();
         sourceScanChecks();
@@ -175,8 +185,14 @@ public final class WalkCheck {
         check("ownership: navigating -> NAVIGATION owns view", f.source() == LookArbiter.Source.NAVIGATION);
         check("ownership: navigating -> backend yaw NOT applied", f.yaw() != 90f);
         check("ownership: navigating -> backend pitch NOT applied", f.pitch() != 45f);
-        check("ownership: navigating -> turns toward path (-10 after 1 tick)", f.yaw() == -10f);
-        check("ownership: navigating -> pitch steps 6 toward path", f.pitch() == 6f);
+        check("ownership: navigating -> turns toward path (negative, behind the cap)",
+                f.yaw() < 0f && f.yaw() > -LookArbiter.NAV_MAX_YAW_STEP);
+        check("ownership: navigating -> pitch turns up, within the cap",
+                f.pitch() > 0f && f.pitch() <= LookArbiter.NAV_MAX_PITCH_STEP);
+        // 曲线整形：第一 tick 是"加速"阶段的步长，比角速度上限小；第二 tick 更大（角加速度有限但方向一致）。
+        LookArbiter.Frame second = a.plan(true, true, f.yaw(), f.pitch());
+        check("ownership: navigating -> turn accelerates (2nd tick step > 1st)",
+                Math.abs(second.yaw() - f.yaw()) > Math.abs(f.yaw() - 0f));
 
         // ② 无导航：后端 look 生效（绝对值，一次性）
         LookArbiter b = new LookArbiter();
@@ -227,42 +243,85 @@ public final class WalkCheck {
         check("ownership: clearAll clears both", !g.hasBackendTarget() && !g.hasNavigationTarget());
     }
 
-    // ── 3. 逐步转：不会瞬间对齐，且能收敛 ────────────────────────
+    // ── 3. 逐步转：不会瞬间对齐，曲线加速→饱和→刹住，且能收敛 ──────
 
+    /**
+     * 用户口径："视角转动……至少不要那么锯齿"。所以这里钉的是**曲线**而不是"每 tick 固定步长"：
+     * 第一 tick 一定**小于**角速度上限（在加速），中途会**饱和**到上限，收尾会**减速**，
+     * 且**绝不越过**目标（越过就会在瞄准点附近来回抖 = 锯齿）。
+     */
     private static void gradualTurnChecks() {
         LookArbiter a = new LookArbiter();
         a.setNavigationTarget(180f, 45f);
         LookArbiter.Frame f = a.plan(true, true, 0f, 0f);
-        check("gradual: 180deg target is NOT snapped (yaw=10 after 1 tick)", f.yaw() == 10f);
-        check("gradual: yaw step is capped at 10", f.yaw() - 0f == LookArbiter.NAV_MAX_YAW_STEP);
-        check("gradual: pitch step is capped at 6", f.pitch() == 6f);
+        check("gradual: 180deg target is NOT snapped (1st tick is an accelerating step)",
+                f.yaw() > 0f && f.yaw() < LookArbiter.NAV_MAX_YAW_STEP);
+        check("gradual: yaw step never exceeds the rate cap",
+                f.yaw() - 0f <= LookArbiter.NAV_MAX_YAW_STEP);
+        check("gradual: pitch step never exceeds the rate cap",
+                f.pitch() > 0f && f.pitch() <= LookArbiter.NAV_MAX_PITCH_STEP);
 
         float yaw = 0f;
         float pitch = 0f;
         int ticks = 0;
+        double peakYawStep = 0.0;
+        double lastYawStep = 0.0;
+        boolean sawAccelerate = false;
+        boolean sawBrake = false;
+        boolean overshot = false;
+        double previousAbsError = 180.0;
         LookArbiter sim = new LookArbiter();
         sim.setNavigationTarget(180f, 45f);
         while (LookArbiter.yawDiff(yaw, 180f) != 0f && ticks < 200) {
             LookArbiter.Frame step = sim.plan(true, true, yaw, pitch);
-            // 单 tick 位移绝不越界
             if (Math.abs(LookArbiter.yawDiff(yaw, step.yaw())) > LookArbiter.NAV_MAX_YAW_STEP + 0.001f) {
                 check("gradual: step never exceeds cap (tick " + ticks + ")", false);
                 return;
             }
+            double moved = step.yaw() - yaw;
+            double absError = Math.abs(LookArbiter.yawDiff(step.yaw(), 180f));
+            if (Math.abs(moved) > 0.0 && Math.abs(moved) < LookArbiter.NAV_MAX_YAW_STEP - 1.0e-4) {
+                if (ticks > 0) {
+                    // 前半段步长变大 ⇒ 在加速；后半段变小 ⇒ 在刹车
+                    if (Math.abs(moved) > lastYawStep) {
+                        sawAccelerate = true;
+                    } else {
+                        sawBrake = true;
+                    }
+                }
+            }
+            if (absError > previousAbsError + 1.0e-6 || step.yaw() > 180f) {
+                overshot = true;   // 越过目标（会抖）
+            }
+            previousAbsError = absError;
+            lastYawStep = Math.abs(moved);
+            peakYawStep = Math.max(peakYawStep, Math.abs(moved));
             yaw = step.yaw();
             pitch = step.pitch();
             ticks++;
         }
-        check("gradual: converges to 180 within 18 ticks (got " + ticks + ")", ticks == 18);
+        check("gradual: converges within 30 ticks (got " + ticks + ")", ticks > 0 && ticks <= 30);
+        check("gradual: the turn accelerates (starts below the cap)", sawAccelerate);
+        check("gradual: the turn brakes before the target", sawBrake);
+        check("gradual: saturates at the rate cap", Math.abs(peakYawStep - LookArbiter.NAV_MAX_YAW_STEP) < 1.0e-4);
+        check("gradual: never overshoots the target (no jitter around it)", !overshot);
         check("gradual: pitch converges to 45", Math.abs(pitch - 45f) < 0.001f);
         check("gradual: once aligned it stays put",
                 sim.plan(true, true, yaw, pitch).yaw() == yaw);
+
+        // 微小偏差：直接落到目标且**不再动**（死区 ⇒ 不抖）
+        LookArbiter micro = new LookArbiter();
+        micro.setNavigationTarget(0.02f, 0f);
+        LookArbiter.Frame m = micro.plan(true, true, 0f, 0f);
+        check("gradual: micro error snaps to the target (no hunting)", m.yaw() == 0.02f);
+        check("gradual: micro error does not keep turning",
+                micro.plan(true, true, m.yaw(), 0f).yaw() == 0.02f);
 
         // 跨 ±180 边界：170 -> -170 只差 20 度，往正方向转
         LookArbiter wrap = new LookArbiter();
         wrap.setNavigationTarget(-170f, 0f);
         LookArbiter.Frame wf = wrap.plan(true, true, 170f, 0f);
-        check("gradual: crosses the +-180 seam the short way", wf.yaw() == 180f);
+        check("gradual: crosses the +-180 seam the short way", wf.yaw() > 170f && wf.yaw() <= 180f);
         check("gradual: seam diff is 20 not 340", wf.yawDiff() == 20f);
 
         // yawDiff 纯函数
@@ -339,6 +398,327 @@ public final class WalkCheck {
             threw = true;
         }
         check("backoff: ctor rejects negative window", threw);
+    }
+
+    // ── 2b. 曲线整形：移动/视角不许 0/1 突变、不许锯齿 ────────────
+
+    /**
+     * 用户口径："移动路径还有视角转动，能不能再做平滑一点……至少不要那么锯齿"、
+     * "有些时候是加速曲线，有些时候是弧形的"。这里对 {@link MotionCurve} 的**行为**做断言
+     * （零依赖纯逻辑，所以能直接断言而不是扫源码）。
+     */
+    private static void motionCurveChecks() {
+        // ① 缓入缓出：端点精确 / 单调 / 有界 / 对称 / 两端导数为 0
+        check("curve: easeInOut endpoints are exact",
+                MotionCurve.easeInOut(0.0) == 0.0 && MotionCurve.easeInOut(1.0) == 1.0);
+        check("curve: easeInOut clamps outside [0,1]",
+                MotionCurve.easeInOut(-3.0) == 0.0 && MotionCurve.easeInOut(3.0) == 1.0);
+
+        boolean monotone = true;
+        boolean bounded = true;
+        boolean symmetric = true;
+        double previous = -1.0;
+        for (int i = 0; i <= 100; i++) {
+            double t = i / 100.0;
+            double v = MotionCurve.easeInOut(t);
+            if (v < previous - 1.0e-12) {
+                monotone = false;
+            }
+            if (v < 0.0 || v > 1.0) {
+                bounded = false;
+            }
+            if (Math.abs(v + MotionCurve.easeInOut(1.0 - t) - 1.0) > 1.0e-9) {
+                symmetric = false;
+            }
+            previous = v;
+        }
+        check("curve: easeInOut is monotone", monotone);
+        check("curve: easeInOut is bounded to [0,1]", bounded);
+        check("curve: easeInOut is symmetric (slow-in == slow-out)", symmetric);
+        check("curve: easeInOut has zero slope at both ends",
+                MotionCurve.easeInOut(0.001) < 0.005 && (1.0 - MotionCurve.easeInOut(0.999)) < 0.005);
+
+        // ② 角速度整形：加速 → 饱和 → 刹住；不超上限、不越过目标、到点不抖
+        MotionCurve.AngularShaper shaper = new MotionCurve.AngularShaper(10.0, 4.0);
+        double error = 180.0;
+        double peak = 0.0;
+        double lastStep = 0.0;
+        int ticks = 0;
+        boolean accelerating = false;
+        boolean braking = false;
+        boolean overCap = false;
+        boolean overshoot = false;
+        while (error != 0.0 && ticks < 200) {
+            double step = shaper.step(error);
+            if (Math.abs(step) > 10.0 + 1.0e-9) {
+                overCap = true;
+            }
+            double remaining = error - step;
+            if (Math.signum(remaining) != Math.signum(error) && remaining != 0.0) {
+                overshoot = true;
+            }
+            if (ticks > 0 && Math.abs(step) > 1.0e-9 && Math.abs(step) < 10.0 - 1.0e-9) {
+                if (Math.abs(step) > lastStep) {
+                    accelerating = true;
+                } else {
+                    braking = true;
+                }
+            }
+            peak = Math.max(peak, Math.abs(step));
+            lastStep = Math.abs(step);
+            error = remaining;
+            ticks++;
+        }
+        check("shaper: converges (got " + ticks + " ticks)", error == 0.0 && ticks > 0 && ticks <= 30);
+        check("shaper: rate cap is never exceeded", !overCap);
+        check("shaper: never overshoots the target", !overshoot);
+        check("shaper: accelerates first (finite angular acceleration)", accelerating);
+        check("shaper: saturates at the rate cap", Math.abs(peak - 10.0) < 1.0e-9);
+        check("shaper: brakes before arriving", braking);
+        check("shaper: stops dead once settled (no jitter)",
+                shaper.step(0.0) == 0.0 && shaper.rate() == 0.0);
+        check("shaper: inside the dead zone it snaps to the target",
+                shaper.step(0.01) == 0.01 && shaper.rate() == 0.0);
+        shaper.reset();
+        check("shaper: reset clears the rate", shaper.rate() == 0.0);
+
+        boolean threw = false;
+        try {
+            new MotionCurve.AngularShaper(0.0, 4.0);
+        } catch (IllegalArgumentException ex) {
+            threw = true;
+        }
+        check("shaper: rejects a zero rate cap", threw);
+
+        // ③ 速度曲线：偏差大降速、直线远距离加速、始终有界
+        check("speed: straight line far away is full speed",
+                Math.abs(MotionCurve.speedScale(0.0, 10.0) - 1.0) < 1.0e-9);
+        check("speed: big heading error means low speed",
+                MotionCurve.speedScale(60.0, 10.0) < MotionCurve.speedScale(10.0, 10.0));
+        check("speed: very close range is slower (no 0/1 step)",
+                MotionCurve.speedScale(0.0, 0.5) > 0.0
+                        && MotionCurve.speedScale(0.0, 0.5) < MotionCurve.speedScale(0.0, 10.0));
+        boolean speedBounded = true;
+        boolean speedMonotoneInTurn = true;
+        double previousSpeed = Double.MAX_VALUE;
+        for (int i = 0; i <= 90; i++) {
+            double v = MotionCurve.speedScale(i, 8.0);
+            if (v < 0.0 || v > 1.0) {
+                speedBounded = false;
+            }
+            if (v > previousSpeed + 1.0e-12) {
+                speedMonotoneInTurn = false;
+            }
+            previousSpeed = v;
+        }
+        check("speed: always bounded to [0,1]", speedBounded);
+        check("speed: monotone slower as the heading error grows", speedMonotoneInTurn);
+
+        // ④ 迟滞：阈值附近不来回抖
+        MotionCurve.Hysteresis gate = new MotionCurve.Hysteresis(0.9, 0.7);
+        check("hysteresis: stays off just below the on-threshold", !gate.update(0.89));
+        check("hysteresis: turns on at the on-threshold", gate.update(0.9));
+        check("hysteresis: stays on inside the band (no thrash)", gate.update(0.75) && gate.update(0.71));
+        check("hysteresis: turns off below the off-threshold", !gate.update(0.69));
+        gate.reset();
+        check("hysteresis: reset clears it", !gate.state());
+        boolean threwGate = false;
+        try {
+            new MotionCurve.Hysteresis(0.5, 0.5);
+        } catch (IllegalArgumentException ex) {
+            threwGate = true;
+        }
+        check("hysteresis: rejects off >= on", threwGate);
+
+        // ⑤ 前视取点（弧形）：远距离看更远、目标更近就看目标本身
+        MotionCurve.Point from = new MotionCurve.Point(0.0, 64.0, 0.0);
+        MotionCurve.Point to = new MotionCurve.Point(10.0, 64.0, 0.0);
+        MotionCurve.Point aheadPoint = MotionCurve.lookAhead(from, to, 3.0);
+        check("lookAhead: takes a point ahead along the direction",
+                Math.abs(aheadPoint.x() - 3.0) < 1.0e-9 && Math.abs(aheadPoint.y() - 64.0) < 1.0e-9);
+        check("lookAhead: a nearer target is not overshot",
+                MotionCurve.lookAhead(from, new MotionCurve.Point(1.0, 64.0, 0.0), 3.0).x() == 1.0);
+        check("lookAhead: distance scales with the range (far looks farther)",
+                MotionCurve.lookAheadDistance(20.0, 2.0, 6.0) > MotionCurve.lookAheadDistance(3.0, 2.0, 6.0));
+        check("lookAhead: distance is clamped to [min,max]",
+                MotionCurve.lookAheadDistance(1.0, 2.0, 6.0) == 2.0
+                        && MotionCurve.lookAheadDistance(1000.0, 2.0, 6.0) == 6.0);
+    }
+
+    // ── 2c. 非完整方块的通行判据（纯逻辑，直接断言规则）──────────
+
+    /**
+     * 用户口径："在一些非完整方块上，比如说是楼梯，梯子，活板门，半砖……有时候能移动，有时候不能"。
+     * 这里把每条规则钉成**行为断言**（{@link Pathfinder.Pure#classifyStep} 是零依赖纯逻辑）。
+     */
+    private static void stepClassifyChecks() {
+        Pathfinder.Pure.StepQuery half = query(0.0, 0.5, 3.0);
+        check("step: half slab (0.5) is walked", step(half) == Pathfinder.Pure.Move.WALK);
+
+        Pathfinder.Pure.StepQuery upperSlab = query(0.0, 1.0, 3.0);
+        check("step: upper slab (1.0) needs a jump, not a walk",
+                step(upperSlab) == Pathfinder.Pure.Move.JUMP_UP);
+
+        Pathfinder.Pure.StepQuery carpet = query(64.0, 64.0625, 3.0);
+        check("step: carpet (1/16) is walked", step(carpet) == Pathfinder.Pure.Move.WALK);
+
+        // 楼梯两向：上行是"迈"（靠来向那半块的脚下剖面），下行是"落"（允许，摔不死）
+        Pathfinder.Pure.StepQuery stairUp = query(64.0, 64.5, 3.0);
+        check("step: stair ascending (entry band 0.5) is walked",
+                step(stairUp) == Pathfinder.Pure.Move.WALK);
+        Pathfinder.Pure.StepQuery stairDown = query(65.0, 64.5, 3.0);
+        check("step: stair descending (0.5 drop) is a drop, allowed",
+                step(stairDown) == Pathfinder.Pure.Move.DROP_DOWN);
+
+        Pathfinder.Pure.StepQuery trapdoorFlat = query(64.0, 64.1875, 3.0);
+        check("step: closed trapdoor (flat, 0.1875) is walked",
+                step(trapdoorFlat) == Pathfinder.Pure.Move.WALK);
+        Pathfinder.Pure.StepQuery trapdoorUp = new Pathfinder.Pure.StepQuery(
+                64.0, 64.1875, 3.0, false, false, 0.0, false);
+        check("step: raised trapdoor (footprint sweep blocked) is refused",
+                !trapdoorUp.corridorClear()
+                        && step(trapdoorUp) == Pathfinder.Pure.Move.REFUSE
+                        && reason(trapdoorUp).contains("path blocked"));
+
+        Pathfinder.Pure.StepQuery ladder = new Pathfinder.Pure.StepQuery(
+                64.0, 64.0, 3.0, false, true, 3.0, true);
+        check("step: ladder/climbable is CLIMB", step(ladder) == Pathfinder.Pure.Move.CLIMB);
+        Pathfinder.Pure.StepQuery loneVine = new Pathfinder.Pure.StepQuery(
+                64.0, 64.0, 3.0, false, true, 0.0, true);
+        check("step: climbable with no reachable rise -> refused as 'CLIMB node, no ladder'",
+                step(loneVine) == Pathfinder.Pure.Move.REFUSE
+                        && reason(loneVine).contains("CLIMB node, no ladder"));
+
+        Pathfinder.Pure.StepQuery noHeadroomStep = query(0.0, 0.5, 1.5);
+        check("step: not enough headroom -> refused",
+                step(noHeadroomStep) == Pathfinder.Pure.Move.REFUSE
+                        && reason(noHeadroomStep).contains("no headroom"));
+        Pathfinder.Pure.StepQuery jumpNoHeadroom = query(0.0, 1.0, 1.5);
+        check("step: 1.0 step with no headroom -> 'needs jump, no headroom'",
+                step(jumpNoHeadroom) == Pathfinder.Pure.Move.REFUSE
+                        && reason(jumpNoHeadroom).contains("step 1.00 needs jump, no headroom"));
+
+        Pathfinder.Pure.StepQuery tooHigh = query(64.0, 66.5, 4.0);
+        check("step: 2.5 up is too high to jump -> refused",
+                step(tooHigh) == Pathfinder.Pure.Move.REFUSE
+                        && reason(tooHigh).contains("too high"));
+        Pathfinder.Pure.StepQuery tooDeep = query(70.0, 64.0, 4.0);
+        check("step: 6.0 drop is too deep -> refused",
+                step(tooDeep) == Pathfinder.Pure.Move.REFUSE
+                        && reason(tooDeep).contains("too deep"));
+
+        Pathfinder.Pure.StepQuery noSupport = query(64.0, Double.NaN, 0.0);
+        check("step: unsupported neighbour needs a block -> refused (no bridging/pillaring)",
+                step(noSupport) == Pathfinder.Pure.Move.REFUSE
+                        && reason(noSupport).contains("no support")
+                        && reason(noSupport).contains("bridging"));
+
+        // 从攀爬柱上出到上一层：起点脚底已经按"能到的最高位置"取（见 Pathfinder.climbAwareFromFoot），
+        // 所以"梯子顶端再跨一步"就是普通一步；柱子够不到的高处照样拒绝。
+        Pathfinder.Pure.StepQuery climbExit = new Pathfinder.Pure.StepQuery(
+                68.0, 69.0, 3.0, true, false, 1.0, true);
+        check("step: stepping off the top of a climb column is a normal step",
+                step(climbExit) == Pathfinder.Pure.Move.JUMP_UP);
+        Pathfinder.Pure.StepQuery climbTooFar = new Pathfinder.Pure.StepQuery(
+                68.0, 72.0, 3.0, true, false, 1.0, true);
+        check("step: climbing higher than the ladder reaches is refused",
+                step(climbTooFar) == Pathfinder.Pure.Move.REFUSE
+                        && reason(climbTooFar).contains("climb exit"));
+
+        check("step: a refused step always carries a machine-readable reason",
+                !reason(tooHigh).isEmpty() && !reason(tooDeep).isEmpty() && !reason(noSupport).isEmpty());
+        check("step: an allowed step carries no reason",
+                reason(half).isEmpty() && reason(ladder).isEmpty());
+        check("step: player height is the vanilla 1.8", Pathfinder.Pure.PLAYER_HEIGHT == 1.8);
+        check("step: thresholds match the documented policy",
+                Pathfinder.Pure.STEP_UP == 0.6 && Pathfinder.Pure.MAX_JUMP == 1.2
+                        && Pathfinder.Pure.MAX_DROP == 3.2);
+    }
+
+    private static Pathfinder.Pure.StepQuery query(double fromFoot, double toFoot, double headroom) {
+        return new Pathfinder.Pure.StepQuery(fromFoot, toFoot, headroom, false, false, 0.0, true);
+    }
+
+    private static Pathfinder.Pure.Move step(Pathfinder.Pure.StepQuery q) {
+        return Pathfinder.Pure.classifyStep(q).move();
+    }
+
+    private static String reason(Pathfinder.Pure.StepQuery q) {
+        return Pathfinder.Pure.classifyStep(q).reason();
+    }
+
+    // ── 2d. 非完整方块的实现形状（源码扫描）──────────────────────
+
+    /**
+     * 判据必须在**脚印内**求、攀爬必须用**原版判据**、路点必须过"能不能站"、卡住必须能说清
+     * 哪一格为什么、视角仍然只有一个写者、寻路里绝不出现放方块。
+     */
+    private static void nonFullBlockChecks() {
+        Path root = Path.of("src", "main", "java", "com", "lcu", "lcumod", "action");
+        String pf = read(root.resolve("Pathfinder.java"));
+        String look = read(root.resolve("LookArbiter.java"));
+        String curve = read(root.resolve("MotionCurve.java"));
+        String ii = read(root.resolve("InputIsolation.java"));
+        if (pf.isEmpty() || look.isEmpty() || curve.isEmpty() || ii.isEmpty()) {
+            check("footprint: sources found", false);
+            return;
+        }
+
+        check("footprint: stand height comes from the player's footprint sub-shape",
+                pf.contains("forAllBoxes(") && pf.contains("PLAYER_HALF_WIDTH")
+                        && pf.contains("footprintTopLocal("));
+        check("footprint: headroom is measured inside the footprint too",
+                pf.contains("headroomAbove("));
+        check("footprint: entry band per direction (stairs step onto the near half)",
+                pf.contains("bandsAt(") && pf.contains("REVERSE_DIRECTION"));
+        check("footprint: the sweep along the step is a real collision test",
+                pf.contains("corridorClear(") && pf.contains("noCollision("));
+        check("footprint: climbable comes from the vanilla criterion (BlockState.isLadder)",
+                pf.contains("isLadder(") && !pf.contains("Blocks.LADDER"));
+        check("footprint: climb columns are nodes with a reachable top",
+                pf.contains("climbColumnTop(") && pf.contains("Move.CLIMB"));
+        check("footprint: climbing is vertical (same column), not a horizontal hop",
+                pf.contains("addVerticalNeighbor(") && pf.contains("classifyVertical(")
+                        && pf.contains("climbAwareFromFoot("));
+        check("footprint: a purely vertical waypoint still presses climb keys",
+                pf.contains("horizontalDistance < 0.01") && pf.contains("waypoint.needsJump()"));
+        check("footprint: every waypoint is a standable node (headroom-confirmed)",
+                pf.contains("createStandingNode(") && pf.contains("hasHeadroom(level, player, standingPos)"));
+        check("footprint: one single classifier drives walk/jump/drop/climb",
+                pf.contains("Pure.classifyStep("));
+
+        // 卡住必须说清"哪一格、为什么"，并进现有 stuck 上报文案
+        check("diagnosis: pathfinder keeps the nearest refusal with its cell",
+                pf.contains("getLastBlockedReport()") && pf.contains("refusalCell"));
+        check("diagnosis: the failure reason carries the blocked cell + reason",
+                pf.contains("blocked.isEmpty() ? \"\" : \"; \" + blocked"));
+        check("diagnosis: being stuck re-judges the current step and says why",
+                pf.contains("explainProgressBlock(") && pf.contains("no progress -> blocked by something else"));
+        check("diagnosis: the stuck watch dog receives it (getLastFailureReason)",
+                pf.contains("getLastFailureReason()"));
+
+        // 纪律：不搭方块 / 视角单一写者 / 迈跳落爬由分类驱动
+        check("discipline: no block placing in the pathfinder",
+                !pf.contains("setBlock") && !pf.contains("place_block") && !pf.contains("useItemOn"));
+        check("discipline: no-rescue policy kept", pf.contains("NO_RESCUE_POLICY"));
+        check("discipline: jump is driven by the classification, not by a probe hack",
+                pf.contains("waypoint.needsJump()") && !pf.contains("shouldJump"));
+        check("discipline: the pathfinder still publishes look via the single writer",
+                pf.contains("setNavigationLookTarget") && !pf.contains("setYRot") && !pf.contains("setXRot"));
+        check("discipline: the arbiter/curve never write the view themselves",
+                !look.contains("setYRot") && !look.contains("setXRot")
+                        && !curve.contains("setYRot") && !curve.contains("setXRot"));
+        check("discipline: only InputIsolation writes yaw/pitch",
+                countOf(ii, "mc.player.setYRot(") == 1 && countOf(ii, "mc.player.setXRot(") == 1);
+
+        // 曲线必须真的用在移动/视角上（不是"写了没用"）
+        check("curve: navigation turning goes through the shaper",
+                look.contains("MotionCurve.AngularShaper") && look.contains("yawShaper.step("));
+        check("curve: movement speed comes from the speed curve + hysteresis",
+                pf.contains("MotionCurve.speedScale(") && pf.contains("MotionCurve.Hysteresis"));
+        check("curve: the view aims ahead along the path (arcs, not right-angle turns)",
+                pf.contains("lookAheadPoint(") && pf.contains("MotionCurve.lookAheadDistance(")
+                        && pf.contains("MotionCurve.lookAhead(") && pf.contains("walkAlongPath("));
     }
 
     // ── 6. 静态扫描：单一写者 ────────────────────────────────────

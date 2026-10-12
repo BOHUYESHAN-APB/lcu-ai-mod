@@ -16,8 +16,12 @@ package com.lcu.lcumod.action;
  *   <li><b>正在导航</b>（有路径）⇒ <b>以路径朝向为准</b>，后端的 {@code look} 绝对目标
  *       <b>不覆盖</b>它；</li>
  *   <li>没有导航 ⇒ 后端的 {@code look} 生效（绝对值、一次性目标，行为与修复前一致）；</li>
- *   <li>导航的朝向是**每 tick 逐步转**（限速 ±{@value #NAV_MAX_YAW_STEP}° 偏航 /
- *       ±{@value #NAV_MAX_PITCH_STEP}° 俯仰），**绝不**写成"瞬间对齐"（那会让 AI 抽风）。</li>
+ *   <li>导航的朝向是**每 tick 逐步转**，而且转的是**曲线**：角速度有上限
+ *       （±{@value #NAV_MAX_YAW_STEP}° 偏航 / ±{@value #NAV_MAX_PITCH_STEP}° 俯仰）但**角加速度有限**
+ *       （±{@value #NAV_MAX_YAW_ACCEL}° / ±{@value #NAV_MAX_PITCH_ACCEL}° 每 tick²，见
+ *       {@link MotionCurve.AngularShaper}）—— 起步加速、中间饱和、收尾刹住、绝不越过目标。
+ *       **绝不**写成"瞬间对齐"（那会让 AI 抽风），也**绝不**是"每 tick 恒定转 N 度"
+ *       （那是"锯齿/机械"的来源）。</li>
  * </ol>
  *
  * <p>本类只**计算**本 tick 应当写入什么，不真正写——真正的唯一写点在
@@ -35,10 +39,14 @@ public final class LookArbiter {
         BACKEND
     }
 
-    /** 导航转身限速（与原版寻路同口径）：每 tick 最多 10°。 */
+    /** 导航转身**角速度上限**（度 / tick，与原版寻路同口径）：每 tick 最多 10°。 */
     public static final float NAV_MAX_YAW_STEP = 10.0f;
-    /** 导航俯仰限速：每 tick 最多 6°。 */
+    /** 导航俯仰**角速度上限**：每 tick 最多 6°。 */
     public static final float NAV_MAX_PITCH_STEP = 6.0f;
+    /** 导航偏航**角加速度上限**（度 / tick²）：起步要能加速、收尾要能刹住。 */
+    public static final float NAV_MAX_YAW_ACCEL = 4.0f;
+    /** 导航俯仰**角加速度上限**（度 / tick²）。 */
+    public static final float NAV_MAX_PITCH_ACCEL = 2.5f;
     /** 俯仰硬上限（避免写进非法角度）。 */
     public static final float PITCH_LIMIT = 90.0f;
 
@@ -60,6 +68,13 @@ public final class LookArbiter {
     private boolean hasNavigation = false;
     private float navigationYaw = 0f;
     private float navigationPitch = 0f;
+
+    // 导航视角的**曲线整形**（有限角加速度）：不是"每 tick 恒定转 N 度"，而是加速→饱和→刹住，
+    // 且不越过目标（见 MotionCurve.AngularShaper 的说明）。
+    private final MotionCurve.AngularShaper yawShaper =
+            new MotionCurve.AngularShaper(NAV_MAX_YAW_STEP, NAV_MAX_YAW_ACCEL);
+    private final MotionCurve.AngularShaper pitchShaper =
+            new MotionCurve.AngularShaper(NAV_MAX_PITCH_STEP, NAV_MAX_PITCH_ACCEL);
 
     // ── 目标设置 ──
 
@@ -87,6 +102,8 @@ public final class LookArbiter {
 
     public void clearNavigationTarget() {
         hasNavigation = false;
+        yawShaper.reset();
+        pitchShaper.reset();
     }
 
     public boolean hasNavigationTarget() {
@@ -120,8 +137,9 @@ public final class LookArbiter {
             case NAVIGATION -> {
                 float yawDiff = yawDiff(currentYaw, navigationYaw);
                 float pitchDiff = navigationPitch - currentPitch;
-                float yaw = currentYaw + clamp(yawDiff, NAV_MAX_YAW_STEP);
-                float pitch = clampPitch(currentPitch + clamp(pitchDiff, NAV_MAX_PITCH_STEP));
+                // 曲线整形：角速度有上限、角加速度有限 ⇒ 起步加速、到顶饱和、收尾刹住，且不越过目标。
+                float yaw = currentYaw + (float) yawShaper.step(yawDiff);
+                float pitch = clampPitch(currentPitch + (float) pitchShaper.step(pitchDiff));
                 return new Frame(Source.NAVIGATION, true, yaw, pitch, yawDiff);
             }
             case BACKEND -> {
@@ -130,6 +148,9 @@ public final class LookArbiter {
                         yawDiff(currentYaw, backendYaw));
             }
             default -> {
+                // 本 tick 视角不归导航 ⇒ 角速度归零（下次导航从静止起步，不带着上次的残余角速度）。
+                yawShaper.reset();
+                pitchShaper.reset();
                 return new Frame(Source.NONE, false, currentYaw, currentPitch, 0f);
             }
         }

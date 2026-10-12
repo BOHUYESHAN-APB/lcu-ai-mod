@@ -202,7 +202,7 @@ cd backend
 pip install -r requirements.txt
 python -m unittest discover -s tests
 ```
-2026-10-12 实测：**1657 tests OK（零 skip）**。Java 侧零依赖自检是 `check` 里的 **18 个 `verifyXxx` 任务**；逐项与完整验收步骤见 [TEST_TABLE.md](TEST_TABLE.md)。
+2026-10-12 实测：**1733 tests OK（零 skip）**。Java 侧零依赖自检是 `check` 里的 **18 个 `verifyXxx` 任务**（共 **1307 项**）；逐项与完整验收步骤见 [TEST_TABLE.md](TEST_TABLE.md)。
 
 ### 代码结构
 - `ActionExecutor.java` — Java 端动作执行中枢（命令分发 + 各 handler）
