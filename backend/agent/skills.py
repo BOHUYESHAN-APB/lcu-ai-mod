@@ -369,8 +369,12 @@ class Skills:
     # ── Advanced Actions ────────────────────────────────────────
 
     def follow_player(self, player_name: str) -> dict:
-        """Follow a specific player."""
+        """Follow a specific player (长驻跟随：他走我走)."""
         return self._send_cmd("follow_player", {"player": player_name})
+
+    def come_to_player(self, player_name: str) -> dict:
+        """一次性走到该玩家**现在**的位置就结束（「过来/来我这」，非跟随）。"""
+        return self._send_cmd("come_to_player", {"player": player_name})
 
     def craft_item(self, item_name: str, count: int = 1) -> dict:
         """Craft an item by name."""

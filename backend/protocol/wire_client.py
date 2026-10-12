@@ -80,11 +80,70 @@ def is_periodic_event(msg_type: str, label: Any) -> bool:
     return name in PERIODIC_EVENT_NAMES or name.endswith("_state")
 
 
+# ── 周期状态摘要（**只影响打印内容**；指纹仍走完整负载 `event_fingerprint`）──────────
+# 用户实机口径："后端传递了好多坐标位的位置" —— `state_update` 这类负载里 `nearby_blocks`
+# （32 条 × xyz）、`entities`/`players`（× xyz）、`nearby_storage`/`nearby_beds`/
+# `remembered_pois`/`stations`/`routes`… 全带坐标，整包逐字打出来就是满屏坐标。这里把
+# **打印内容**换成紧凑摘要：标量原样（位置/血量/饥饿/维度…），数组只留**条数**，
+# 空间类数组（方块/实体/玩家/站点…）再附**距离最近的一条**作样本。判"变没变"仍用完整负载，
+# 所以"到底变没变"照样能答，"变了什么"看摘要里的关键字段与条数。
+_SAMPLE_LIST_KEYS = frozenset({
+    "nearby_blocks", "nearby_workstations", "nearby_storage", "nearby_beds",
+    "entities", "players", "remembered_pois", "known_containers",
+    "stations", "routes",
+})
+
+
+def _nearest_sample(items: list) -> Any:
+    """数组里距离最近的一条作样本：带 distance 的取最小，否则第一条 dict、再退到首个非 dict。"""
+    best = None
+    best_distance = None
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        distance = item.get("distance")
+        if isinstance(distance, (int, float)):
+            if best is None or distance < best_distance:
+                best, best_distance = item, distance
+        elif best is None:
+            best = item
+    if best is not None:
+        return best
+    for item in items:
+        if not isinstance(item, dict):
+            return item
+    return None
+
+
+def summarize_periodic_payload(payload: Any) -> Any:
+    """周期状态负载的**打印摘要**（不改指纹）：数组 → 条数（空间类附最近一条样本），标量原样。"""
+    if not isinstance(payload, dict):
+        return payload
+    summary: dict[str, Any] = {}
+    for key, value in payload.items():
+        if isinstance(value, list):
+            entry: dict[str, Any] = {"count": len(value)}
+            if key in _SAMPLE_LIST_KEYS:
+                sample = _nearest_sample(value)
+                if sample is not None:
+                    entry["nearest"] = sample
+            summary[key] = entry
+        else:
+            summary[key] = value
+    return summary
+
+
 def format_event_content(obj: dict, limit: int = MAX_LOG_CONTENT_CHARS) -> str:
-    """把事件负载压成单行（紧凑 JSON），用于变化日志里的"新内容"。"""
+    """把事件负载压成单行（紧凑 JSON），用于变化日志里的"新内容"。
+
+    周期状态负载先过 `summarize_periodic_payload` 压成摘要（数组只留条数 + 最近样本），
+    避免"内容一变就打印满屏坐标"；**判变化的指纹仍用完整负载**（`event_fingerprint`），
+    所以灵敏度不减、"到底变没变"照样能答。
+    """
     payload = obj.get("data") if isinstance(obj, dict) else None
     if payload is None:
         payload = obj
+    payload = summarize_periodic_payload(payload)
     try:
         text = json.dumps(payload, ensure_ascii=False, sort_keys=True,
                           separators=(",", ":"), default=str)

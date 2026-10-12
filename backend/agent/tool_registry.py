@@ -143,13 +143,21 @@ def composite_specs() -> tuple[ToolSpec, ...]:
 TOOL_SPECS: tuple[ToolSpec, ...] = (
     # ── move ──
     ToolSpec("move_to", "移动到坐标", "x,y,z", ("move",), "_tool_move_to", job=True),
-    ToolSpec("follow", "跟随玩家", "player", ("move",), "_tool_follow", job=True),
+    ToolSpec("follow", "**只在玩家明确要求跟随**（「跟着我 / 别走开 / 跟我来」）时用：长驻跟住他、"
+                       "他走我走（目标会动）。玩家说「过来 / 来我这」是**一次性**走到他那里 ⇒ 用 "
+                       "come_to_player（或 move_to 到他的坐标），**不要**用 follow",
+             "player", ("move",), "_tool_follow", job=True),
+    ToolSpec("come_to_player", "一次性走到某玩家**现在**站的位置，到了就结束这一次"
+                               "（玩家说「过来 / 来我这」时用它；他之后又走开不跟着他 —— 那是 "
+                               "follow 的事）。到不了也结束，要再走一趟就再叫一次",
+             "player", ("move",), "_tool_come_to_player", job=True),
     ToolSpec("explore", "探索半径", "radius", ("move",), "_tool_explore", job=True),
     ToolSpec("stop", "停止动作", "", ("move",), "_tool_stop"),
     # ── locate ──
     ToolSpec("where_is", "问「某东西在哪」：先调 where_is 拿候选清单（在线玩家/记忆点/站点/"
                          "容器/区域/基地），每条带坐标、距离与来源；再从候选里挑一个用 "
-                         "move_to/go_to_block/follow 过去——「先问位置、挑一个、再过去」的闭环。"
+                         "move_to/go_to_block/come_to_player/follow 过去——「先问位置、挑一个、再过去」的闭环。"
+                         "玩家说「过来」用 come_to_player，长驻跟随才用 follow。"
                          "只答位置：不移动、不扫描、不猜坐标，问不到就如实说不知道"
                          "（kind=auto|player|poi|station|container|zone，默认 auto）",
              "target,kind", ("locate",), "_tool_where_is"),
@@ -157,7 +165,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
                             "（牛/羊/村民/僵尸这类，写英文 cow/villager/zombie 或中文「牛」"
                             "「村民」都行；也能按类别 animal|hostile|item|player|mob），"
                             "每条带坐标、距离与类别——数据只来自 state 快照（我周围约 16 格），"
-                            "要过去就另外调 move_to/go_to_block/follow（我只答，不移动、不扫描、"
+                            "要过去就另外调 move_to/go_to_block/come_to_player/follow（我只答，不移动、不扫描、"
                             "不编坐标）；快照里没有就如实说没有。kind 留空＝把附近实体都列出来",
              "kind,limit", ("locate",), "_tool_find_entity"),
     ToolSpec("find_block", "扫附近有无该方块（只查不走）", "block,radius,limit",

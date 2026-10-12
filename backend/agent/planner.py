@@ -98,6 +98,10 @@ LOCATE_TIMEOUT_SECONDS = 6.0
 # 驻守的默认水平半径（用户口径：如 32 格）。
 GUARD_DEFAULT_RADIUS = 32
 
+# `come_to_player` 是**一次性**动作（走到玩家此刻的位置就结束）：只有"同一格上的紧邻重复请求"
+# 才当重复压掉，隔这么久之后（或玩家挪了位置）再叫一律照发（见 `_tool_come_to_player`）。
+COME_TO_PLAYER_REPEAT_WINDOW = 5.0
+
 ITEM_ALIASES = {
     "木剑": "wooden_sword",
     "木棍": "stick",
@@ -499,6 +503,8 @@ class Planner:
         # 最近一次派发**被哪道门拦下**（"" = 没被门拦；permission/container/resource/backoff）：
         # 只给复合体的"卡在第几步 + code"用（如实转发门的原因，不另造一套判定）。
         self._last_tool_gate: str = ""
+        # `come_to_player` 的"同格紧邻重复"去重记忆：(玩家名@格, 时刻)；一次性动作，只压紧邻重复。
+        self._come_to_player_last: Optional[tuple[str, float]] = None
         # 别人家的田：每次动手（含被拒）都留审计 —— "这谁让他动的"必须能查。
         self._farm_others_audit: list[dict] = []
         # L1 版本键 + 上一次组装的 L0+L1 字符串：键不变就复用**同一份字符串**
@@ -1916,6 +1922,48 @@ class Planner:
             self.skills.follow_player(str(player))
             return True
         return False
+
+    @staticmethod
+    def _player_cell(context: dict, name: str) -> str:
+        """在线玩家快照里某玩家**当前所在格**（"x,y,z"，取整到格）；快照里没有返回 ""。"""
+        players = context.get("players") if isinstance(context, dict) else None
+        if not isinstance(players, list):
+            return ""
+        wanted = str(name or "").strip().lower()
+        for row in players:
+            if not isinstance(row, dict) or str(row.get("name", "")).strip().lower() != wanted:
+                continue
+            coords = [row.get(k) for k in ("x", "y", "z")]
+            if all(isinstance(c, (int, float)) for c in coords):
+                return "{:.0f},{:.0f},{:.0f}".format(*coords)
+            return ""
+        return ""
+
+    def _tool_come_to_player(self, payload: dict, context: dict) -> bool:
+        """一次性走到某玩家**现在**的位置（「过来 / 来我这」）——与长驻的 `follow` 语义不同。
+
+        因此**不**套 `_is_duplicate_task({"follow"})` 那道门：那会把"到不了之后再叫一次"或
+        "先走到 A 又要求走到 B"静默吞掉。这里只压掉**同一格上的紧邻重复请求**——键 = 玩家名 +
+        该玩家**当前所在格**（从 context 的在线玩家快照解析），窗口 `COME_TO_PLAYER_REPEAT_WINDOW`：
+        玩家挪到别处、或隔几秒后重叫，都照发；解析不出目标格时干脆不压（宁可多发，不许吞）。
+        真正的"到没到 / 在不在走"由模组侧按 `come_to_player` 自己收敛。
+        """
+        player = payload.get("player") or payload.get("player_name")
+        if not player or not str(player).strip():
+            return False
+        name = str(player).strip()
+        cell = self._player_cell(context, name)
+        key = f"{name.lower()}@{cell}" if cell else ""
+        now = time.monotonic()
+        last = getattr(self, "_come_to_player_last", None)
+        if key and last and last[0] == key and (now - last[1]) < COME_TO_PLAYER_REPEAT_WINDOW:
+            logger.info("[Planner] come_to_player 同一格紧邻重复（%s @ %s，%.1fs 内）→ 忽略",
+                        name, cell, now - last[1])
+            return False
+        self.skills.come_to_player(name)
+        self._come_to_player_last = (key, now) if key else None
+        logger.info("[Planner] 一次性走到 %s 当前位置", name)
+        return True
 
     def _tool_explore(self, payload: dict, context: dict) -> bool:
         self.skills.explore(int(payload.get("radius", 16)))
