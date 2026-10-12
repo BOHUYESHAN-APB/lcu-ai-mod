@@ -19,6 +19,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from . import anchor
 from . import perception
 from . import where
 from .borrow import BorrowLedger
@@ -1205,9 +1206,26 @@ class Planner:
 
         speaker_line = ""
         if last_speaker.get("name"):
-            where = ""
-            if isinstance(last_speaker.get("x"), (int, float)) and isinstance(last_speaker.get("z"), (int, float)):
-                where = f"，说话时站在 ({float(last_speaker['x']):.0f}, {float(last_speaker.get('y') or 0):.0f}, {float(last_speaker['z']):.0f})"
+            # 锚点 = **他说话那一瞬间站的位置**（用户口径：「来到这里」就去这儿，
+            # 「这附近」就以它为圆心）。有可信时间戳就报"多久之前"并判过期；
+            # 没有时间戳就**只报位置、不编"刚刚"** —— 宁可不说过期，也不假装新鲜。
+            now = time.time()
+            spot = anchor.Anchor.from_speaker(last_speaker, ts=last_speaker.get("time"))
+            where = ""          # 坐标读不出来就什么都不说（宁可只说名字，也不编位置）
+            if spot is not None and spot.is_fresh(now):
+                where = (f"，**他刚说这句话时**站在 {spot.text(now)}"
+                         f" —— 「这里」「这附近」的圆心**就是它**（不是我站的地方）；"
+                         f"要围着他找就先 move_to 过去、再 find_block / scan_entities")
+            elif spot is not None:
+                where = (f"，他上次说话是 {spot.text(now)} —— **已经过期**"
+                         f"（超过 {anchor.MAX_AGE_SECONDS:.0f} 秒没说话，他多半已经走开了），"
+                         f"别把这个旧坐标当成他现在的位置；要找他先 come_to_player / follow")
+            elif isinstance(last_speaker.get("x"), (int, float)) \
+                    and isinstance(last_speaker.get("z"), (int, float)):
+                where = (f"，说话时站在 ({float(last_speaker['x']):.0f}, "
+                         f"{float(last_speaker.get('y') or 0):.0f}, "
+                         f"{float(last_speaker['z']):.0f})（这次没带时间戳，"
+                         f"不知道多久以前，别当成他现在的站位）")
             speaker_line = f"- 最近发话者：{last_speaker['name']}{where}\n"
 
         # L2 的状态块：人设三段已进 L1（system），这里只留**会变**的 state_block，
@@ -1337,7 +1355,11 @@ class Planner:
   背包满了/太远/快消失了就别白跑。）
   （坐标口径：默认只上报**要处理的（威胁）/ 人（玩家）**的位置，其余档位只报计数 ——
   **「摘要里没有」不等于「附近没有」**；需要细节就**按需扫描**（实体 `scan_entities`、
-  方块 `find_block`），别自己把"没报"读成"没有"。）
+  方块 `find_block`），别自己把"没报"读成"没有"。
+  圆心：**「这里 / 这附近」= 用户说那句话时他站的位置**（见上面「最近发话者」那行），
+  **不是我自己站的地方**；而 `find_block` / `scan_entities` 扫的是**我自己周围** ——
+  所以要围着他找，先 `move_to` 到他那个坐标、再扫；他给了明确坐标就按明确坐标来，
+  别拿我自己的位置顶替。）
 
 最近一次按需扫描（`scan_entities` 的回执；摘要里没坐标的档位只能这样拿明细）：
 {scan_text}
