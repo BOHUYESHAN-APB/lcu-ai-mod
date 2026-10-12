@@ -28,8 +28,30 @@ public final class AfkController {
     /** keepalive 单次点头幅度（度）。 */
     public static final float KEEPALIVE_PITCH_DELTA = 1.5f;
 
+    /** 回位尝试上限：用满即**诚实失败**，绝不无限重试、也绝不假装还在回位。 */
+    public static final int MAX_RETURN_ATTEMPTS = 3;
+    /** 两次回位尝试之间的节流（tick）。 */
+    private static final int RETURN_COOLDOWN_TICKS = 20;
+    /** 单次回位尝试"无进展"多久就判失败（tick）：3 秒没靠近就换下一次尝试。 */
+    private static final int RETURN_PROGRESS_TIMEOUT_TICKS = 60;
+    /** 进步判据：drift 至少减少这么多才算"在靠近"（抖动不算）。 */
+    private static final double RETURN_PROGRESS_EPSILON = 0.25;
+
     /** 本 tick 的驻守动作。 */
     public enum Action { HOLD, RETURN }
+
+    /**
+     * 回位状态机的一步（由 {@code ActionExecutor} 每 tick 驱动）。
+     *
+     * <ul>
+     *   <li>{@link #HOLD}：等待（还在导航 / 冷却中 / 尚未超时）；</li>
+     *   <li>{@link #NAVIGATE}：发起一次回位导航（尝试计数 +1）；</li>
+     *   <li>{@link #TIMEOUT}：本次尝试 3 秒无进展 —— 调用方停路，下一轮换新尝试；</li>
+     *   <li>{@link #SETTLED}：已真的停在站点半径内 —— 回位结束；</li>
+     *   <li>{@link #GIVE_UP}：尝试用满 —— 进失败态，原因见 {@link #failureReason()}。</li>
+     * </ul>
+     */
+    public enum ReturnAction { HOLD, NAVIGATE, TIMEOUT, SETTLED, GIVE_UP }
 
     private StationMemory.Station station;
     private boolean keepalive;
@@ -39,6 +61,30 @@ public final class AfkController {
     private boolean returning;
     private int pulses;
     private int lastPulseTick;
+    // ── 回位重试状态（纯逻辑，可自检；不再由 ActionExecutor 的“是否在导航”清零）──
+    private boolean returnStarted;
+    private int returnAttempts;
+    private int returnCooldown;
+    private int returnDeadline;
+    private double returnBestDrift;
+    private boolean failed;
+    private String failureReason = "";
+
+    /**
+     * 驻守（AFK）到点的**到达盒半宽**（XZ 每轴），传给
+     * {@code Pathfinder.navigateTo(..., reachXz)}。
+     *
+     * <p>缺陷：Pathfinder 默认盒每轴 0.62 ⇒ 最差水平漂移 {@code 0.62×√2≈0.877}，大于
+     * {@code StationMemory.MIN_RADIUS}（0.5）⇒ 半径 &lt; 0.88 时 Pathfinder 报"到达"，
+     * 而驻守状态机眼里还在半径外 ⇒"报在回位却一步不动"。
+     *
+     * <p>修法（**按站点收缩**，不动全局默认盒）：取 {@code radius/√2} ⇒ 到达盒内任一点的
+     * 水平漂移都 ≤ {@code radius} ⇒ Pathfinder 一报到达，{@link #settleIfWithinRadius()}
+     * 就能诚实地收尾。大半径不设上限：半径 16 的站点本来就允许离得远。
+     */
+    public static double arrivalReachXz(double radius) {
+        return radius / Math.sqrt(2.0);
+    }
 
     /** 开始驻守。station 为 null 则拒绝（保持停用）。 */
     public boolean begin(StationMemory.Station station, boolean keepalive) {
@@ -53,6 +99,7 @@ public final class AfkController {
         this.returning = false;
         this.pulses = 0;
         this.lastPulseTick = 0;
+        resetReturnCycle();
         return true;
     }
 
@@ -65,6 +112,18 @@ public final class AfkController {
         returning = false;
         pulses = 0;
         lastPulseTick = 0;
+        resetReturnCycle();
+    }
+
+    /** 回位回合归零：新一次漂移越界从零额度开始（失败态也一并清掉）。 */
+    private void resetReturnCycle() {
+        returnStarted = false;
+        returnAttempts = 0;
+        returnCooldown = 0;
+        returnDeadline = 0;
+        returnBestDrift = 0.0;
+        failed = false;
+        failureReason = "";
     }
 
     public boolean isActive() {
@@ -98,12 +157,100 @@ public final class AfkController {
         return returning;
     }
 
+    /** 本回合已发起的回位尝试次数。 */
+    public int returnAttempts() {
+        return returnAttempts;
+    }
+
+    /** 回位额度用尽（进失败态）。 */
+    public boolean failed() {
+        return failed;
+    }
+
+    /** 失败原因（未失败为空串；失败后**非空**，供 state.afk 如实上报）。 */
+    public String failureReason() {
+        return failureReason;
+    }
+
     public boolean keepaliveEnabled() {
         return keepalive;
     }
 
     public int pulses() {
         return pulses;
+    }
+
+    /**
+     * 导航器报到达后的收尾：确实停在站点半径内就结束回位。
+     *
+     * <p>为什么不能只靠 {@link #tick} 的滞回（{@code radius × 0.5}）：路径节点是**格心**
+     * （见 {@code Pathfinder.StandingNode.standingPos}），站点记的是玩家当时的精确位姿，
+     * 两者可能差半个方块 —— 走到节点后 drift 落在 {@code (radius×0.5, radius]} 时滞回永不满足，
+     * 于是"报在回位却一步不动"。这里以"物理上已经在半径内"为诚实口径收尾，
+     * 并由 {@link #arrivalReachXz(double)} 保证"报到达 ⇒ 在半径内"。
+     */
+    public boolean settleIfWithinRadius() {
+        if (!returning || station == null || drift > station.radius()) {
+            return false;
+        }
+        returning = false;
+        resetReturnCycle();
+        return true;
+    }
+
+    /**
+     * 回位状态机推进（纯逻辑，每 tick 调用一次，只在 {@link #returning()} 为真时有意义）。
+     *
+     * <p>修复的缺陷：旧实现把尝试计数放在 {@code ActionExecutor}，且"只要 Pathfinder 在导航就
+     * 清零"⇒ 一旦导航永远不报到达（路径节点达不到精确站点位姿），计数永远归零、永不收尾。
+     * 现在计数归 AfkController 所有：导航中**不清零**，只按"3 秒无进展"判本次失败，额度用满
+     * 即 {@link ReturnAction#GIVE_UP}（失败态 + 非空原因）。
+     *
+     * @param navigating         Pathfinder 当前是否在走回
+     * @param lastFailureReason  Pathfinder 最近一次失败原因（可为空）
+     */
+    public ReturnAction advanceReturn(boolean navigating, String lastFailureReason) {
+        if (!returning || station == null) {
+            return ReturnAction.HOLD;
+        }
+        if (failed) {
+            return ReturnAction.GIVE_UP;
+        }
+        if (!navigating && drift <= station.radius()) {
+            settleIfWithinRadius();
+            return ReturnAction.SETTLED;
+        }
+        if (!returnStarted) {
+            // 第一次调用：本次回位（可能是 go_afk 已经发起的导航）算作第 1 次尝试。
+            returnStarted = true;
+            returnAttempts = 1;
+            returnCooldown = 0;
+            returnBestDrift = drift;
+            returnDeadline = sinceTicks + RETURN_PROGRESS_TIMEOUT_TICKS;
+            return navigating ? ReturnAction.HOLD : ReturnAction.NAVIGATE;
+        }
+        if (navigating) {
+            if (drift < returnBestDrift - RETURN_PROGRESS_EPSILON) {
+                returnBestDrift = drift;
+                returnDeadline = sinceTicks + RETURN_PROGRESS_TIMEOUT_TICKS;
+            }
+            return sinceTicks >= returnDeadline ? ReturnAction.TIMEOUT : ReturnAction.HOLD;
+        }
+        if (returnCooldown > 0) {
+            returnCooldown--;
+            return ReturnAction.HOLD;
+        }
+        if (returnAttempts >= MAX_RETURN_ATTEMPTS) {
+            failed = true;
+            failureReason = "cannot return to station: "
+                    + (lastFailureReason == null || lastFailureReason.isBlank() ? "no path" : lastFailureReason);
+            return ReturnAction.GIVE_UP;
+        }
+        returnAttempts++;
+        returnCooldown = RETURN_COOLDOWN_TICKS;
+        returnBestDrift = drift;
+        returnDeadline = sinceTicks + RETURN_PROGRESS_TIMEOUT_TICKS;
+        return ReturnAction.NAVIGATE;
     }
 
     /**
@@ -118,8 +265,10 @@ public final class AfkController {
 
         if (!returning && drift > station.radius()) {
             returning = true;
+            resetReturnCycle();
         } else if (returning && drift <= station.radius() * RETURN_HYSTERESIS) {
             returning = false;
+            resetReturnCycle();
         }
         return returning ? Action.RETURN : Action.HOLD;
     }

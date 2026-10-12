@@ -60,6 +60,12 @@ public class Pathfinder {
     private static final double HEADROOM_CAP = 4.0;
     private static final double WAYPOINT_REACH_XZ = 0.62;
     private static final double WAYPOINT_REACH_Y = 0.9;
+    /**
+     * 当前导航的**到达盒**半宽（XZ 每轴）：默认 {@link #WAYPOINT_REACH_XZ}；驻守（AFK）用
+     * {@code AfkController.arrivalReachXz(double)} 收缩它。路点间推进仍用默认盒 —— 只有**最终目标**的到达判定
+     * 走这个值（见 {@link #isAtDestination}）。
+     */
+    private static double activeReachXz = WAYPOINT_REACH_XZ;
     /** 前视（look-ahead）距离：距离越远看得越远 ⇒ 拐角走弧线而不是"到点才急转"。 */
     private static final double LOOK_AHEAD_MIN = 2.0;
     private static final double LOOK_AHEAD_MAX = 6.0;
@@ -131,6 +137,17 @@ public class Pathfinder {
     private static Vec3 detourPoint = null;
 
     public static boolean navigateTo(String requestId, double x, double y, double z) {
+        return navigateTo(requestId, x, y, z, WAYPOINT_REACH_XZ);
+    }
+
+    /**
+     * 带自定义**到达盒**（XZ 每轴半宽）的导航。
+     *
+     * <p>净化场景：驻守（{@code go_afk}）要求"Pathfinder 一报到达，就确实落在站点半径内"，
+     * 否则会出现"报在回位却一步不动"（见 {@code AfkController.arrivalReachXz(double)}）。
+     */
+    public static boolean navigateTo(String requestId, double x, double y, double z, double reachXz) {
+        activeReachXz = reachXz > 0.0 && !Double.isNaN(reachXz) ? reachXz : WAYPOINT_REACH_XZ;
         targetPos = new Vec3(x, y, z);
         currentPath.clear();
         currentPathIndex = 0;
@@ -308,6 +325,7 @@ public class Pathfinder {
         isNavigating = false;
         lastPosition = null;
         stuckTicks = 0;
+        activeReachXz = WAYPOINT_REACH_XZ;
         // 收工：绕行点/绕行额度一起清（下一段导航是新回合）。
         detourPoint = null;
         DETOUR.reset();
@@ -333,7 +351,7 @@ public class Pathfinder {
         }
 
         Vec3 playerPos = mc.player.position();
-        if (isReached(playerPos, targetPos)) {
+        if (isAtDestination(playerPos, targetPos)) {
             reportProgress(1.0, "arrived");
             stop();
             return;
@@ -1212,6 +1230,15 @@ public class Pathfinder {
     private static boolean isReached(Vec3 current, Vec3 target) {
         return Math.abs(current.x - target.x) <= WAYPOINT_REACH_XZ
             && Math.abs(current.z - target.z) <= WAYPOINT_REACH_XZ
+            && Math.abs(current.y - target.y) <= WAYPOINT_REACH_Y;
+    }
+
+    /**
+     * 最终目标的到达判定：用**当前导航的到达盒**（驻守会收缩它）；路点间推进仍用默认盒。
+     */
+    private static boolean isAtDestination(Vec3 current, Vec3 target) {
+        return Math.abs(current.x - target.x) <= activeReachXz
+            && Math.abs(current.z - target.z) <= activeReachXz
             && Math.abs(current.y - target.y) <= WAYPOINT_REACH_Y;
     }
 

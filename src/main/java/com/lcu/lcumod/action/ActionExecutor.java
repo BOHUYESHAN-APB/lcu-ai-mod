@@ -154,10 +154,6 @@ public class ActionExecutor {
 
     // ── 站点驻守（go_afk / afk_stop）：到站点后在半径内"钉住"，被撞出去自己走回 ──
     private static final AfkController AFK = new AfkController();
-    /** 走回站点的重试节流与尝试计数（连不上就诚实失败，不假装还在驻守）。 */
-    private static int afkReturnCooldown = 0;
-    private static int afkReturnAttempts = 0;
-    private static final int AFK_MAX_RETURN_ATTEMPTS = 3;
 
     // ── 路径记忆与重放（route_record_start/stop、route_follow）──
     /** 现场压缩器；非 null 即"正在记录实际走过的路"。 */
@@ -1556,8 +1552,6 @@ public class ActionExecutor {
         abortPendingPlace();
         // 驻守 / 重放 / 记录：stop_all 一视同仁全部停下（记录直接丢弃，不留下半条线）
         AFK.stop();
-        afkReturnAttempts = 0;
-        afkReturnCooldown = 0;
         ROUTE.reset();
         resetRouteStall();
         routeRecorder = null;
@@ -2572,10 +2566,10 @@ public class ActionExecutor {
         // guard 也是"占住身体"的驻守：go_afk 接管后旧守卫点必须让位，否则两个驻守会互相抢控制
         guardPoint = null;
         AFK.begin(station, keepalive);
-        afkReturnCooldown = 0;
-        afkReturnAttempts = 0;
         double distance = station.distanceTo(mc.player.getX(), mc.player.getY(), mc.player.getZ());
-        Pathfinder.navigateTo(cmd.id(), station.x(), station.y(), station.z());
+        // 驻守用**收缩后的到达盒**：保证 Pathfinder 一报到达，漂移就已落在站点半径内
+        Pathfinder.navigateTo(cmd.id(), station.x(), station.y(), station.z(),
+                AfkController.arrivalReachXz(station.radius()));
         setTaskState("afk", "running", name,
                 keepalive ? "heading to station (keepalive)" : "heading to station", 0.1);
         StateCollector.requestRefresh();
@@ -2593,8 +2587,6 @@ public class ActionExecutor {
         String name = AFK.stationName();
         if (wasActive) {
             AFK.stop();
-            afkReturnAttempts = 0;
-            afkReturnCooldown = 0;
             Pathfinder.stop();
             setTaskState("afk", "cancelled", name, "afk stopped", 0.0);
             StateCollector.requestRefresh();
@@ -2798,36 +2790,50 @@ public class ActionExecutor {
         boolean returning = AFK.tick(mc.player.getX(), mc.player.getZ()) == AfkController.Action.RETURN;
 
         if (returning) {
-            if (Pathfinder.isNavigating()) {
-                afkReturnAttempts = 0; // 正在走回，别打断
-                return;
+            // 回位重试的账本在 AfkController 里（纯逻辑）：导航中**不清零**，
+            // 只按"3 秒无进展"判本次失败，额度用满就诚实失败 —— 绝不无限重试、绝不假装还在回位。
+            AfkController.ReturnAction act =
+                    AFK.advanceReturn(Pathfinder.isNavigating(), Pathfinder.getLastFailureReason());
+            switch (act) {
+                case NAVIGATE -> {
+                    Pathfinder.navigateTo("go_afk", station.x(), station.y(), station.z(),
+                            AfkController.arrivalReachXz(station.radius()));
+                    setTaskState("afk", "running", station.name(),
+                            "returning to station (drift " + round1(AFK.drift()) + "m, attempt "
+                                    + AFK.returnAttempts() + "/" + AfkController.MAX_RETURN_ATTEMPTS + ")", 0.5);
+                    StateCollector.requestRefresh();
+                    return;
+                }
+                case TIMEOUT -> {
+                    // 本 tick 无进展：停路，下一轮换一次新尝试（计数不归零）。
+                    Pathfinder.stop();
+                    LCUMod.LOGGER.warn("[AFK] 回位 3s 无进展，停路重试 {}/{}：{}",
+                            AFK.returnAttempts(), AfkController.MAX_RETURN_ATTEMPTS, station.name());
+                    return;
+                }
+                case GIVE_UP -> {
+                    String why = AFK.failureReason();
+                    setTaskState("afk", "failed", station.name(), why, 0.0);
+                    Pathfinder.stop();
+                    AFK.stop();
+                    StateCollector.requestRefresh();
+                    LCUMod.LOGGER.warn("[AFK] 回不去站点 {}，已诚实停止驻守（{}）", station.name(), why);
+                    return;
+                }
+                case SETTLED -> {
+                    setTaskState("afk", "running", station.name(),
+                            "holding station r=" + round1(station.radius()), 1.0);
+                    StateCollector.requestRefresh();
+                }
+                case HOLD -> {
+                    return;
+                }
             }
-            if (afkReturnCooldown-- > 0) {
-                return;
-            }
-            afkReturnCooldown = 20;
-            afkReturnAttempts++;
-            if (afkReturnAttempts > AFK_MAX_RETURN_ATTEMPTS) {
-                String why = Pathfinder.getLastFailureReason();
-                setTaskState("afk", "failed", station.name(),
-                        "cannot return to station: " + (why == null || why.isBlank() ? "no path" : why), 0.0);
-                Pathfinder.stop();
-                AFK.stop();
-                StateCollector.requestRefresh();
-                LCUMod.LOGGER.warn("[AFK] 回不去站点 {}，已诚实停止驻守", station.name());
-                return;
-            }
-            Pathfinder.navigateTo("go_afk", station.x(), station.y(), station.z());
-            setTaskState("afk", "running", station.name(),
-                    "returning to station (drift " + round1(AFK.drift()) + "m)", 0.5);
-            StateCollector.requestRefresh();
-            return;
         }
 
         // 站定：第一次到达时停寻路；然后保持站点朝向 + 按需 keepalive（绝不写移动键）
         if (Pathfinder.isNavigating()) {
             Pathfinder.stop();
-            afkReturnAttempts = 0;
             setTaskState("afk", "running", station.name(),
                     "holding station r=" + round1(station.radius()), 1.0);
             StateCollector.requestRefresh();
@@ -2931,8 +2937,6 @@ public class ActionExecutor {
         }
         String name = AFK.stationName();
         AFK.stop();
-        afkReturnAttempts = 0;
-        afkReturnCooldown = 0;
         LCUMod.LOGGER.info("[AFK] 停止驻守 {}（{}）", name, reason);
     }
 
@@ -3331,6 +3335,14 @@ public class ActionExecutor {
         int z = args != null && args.has("z") ? args.get("z").getAsInt() : base.getZ();
         int radius = args != null && args.has("radius")
                 ? Math.max(4, Math.min(args.get("radius").getAsInt(), 128)) : 32;
+        // 驻守互斥：guard 与 go_afk 都是"占住身体"的驻守，共用同一个 Pathfinder。
+        // 进 guard 前必须把 AFK 停掉，否则两个驻守互相抢控制、行为不可预测。
+        // （反向由 handleGoAfk 的 guardPoint = null 保证 —— 两条路互为唯一入口。）
+        if (AFK.isActive()) {
+            String afkName = AFK.stationName();
+            afkStopQuiet("guard takeover");
+            setTaskState("afk", "cancelled", afkName, "guard takeover", 0.0);
+        }
         guardPoint = new BlockPos(x, y, z);
         guardRadius = radius;
         guardCheckCooldown = 0;

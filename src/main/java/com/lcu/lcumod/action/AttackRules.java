@@ -39,10 +39,11 @@ public final class AttackRules {
     private AttackRules() {
     }
 
-    /** 出手判定结果（顺序即优先级：先没有目标，再死/远/挡，最后误伤）。 */
+    /** 出手判定结果（顺序即优先级：先没有目标，再**目标是玩家**，再死/挡/远，最后误伤）。 */
     public enum Verdict {
         OK,
         NO_TARGET,
+        PLAYER_TARGET,
         DEAD_OR_OTHER_LEVEL,
         WEAPON_BANNED,
         TOO_FAR,
@@ -77,50 +78,72 @@ public final class AttackRules {
     /** 完整判定（含原因），调用点据此如实上报。 */
     public static Verdict check(Minecraft mc, Entity target) {
         if (mc == null || mc.player == null || mc.level == null || target == null) {
-            return Verdict.NO_TARGET;
+            return decide(false, false, false, false, false, false, false, false);
         }
         var player = mc.player;
-        if (!target.isAlive() || target.level() != player.level()) {
-            return Verdict.DEAD_OR_OTHER_LEVEL;
-        }
-
         String held = heldWeaponId(player);
-        if (WeaponPolicy.isBanned(held)) {
-            // 重锤 / 矛：AI 一律不许用它们出手（用户口径：误伤更严重）。
-            return Verdict.WEAPON_BANNED;
-        }
-
-        double distance = player.distanceTo(target);
-        if (distance > REACH) {
-            return Verdict.TOO_FAR;
-        }
 
         // 视线：从眼睛射向目标**身体中心**；射线先撞到方块（比目标更近）就是被挡住了 ⇒ 不许挥。
         Vec3 eye = player.getEyePosition();
         Vec3 aim = target.getBoundingBox().getCenter();
         HitResult hit = mc.level.clip(new ClipContext(eye, aim,
                 ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, player));
-        if (hit.getType() == HitResult.Type.BLOCK) {
-            double blockedAt = hit.getLocation().distanceTo(eye);
-            if (blockedAt < eye.distanceTo(aim) - 0.15) {
-                return Verdict.NO_LINE_OF_SIGHT;
-            }
-        }
+        boolean blocked = hit.getType() == HitResult.Type.BLOCK
+                && hit.getLocation().distanceTo(eye) < eye.distanceTo(aim) - 0.15;
 
-        // 误伤：横扫范围里有别的玩家（不是自己、也不是目标）⇒ 不出手。
+        // 误伤：横扫范围里有别的玩家（不是自己、也不是目标）⇒ 不出手（不触发横扫的武器才放行）。
+        boolean playerNearby = false;
         for (Player other : mc.level.players()) {
             if (other == player || other == target) {
                 continue;
             }
             if (other.distanceTo(player) <= SWEEP_PLAYER_CLEARANCE) {
-                // 旁边有人：只有"不触发横扫"的武器（斧子/空手）才放行（用户口径："可以用斧子"）。
-                if (!WeaponPolicy.isSweepSafe(held)) {
-                    return Verdict.PLAYER_TOO_CLOSE;
-                }
+                playerNearby = true;
                 break;
             }
         }
 
+        return decide(true,
+                target instanceof Player,
+                target.isAlive() && target.level() == player.level(),
+                WeaponPolicy.isBanned(held),
+                player.distanceTo(target) <= REACH,
+                blocked,
+                playerNearby,
+                WeaponPolicy.isSweepSafe(held));
+    }
+
+    /**
+     * 判定顺序的**纯逻辑内核**（零 Minecraft 依赖 ⇒ {@code verifyWalk} 直接断言）。
+     *
+     * <p>顺序 = 没有目标 → **目标是玩家**（用户口径："AI 不许打玩家"，2026-10 修：旧实现只在
+     * 横扫循环里跳过 {@code target}，于是目标本身是玩家时不被拦）→ 死/异界 → 禁用武器 →
+     * 够不着 → 视线被挡 → 旁边有玩家（只放行斧/空手）→ OK。
+     */
+    public static Verdict decide(boolean hasTarget, boolean targetIsPlayer, boolean aliveSameLevel,
+                                 boolean weaponBanned, boolean withinReach, boolean blocked,
+                                 boolean playerNearby, boolean sweepSafeWeapon) {
+        if (!hasTarget) {
+            return Verdict.NO_TARGET;
+        }
+        if (targetIsPlayer) {
+            return Verdict.PLAYER_TARGET;
+        }
+        if (!aliveSameLevel) {
+            return Verdict.DEAD_OR_OTHER_LEVEL;
+        }
+        if (weaponBanned) {
+            return Verdict.WEAPON_BANNED;
+        }
+        if (!withinReach) {
+            return Verdict.TOO_FAR;
+        }
+        if (blocked) {
+            return Verdict.NO_LINE_OF_SIGHT;
+        }
+        if (playerNearby && !sweepSafeWeapon) {
+            return Verdict.PLAYER_TOO_CLOSE;
+        }
         return Verdict.OK;
     }
 

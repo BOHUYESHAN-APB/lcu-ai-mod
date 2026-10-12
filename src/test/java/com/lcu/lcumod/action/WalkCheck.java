@@ -62,6 +62,7 @@ public final class WalkCheck {
         entityScanChecks();
         wireTokenArmedChecks();
         dropChannelChecks();
+        stationHoldChecks();
 
         System.out.println("[WalkCheck] " + passed + " checks passed, " + failed + " failed");
         if (failed > 0) {
@@ -2025,6 +2026,187 @@ public final class WalkCheck {
                         && !ae.substring(pureStart, pureEnd).contains("net.minecraft"));
     }
 
+    /**
+     * 站点驻守四缺陷的纯逻辑钉子：
+     * <ol>
+     *   <li>到达盒按站点收缩：Pathfinder 报到达 ⇒ 水平漂移 ≤ radius（半径 0.5 不再"报在回位却不动"）；</li>
+     *   <li>回位尝试计数归 AfkController 所有，导航中不清零，3 秒无进展算一次失败，额度用满诚实失败；</li>
+     *   <li>guard 与 AFK 互斥（静态扫描钉住两处互相清对方）；</li>
+     *   <li>出手判定：目标是玩家直接拒（{@code player_target}），旁边有玩家只放行斧/空手。</li>
+     * </ol>
+     */
+    private static void stationHoldChecks() {
+        // ── ① 到达盒矩阵：arrivalReachXz(r) × √2 ≤ r ⇒ 报到达时一定落在半径内 ──
+        double[] radii = {0.5, 0.8, 1.0, 1.5, 4.0, 16.0};
+        boolean boxFits = true;
+        boolean boxPositive = true;
+        for (double r : radii) {
+            double reach = AfkController.arrivalReachXz(r);
+            if (reach <= 0.0) {
+                boxPositive = false;
+            }
+            // 到达盒每轴半宽 reach ⇒ 最差水平漂移 = reach × √2；必须 ≤ 半径。
+            if (reach * Math.sqrt(2.0) > r + 1.0e-9) {
+                boxFits = false;
+            }
+        }
+        check("afk/box: every station radius gets a positive arrival box", boxPositive);
+        check("afk/box: declaring arrival implies drift <= radius (all radii)", boxFits);
+        check("afk/box: box shrinks with the radius (0.5 tighter than 4.0)",
+                AfkController.arrivalReachXz(0.5) < AfkController.arrivalReachXz(4.0));
+        check("afk/box: radius 0.5 box is tighter than the default waypoint box (0.62)",
+                AfkController.arrivalReachXz(0.5) < 0.62);
+        // 默认路点盒没被全局改小（普通寻路手感不变）。
+        String pfSrc = read(Path.of("src", "main", "java", "com", "lcu", "lcumod", "action", "Pathfinder.java"));
+        check("afk/box: the default waypoint reach is untouched (0.62 / 0.9)",
+                pfSrc.contains("WAYPOINT_REACH_XZ = 0.62") && pfSrc.contains("WAYPOINT_REACH_Y = 0.9"));
+
+        // ── ② 半径 0.5：不再"报在回位却一步不动"（能推进或如实失败）──
+        AfkController half = new AfkController();
+        half.begin(station("tower", 0, 64, 0, 0.5), false);
+        check("afk/r0.5: inside radius holds", half.tick(0.3, 0) == AfkController.Action.HOLD);
+        check("afk/r0.5: drift 0.7 > 0.5 asks to return", half.tick(0.7, 0) == AfkController.Action.RETURN);
+        check("afk/r0.5: walking back to 0.4 is still a return",
+                half.tick(0.4, 0) == AfkController.Action.RETURN && half.returning());
+        check("afk/r0.5: navigator arrival at drift 0.4 settles honestly",
+                half.advanceReturn(false, "") == AfkController.ReturnAction.SETTLED
+                        && !half.returning() && half.atTarget());
+
+        // ── ②(b) drift/radius 取值矩阵：判据必须"能推进"或"如实失败"，不能卡住还说在回位 ──
+        double[] drifts = {0.0, 0.2, 0.3, 0.49, 0.5, 0.6, 0.9, 1.2, 1.5, 5.0, 20.0};
+        boolean thresholdOk = true;
+        boolean canFinish = true;
+        for (double r : radii) {
+            for (double d : drifts) {
+                AfkController a = new AfkController();
+                a.begin(station("m", 0, 64, 0, r), false);
+                boolean ret = a.tick(d, 0) == AfkController.Action.RETURN;
+                if (ret != (d > r)) {
+                    thresholdOk = false;
+                }
+                if (ret) {
+                    // 回到站点中心 ⇒ 滞回带内必停（能推进）。
+                    a.tick(0.0, 0);
+                    if (a.returning()) {
+                        canFinish = false;
+                    }
+                }
+            }
+        }
+        check("afk/matrix: return is asked iff drift > radius (every radius/drift cell)", thresholdOk);
+        check("afk/matrix: every returning cell can finish (hysteresis stop)", canFinish);
+
+        // ── ②(c) 半径 1.0 被推出 1.5：发起回位，回到 radius*0.5 停（滞回不抖）──
+        AfkController pushed = new AfkController();
+        pushed.begin(station("tower", 0, 64, 0, 1.0), false);
+        check("afk: pushed to 1.5 starts a return", pushed.tick(1.5, 0) == AfkController.Action.RETURN);
+        check("afk: still returning at drift 0.8 (inside hysteresis band)",
+                pushed.tick(0.8, 0) == AfkController.Action.RETURN);
+        check("afk: holds once drift <= radius*0.5 (hysteresis, no jitter)",
+                pushed.tick(0.4, 0) == AfkController.Action.HOLD && !pushed.returning());
+
+        // ── ②(d) 3 次尝试用满 ⇒ 失败态 + 原因非空；导航中计数不清零、绝不无限重试 ──
+        AfkController mid = new AfkController();
+        mid.begin(station("tower", 0, 64, 0, 1.0), false);
+        mid.tick(5.0, 0);
+        check("afk/retry: the first return issues a navigation and counts attempt 1",
+                mid.advanceReturn(false, "") == AfkController.ReturnAction.NAVIGATE
+                        && mid.returnAttempts() == 1);
+        boolean heldWhileWalking = true;
+        for (int i = 0; i < 10; i++) {
+            mid.tick(5.0, 0);
+            if (mid.advanceReturn(true, "") != AfkController.ReturnAction.HOLD
+                    || mid.returnAttempts() != 1) {
+                heldWhileWalking = false;
+            }
+        }
+        check("afk/retry: while navigating the attempt count is NOT reset", heldWhileWalking);
+
+        AfkController stuck = new AfkController();
+        stuck.begin(station("tower", 0, 64, 0, 1.0), false);
+        boolean navigating = false;
+        int navigations = 0;
+        boolean gaveUp = false;
+        int loopTicks = 0;
+        for (; loopTicks < 5000 && !gaveUp; loopTicks++) {
+            stuck.tick(5.0, 0); // 位置一直不动（drift 恒 5）
+            switch (stuck.advanceReturn(navigating, "")) {
+                case NAVIGATE -> {
+                    navigations++;
+                    navigating = true;
+                }
+                case TIMEOUT -> navigating = false;
+                case GIVE_UP -> gaveUp = true;
+                default -> {
+                }
+            }
+        }
+        check("afk/retry: exactly MAX_RETURN_ATTEMPTS navigations, then give up",
+                gaveUp && navigations == AfkController.MAX_RETURN_ATTEMPTS);
+        check("afk/retry: the state machine terminates (no infinite retry)", loopTicks < 5000);
+        check("afk/retry: failed state carries a non-empty reason",
+                stuck.failed() && !stuck.failureReason().isBlank());
+
+        // ── ③ guard / AFK 互斥（静态扫描：两条路互为唯一入口，各自清掉对方）──
+        String aeSrc = codeOnly(read(Path.of("src", "main", "java", "com", "lcu", "lcumod", "action",
+                "ActionExecutor.java")));
+        String guardBody = methodBody(aeSrc, "private void handleGuard(WireServer.WireCommand cmd)");
+        String afkBody = methodBody(aeSrc, "private void handleGoAfk(WireServer.WireCommand cmd)");
+        String afkTickBody = methodBody(aeSrc, "private void tickAfk(Minecraft mc)");
+        check("guard/afk: handleGuard found", !guardBody.isEmpty());
+        check("guard/afk: handleGoAfk found", !afkBody.isEmpty());
+        check("guard/afk: entering guard stops AFK (mutual exclusion)",
+                guardBody.contains("AFK.isActive()") && guardBody.contains("afkStopQuiet("));
+        check("guard/afk: entering AFK clears the guard post (mutual exclusion)",
+                afkBody.contains("guardPoint = null"));
+        check("guard/afk: AFK navigation uses the shrunken arrival box",
+                countOf(aeSrc, "AfkController.arrivalReachXz(station.radius())") >= 2);
+        check("guard/afk: returning drives the pure retry state machine",
+                afkTickBody.contains("advanceReturn("));
+        AfkController gone = new AfkController();
+        gone.begin(station("tower", 0, 64, 0, 1.0), false);
+        gone.tick(5.0, 0);
+        gone.stop();
+        check("guard/afk: a stopped AFK controller issues nothing (yields the Pathfinder)",
+                !gone.isActive()
+                        && gone.advanceReturn(false, "") == AfkController.ReturnAction.HOLD);
+
+        // ── ④ 出手判定顺序：目标是玩家直接拒；旁边有玩家只放行斧/空手 ──
+        // AttackRules 引用 Minecraft 类型（Player/Entity），零依赖 JVM 里加载不了，
+        // 故沿用本文件既有做法：对**纯逻辑内核** decide() 做源码钉（顺序 + 零依赖 + 入口传参）。
+        String attackSrc = codeOnly(read(Path.of("src", "main", "java", "com", "lcu", "lcumod", "action",
+                "AttackRules.java")));
+        String decideBody = methodBody(attackSrc, "public static Verdict decide(");
+        String checkBody = methodBody(attackSrc, "public static Verdict check(Minecraft mc, Entity target)");
+        check("attack/pure: the ordering kernel decide() exists", !decideBody.isEmpty());
+        check("attack/pure: the kernel is zero Minecraft dependency", !decideBody.contains("net.minecraft"));
+        check("attack/pure: a player target is refused (PLAYER_TARGET)",
+                decideBody.contains("if (targetIsPlayer)") && decideBody.contains("return Verdict.PLAYER_TARGET;"));
+        check("attack/pure: the player-target code is machine readable",
+                attackSrc.contains("PLAYER_TARGET") && attackSrc.contains("return name().toLowerCase()"));
+        int iTarget = decideBody.indexOf("Verdict.PLAYER_TARGET");
+        int iDead = decideBody.indexOf("Verdict.DEAD_OR_OTHER_LEVEL");
+        int iBanned = decideBody.indexOf("Verdict.WEAPON_BANNED");
+        int iFar = decideBody.indexOf("Verdict.TOO_FAR");
+        int iLos = decideBody.indexOf("Verdict.NO_LINE_OF_SIGHT");
+        int iNear = decideBody.indexOf("Verdict.PLAYER_TOO_CLOSE");
+        check("attack/pure: no-target first, player-target second (order pinned)",
+                decideBody.indexOf("Verdict.NO_TARGET") >= 0
+                        && decideBody.indexOf("Verdict.NO_TARGET") < iTarget && iTarget < iDead);
+        check("attack/pure: player target outranks dead/banned/reach/los/sweep",
+                iTarget < iDead && iTarget < iBanned && iTarget < iFar && iTarget < iLos && iTarget < iNear);
+        check("attack/pure: dead / other level is refused", decideBody.contains("if (!aliveSameLevel)"));
+        check("attack/pure: banned weapons are refused", decideBody.contains("if (weaponBanned)"));
+        check("attack/pure: out of reach is refused", decideBody.contains("if (!withinReach)"));
+        check("attack/pure: blocked line of sight is refused", decideBody.contains("if (blocked)"));
+        check("attack/pure: a nearby player only blocks non-sweep-safe weapons",
+                decideBody.contains("if (playerNearby && !sweepSafeWeapon)"));
+        check("attack/pure: check() feeds target instanceof Player into the kernel",
+                checkBody.contains("target instanceof Player"));
+        check("attack/pure: check() delegates every verdict to decide()",
+                checkBody.contains("return decide(true,") && checkBody.contains("return decide(false,"));
+    }
+
     /** 去掉 {@code //} 行注释与块注释：静态扫描只看代码。 */
     private static String codeOnly(String source) {
         StringBuilder out = new StringBuilder(source.length());
@@ -2106,6 +2288,10 @@ public final class WalkCheck {
         } catch (IllegalArgumentException ex) {
             return true;
         }
+    }
+
+    private static StationMemory.Station station(String name, double x, double y, double z, double radius) {
+        return new StationMemory.Station(name, "mob_farm", x, y, z, 0f, 0f, radius, 0);
     }
 
     private static void check(String name, boolean ok) {
