@@ -72,6 +72,11 @@ DEFAULT_REQUEST_TIMEOUT = 120.0
 ROLE_TIMEOUT_CONFIG_KEYS: dict[str, str] = {"gate": "semantic_gate"}
 
 
+# 用量**明细**（每请求一条）在内存里的上限：长期跑的后端不许在这里无界累积。
+# 累计 token / 累计请求数另有独立计数器 ⇒ 截断明细**不影响**用量账（见 `get_usage`）。
+USAGE_HISTORY_LIMIT = 500
+
+
 class LLMService:
     """
     Lightweight LLM API client.
@@ -98,9 +103,10 @@ class LLMService:
         self._system_key: Optional[str] = None
         self._system_cache: str = ""
 
-        # Token tracking
+        # Token tracking：累计量是**计数器**（无界增长的是数值，不是内存）；明细列表**有上限**。
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
+        self._request_count = 0
         self._usage_history: list[dict] = []
 
     # ── 按角色读超时 ──
@@ -530,14 +536,23 @@ class LLMService:
         if pt or ct:
             self.total_prompt_tokens += pt
             self.total_completion_tokens += ct
+            self._request_count += 1
             self._usage_history.append({"time": time.time(), "prompt": pt, "completion": ct})
+            # **有界**：只留最近 `USAGE_HISTORY_LIMIT` 条明细（长期跑的后端不许在这里无界累积）。
+            # 累计量（`total_*` / `request_count`）是独立的计数器，**不受**截断影响 ——
+            # `/api/status` 的"总用量"和 session 的"本轮增量"照旧精确。
+            if len(self._usage_history) > USAGE_HISTORY_LIMIT:
+                del self._usage_history[:-USAGE_HISTORY_LIMIT]
 
     def get_usage(self) -> dict:
         return {
             "total_prompt_tokens": self.total_prompt_tokens,
             "total_completion_tokens": self.total_completion_tokens,
             "total_tokens": self.total_prompt_tokens + self.total_completion_tokens,
-            "request_count": len(self._usage_history),
+            # 累计请求数（**不是** `len(_usage_history)`：明细有上限，计数没有）。
+            "request_count": self._request_count,
+            "history_entries": len(self._usage_history),
+            "history_limit": USAGE_HISTORY_LIMIT,
         }
 
     def close(self):

@@ -403,15 +403,17 @@ def format_compression_event(*, before: int, after: int, budget: Any, removed: i
 
 def format_estimate_vs_actual(estimated: int, actual_prompt: int | None, *,
                               requests: int = 0, agent: str = "planner") -> str:
-    """把"估算 vs 实际"对照行打出来（同一轮里两个数直接并排）。"""
+    """把"估算 vs 实际"对照行打出来（同一轮里两个数直接并排）。
+
+    口径写清楚、行要短（用户口径 2026-10-12："token（用量/流）的内容太多了"）：
+    `estimated` **只覆盖对话记忆层**（见 `Session._context_messages_for_estimate`），
+    而 `actual_prompt` 是 provider 的**整轮输入 usage** —— 两者口径不同，**不比偏差**
+    （以前每轮都打"偏差 +100%"，那是拿"对话层估算"比"整轮实际"，纯噪音）。
+    """
     if actual_prompt is None:
         if int(requests) <= 0:
-            return (f"[Context] 估算 vs 实际（{agent}）：估算 prompt {int(estimated):,} token；"
-                    f"实际未知（本轮没有发生 API 调用）")
-        return (f"[Context] 估算 vs 实际（{agent}）：估算 prompt {int(estimated):,} token；"
-                f"实际未知（本轮 {int(requests)} 次 API 调用都没有返回 usage）")
-    estimated = int(estimated)
+            return (f"[Context] {agent} 本轮没有 API 调用；对话层估算 {int(estimated):,} token")
+        return (f"[Context] {agent} 本轮 {int(requests)} 次 API 调用都没返回 usage（实际未知）")
     actual = int(actual_prompt)
-    drift = ((actual - estimated) / actual * 100.0) if actual else 0.0
-    return (f"[Context] 估算 vs 实际（{agent}）：估算 {estimated:,} token / "
-            f"实际 {actual:,} token（API 返回的输入用量，偏差 {drift:+.0f}%）")
+    return (f"[Context] {agent} 本轮实际输入 {actual:,} token（API 实测；"
+            f"对话层估算 {int(estimated):,}，口径不同不计偏差）")

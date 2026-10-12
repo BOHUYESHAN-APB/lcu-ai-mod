@@ -4,11 +4,14 @@ Serves dashboard, WebSocket, and REST API for the Session-based architecture.
 """
 
 import json
+import logging
 import math
 import os
+import queue
 import re
 import threading
 import time
+from concurrent import futures as _futures
 from pathlib import Path
 from typing import Any, Optional, cast
 
@@ -29,6 +32,9 @@ from agent.persona_store import KNOWN_KEYS as PERSONA_KEYS, PersonaStore
 from protocol import WireClient
 
 app = FastAPI(title="LCUMod Backend")
+
+# 关停路径的日志走 `backend` logger（与 `main.py` 同一个名字 ⇒ 同一份 handler/级别）。
+logger = logging.getLogger("backend")
 
 CONFIG_PATH = DEFAULT_CONFIG_PATH
 # 共享实例：Session/Planner 拿到的必须是同一个（否则 UI 改阈值不生效）
@@ -58,6 +64,201 @@ wire: WireClient | None = None
 orchestrator: Orchestrator | None = None
 llm_service = LLMService()
 connected_browsers: list[WebSocket] = []
+
+# ── 关停（Ctrl+C / SIGTERM）──────────────────────────────────────────────────
+# 用户口径（2026-10-12）："意外的那种后端服务器 ctrl 加 c 居然关不掉，只能把整个终端杀掉。"
+#
+# 关停必须**显式**收掉本进程起的每一条后台动线，而且**有界**（不许无限等）：
+#   ① 接线循环 `wire_bridge_loop`（20Hz tick）→ `_stop_event` 通知退出；
+#   ② 热载看门狗线程 → `hot_reload_watch(False)`（内部 join，有上限）；
+#   ③ wire 读线程 → `wire.disconnect()`（关 socket ⇒ recv 立刻返回）；
+#   ④ overlay/通讯录的状态推送任务 + 浏览器 WS → 取消 / 关闭；
+#   ⑤ 视觉抓屏线程 → `session.vision.stop()`；
+#   ⑥ 日志文件 handler → `main.py` 退出前显式 close（不靠 atexit 兜）。
+# 关停后 `background_threads()` 如实报告"我们还剩谁在跑"（自检与 `/api/status` 共用）。
+_BACKEND_THREAD_NAMES = frozenset({"backend-connect", "hot-reload-watch", "vision",
+                                   "wire-reader", "lcu-chat", "lcu-decision"})
+BACKEND_SHUTDOWN_TIMEOUT = 0.5        # 关我们自己的线程最多等这么久（总退出仍 ≤2s）
+_stop_event = threading.Event()
+_connect_thread: threading.Thread | None = None
+_shutdown_lock = threading.Lock()
+
+
+class _ChatWorker:
+    """把"一轮对话"从**事件循环**挪到一条 **daemon 线程**上跑（`handle_chat` 是同步 LLM 调用）。
+
+    两条都是必需的（就是用户"卡 + Ctrl+C 关不掉"的两半）：
+
+    * **别堵事件循环**：实测一轮对话 3~5 秒（超时上限 120 秒）。以前在 async 处理函数里直接
+      调它 ⇒ 这几秒里 uvicorn 的事件循环什么都干不了：overlay 状态推送停、REST 全卡、
+      **连 SIGINT 的处理都要等它返回**（观感就是"Ctrl+C 没反应"）。
+    * **必须 daemon**：`asyncio.to_thread` 走默认 `ThreadPoolExecutor`，它的线程会被
+      `concurrent.futures` 的 `atexit` 钩子 **join** —— 一个在飞的 120 秒请求就能把进程卡在
+      出口退不出去（"只能把整个终端杀掉"）。这里自己起线程并标 `daemon=True`，
+      进程退出不受在飞请求拖累。
+
+    串行化：一次只跑一轮（与"事件循环里同步跑"的旧行为一致），不并发调模型。
+    """
+
+    def __init__(self) -> None:
+        self._queue: "queue.Queue[Optional[tuple]]" = queue.Queue()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+
+    @property
+    def running(self) -> bool:
+        thread = self._thread
+        return thread is not None and thread.is_alive()
+
+    def start(self) -> None:
+        with self._lock:
+            if self.running:
+                return
+            self._thread = threading.Thread(target=self._run, name="lcu-chat", daemon=True)
+            self._thread.start()
+
+    def submit(self, fn, *args) -> _futures.Future:
+        """排一轮；返回的 Future 交给 `asyncio.wrap_future` 等（事件循环全程不阻塞）。
+
+        线程**按需启动**：没走过 lifespan（例如测试里直接打接口）也不会把请求排进没人消费的
+        队列里等到超时。
+        """
+        future: _futures.Future = _futures.Future()
+        if not self.running:
+            self.start()
+        self._queue.put((future, fn, args))
+        return future
+
+    def stop(self, timeout: float = 0.3) -> bool:
+        """通知 worker 收工：**不打断**正在跑的那一轮（它可能是 LLM 在飞），只是不再接新活。
+
+        返回线程是否已停（`False` = 还在跑，如实报；daemon 线程拦不住进程退出）。
+        """
+        with self._lock:
+            thread = self._thread
+            self._thread = None
+        self._queue.put(None)
+        if thread is None:
+            return True
+        thread.join(max(0.0, float(timeout)))
+        return not thread.is_alive()
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            future, fn, args = item
+            if not future.set_running_or_notify_cancel():
+                continue
+            try:
+                future.set_result(fn(*args))
+            except BaseException as exc:  # noqa: BLE001 —— 原样交给调用方（WS 那边如实回错）
+                future.set_exception(exc)
+
+
+_chat_worker = _ChatWorker()
+
+
+def background_threads() -> list[threading.Thread]:
+    """后端自己起的后台线程（按名字认）—— 关停自检与 `/api/status` 共用同一份判据。"""
+    return [thread for thread in threading.enumerate()
+            if thread.is_alive() and thread.name in _BACKEND_THREAD_NAMES]
+
+
+def stop_background_work(timeout: float = BACKEND_SHUTDOWN_TIMEOUT) -> dict:
+    """**显式**关掉本进程的后台动线（幂等；可重复调用）。返回关停报告。
+
+    为什么要有它（根因证据见 `docs`/报告）：uvicorn 收到 SIGINT 后只会"停止接收新连接 +
+    等后台任务自己结束"，**不会**替我们停线程/断线/关看门狗 —— 更关键的是：任何一条
+    卡在阻塞调用里的东西都会让进程看起来"关不掉"。所以这里主动收：
+      1. `_stop_event.set()` —— 接线循环下一拍就退；
+      2. 热载看门狗 `stop()`（内部有 join 上限）;
+      3. 视觉抓屏线程 `stop()`；
+      4. `wire.disconnect()` —— 关 socket，读线程的 `recv` 立刻返回；
+      5. 逐个 `join(timeout)` —— **有界**，超时就如实报"还活着"，绝不无限等。
+    """
+    global _connect_thread
+    with _shutdown_lock:
+        report: dict = {"stopped": [], "still_alive": []}
+        _stop_event.set()
+        session = getattr(orchestrator, "session", None) if orchestrator is not None else None
+
+        if _hot_reload_watcher is not None:
+            try:
+                hot_reload_watch(False)
+                report["stopped"].append("hot-reload-watch")
+            except Exception as exc:  # noqa: BLE001 —— 关停失败不许反过来卡住关停
+                report.setdefault("errors", []).append(f"hot-reload-watch: {exc}")
+
+        vision = getattr(session, "vision", None)
+        if vision is not None:
+            try:
+                vision.stop()
+                report["stopped"].append("vision")
+            except Exception as exc:  # noqa: BLE001
+                report.setdefault("errors", []).append(f"vision: {exc}")
+
+        # 0.1s：在飞的那一轮（LLM 请求，最长 120s）**不打断**，只是不再等它 ——
+        # worker 是 daemon 线程，进程退出不受它影响；这里只保证"关停预算"里它不占大头。
+        if not _chat_worker.stop(timeout=0.1):
+            # 在飞的那一轮还没回来 —— 不打断它，但如实记下来
+            report["still_alive"].append("lcu-chat")
+
+        if orchestrator is not None:
+            try:
+                orchestrator.stop()
+            except Exception as exc:  # noqa: BLE001
+                report.setdefault("errors", []).append(f"orchestrator: {exc}")
+
+        if wire is not None:
+            try:
+                wire.disconnect()
+                report["stopped"].append("wire")
+            except Exception as exc:  # noqa: BLE001
+                report.setdefault("errors", []).append(f"wire: {exc}")
+
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        thread = _connect_thread
+        _connect_thread = None
+        for candidate in [thread] + background_threads():
+            if candidate is None or candidate is threading.current_thread():
+                continue
+            if not candidate.is_alive():
+                continue
+            candidate.join(max(0.0, deadline - time.monotonic()))
+            if candidate.is_alive():
+                report["still_alive"].append(candidate.name)
+
+        report["still_alive"] = sorted(set(report["still_alive"]))
+        logger.info("[Backend] 关停：已停 %s；仍在跑 %s",
+                    report["stopped"] or "（无）", report["still_alive"] or "（无）")
+        return report
+
+
+def wire_bridge_loop(w: WireClient, o: Orchestrator, stop_event: threading.Event,
+                     *, host: str = "", port: int = 0, tick_seconds: float = 0.05,
+                     retry_seconds: float = 5.0) -> None:
+    """接线循环：连模组 → 20Hz `tick` → 断了就重连；`stop_event` 置位即**立刻**退出。
+
+    以前它是个 `while True` + `time.sleep`：关停时最长要等一拍/一次重试（5s）才结束，
+    5 秒的重试 `sleep` 甚至会把"关掉后端"拖到超时。现在两处 `sleep` 都换成
+    `stop_event.wait(...)` —— 置位即刻返回，退出路径不留尾巴。
+    """
+    while not stop_event.is_set():
+        if w.connect():
+            print(f"[Backend] Connected to mod at {host}:{port}")
+            o.start()
+            # Event loop: drain wire + tick orchestrator
+            while w.connected and not stop_event.is_set():
+                o.tick()
+                stop_event.wait(tick_seconds)       # 20Hz；置位立刻退
+            o.stop()
+            if not stop_event.is_set():
+                print("[Backend] Disconnected. Reconnecting...")
+        else:
+            print(f"[Backend] Mod not available at {host}:{port}. Retry in {retry_seconds:g}s...")
+            stop_event.wait(retry_seconds)          # 置位立刻退（不再白等 5 秒）
 
 
 def _apply_config_to_llm_services():
@@ -254,28 +455,42 @@ async def startup():
 
     cast(Any, orchestrator).on_chat = _broadcast_chat
 
-    # Connect in background thread with auto-reconnect
-    def _connect_loop():
-        w = wire
-        o = orchestrator
-        if w is None or o is None:
-            return
-        while True:
-            if w.connect():
-                print(f"[Backend] Connected to mod at {host}:{port}")
-                o.start()
-                # Event loop: drain wire + tick orchestrator
-                while w.connected:
-                    o.tick()
-                    time.sleep(0.05)  # 20Hz loop
-                o.stop()
-                print("[Backend] Disconnected. Reconnecting...")
-            else:
-                print(f"[Backend] Mod not available at {host}:{port}. Retry in 5s...")
-                time.sleep(5)
+    # 聊天轮次跑在**独立 daemon 线程**上（见 `_ChatWorker`）：事件循环不许被同步 LLM 调用堵住。
+    # （`submit()` 里也会按需启动，这里只是把线程**在启动时就建好**，别等到第一条消息。）
+    _chat_worker.start()
 
-    t = threading.Thread(target=_connect_loop, daemon=True)
-    t.start()
+    # Connect in background thread with auto-reconnect（关停靠 `_stop_event` 通知退出）
+    global _connect_thread
+    _stop_event.clear()
+    _connect_thread = threading.Thread(
+        target=wire_bridge_loop, args=(wire, orchestrator, _stop_event),
+        kwargs={"host": host, "port": port}, name="backend-connect", daemon=True)
+    _connect_thread.start()
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    """关停（Ctrl+C / SIGTERM）：**显式**收掉本进程的所有后台动线，且**有界**。
+
+    与 `stop_background_work()` 的分工：这里先做只能异步做的两件事（取消 overlay 推送任务、
+    关掉浏览器 WS），再交给同步的关停序列去停线程/断线/停看门狗。任何一步抛错都不许
+    反过来卡住关停（用户口径：Ctrl+C 必须关得掉）。
+    """
+    for browser in list(status_pushers):
+        _stop_status_push(browser)
+        try:
+            await browser.close(code=1001)
+        except Exception:  # noqa: BLE001 —— 关不掉某个浏览器 WS 不该拦退出
+            pass
+    for browser in list(connected_browsers):
+        try:
+            await browser.close(code=1001)
+        except Exception:  # noqa: BLE001
+            pass
+    connected_browsers.clear()
+    stop_background_work()
+    logger.info("[Backend] 关停完成：后台线程剩余 %s",
+                [thread.name for thread in background_threads()] or "（无）")
 
 
 # ── Routes ──
@@ -376,7 +591,12 @@ async def websocket_endpoint(ws: WebSocket):
                                  "这条消息仍记进了对话记忆")
                     else:
                         try:
-                            response = orchestrator.handle_chat(sender, message) or ""
+                            # **不阻塞事件循环**：一轮对话是同步 LLM 调用（3~5s，超时上限 120s），
+                            # 丢给 daemon worker 跑；等结果的这段时间事件循环照常服务
+                            # （overlay 推送 / REST / 关停信号处理都不许被它堵住）。
+                            response = await asyncio.wrap_future(
+                                _chat_worker.submit(orchestrator.handle_chat, sender, message)
+                            ) or ""
                         except Exception as e:
                             error = f"{type(e).__name__}: {e}"
                         if not response and not error:
@@ -444,8 +664,14 @@ def _status_payload() -> dict:
         status = orchestrator.get_status()
         status["mod_connected"] = bool(wire and wire.connected)
         status["wire"] = f"{os.getenv('MOD_HOST', '127.0.0.1')}:{os.getenv('MOD_PORT', '25568')}"
+        # 后台线程自述（关停自检用的同一份判据）：正常时只有接线/读线程/看门狗；
+        # 关停后应该**空**。让操作者能一眼看出"还有东西在跑"。
+        status["background_threads"] = [thread.name for thread in background_threads()]
+        # 入站队列自述（内存观察点）：排了两千条"最新状态"说明消费端被什么堵住了。
+        status["wire_queue"] = wire.queue_stats() if wire is not None else {}
         return status
-    return {"running": False, "mod_connected": False}
+    return {"running": False, "mod_connected": False,
+            "background_threads": [thread.name for thread in background_threads()]}
 
 
 @app.get("/api/status")

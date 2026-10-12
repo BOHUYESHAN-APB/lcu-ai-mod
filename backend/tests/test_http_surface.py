@@ -353,7 +353,10 @@ class V2AuditTests(_SurfaceTestCase):
 class ExistingRoutesUntouchedTests(_SurfaceTestCase):
     def test_status_and_sdk_context_still_behave_as_before(self):
         status = self.client.get("/api/status").json()
-        self.assertEqual(status, {"running": False, "mod_connected": False})
+        # `background_threads` 是 2026-10-12 新加的**观察点**（关停自检口径）：会话没起来时
+        # 应该是空表；其余两个键与以前逐字相同。
+        self.assertEqual(status, {"running": False, "mod_connected": False,
+                                  "background_threads": []})
         context = self.client.get("/api/sdk/context")
         self.assertEqual(context.status_code, 200)
         self.assertEqual(set(context.json()), {"persona", "integration"})

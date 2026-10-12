@@ -80,10 +80,11 @@ class WireLogDedupeTests(unittest.TestCase):
         _wire, out = self._run(lines)
 
         self.assertEqual(len(out), 2, "5 条相同只该 1 行；内容变了再 1 行")
-        self.assertEqual(out[0], '← behavior_state: {"navigating":false}')
+        # 摘要行（2026-10-12 起是**人读摘要**，不再是整段 JSON）：内容仍逐字可判
+        self.assertEqual(out[0], '← behavior_state: navigating=否')
         self.assertIn("与上一条相同 ×4", out[1], "被压掉的 4 条要在下一行里交代清楚")
         self.assertIn("持续", out[1])
-        self.assertIn('{"navigating":true}', out[1], "变化行要带新内容")
+        self.assertIn("navigating=是", out[1], "变化行要带新内容")
 
     def test_each_content_change_emits_immediately(self):
         lines = [_event("control_state", {"ai_controlled": v}) for v in (True, False, True)]
@@ -91,9 +92,9 @@ class WireLogDedupeTests(unittest.TestCase):
         _wire, out = self._run(lines)
 
         self.assertEqual(len(out), 3, "每次内容变化都要立刻一行")
-        self.assertIn('{"ai_controlled":true}', out[0])
-        self.assertIn('{"ai_controlled":false}', out[1])
-        self.assertIn('{"ai_controlled":true}', out[2])
+        self.assertIn("ai_controlled=是", out[0])
+        self.assertIn("ai_controlled=否", out[1])
+        self.assertIn("ai_controlled=是", out[2])
 
     def test_two_event_types_keep_independent_counts(self):
         lines = []
@@ -105,8 +106,9 @@ class WireLogDedupeTests(unittest.TestCase):
         _wire, out = self._run(lines)
 
         self.assertEqual(len(out), 3, "两类事件各自计数，互不串味")
-        self.assertEqual(out[0], '← behavior_state: {"navigating":false}')
-        self.assertEqual(out[1], '← control_state: {"ai_controlled":true}')
+        # 摘要行（2026-10-12 起是**人读摘要**，不再是整段 JSON）：内容仍逐字可判
+        self.assertEqual(out[0], '← behavior_state: navigating=否')
+        self.assertEqual(out[1], '← control_state: ai_controlled=是')
         self.assertIn("与上一条相同 ×3", out[2], "behavior_state 自己的第 3 次相同")
         self.assertNotIn("×3", out[1])
 

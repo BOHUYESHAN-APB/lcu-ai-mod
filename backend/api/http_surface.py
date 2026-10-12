@@ -233,7 +233,15 @@ async def sdk_chat(data: dict):
     if not message:
         raise HTTPException(status_code=422, detail="message must be a non-empty string")
     sender = str(payload.get("sender") or "sdk")
-    response = await asyncio.to_thread(orchestrator.handle_chat, sender, message)
+    # LLM 调用会阻塞 ⇒ 丢到 server 的那个 **daemon** worker 线程里跑（与 `/ws` 同一个出口）。
+    # 不用 `asyncio.to_thread`：默认线程池的线程会被 `concurrent.futures` 的 atexit 钩子 join，
+    # 一个在飞的 120 秒请求就能把进程卡在出口（用户口径："Ctrl+C 关不掉"）。
+    worker = getattr(_server_module(), "_chat_worker", None)
+    if worker is None:  # 理论上不会有（`server` 一定会建）；真没有就退回线程池，行为不变
+        response = await asyncio.to_thread(orchestrator.handle_chat, sender, message)
+    else:
+        response = await asyncio.wrap_future(
+            worker.submit(orchestrator.handle_chat, sender, message))
     return {"status": "ok", "response": response or ""}
 
 
