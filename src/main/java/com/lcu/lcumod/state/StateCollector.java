@@ -218,6 +218,10 @@ public class StateCollector {
         boolean forceRefresh = refreshRequested;
         refreshRequested = false;
 
+        // 死亡点：每 tick 更新"最近活着的位置"，死了就记一条 —— 这一步**不能**受 interval 节流，
+        // 否则死亡那一瞬间可能刚好被跳过。
+        com.lcu.lcumod.action.DeathPoint.tick(Minecraft.getInstance());
+
         // Check if config is loaded before accessing it
         try {
             int interval = ModConfig.STATE_INTERVAL.getAsInt();
@@ -460,6 +464,16 @@ public class StateCollector {
                 e.addProperty("item_id", BuiltInRegistries.ITEM.getKey(stack.getItem()).toString());
                 e.addProperty("item_count", stack.getCount());
                 e.addProperty("display", stack.getDisplayName().getString());
+                // 谁丢的 + 掉多久了 + 还有多久消失：**判断该不该捡的是模型**（用户口径），
+                // 我们只把事实摆出来。owner 为空 = 方块/发射器掉的（不是谁丢的）。
+                ItemEntity item = (ItemEntity) entity;
+                Entity owner = item.getOwner();
+                e.addProperty("owner", owner == null ? "" : owner.getName().getString());
+                e.addProperty("owner_type", owner == null ? ""
+                        : (owner instanceof Player ? "player" : "other"));
+                int age = item.getAge();
+                e.addProperty("age", age);
+                e.addProperty("despawn_in", Math.max(0, item.lifespan - age));
             } else {
                 // 生物对待档位：**与本地反射 / 后端模型同一张表**（用户口径：高危险的不主动打、
                 // 中立的不惹、只有该处理的才处理）。认不出 ⇒ UNKNOWN，**不默认 hostile**；
@@ -537,6 +551,10 @@ public class StateCollector {
             }
         }
         state.add("nearby_beds", cachedBeds);
+
+        // 死亡点（最新在前，最多 3 条）：**只报事实**（死在哪、什么时候），
+        // 要不要回去/去捡装备由模型决定（后端有 go_to_death_point 工具）。
+        state.add("death_points", com.lcu.lcumod.action.DeathPoint.snapshot());
 
         // 主动记录过的记忆点（持久，可能很远）
         JsonArray remembered = new JsonArray();

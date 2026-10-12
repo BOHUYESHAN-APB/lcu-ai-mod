@@ -84,6 +84,10 @@ public class Pathfinder {
     private static final AlignmentGuard ALIGNMENT = new AlignmentGuard(ALIGN_TIMEOUT_TICKS);
     /** 卡住后"重算同一个目标"的退避 + 结果去重（治每秒多条 Calculated path 的抖动）。 */
     private static final ReplanGate REPLAN = new ReplanGate(REPLAN_BACKOFF_MS);
+    /** 卡住后的**有界绕行预算**（最多 {@link StuckDetour#MAX_ATTEMPTS} 次，每次换法不同）。 */
+    private static final StuckDetour DETOUR = new StuckDetour();
+    /** 当前绕行落脚点（null = 直奔 {@link #targetPos}）；到了由 {@link #tick} 恢复"直奔目标"。 */
+    private static Vec3 detourPoint = null;
 
     public static boolean navigateTo(String requestId, double x, double y, double z) {
         targetPos = new Vec3(x, y, z);
@@ -94,6 +98,9 @@ public class Pathfinder {
         stuckTicks = 0;
         lastFailureReason = "";
         activeRequestId = requestId;
+        // 新指令：上一次的绕行点与本卡住回合的绕行额度都与本条指令无关，一并归零。
+        detourPoint = null;
+        DETOUR.reset();
         // 新指令：退避/去重状态归零（每次导航至多上报一次相同结果），收敛计数归零。
         REPLAN.reset();
         ALIGNMENT.reset();
@@ -132,7 +139,118 @@ public class Pathfinder {
             return true;
         }
         targetPos = next;
+        // 目标挪出了迟滞带：上一次的绕行点是为"旧几何"算的，作废；本卡住回合的绕行额度保留
+        // （同一个回合里不该因为目标动了一下就把预算刷新，否则会失去"有界"的意义）。
+        detourPoint = null;
         return calculatePath();
+    }
+
+    /** {@link #attemptDetour()} 的结果：调用方据此决定"继续走 / 等窗口 / 如实上报"。 */
+    public enum DetourOutcome {
+        /** 已换到一条新路线（横向绕行点），继续走。 */
+        DETOURED,
+        /** 退避窗口内，或这次的绕行点没算出路 —— 等下一个窗口再试，**不**升级上报。 */
+        WAIT,
+        /** 绕行额度用完 —— 调用方如实停路并上报"试过 N 次绕行"。 */
+        EXHAUSTED,
+        /** 当前没有导航 / 没有目标 —— 无从绕行。 */
+        UNAVAILABLE
+    }
+
+    /**
+     * 卡住后的**自动绕行**：先换一条真的不同的路线再试（用户口径："卡住不要只停"）。
+     *
+     * <p>换法：把落脚目标沿"玩家→目标"连线的**垂直方向**偏移
+     * {@link StuckDetour#LATERAL_OFFSET} 格，算一条到该绕行点的路；走到绕行点后由
+     * {@link #tick} 恢复"直奔原目标"。两次绕行的偏移方向相反（见 {@link StuckDetour#consumeOffset()}），
+     * 所以每次换法真的不同 —— 不是把同一条路重算一遍。
+     *
+     * <p>约束（全部由本方法自身保证，调用方只管读 {@link DetourOutcome}）：
+     * <ul>
+     *   <li><b>有界</b>：一个卡住回合最多 {@link StuckDetour#MAX_ATTEMPTS} 次，超了返回
+     *       {@link DetourOutcome#EXHAUSTED}（交调用方如实上报）；</li>
+     *   <li><b>限速</b>：重算受 {@link ReplanGate} 退避约束（同一目标每窗口至多一次），
+     *       不会每 tick 重算；</li>
+     *   <li><b>不做全量重设</b>：不清路径进度之外的东西 —— 卡住历史、朝向收敛计数、导航视角目标
+     *       一律保留（那正是"跟着走却一步不动"的根因）；</li>
+     *   <li><b>不搭方块</b>：只走既有地形（见 {@link #NO_RESCUE_POLICY}）。</li>
+     * </ul>
+     */
+    public static DetourOutcome attemptDetour() {
+        if (!isNavigating || targetPos == null) {
+            return DetourOutcome.UNAVAILABLE;
+        }
+        if (DETOUR.exhausted()) {
+            return DetourOutcome.EXHAUSTED;
+        }
+        if (!REPLAN.allow("detour:" + targetKey(targetPos), System.currentTimeMillis())) {
+            // 退避窗口内：等窗口过去再换路，不升级上报（反正也没算路）。
+            return DetourOutcome.WAIT;
+        }
+        double lateral = DETOUR.consumeOffset();
+        if (!calculateDetourPath(lateral)) {
+            // 这一次的绕行点没算出可走的路：还有额度就等下一个窗口换另一边，没有就如实上报。
+            return DETOUR.canAttempt() ? DetourOutcome.WAIT : DetourOutcome.EXHAUSTED;
+        }
+        if (REPLAN.allowOnce("detourlog:" + targetKey(targetPos) + "#" + DETOUR.attempts())) {
+            LCUMod.LOGGER.info("[Pathfinder] Stuck detour {}/{}: veering {} block(s) sideways "
+                            + "(walking existing terrain only, no block placing)",
+                    DETOUR.attempts(), DETOUR.maxAttempts(), (int) lateral);
+        }
+        return DetourOutcome.DETOURED;
+    }
+
+    /**
+     * 把落脚目标横向偏移 {@code lateralOffset} 格，算一条到该绕行点的路。
+     *
+     * <p>只重算路径：不动 {@link #targetPos}、不清卡住历史/朝向收敛/导航视角目标、不放方块。
+     * 算不出路时把 {@link #detourPoint} 复原（别把导航挂在一条空路上）。
+     */
+    private static boolean calculateDetourPath(double lateralOffset) {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.player == null || mc.level == null || targetPos == null) return false;
+        Vec3 playerPos = mc.player.position();
+        double dx = targetPos.x - playerPos.x;
+        double dz = targetPos.z - playerPos.z;
+        double horizontal = Math.sqrt(dx * dx + dz * dz);
+        if (horizontal < 1.0e-3) {
+            // 已经站在目标正上/正下：横向偏移没有意义（绕不出新路）。
+            return false;
+        }
+        double perpX = -dz / horizontal;
+        double perpZ = dx / horizontal;
+        Vec3 detour = new Vec3(targetPos.x + perpX * lateralOffset, targetPos.y,
+                targetPos.z + perpZ * lateralOffset);
+
+        Vec3 previous = detourPoint;
+        detourPoint = detour;
+        if (!calculatePath()) {
+            detourPoint = previous;
+            return false;
+        }
+        return true;
+    }
+
+    /** 本卡住回合已经试过几次绕行（如实上报时要说明白"试过 N 次"）。 */
+    public static int detourAttempts() {
+        return DETOUR.attempts();
+    }
+
+    /** 绕行额度的上界（{@link StuckDetour#MAX_ATTEMPTS}）。 */
+    public static int maxDetourAttempts() {
+        return DETOUR.maxAttempts();
+    }
+
+    /**
+     * 真的走动了（走出一个"卡住回合"）⇒ 绕行额度重置：下一次卡住重新给足
+     * {@link StuckDetour#MAX_ATTEMPTS} 次。
+     *
+     * <p>阈值刻意与卡住看门狗的 0.6 格同口径（**不是** {@link #isStuck} 的 0.05 格）：
+     * 被实体推来推去的微小抖动不该算"走动了"，否则绕行额度会被反复刷新，"有界"就名存实亡。
+     * 因此重置点只有一个 —— 看门狗判"真走动了"的地方。
+     */
+    public static void resetDetourBudget() {
+        DETOUR.reset();
     }
 
     /** 当前目标距可以重算还有多少毫秒（0 = 现在就可以；跟随循环据此决定要不要等）。 */
@@ -148,6 +266,9 @@ public class Pathfinder {
         isNavigating = false;
         lastPosition = null;
         stuckTicks = 0;
+        // 收工：绕行点/绕行额度一起清（下一段导航是新回合）。
+        detourPoint = null;
+        DETOUR.reset();
         ALIGNMENT.reset();
         // 交还视角：导航结束后，后端的 look（若有）从下一 tick 起重新生效（见 LookArbiter）。
         InputIsolation.clearNavigationLookTarget();
@@ -172,6 +293,12 @@ public class Pathfinder {
             reportProgress(1.0, "arrived");
             stop();
             return;
+        }
+
+        // 绕行点到了 ⇒ 恢复"直奔原目标"（绕行点只在卡住时临时生效，这里是唯一的恢复点）。
+        if (detourPoint != null && isReached(playerPos, detourPoint)) {
+            detourPoint = null;
+            calculatePath();
         }
 
         if (isStuck(playerPos)) {
@@ -224,12 +351,20 @@ public class Pathfinder {
         moveToward(mc, playerPos, nextPoint);
     }
 
+    /**
+     * 本 tick 实际要去的落脚点：有绕行点（卡住自救）时先去绕行点，否则直奔 {@link #targetPos}。
+     */
+    private static Vec3 activeGoal() {
+        return detourPoint != null ? detourPoint : targetPos;
+    }
+
     private static boolean calculatePath() {
         Minecraft mc = Minecraft.getInstance();
-        if (mc.player == null || mc.level == null || targetPos == null) return false;
+        Vec3 goalPos = activeGoal();
+        if (mc.player == null || mc.level == null || goalPos == null) return false;
 
         StandingNode start = findClosestStandingNode(mc.level, mc.player.position(), 2, 4);
-        StandingNode goal = findClosestStandingNode(mc.level, targetPos, 3, 6);
+        StandingNode goal = findClosestStandingNode(mc.level, goalPos, 3, 6);
         currentPath.clear();
         currentPathIndex = 0;
 
@@ -277,7 +412,7 @@ public class Pathfinder {
     /** 当前目标的整数格键 + 出发点格键（日志/上报去重用）。 */
     private static String failureKey() {
         Minecraft mc = Minecraft.getInstance();
-        String target = targetKey(targetPos);
+        String target = targetKey(activeGoal());
         if (mc == null || mc.player == null) {
             return target;
         }
@@ -602,8 +737,9 @@ public class Pathfinder {
         if (!isNavigating || targetPos == null) {
             return "Idle";
         }
-        return String.format("Navigating to (%.0f, %.0f, %.0f) path=%d idx=%d",
-            targetPos.x, targetPos.y, targetPos.z, currentPath.size(), currentPathIndex);
+        return String.format("Navigating to (%.0f, %.0f, %.0f) path=%d idx=%d detour=%d/%d",
+            targetPos.x, targetPos.y, targetPos.z, currentPath.size(), currentPathIndex,
+            DETOUR.attempts(), DETOUR.maxAttempts());
     }
 
     public static String getLastFailureReason() {

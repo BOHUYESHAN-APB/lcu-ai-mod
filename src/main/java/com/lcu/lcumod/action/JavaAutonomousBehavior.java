@@ -30,7 +30,11 @@ public class JavaAutonomousBehavior {
     private static final Random random = new Random();
     
     // State
-    private static boolean enabled = true;
+    // 用户口径："后台不许有自主开关/自动触发" ⇒ **默认关**（由 `ModConfig.AUTONOMOUS_FALLBACK` 同步，
+    // 默认 false）。开着它才跑 wander/track/collect；没后端时默认就是站着不动，等后端回来。
+    // 入口仍然收窄成"只在没有后端连接、且 AI 持控制时"（ActionExecutor 里那道门不变）。
+    // P0 生存反射是**另一套**（CombatReflex / SwimReflex / MlgReflex / 进食反射），不受这里影响。
+    private static boolean enabled = false;
     private static BehaviorState currentState = BehaviorState.IDLE;
     private static int stateTicks = 0;
     private static int idleTicks = 0;
@@ -163,6 +167,41 @@ public class JavaAutonomousBehavior {
         }
     }
     
+    // ── Movement Routing ──
+
+    /** 距上次导航目标多远就算"目标换了个地方、旧路的进度没有参考价值"（才重开一条路）。 */
+    private static final double ROUTE_RESTART_DISTANCE = 16.0;
+
+    /**
+     * 自主行为里所有"往某点走"的**唯一入口**。
+     *
+     * <p>用户实机根因（与已修的跟随是同一个 bug）：这些路径以前每 tick 调
+     * {@code MovementSystem.moveTo} ⇒ 落到 {@code Pathfinder.navigateTo} ⇒ 把路径进度、卡住判定
+     * 历史、朝向收敛、导航视角目标**全部清零** ⇒ 一步都走不出去（"原地罚站"）。
+     *
+     * <p>判据（写在这里，调用点不再各自判断）：
+     * <ul>
+     *   <li><b>还在往同一片区域走</b>：已有在走的导航，且新目标没挪出
+     *       {@link #ROUTE_RESTART_DISTANCE} ⇒ 只做**非破坏性重定向**
+     *       {@code Pathfinder.retarget}（不清进度；重算频率由"目标走了多远"决定，并受迟滞带与
+     *       退避窗口约束）；</li>
+     *   <li><b>上一次路已废弃</b>（没有在走的导航：从未开始 / 到点停下 / 卡住被停）
+     *       <b>或目标换到了很远的地方</b>（旧路进度没有参考价值）⇒ 这才叫"重开一条路"，
+     *       用 {@code Pathfinder.navigateTo} 做完整初始化。</li>
+     * </ul>
+     */
+    private static void headTo(double x, double y, double z) {
+        Vec3 currentTarget = Pathfinder.getTarget();
+        boolean routeAlive = Pathfinder.isNavigating() && currentTarget != null;
+        boolean sameDestination = routeAlive
+                && currentTarget.distanceTo(new Vec3(x, y, z)) < ROUTE_RESTART_DISTANCE;
+        if (sameDestination) {
+            Pathfinder.retarget(null, x, y, z);
+        } else {
+            Pathfinder.navigateTo(null, x, y, z);
+        }
+    }
+
     // ── Survival Logic ──
     
     private static boolean shouldFlee(Minecraft mc) {
@@ -191,7 +230,8 @@ public class JavaAutonomousBehavior {
         double targetZ = playerPos.z + fleeDir.z * 10;
         double targetY = mc.player.getY();
         
-        MovementSystem.moveTo(targetX, targetY, targetZ, 1.5f);  // Sprint away
+        // 逃生：只重定向（不清路径进度/卡住历史/朝向收敛），不再全量重设目标。
+        headTo(targetX, targetY, targetZ);
     }
     
     // ── Combat Logic ──
@@ -241,13 +281,8 @@ public class JavaAutonomousBehavior {
             attackTarget = null;
             setState(BehaviorState.IDLE);
         } else {
-            // Move toward target
-            MovementSystem.moveTo(
-                attackTarget.getX(), 
-                attackTarget.getY(), 
-                attackTarget.getZ(), 
-                1.2f
-            );
+            // Move toward target（贴怪也走同一条路由：只重定向，不清进度）
+            headTo(attackTarget.getX(), attackTarget.getY(), attackTarget.getZ());
         }
     }
     
@@ -471,8 +506,8 @@ public class JavaAutonomousBehavior {
             return;
         }
         
-        // Move toward target
-        MovementSystem.moveTo(wanderTarget.x, wanderTarget.y, wanderTarget.z, 0.8f);
+        // Move toward target（同一片区域的巡逻点：只重定向，不清进度）
+        headTo(wanderTarget.x, wanderTarget.y, wanderTarget.z);
     }
     
     // ── Status ──

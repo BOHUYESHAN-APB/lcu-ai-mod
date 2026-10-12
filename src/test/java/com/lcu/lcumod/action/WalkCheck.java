@@ -39,6 +39,10 @@ public final class WalkCheck {
         landmarkMemoryChecks();
         mobPolicyChecks();
         gearReflexChecks();
+        stuckDetourChecks();
+        autonomousJitterChecks();
+        deathPointChecks();
+        autonomousDefaultChecks();
 
         System.out.println("[WalkCheck] " + passed + " checks passed, " + failed + " failed");
         if (failed > 0) {
@@ -543,6 +547,190 @@ public final class WalkCheck {
                 read(root.resolve("AttackRules.java")).contains("BuiltInRegistries.ENTITY_TYPE"));
     }
 
+    // ── 11. 卡住自动绕行（用户口径：卡住不要只停，先换路线再试，试不动才如实报）──
+
+    /**
+     * 用户口径：「卡住不要只停：先自动换路线（绕行）再试，试不动才如实报」。
+     *
+     * <p>这里钉两件事：① 绕行额度是**有界**的纯逻辑（{@link StuckDetour}：最多 2 次、每次偏移
+     * 方向不同 ⇒ 每次换法真的不同）；② 看门狗**先绕行、绕行不奏效才**走原来的
+     * {@code stuck:} 上报，且绕行本身不重置进度（不清卡住历史/朝向收敛/导航视角目标）、
+     * 走 REPLAN 限速、不搭方块。
+     */
+    private static void stuckDetourChecks() {
+        Path root = Path.of("src", "main", "java", "com", "lcu", "lcumod", "action");
+        String pf = read(root.resolve("Pathfinder.java"));
+        String ae = read(root.resolve("ActionExecutor.java"));
+        String sd = read(root.resolve("StuckDetour.java"));
+        if (pf.isEmpty() || ae.isEmpty() || sd.isEmpty()) {
+            check("stuck-detour: sources found", false);
+            return;
+        }
+
+        // ① 纯逻辑：有界 + 每次换法真的不同
+        StuckDetour budget = new StuckDetour();
+        check("stuck-detour: budget is bounded at 2 attempts",
+                StuckDetour.MAX_ATTEMPTS == 2 && budget.maxAttempts() == 2);
+        check("stuck-detour: can attempt while under budget", budget.canAttempt() && !budget.exhausted());
+        double first = budget.consumeOffset();
+        double second = budget.consumeOffset();
+        check("stuck-detour: the second detour goes the opposite way",
+                Math.signum(first) != 0.0 && Math.signum(first) == -Math.signum(second));
+        check("stuck-detour: both detours are lateral (non-zero, real offset >= 2 blocks)",
+                StuckDetour.LATERAL_OFFSET >= 2.0
+                        && Math.abs(first) == StuckDetour.LATERAL_OFFSET
+                        && Math.abs(second) == StuckDetour.LATERAL_OFFSET);
+        check("stuck-detour: the two attempts are really different", first != second);
+        check("stuck-detour: exhausted only after the budget is used",
+                budget.exhausted() && !budget.canAttempt() && budget.attempts() == 2);
+        check("stuck-detour: an over-budget attempt is rejected", throwsIllegalState(budget::consumeOffset));
+        budget.reset();
+        check("stuck-detour: reset restores the budget", budget.canAttempt() && budget.attempts() == 0);
+        check("stuck-detour: an empty budget is rejected", throwsIllegalArgument(() -> new StuckDetour(0)));
+        check("stuck-detour: budget stays zero dependency (no net.minecraft)",
+                !sd.contains("net.minecraft"));
+
+        // ② 静态：绕行换路本身不重置进度、受限速、有界、不搭方块
+        String detour = methodBody(pf, "public static DetourOutcome attemptDetour()");
+        String detourPath = methodBody(pf, "private static boolean calculateDetourPath(");
+        check("stuck-detour: Pathfinder exposes the bounded detour entry point",
+                !detour.isEmpty() && pf.contains("StuckDetour DETOUR"));
+        check("stuck-detour: detour never re-issues a full reset (no navigateTo)",
+                !detour.contains("navigateTo(") && !detourPath.contains("navigateTo("));
+        check("stuck-detour: detour never wipes the stuck history",
+                !detour.contains("lastPosition = null") && !detourPath.contains("lastPosition = null"));
+        check("stuck-detour: detour never resets the alignment guard",
+                !detour.contains("ALIGNMENT.reset()") && !detourPath.contains("ALIGNMENT.reset()"));
+        check("stuck-detour: detour never wipes the replan gate wholesale",
+                !detour.contains("REPLAN.reset()") && !detourPath.contains("REPLAN.reset()"));
+        check("stuck-detour: detour keeps the navigation look target",
+                !detour.contains("clearNavigationLookTarget()")
+                        && !detourPath.contains("clearNavigationLookTarget()"));
+        check("stuck-detour: detour is rate limited by the replan gate",
+                detour.contains("REPLAN.allow(\"detour:"));
+        check("stuck-detour: detour is bounded by the zero-dep budget",
+                detour.contains("DETOUR.exhausted()") && detour.contains("DETOUR.consumeOffset()"));
+        check("stuck-detour: each attempt shifts the goal sideways then recomputes",
+                detour.contains("calculateDetourPath(") && detourPath.contains("calculatePath()"));
+        check("stuck-detour: no bridging/pillar-up rescue in the detour path",
+                !detour.contains("useItemOn") && !detourPath.contains("useItemOn")
+                        && !detour.contains("place_block") && !detourPath.contains("place_block")
+                        && !detour.contains("BlockItem") && !detourPath.contains("BlockItem"));
+        check("stuck-detour: reaching the detour point resumes the real goal",
+                methodBody(pf, "public static void tick(Minecraft mc)").contains("detourPoint = null"));
+
+        // ③ 静态：看门狗先绕行、绕行不奏效才报 stuck（保留原去向与 no-rescue 口径）
+        String watchdog = methodBody(ae, "private void tickStuckWatchdog(Minecraft mc)");
+        check("stuck-detour: watchdog tries a detour before giving up",
+                watchdog.contains("Pathfinder.attemptDetour()")
+                        && watchdog.indexOf("attemptDetour()") < watchdog.indexOf("\"stuck: \""));
+        check("stuck-detour: watchdog only reports stuck for exhausted/unavailable detours",
+                watchdog.contains("detour != Pathfinder.DetourOutcome.EXHAUSTED")
+                        && watchdog.contains("detour != Pathfinder.DetourOutcome.UNAVAILABLE")
+                        && watchdog.indexOf("DetourOutcome.UNAVAILABLE") < watchdog.indexOf("\"stuck: \""));
+        check("stuck-detour: a successful detour keeps the task running (no stop)",
+                watchdog.contains("DetourOutcome.DETOURED")
+                        && !watchdog.substring(watchdog.indexOf("DetourOutcome.DETOURED"),
+                                watchdog.indexOf("DetourOutcome.EXHAUSTED")).contains("Pathfinder.stop()"));
+        check("stuck-detour: the honest report says how many detours were tried",
+                watchdog.contains("detourAttempts()") && watchdog.contains("\"stuck: \""));
+        check("stuck-detour: the no-rescue policy is still the reported fallback",
+                watchdog.contains("NO_RESCUE_POLICY"));
+        check("stuck-detour: the budget only resets on real movement (same 0.6 block threshold)",
+                watchdog.contains("Pathfinder.resetDetourBudget()") && watchdog.contains("moved > 0.6"));
+    }
+
+    // ── 12. 无后端自主行为的抖动（flee/wander/贴怪不再全量重置目标）──
+
+    /**
+     * 与"跟随"同一个 bug：{@code MovementSystem.moveTo} 落到 {@code Pathfinder.navigateTo}，
+     * 每 tick 调用就把路径进度/卡住历史/朝向收敛清零 ⇒ 原地罚站。这里把修复形态钉死：
+     * 这些路径一律走"非破坏性重定向"，只有"上一次路已废弃 / 目标换到很远的地方"才重开一条路。
+     */
+    private static void autonomousJitterChecks() {
+        Path root = Path.of("src", "main", "java", "com", "lcu", "lcumod", "action");
+        String auton = read(root.resolve("JavaAutonomousBehavior.java"));
+        String ae = read(root.resolve("ActionExecutor.java"));
+        if (auton.isEmpty() || ae.isEmpty()) {
+            check("auton: sources found", false);
+            return;
+        }
+
+        String flee = methodBody(auton, "private static void flee(Minecraft mc)");
+        String wander = methodBody(auton, "private static void wander(Minecraft mc)");
+        String approach = methodBody(auton, "private static void attackNearbyHostile(Minecraft mc)");
+        String headTo = methodBody(auton, "private static void headTo(");
+
+        check("auton: the full-reset moveTo is gone from the whole behavior", 
+                !auton.contains("MovementSystem.moveTo("));
+        check("auton: flee retargets without wiping progress",
+                flee.contains("headTo(") || flee.contains("Pathfinder.retarget("));
+        check("auton: wander retargets without wiping progress",
+                wander.contains("headTo(") || wander.contains("Pathfinder.retarget("));
+        check("auton: closing in on a mob retargets without wiping progress",
+                approach.contains("headTo(") || approach.contains("Pathfinder.retarget("));
+        check("auton: routing never wipes the stuck history", !auton.contains("lastPosition = null"));
+        check("auton: a full navigation only happens through the one documented criterion",
+                !headTo.isEmpty() && headTo.contains("ROUTE_RESTART_DISTANCE")
+                        && headTo.contains("Pathfinder.retarget(")
+                        && headTo.contains("Pathfinder.navigateTo(")
+                        && countOf(auton, "Pathfinder.navigateTo(") == 1);
+        check("auton: the restart criterion only fires when the old route is dead or far away",
+                headTo.contains("Pathfinder.isNavigating()"));
+        check("auton: still only runs as a no-backend fallback",
+                ae.contains("!backendConnected && InputIsolation.isAiControlled()"));
+    }
+
+    // ── 10. 死亡点 + 无后端自主行为的默认开关 ──
+
+    /**
+     * 死亡点：用户口径"死了不会回死亡点捡装备" ⇒ 模组**只报事实**（死在哪、什么时候），
+     * 回不回由模型决定。这里把"只报事实、不自动回去"钉成结构。
+     */
+    private static void deathPointChecks() {
+        String death = read(Path.of("src", "main", "java", "com", "lcu", "lcumod", "action",
+                "DeathPoint.java"));
+        String collector = read(Path.of("src", "main", "java", "com", "lcu", "lcumod", "state",
+                "StateCollector.java"));
+
+        check("death: keeps the last few points, newest first", death.contains("MAX_POINTS = 3")
+                && death.contains("addFirst("));
+        check("death: remembers the last position while alive, not the respawn point",
+                death.contains("lastAliveX") && death.contains("isDeadOrDying()"));
+        check("death: records once per death (edge triggered)", death.contains("if (!wasAlive)"));
+        check("death: stamps when it happened", death.contains("System.currentTimeMillis()"));
+        check("death: never invents coordinates it never had", death.contains("Double.isNaN(x)"));
+        check("death: reports facts only, never walks anywhere",
+                !death.contains("Pathfinder.") && !death.contains("MovementSystem."));
+        check("death: is ticked every client tick, not behind the state interval",
+                collector.indexOf("DeathPoint.tick(") > 0
+                        && collector.indexOf("DeathPoint.tick(") < collector.indexOf("STATE_INTERVAL"));
+        check("death: surfaces in the state payload", collector.contains("state.add(\"death_points\""));
+    }
+
+    /**
+     * 无后端时那套 legacy 自主行为的**默认开关**：用户口径"后台不许有自主开关/自动触发" ⇒ 默认关；
+     * 想开是**偏好**（配置项），不是自主触发；P0 生存反射不受它影响。
+     */
+    private static void autonomousDefaultChecks() {
+        String autonomy = read(Path.of("src", "main", "java", "com", "lcu", "lcumod", "action",
+                "JavaAutonomousBehavior.java"));
+        String config = read(Path.of("src", "main", "java", "com", "lcu", "lcumod", "config",
+                "ModConfig.java"));
+        String executor = read(Path.of("src", "main", "java", "com", "lcu", "lcumod", "action",
+                "ActionExecutor.java"));
+
+        check("auton: default off", autonomy.contains("private static boolean enabled = false;"));
+        check("auton: the switch is a preference, not a behaviour",
+                config.contains("AUTONOMOUS_FALLBACK") && config.contains(".define(\"autonomousFallback\", false)"));
+        check("auton: the config drives it (and a missing config keeps it off)",
+                executor.contains("AUTONOMOUS_FALLBACK.getAsBoolean()")
+                        && executor.contains("JavaAutonomousBehavior.setEnabled("));
+        check("auton: turning it off does not touch the P0 survival reflexes",
+                !read(Path.of("src", "main", "java", "com", "lcu", "lcumod", "action",
+                        "CombatReflex.java")).contains("AUTONOMOUS_FALLBACK"));
+    }
+
     /** 取某个成员（含签名行）到下一个成员声明之间的源码片段（静态扫描用）。 */
     private static String methodBody(String source, String signature) {
         int start = source.indexOf(signature);
@@ -581,6 +769,24 @@ public final class WalkCheck {
             }
             count++;
             from = idx + needle.length();
+        }
+    }
+
+    private static boolean throwsIllegalState(Runnable action) {
+        try {
+            action.run();
+            return false;
+        } catch (IllegalStateException ex) {
+            return true;
+        }
+    }
+
+    private static boolean throwsIllegalArgument(Runnable action) {
+        try {
+            action.run();
+            return false;
+        } catch (IllegalArgumentException ex) {
+            return true;
         }
     }
 

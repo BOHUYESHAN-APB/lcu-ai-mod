@@ -38,8 +38,17 @@ public class ModConfig {
 
     // Surroundings scan radius
     public static final ModConfigSpec.IntValue SURROUNDINGS_RADIUS = BUILDER
-            .comment("Radius in blocks to scan surroundings")
-            .defineInRange("surroundingsRadius", 8, 2, 32);
+        .comment("Radius in blocks to scan surroundings")
+        .defineInRange("surroundingsRadius", 8, 2, 32);
+
+    // 无后端时那套 legacy 自主行为（wander / track players / collect / flee）是否启用。
+    // 默认**关**：用户口径"后台不许有自主开关/自动触发"，没后端时宁可站着也别自己乱跑。
+    // 注意：P0 生存反射（战斗还手 / 溺水 / MLG / 进食）**不**受这个开关影响，它们该动还是会动。
+    public static final ModConfigSpec.BooleanValue AUTONOMOUS_FALLBACK = BUILDER
+        .comment("Run the legacy autonomous behaviour bundle (wander/track/collect) while no backend is connected.",
+                "Default false: without a brain it stands still instead of acting on its own.",
+                "P0 survival reflexes (combat, drowning, MLG, eating) are NOT affected by this switch.")
+        .define("autonomousFallback", false);
 
     public static final ModConfigSpec SPEC = BUILDER.build();
 }

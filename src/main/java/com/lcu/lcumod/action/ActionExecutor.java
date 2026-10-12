@@ -296,6 +296,15 @@ public class ActionExecutor {
         // modes_engine owns behavior and Java autonomy must stay idle (fallback only).
         boolean backendConnected = LCUMod.WIRE != null && LCUMod.WIRE.hasClients();
         if (!backendConnected && InputIsolation.isAiControlled()) {
+            // 偏好开关（不是自主触发）：默认关，只有配置里明确打开才跑这套 legacy 行为。
+            try {
+                boolean wantAutonomy = com.lcu.lcumod.config.ModConfig.AUTONOMOUS_FALLBACK.getAsBoolean();
+                if (wantAutonomy != JavaAutonomousBehavior.isEnabled()) {
+                    JavaAutonomousBehavior.setEnabled(wantAutonomy);
+                }
+            } catch (IllegalStateException ignored) {
+                // 配置还没加载：保持当前状态（默认关），不瞎开。
+            }
             boolean behaviorActive = JavaAutonomousBehavior.tick(mc);
             // If behavior is active and no backend command is pending, skip other actions
             if (behaviorActive && WireServer.commandQueue.isEmpty()) {
@@ -3505,8 +3514,11 @@ public class ActionExecutor {
      * 卡住看门狗（用户实机："追进水里就站住不动"、"有些情况下莫名其妙站在原地不动"）。
      *
      * 这是**通用**机制、不是特判：只要"当前有该走完全程的任务"，3 秒内水平位移 <0.6 格，
-     * 就停止寻路、把任务诚实标成 failed 并附上 `Pathfinder` 的失败原因，随后由后端（LLM）
-     * 重新规划——本地层不硬撑、也不假装还在推进。
+     * 先**自己换一条路线再试**（有界绕行，见 {@link Pathfinder#attemptDetour()} 与
+     * {@link StuckDetour}：最多 2 次、每次横向偏移方向不同、受 {@code ReplanGate} 限速、
+     * 只走既有地形 —— 绝不搭方块）；两次绕行都还走不动，才停止寻路、把任务诚实标成 failed、
+     * 附上 `Pathfinder` 的失败原因与"试过几次绕行"，随后由后端（LLM）重新规划 ——
+     * 本地层不硬撑、也不假装还在推进（用户口径："卡住不要只停：先自动换路线再试，试不动才如实报"）。
      *
      * <p>与驻守/重放的边界：驻守期间"不动"是**意图**（用户要的就是站桩挂机），重放有自己的
      * 段级判定（带"卡在第几个点"的上下文）—— 因此这两者在此整体让路，绝不互相打架。
@@ -3541,6 +3553,9 @@ public class ActionExecutor {
             stuckTicks = 0;
             stuckLastX = mc.player.getX();
             stuckLastZ = mc.player.getZ();
+            // 真的走动了 ⇒ 上一个"卡住回合"结束：绕行额度重置（下一次卡住重新给 2 次）。
+            // 阈值与这里的 0.6 格同口径：被推来推去的微小抖动不算"走动了"，否则额度会被反复刷新。
+            Pathfinder.resetDetourBudget();
             return;
         }
 
@@ -3549,15 +3564,41 @@ public class ActionExecutor {
             return; // 3 秒容忍（含正常转身/挖方块的时间）
         }
 
+        // ── 卡住不要只停：先自己换一条路线（有界绕行）再试，试不动才如实上报（用户口径）──
+        // 绕行本身**有界**（{@link StuckDetour} 最多 2 次）、**限速**（Pathfinder 内部走 REPLAN 门，
+        // 不会每 tick 重算）、且只走既有地形（NO_RESCUE_POLICY：不搭方块/不立柱/不填坑）。
+        Pathfinder.DetourOutcome detour = Pathfinder.attemptDetour();
+        if (detour == Pathfinder.DetourOutcome.DETOURED) {
+            // 换到新路了：重新计 3 秒窗口继续走 —— 不停路、不上报（还没到"试不动"）。
+            stuckTicks = 0;
+            stuckLastX = Double.NaN;
+            setTaskState(activeTaskKind == null || activeTaskKind.isBlank() ? "move" : activeTaskKind,
+                    "running", activeTaskTarget,
+                    String.format("stuck -> detour %d/%d (trying another route)",
+                            Pathfinder.detourAttempts(), Pathfinder.maxDetourAttempts()), 0.1);
+            LCUMod.LOGGER.warn("[Stuck] 3s 无位移 → 自动绕行 {}/{}（换条路再试，不搭方块救援）",
+                    Pathfinder.detourAttempts(), Pathfinder.maxDetourAttempts());
+            return;
+        }
+        if (detour != Pathfinder.DetourOutcome.EXHAUSTED
+                && detour != Pathfinder.DetourOutcome.UNAVAILABLE) {
+            // WAIT：退避窗口内 / 这次绕行点没算出路 —— 等下一个窗口再试，不升级上报（也没算路，别刷屏）。
+            return;
+        }
+
+        // 只剩 EXHAUSTED（绕行额度用尽仍不走）/ UNAVAILABLE（没有可绕的导航）：如实停路 + 上报。
         String reason = Pathfinder.getLastFailureReason();
         String stuckReason = reason == null || reason.isBlank()
                 ? "no progress; " + Pathfinder.NO_RESCUE_POLICY
                 : reason;
+        int detours = Pathfinder.detourAttempts();
+        String tried = detours > 0 ? String.format(" (tried %d detour(s), none worked)", detours) : "";
         Pathfinder.stop();
         setTaskState(activeTaskKind == null || activeTaskKind.isBlank() ? "move" : activeTaskKind,
-                "failed", activeTaskTarget, "stuck: " + stuckReason, 0.0);
+                "failed", activeTaskTarget, "stuck: " + stuckReason + tried, 0.0);
         StateCollector.requestRefresh();
-        LCUMod.LOGGER.warn("[Stuck] 3s 无位移，已停止寻路并上报（不搭方块自救）：{}", stuckReason);
+        LCUMod.LOGGER.warn("[Stuck] 3s 无位移，绕行 {} 次仍不走，已停止寻路并上报（不搭方块自救）：{}",
+                detours, stuckReason);
         stuckTicks = 0;
         stuckLastX = Double.NaN;
         stuckCooldown = 20 * 5;
