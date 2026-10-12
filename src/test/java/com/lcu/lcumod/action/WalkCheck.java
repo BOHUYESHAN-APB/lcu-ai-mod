@@ -35,6 +35,8 @@ public final class WalkCheck {
         replanGateChecks();
         sourceScanChecks();
         comeVsFollowChecks();
+        attackSafetyChecks();
+        landmarkMemoryChecks();
 
         System.out.println("[WalkCheck] " + passed + " checks passed, " + failed + " failed");
         if (failed > 0) {
@@ -315,6 +317,87 @@ public final class WalkCheck {
         ReplanGate gate = new ReplanGate(2000L);
         check("come/follow: replan gate rate limits retargets",
                 gate.allow("retarget", 0L) && !gate.allow("retarget", 1000L) && gate.allow("retarget", 2000L));
+    }
+
+    // ── 7. 出手安全：隔墙不打 / 不误伤旁边玩家（用户实机："他隔墙攻击，所以打到了我"）──
+
+    /**
+     * 把"出手必须先过统一安全检查"钉成结构：任何会**真打出伤害**的文件（含
+     * {@code mc.gameMode.attack(}）都必须调用 {@link AttackRules}。
+     *
+     * <p>背景（用户实机）：他知道墙后有怪（{@code getLastHurtByMob} 记住了），就朝那个方向挥 ——
+     * 中间隔着方块也照挥，于是在刷铁机边上误伤了主人。规则：视线被挡不挥；剑有横扫，旁边站着
+     * 别的玩家也不挥；够不着不挥。被拒时给**机器可读原因码**，如实上报而不是假装打过了。
+     */
+    private static void attackSafetyChecks() {
+        Path root = Path.of("src", "main", "java", "com", "lcu", "lcumod", "action");
+        String rules = read(root.resolve("AttackRules.java"));
+        check("attack: AttackRules exists", !rules.isEmpty());
+        check("attack: uses the verified 26.3 raycast API",
+                rules.contains("new ClipContext(") && rules.contains("ClipContext.Block.COLLIDER")
+                        && rules.contains("HitResult.Type.BLOCK"));
+        check("attack: blocked line of sight is a refusal code", rules.contains("NO_LINE_OF_SIGHT"));
+        check("attack: no friendly fire near other players",
+                rules.contains("PLAYER_TOO_CLOSE") && rules.contains("SWEEP_PLAYER_CLEARANCE"));
+        check("attack: verdicts are machine readable", rules.contains("public String code()"));
+
+        String[] mustGuard = {"ActionExecutor.java", "CombatReflex.java",
+                "JavaAutonomousBehavior.java", "ControlStream.java"};
+        for (String file : mustGuard) {
+            String src = read(root.resolve(file));
+            boolean attacks = src.contains("gameMode.attack(");
+            boolean guarded = src.contains("AttackRules.check(") || src.contains("AttackRules.canHit(");
+            check("attack: " + file + " gates its attacks behind AttackRules", !attacks || guarded);
+        }
+
+        // 武器策略（WeaponPolicy 零依赖 ⇒ 直接测逻辑，不加载任何 MC 类）：
+        // 用户口径："旁边有玩家的情况下可以用斧子；重锤和矛禁止 AI 使用，因为误伤更严重。"
+        check("attack: mace is banned for the AI", WeaponPolicy.isBanned("minecraft:mace"));
+        check("attack: every spear tier is banned",
+                WeaponPolicy.isBanned("minecraft:wooden_spear")
+                        && WeaponPolicy.isBanned("minecraft:netherite_spear"));
+        check("attack: banned weapons are never auto-equipped",
+                WeaponPolicy.score("minecraft:mace") == 0
+                        && WeaponPolicy.score("minecraft:iron_spear") == 0);
+        check("attack: axe and bare hand are sweep-safe near players",
+                WeaponPolicy.isSweepSafe("minecraft:iron_axe") && WeaponPolicy.isSweepSafe(""));
+        check("attack: sword is not sweep-safe", !WeaponPolicy.isSweepSafe("minecraft:netherite_sword"));
+        check("attack: normal preference still ranks sword over axe",
+                WeaponPolicy.score("minecraft:netherite_sword") > WeaponPolicy.score("minecraft:netherite_axe"));
+        check("attack: trident still ranks above axe",
+                WeaponPolicy.score("minecraft:trident") > WeaponPolicy.score("minecraft:iron_axe"));
+        check("attack: weapon policy stays zero dependency",
+                !read(root.resolve("WeaponPolicy.java")).contains("net.minecraft"));
+        check("attack: AttackRules enforces the weapon policy",
+                rules.contains("WeaponPolicy.isBanned(") && rules.contains("WeaponPolicy.isSweepSafe("));
+        check("attack: best-weapon pick delegates to the policy",
+                read(root.resolve("ActionExecutor.java")).contains("WeaponPolicy.score("));
+    }
+
+    // ── 8. 地标记忆的标签与作废（用户口径：床没了 ⇒ 作废 bed 标签、保留 home）──
+
+    /**
+     * 用户实机口径：记忆要**带标签**；"home 的标签没有错，只是床的标签没了" ⇒ 它应该自己往 home 走、
+     * 重新找床/做床；用户让它设新床时，home 也跟着变。这里把这条**生命周期**钉成结构。
+     */
+    private static void landmarkMemoryChecks() {
+        Path root = Path.of("src", "main", "java", "com", "lcu", "lcumod", "action");
+        String poi = read(root.resolve("PoiMemory.java"));
+        String collector = read(Path.of("src", "main", "java", "com", "lcu", "lcumod", "state",
+                "StateCollector.java"));
+
+        check("memory: entries carry a tag set", poi.contains("final Set<String> tags"));
+        check("memory: a point can hold several tags (bed + home)", poi.contains("void addTag("));
+        check("memory: dropping a tag re-labels the point", poi.contains("void removeTag("));
+        check("memory: first bed becomes the home too",
+                poi.contains("remember(pos") && poi.contains("\"home\"") && poi.contains("\"bed\""));
+        check("memory: bed loss is detected from the vanilla respawn point",
+                poi.contains("invalidateBedIfGone") && poi.contains("getRespawnData()"));
+        check("memory: bed loss only drops the bed tag, home stays",
+                poi.contains("removeTag(\"bed\")") && !poi.contains("removeTag(\"home\")"));
+        check("memory: respawn point is remembered proactively", poi.contains("rememberLandmarks("));
+        check("memory: tags are reported in the state", poi.contains("item.add(\"tags\""));
+        check("memory: bed is remembered when seen", collector.contains("PoiMemory.rememberBed("));
     }
 
     /** 取某个成员（含签名行）到下一个成员声明之间的源码片段（静态扫描用）。 */
