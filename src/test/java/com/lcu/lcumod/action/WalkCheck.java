@@ -34,6 +34,7 @@ public final class WalkCheck {
         alignmentGuardChecks();
         replanGateChecks();
         sourceScanChecks();
+        comeVsFollowChecks();
 
         System.out.println("[WalkCheck] " + passed + " checks passed, " + failed + " failed");
         if (failed > 0) {
@@ -247,6 +248,91 @@ public final class WalkCheck {
         check("scan: InputIsolation writes through the arbiter", ii.contains("LOOK.plan("));
         check("scan: InputIsolation guards the write on the frame", ii.contains("look.wrote()"));
         check("scan: InputIsolation no longer keeps a second look channel", !ii.contains("aiHasTarget"));
+    }
+
+    // ── 6. "过来" vs "跟着"：一次性快照 vs 迟滞带动态目标（用户口径）──────
+
+    /**
+     * 用户实机根因："跟随每 0.5 秒重设一次目标 ⇒ 路径进度 / 卡住历史 / 对准收敛全被清零 ⇒
+     * 一步都走不出去"。这里把修复的**结构**钉死，防止以后又被改回 navigateTo：
+     * <ol>
+     *   <li>跟随循环只许用 {@code Pathfinder.retarget}（不清进度），不许用 navigateTo / moveTo；</li>
+     *   <li>{@code retarget} 本身不许出现任何"清零进度"的语句；</li>
+     *   <li>迟滞带 / 到达距离 / 超时 / 卡住退避让路 / 目标失联如实收尾，都必须还在；</li>
+     *   <li>"过来"是一次性：走 navigateTo，且**不**重定向；</li>
+     *   <li>战斗反射：寻路中不接管位移、阶段变化才打日志；进食反射让路给战斗。</li>
+     * </ol>
+     */
+    private static void comeVsFollowChecks() {
+        Path root = Path.of("src", "main", "java", "com", "lcu", "lcumod", "action");
+        String pf = read(root.resolve("Pathfinder.java"));
+        String ae = read(root.resolve("ActionExecutor.java"));
+        String cr = read(root.resolve("CombatReflex.java"));
+        if (pf.isEmpty() || ae.isEmpty() || cr.isEmpty()) {
+            check("come/follow: sources found", false);
+            return;
+        }
+
+        String followTick = methodBody(ae, "private void tickFollowTarget(Minecraft mc)");
+        String come = methodBody(ae, "private void handleComeToPlayer(WireServer.WireCommand cmd)");
+        String retarget = methodBody(pf, "public static boolean retarget(");
+
+        check("come/follow: follow tick found", !followTick.isEmpty());
+        check("come/follow: follow tick retargets without wiping progress",
+                followTick.contains("Pathfinder.retarget("));
+        check("come/follow: follow tick never re-issues a full navigateTo",
+                !followTick.contains("navigateTo(") && !followTick.contains("MovementSystem.moveTo("));
+        check("come/follow: follow tick has hysteresis (arrive + chase distances)",
+                followTick.contains("FOLLOW_ARRIVE_DISTANCE") && followTick.contains("FOLLOW_CHASE_DISTANCE"));
+        check("come/follow: follow tick yields to the stuck watchdog backoff",
+                followTick.contains("stuckCooldown > 0"));
+        check("come/follow: follow tick has an honest timeout",
+                followTick.contains("FOLLOW_TIMEOUT_TICKS") && followTick.contains("follow timeout"));
+        check("come/follow: follow tick reports a lost target honestly",
+                followTick.contains("target left the world"));
+
+        check("come/follow: retarget exists", !retarget.isEmpty());
+        check("come/follow: retarget never resets the alignment guard", !retarget.contains("ALIGNMENT.reset()"));
+        check("come/follow: retarget never resets the stuck history", !retarget.contains("lastPosition = null"));
+        check("come/follow: retarget never resets the replan gate wholesale", !retarget.contains("REPLAN.reset()"));
+        check("come/follow: retarget keeps the navigation look target", !retarget.contains("clearNavigationLookTarget()"));
+        check("come/follow: retarget is rate limited by the replan gate", retarget.contains("REPLAN.allow("));
+        check("come/follow: hysteresis constant is 2.5 blocks", pf.contains("RETARGET_HYSTERESIS = 2.5"));
+
+        check("come/follow: come is one-shot (full navigation, no retarget)",
+                come.contains("Pathfinder.navigateTo(") && !come.contains("retarget("));
+        check("come/follow: come clears the persistent follow first", come.contains("followTargetName = null;"));
+        check("come/follow: come is dispatched", ae.contains("case \"come_to_player\" -> handleComeToPlayer(cmd);"));
+        check("come/follow: come counts as a new task (cancels follow)",
+                ae.contains("NEW_TASK_COMMANDS") && ae.contains("\"come_to_player\""));
+
+        check("combat: reflex logs phase changes only", cr.contains("logPhase(") && cr.contains("loggedPhase"));
+        check("combat: reflex does not steal movement while navigating",
+                cr.contains("if (Pathfinder.isNavigating())"));
+        check("combat: eating yields to combat", ae.contains("if (CombatReflex.isEngaged())"));
+
+        // 纯逻辑：retarget 的限速就是 ReplanGate（同一 key 在窗口内只放行一次）。
+        ReplanGate gate = new ReplanGate(2000L);
+        check("come/follow: replan gate rate limits retargets",
+                gate.allow("retarget", 0L) && !gate.allow("retarget", 1000L) && gate.allow("retarget", 2000L));
+    }
+
+    /** 取某个成员（含签名行）到下一个成员声明之间的源码片段（静态扫描用）。 */
+    private static String methodBody(String source, String signature) {
+        int start = source.indexOf(signature);
+        if (start < 0) {
+            return "";
+        }
+        int after = start + signature.length();
+        int end = source.indexOf("\n    private ", after);
+        int pub = source.indexOf("\n    public ", after);
+        if (end < 0 || (pub >= 0 && pub < end)) {
+            end = pub;
+        }
+        if (end < 0) {
+            end = source.length();
+        }
+        return source.substring(start, end);
     }
 
     // ── helpers ──────────────────────────────────────────────────

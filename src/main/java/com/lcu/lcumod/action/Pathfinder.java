@@ -38,6 +38,13 @@ public class Pathfinder {
     private static final double MAX_DROP_HEIGHT = 3.2;
     private static final double WAYPOINT_REACH_XZ = 0.62;
     private static final double WAYPOINT_REACH_Y = 0.9;
+    /**
+     * 动态目标（跟随）的**迟滞带**：目标没挪出这个距离就不重算路径。
+     *
+     * <p>对齐 mineflayer-pathfinder 的 {@code GoalFollow.hasChanged()}：它也只在该实体挪出
+     * {@code range²} 时才让引擎重算 —— 重算频率由"目标走了多远"决定，不由 tick 频率决定。
+     */
+    private static final double RETARGET_HYSTERESIS = 2.5;
     private static final int STUCK_TIMEOUT_TICKS = 40;
     private static final int MAX_SEARCH_EXPANSIONS = 2048;
     /** 视角对准到多少度以内才允许按前进键（保留原意图）。 */
@@ -92,6 +99,45 @@ public class Pathfinder {
         ALIGNMENT.reset();
         InputIsolation.clearNavigationLookTarget();
         return calculatePath();
+    }
+
+    /**
+     * 动态目标的**非破坏性**重定向（"跟随"这类目标自己在动的场景专用）。
+     *
+     * <p>为什么不能直接用 {@link #navigateTo}：它把 {@code currentPathIndex} / {@code lastPosition}
+     * / {@code stuckTicks} / 收敛计数 / 导航视角目标**全部清零重来**。跟随循环每 0.5 秒调一次
+     * ⇒ 走了一半的进度、卡住判定历史、朝向收敛全被抹掉 ⇒ 一步都走不出去，看门狗每 3 秒报一次
+     * "无位移"并停路，然后跟随循环又把它重开（用户实机：站着不动、被僵尸打死）。
+     *
+     * <p>口径（对齐 mineflayer-pathfinder {@code GoalFollow.hasChanged} 的迟滞带）：目标没挪出
+     * {@link #RETARGET_HYSTERESIS} ⇒ **什么都不做**，继续走现有路；挪出去了 ⇒ 只重算路径，
+     * **保留**卡住历史、收敛计数与导航视角目标；重算本身仍受 {@link ReplanGate} 退避约束
+     * （最多每 {@link ReplanGate#DEFAULT_BACKOFF_MS} 一次）——重算频率由"目标走了多远"决定，
+     * 不由 tick 频率决定。
+     *
+     * @return true = 现在"有路可走"（可能仍在走旧路）
+     */
+    public static boolean retarget(String requestId, double x, double y, double z) {
+        if (!isNavigating || targetPos == null || currentPath.isEmpty()) {
+            // 没在导航（或没有路）：这就是一次新的导航，走完整初始化。
+            return navigateTo(requestId, x, y, z);
+        }
+        activeRequestId = requestId;
+        Vec3 next = new Vec3(x, y, z);
+        if (targetPos.distanceTo(next) < RETARGET_HYSTERESIS) {
+            return true;
+        }
+        if (!REPLAN.allow("retarget", System.currentTimeMillis())) {
+            // 退避窗口内：按现有路继续尝试（不重算、不清进度、不假装到达）。
+            return true;
+        }
+        targetPos = next;
+        return calculatePath();
+    }
+
+    /** 当前目标距可以重算还有多少毫秒（0 = 现在就可以；跟随循环据此决定要不要等）。 */
+    public static long replanRemainingMs() {
+        return REPLAN.remainingMs("retarget", System.currentTimeMillis());
     }
 
     public static void stop() {

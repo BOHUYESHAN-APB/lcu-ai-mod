@@ -73,10 +73,23 @@ public class ActionExecutor {
     private static int respawnAttempts = 0;
     private static String followTargetName = null;
     private static int followRefreshTicks = 0;
+    /** 跟随剩余时长（tick）：到点**如实收尾**，不无限追（用户实机："追进水里就站住不动"）。 */
+    private static int followTicks = 0;
+    /** 跟随状态上报节流（tick）：每 2 秒更新一次，不刷 wire。 */
+    private static int followReportTicks = 0;
+
+    /** 跟随：进到这个距离内算"跟上了"（停下等他走远再追，不是结束跟随）。 */
+    private static final double FOLLOW_ARRIVE_DISTANCE = 2.5;
+    /** 跟随：目标走出这个距离才重新起步（**迟滞带**，防 0.5 秒抖一次目标）。 */
+    private static final double FOLLOW_CHASE_DISTANCE = 4.5;
+    /** 一次跟随的最长时长（20 tick/s × 120s）：超时停下并如实上报，交后端重新决定。 */
+    private static final int FOLLOW_TIMEOUT_TICKS = 20 * 120;
+    /** 跟随状态上报间隔（tick）。 */
+    private static final int FOLLOW_REPORT_INTERVAL_TICKS = 40;
 
     /** 收到这些命令视为"新任务"，先取消 Java 侧持久跟随（否则会"嘴上说不跟、身体还在跟"）。 */
     private static final java.util.Set<String> NEW_TASK_COMMANDS = java.util.Set.of(
-            "move_to", "follow_player", "explore", "go_to_block", "collect_blocks",
+            "move_to", "follow_player", "come_to_player", "explore", "go_to_block", "collect_blocks",
             "craft_item", "build", "trade", "mine_block", "dig_block", "place_block", "sleep", "guard",
             // 站点驻守与路径重放同样是"占住身体"的任务，必须参与新任务让路
             "go_afk", "route_follow");
@@ -556,6 +569,7 @@ public class ActionExecutor {
                 case "place_block" -> handlePlace(cmd);
                 // Advanced actions
                 case "follow_player" -> handleFollowPlayer(cmd);
+                case "come_to_player" -> handleComeToPlayer(cmd);
                 case "craft_item" -> handleCraftItem(cmd);
                 case "collect_blocks" -> handleCollectBlocks(cmd);
                 case "explore" -> handleExplore(cmd);
@@ -1903,6 +1917,14 @@ public class ActionExecutor {
 
     // ── Advanced Action Handlers ────────────────────────────────
 
+    /**
+     * 跟随（**长驻**）：只在玩家明确要求"跟着我 / 别走开 / 跟我来"时由后端下发。
+     *
+     * <p>与"过来"的分工是刻意的（用户口径"玩家说过来≠让ai跟着"；对齐 mineflayer 的
+     * {@code GoalNear} 快照 vs {@code GoalFollow} 动态目标、mindcraft 的 {@code goToPlayer}
+     * vs {@code followPlayer}）：这里的目标**会动**，由 {@link #tickFollowTarget} 按迟滞带
+     * 持续重定向；"过来"是 {@link #handleComeToPlayer}，**一次性**、到了就结束。
+     */
     private void handleFollowPlayer(WireServer.WireCommand cmd) {
         var args = cmd.args();
         if (args == null || !args.has("player")) {
@@ -1920,21 +1942,70 @@ public class ActionExecutor {
         pendingCraftTicks = 0;
         pendingCraftAttempts = 0;
         abortEat("new_task");
-        followTargetName = playerName;
-        followRefreshTicks = 0;
-        setTaskState("follow", "running", playerName, "following player", 0.1);
-        
-        // Find player by name
+
         for (var player : mc.level.players()) {
-            if (player.getName().getString().equalsIgnoreCase(playerName)) {
-                // Move toward player
-                MovementSystem.moveTo(player.getX(), player.getY(), player.getZ(), 1.2f);
-                sendBehaviorSnapshot();
-                sendResponse(cmd.id(), true, "Following " + playerName);
-                return;
+            if (!player.getName().getString().equalsIgnoreCase(playerName) || player == mc.player) {
+                continue;
             }
+            followTargetName = playerName;
+            followRefreshTicks = 0;
+            followReportTicks = 0;
+            followTicks = FOLLOW_TIMEOUT_TICKS;
+            // 起步用一次完整寻路；后续由 tickFollowTarget 用 retarget 续（**不再清零进度**）。
+            MovementSystem.moveTo(player.getX(), player.getY(), player.getZ(), 1.2f);
+            setTaskState("follow", "running", playerName, "following player", 0.1);
+            sendBehaviorSnapshot();
+            sendResponse(cmd.id(), true, "Following " + playerName);
+            return;
         }
+
         followTargetName = null;
+        followTicks = 0;
+        sendBehaviorSnapshot();
+        sendResponse(cmd.id(), false, "Player " + playerName + " not found");
+    }
+
+    /**
+     * "过来"（**一次性**）：走到该玩家**现在**站的位置，到了就结束。
+     *
+     * <p>关键差别（用户口径）：这里只**快照一次坐标**就交给寻路，之后不再重设目标 ——
+     * 玩家中途走开也不会改目标（要"跟着"是另一个命令 `follow_player`）。所以它天然不会
+     * 出现"每 0.5 秒重算一次路、一步都走不出去"的抖动。
+     */
+    private void handleComeToPlayer(WireServer.WireCommand cmd) {
+        var args = cmd.args();
+        if (args == null || !args.has("player")) {
+            sendResponse(cmd.id(), false, "Need player name");
+            return;
+        }
+        var mc = Minecraft.getInstance();
+        if (mc.player == null || mc.level == null) {
+            sendResponse(cmd.id(), false, "No player");
+            return;
+        }
+        String playerName = args.get("player").getAsString();
+        abortEat("new_task");
+        // "过来"不是跟随：清掉长驻跟随，避免两条链同时改同一个导航目标。
+        followTargetName = null;
+        followTicks = 0;
+
+        for (var player : mc.level.players()) {
+            if (!player.getName().getString().equalsIgnoreCase(playerName) || player == mc.player) {
+                continue;
+            }
+            double x = player.getX();
+            double y = player.getY();
+            double z = player.getZ();
+            boolean accepted = Pathfinder.navigateTo(cmd.id(), x, y, z);
+            setTaskState("come", accepted ? "running" : "failed", playerName,
+                    accepted ? "walking to player" : "no path to player", accepted ? 0.1 : 0.0);
+            sendBehaviorSnapshot();
+            sendResponse(cmd.id(), accepted, accepted
+                    ? String.format("Walking to %s (%.1f, %.1f, %.1f)", playerName, x, y, z)
+                    : "No path to " + playerName);
+            return;
+        }
+
         sendBehaviorSnapshot();
         sendResponse(cmd.id(), false, "Player " + playerName + " not found");
     }
@@ -3528,6 +3599,11 @@ public class ActionExecutor {
         if (ReflexGate.isSuppressed("eat")) {
             return;
         }
+        if (CombatReflex.isEngaged()) {
+            // 打架优先：被打了**先还手**，别站在原地吃东西（用户实机："被僵尸打了还在那吃东西，
+            // 不会反击"）。打完了下一轮自然会吃 —— 进食是 10 秒冷却的循环，不会因此饿死。
+            return;
+        }
         int food = mc.player.getFoodData().getFoodLevel();
         float health = mc.player.getHealth();
         boolean hungry = food <= HUNGER_REFLEX_FOOD;
@@ -4148,10 +4224,39 @@ public class ActionExecutor {
         if (LCUMod.WIRE != null) LCUMod.WIRE.sendResponse(id, success, data, error);
     }
 
+    /**
+     * 跟随的**持续重定向**（长驻跟随唯一的推进点）。
+     *
+     * <p>用户实机根因（"站着不动、被僵尸打死"）：这里以前每 0.5 秒调一次
+     * {@code MovementSystem.moveTo} ⇒ 落到 {@code Pathfinder.navigateTo} ⇒ 把路径进度、
+     * 卡住判定历史、朝向收敛、导航视角目标**全部清零重算** ⇒ 一步都走不出去 ⇒ 看门狗每 3 秒
+     * 报一次"无位移"并停路 ⇒ 0.5 秒后这里又重开 ⇒ 死循环，waypoint 数一路从 22 涨到 47。
+     *
+     * <p>现在三条规则（对齐 mineflayer {@code GoalFollow.hasChanged} 的迟滞带）：
+     * <ol>
+     *   <li>用 {@link Pathfinder#retarget}（**不清进度**），不再用 navigateTo/moveTo；</li>
+     *   <li>迟滞带：进到 {@link #FOLLOW_ARRIVE_DISTANCE} 内**停下等他走远**，走出
+     *       {@link #FOLLOW_CHASE_DISTANCE} 才重新起步 —— 重算频率由"他走了多远"决定；</li>
+     *   <li>看门狗的退避窗口内（{@code stuckCooldown}）**不重开**导航；跟随超时
+     *       （{@link #FOLLOW_TIMEOUT_TICKS}）或目标离开当前世界 ⇒ **如实收尾并上报**。</li>
+     * </ol>
+     */
     private void tickFollowTarget(Minecraft mc) {
         if (followTargetName == null || !InputIsolation.isAiControlled() || mc.player == null || mc.level == null) {
             return;
         }
+
+        if (followTicks <= 0) {
+            String who = followTargetName;
+            followTargetName = null;
+            Pathfinder.stop();
+            setTaskState("follow", "failed", who, "follow timeout: 没能在时限内跟上", 0.0);
+            StateCollector.requestRefresh();
+            LCUMod.LOGGER.warn("[Follow] 超时收尾：{} tick 内没跟上 {}（不无限追，交后端重新决定）",
+                    FOLLOW_TIMEOUT_TICKS, who);
+            return;
+        }
+        followTicks--;
 
         if (followRefreshTicks-- > 0) {
             return;
@@ -4164,13 +4269,43 @@ public class ActionExecutor {
             }
 
             double distance = mc.player.distanceTo(player);
-            if (distance > 4.5) {
-                MovementSystem.moveTo(player.getX(), player.getY(), player.getZ(), 1.1f);
-            } else if (distance < 2.0 && Pathfinder.isNavigating()) {
-                Pathfinder.stop();
+            if (distance <= FOLLOW_ARRIVE_DISTANCE) {
+                // 跟上了：停下等他走远（**不退出**跟随模式——"跟着我"是长驻的）。
+                if (Pathfinder.isNavigating()) {
+                    Pathfinder.stop();
+                }
+            } else if (distance >= FOLLOW_CHASE_DISTANCE) {
+                if (stuckCooldown > 0) {
+                    // 刚被判"卡住"：退避期内不重开（否则"停路→重开"死循环），如实等窗口过去。
+                    if (followReportTicks-- <= 0) {
+                        followReportTicks = FOLLOW_REPORT_INTERVAL_TICKS;
+                        setTaskState("follow", "running", followTargetName,
+                                String.format("stuck, waiting %.1fs before retry (%.1fm away)",
+                                        stuckCooldown / 20.0, distance), 0.0);
+                    }
+                    return;
+                }
+                // 在走 ⇒ 交给 retarget 的迟滞带 + 退避决定要不要重算；没在走 ⇒ 重新起步。
+                Pathfinder.retarget(null, player.getX(), player.getY(), player.getZ());
+            }
+
+            if (followReportTicks-- <= 0) {
+                followReportTicks = FOLLOW_REPORT_INTERVAL_TICKS;
+                double progress = Math.max(0.0, Math.min(0.9, 1.0 - distance / 32.0));
+                setTaskState("follow", "running", followTargetName,
+                        String.format("following %.1fm", distance), progress);
             }
             return;
         }
+
+        // 目标不在这个世界（走了/离线/换维度）：如实停，不假装还在跟。
+        String who = followTargetName;
+        followTargetName = null;
+        followTicks = 0;
+        Pathfinder.stop();
+        setTaskState("follow", "failed", who, "target left the world", 0.0);
+        StateCollector.requestRefresh();
+        LCUMod.LOGGER.warn("[Follow] 目标 {} 不在当前世界，已停止跟随（如实上报）", who);
     }
 
     private void tickPendingCraft(Minecraft mc) {

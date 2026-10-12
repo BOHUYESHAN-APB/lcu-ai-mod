@@ -1,5 +1,6 @@
 package com.lcu.lcumod.action;
 
+import com.lcu.lcumod.LCUMod;
 import net.minecraft.client.Minecraft;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
@@ -20,7 +21,8 @@ import net.minecraft.world.item.component.SwingAnimation;
  * - **只还击敌对生物**（`instanceof Enemy`）；玩家（包括服主本人）打你**不会**被打回去。
  * - 只在 AI 控制模式下工作；用户控制模式绝不插手。
  * - 尊重原版攻击冷却（`getAttackStrengthScale`）与出手间隔，不刷攻速。
- * - 不写 WASD（移动交给 Pathfinder/控制流），只写**朝向 + 攻击**，因此不会抢走移动控制权。
+ * - **寻路中不写 WASD**（移动交给 Pathfinder / 控制流），只写**朝向 + 攻击**；只有在**没有**寻路
+ *   任务时才由反射贴上去 / 后撤 —— 否则会跟寻路抢 forward 键，表现就是"卡在原地"（用户实机）。
  *
  * 调用时机：`ActionExecutor.onTick` 中**放在 ControlStream.tick 之后** —— 需要它在这种
  * 紧急情形下成为朝向的最后写入者（否则会被控制流的视角覆盖，等于不还手）。
@@ -39,6 +41,8 @@ public final class CombatReflex {
     private static int memoryTicks = 0;
     private static String lastAction = "";
     private static boolean engaged = false;
+    /** 变化驱动日志：只在这个"阶段"变了才打一行（用户口径："没有状态刷新就不刷新日志"）。 */
+    private static String loggedPhase = "";
 
     private CombatReflex() {
     }
@@ -77,6 +81,7 @@ public final class CombatReflex {
             memoryTicks = 0;
             engaged = false;
             lastAction = "";
+            logPhase("");
             releaseMovement();
             return false;
         }
@@ -84,6 +89,7 @@ public final class CombatReflex {
         if (!attacker.isAlive() || attacker.level() != player.level()) {
             lastAttacker = null;
             engaged = false;
+            logPhase("");
             releaseMovement();
             return false;
         }
@@ -94,6 +100,7 @@ public final class CombatReflex {
         if (freshEngagement) {
             String weapon = ActionExecutor.equipBestWeapon(mc);
             lastAction = weapon == null ? "engage:barehand" : "equip:" + weapon;
+            logPhase("engage:" + lastAction);
         }
 
         float[] aim = aimAngles(player, attacker);
@@ -111,9 +118,15 @@ public final class CombatReflex {
         boolean weaponReady = player.getAttackStrengthScale(0.5f) >= 1.0f;
 
         // 边打边走（用户实机："攻击僵尸时不会边移动边攻击"）。参考 minecraft-agent 的 defendSelf：
-        // 距离 >=4 贴上去、距离 <=2 后撤，中间原地打 —— 只在朝向对准时按。
-        ActionExecutor.setInput("forward", distance > 4.0);
-        ActionExecutor.setInput("back", distance < 1.8);
+        // 距离 >=4 贴上去、距离 <=2 后撤，中间原地打。
+        // 但**寻路中不接管位移**：那会跟 Pathfinder 抢同一个 forward 键（谁后写谁赢），
+        // 表现就是"有任务却卡在原地"。寻路时只写朝向 + 出手。
+        if (Pathfinder.isNavigating()) {
+            releaseMovement();
+        } else {
+            ActionExecutor.setInput("forward", distance > 4.0);
+            ActionExecutor.setInput("back", distance < 1.8);
+        }
 
         if (distance <= REACH && weaponReady && cooldown == 0 && aimed) {
             mc.gameMode.attack(player, attacker);
@@ -121,12 +134,38 @@ public final class CombatReflex {
             cooldown = MIN_ATTACK_INTERVAL_TICKS;
             lastAction = "retaliate:" + attacker.getName().getString()
                     + "@" + String.format("%.1f", distance) + "m";
+            logPhase("retaliate:" + attacker.getName().getString());
             return true;
         }
 
         lastAction = (aimed ? "facing:" : "turning:")
                 + attacker.getName().getString() + "@" + String.format("%.1f", distance) + "m";
+        logPhase((aimed ? "facing:" : "turning:") + attacker.getName().getString());
         return distance <= REACH * 2.0;
+    }
+
+    /**
+     * 变化驱动日志：**阶段变了才打一行**（用户口径"没有状态刷新就不刷新日志"）。
+     *
+     * <p>为什么需要它：用户实机报"被打了不会还手"时，日志里**一条战斗记录都没有** ——
+     * 这个反射以前只把状态塞进 state（`reflex_combat`），日志里看不出"到底有没有进入交战、
+     * 有没有出手"，只能靠猜。这里在阶段（进入交战 / 出手 / 对准 / 转身 / 结束）变化时各打一次，
+     * 距离抖动不再刷屏（否则每 tick 都在变，等于刷屏）。
+     */
+    private static void logPhase(String phase) {
+        if (phase.equals(loggedPhase)) {
+            return;
+        }
+        loggedPhase = phase;
+        if (phase.isEmpty()) {
+            LCUMod.LOGGER.info("[Reflex] Combat: 交战结束（目标没了或已死亡）");
+        } else if (phase.startsWith("engage")) {
+            LCUMod.LOGGER.info("[Reflex] Combat: 进入交战（{}）", lastAction);
+        } else if (phase.startsWith("retaliate")) {
+            LCUMod.LOGGER.info("[Reflex] Combat: 出手 {}", lastAction);
+        } else {
+            LCUMod.LOGGER.info("[Reflex] Combat: {} {}", phase, lastAction);
+        }
     }
 
     /** 最近一次反射动作（用于状态上报/排错）。 */
