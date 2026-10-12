@@ -147,19 +147,20 @@ public final class WalkCheck {
             return;
         }
         check("mixin-static: mixin sources listed", !files.isEmpty());
-        boolean anySetOf = false;
+        boolean anyOfFactory = false;
         boolean usesShield = false;
         for (Path file : files) {
             String text = read(file);
-            if (text.contains("Set.of(")) {
-                anySetOf = true;
+            // `Set.of`/`Map.of` 对**重复元素**抛异常（`List.of` 不会，列表本来就允许重复）。
+            if (text.contains("Set.of(") || text.contains("Map.of(")) {
+                anyOfFactory = true;
             }
             if (text.contains("KeyShield.allowed(")) {
                 usesShield = true;
             }
         }
-        check("mixin-static: no mixin builds a set with Set.of (duplicates crash the target's <clinit>)",
-                !anySetOf);
+        check("mixin-static: no mixin builds a set/map with of() (duplicates crash the target's <clinit>)",
+                !anyOfFactory);
         check("mixin-static: the always-allowed keys go through KeyShield.allowed", usesShield);
     }
 
