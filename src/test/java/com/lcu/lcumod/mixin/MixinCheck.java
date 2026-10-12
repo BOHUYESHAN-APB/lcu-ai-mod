@@ -334,8 +334,11 @@ public final class MixinCheck {
             return;
         }
         String build = property(props, "neo_version");
+        String validated = property(props, "neo_version_validated");
         String range = property(props, "neo_version_range");
         check(build != null && !build.isBlank(), "loader: neo_version is set");
+        check(validated != null && !validated.isBlank(),
+            "loader: neo_version_validated is set (the version we actually run in the real client)");
         check(range != null && !range.isBlank(), "loader: neo_version_range is set");
         if (build == null || range == null) {
             return;
@@ -346,9 +349,11 @@ public final class MixinCheck {
         }
         int comma = lower.indexOf(',');
         lower = (comma >= 0 ? lower.substring(0, comma) : lower).trim();
-        check(lower.equals(build.trim()), "loader: the declared NeoForge lower bound (" + lower
-            + ") must equal the version we build against (" + build.trim()
-            + ") - we do not claim to run on a loader we never compiled or tested against");
+        check(lower.equals(build.trim()) || lower.equals(validated == null ? "" : validated.trim()),
+            "loader: the NeoForge lower bound (" + lower + ") must be either the version we build against ("
+            + build.trim() + ") or the version validated in the real client ("
+            + (validated == null ? "unset" : validated.trim())
+            + ") - we do not claim to run on a combination nobody ever compiled or ran");
 
         String template = readSource("src/main/templates/META-INF/neoforge.mods.toml");
         check(template != null && template.contains("${neo_version_range}"),
