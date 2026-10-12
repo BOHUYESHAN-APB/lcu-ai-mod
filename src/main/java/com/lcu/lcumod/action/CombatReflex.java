@@ -129,6 +129,14 @@ public final class CombatReflex {
         }
 
         if (distance <= REACH && weaponReady && cooldown == 0 && aimed) {
+            // 出手前的统一安全检查（用户实机："他隔墙攻击，所以打到了我"）：
+            // 视线被挡 / 旁边有别的玩家（横扫误伤）/ 够不着 ⇒ 不挥，如实记原因。
+            AttackRules.Verdict verdict = AttackRules.check(mc, attacker);
+            if (verdict != AttackRules.Verdict.OK) {
+                lastAction = "blocked:" + verdict.code() + ":" + attacker.getName().getString();
+                logPhase("blocked:" + verdict.code());
+                return distance <= REACH * 2.0;
+            }
             mc.gameMode.attack(player, attacker);
             player.swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, true);
             cooldown = MIN_ATTACK_INTERVAL_TICKS;

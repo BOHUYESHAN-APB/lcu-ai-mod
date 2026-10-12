@@ -216,8 +216,16 @@ public class JavaAutonomousBehavior {
         // Look at target
         lookAtEntity(mc, attackTarget);
         
-        // Attack if close enough
+        // Attack if close enough —— 且**出手必须干净**：隔墙不打、旁边有别的玩家不打（统一安全检查）。
         if (mc.player.distanceTo(attackTarget) < 4) {
+            AttackRules.Verdict verdict = AttackRules.check(mc, attackTarget);
+            if (verdict != AttackRules.Verdict.OK) {
+                // 打不到就退避一个冷却再重扫（否则会每 tick 重选同一个目标空转）。
+                attackCooldown = ATTACK_COOLDOWN_TICKS * 4;
+                attackTarget = null;
+                setState(BehaviorState.IDLE);
+                return;
+            }
             if (mc.gameMode != null) {
                 mc.gameMode.attack(mc.player, attackTarget);
                 mc.player.swing(net.minecraft.world.InteractionHand.MAIN_HAND, net.minecraft.world.item.component.SwingAnimation.DEFAULT, true);

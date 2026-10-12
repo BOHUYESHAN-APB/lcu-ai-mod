@@ -780,6 +780,13 @@ public class ActionExecutor {
                 sendZoneBlocked(cmd, zoneBlock, "attack " + target.getName().getString());
                 return;
             }
+            // 出手前的统一安全检查：视线被挡（隔墙）/ 旁边有别的玩家（横扫误伤）/ 够不着 ⇒ 如实拒。
+            AttackRules.Verdict verdict = AttackRules.check(mc, target);
+            if (verdict != AttackRules.Verdict.OK) {
+                sendResponse(cmd.id(), false, "cannot attack " + target.getName().getString()
+                        + ": " + verdict.code());
+                return;
+            }
             mc.gameMode.attack(mc.player, target);
             mc.player.swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, true);
             sendResponse(cmd.id(), true, "Attacked " + target.getName().getString());
@@ -3187,8 +3194,9 @@ public class ActionExecutor {
 
     /**
      * 换成热栏里"最强武器"（用户要求：被打了要会切物品栏、先用手上的东西还击）。
-     * 判定**只用物品 id 字符串**（`_sword` > `_trident/_mace` > `_axe`，材质 netherite>diamond>iron>stone>gold>wood），
-     * 因此不依赖可能变化的物品类 API；非武器（方块/食物）返回 0 不参与。
+     *
+     * <p>评分逻辑搬到了**零依赖**的 {@link WeaponPolicy}（便于零依赖自检直接测；重锤/矛在那里被
+     * 判为禁用 ⇒ 永不主动切过去）。
      */
     public static String equipBestWeapon(Minecraft mc) {
         if (mc == null || mc.player == null) {
@@ -3216,32 +3224,8 @@ public class ActionExecutor {
     }
 
     private static int weaponScore(String itemId) {
-        String id = itemId == null ? "" : itemId.toLowerCase();
-        int kind;
-        if (id.endsWith("_sword")) {
-            kind = 40;
-        } else if (id.endsWith("_trident") || id.endsWith("_mace")) {
-            kind = 35;
-        } else if (id.endsWith("_axe")) {
-            kind = 30;
-        } else {
-            return 0;
-        }
-        int tier;
-        if (id.contains("netherite")) {
-            tier = 6;
-        } else if (id.contains("diamond")) {
-            tier = 5;
-        } else if (id.contains("iron")) {
-            tier = 4;
-        } else if (id.contains("stone")) {
-            tier = 3;
-        } else if (id.contains("gold")) {
-            tier = 2;
-        } else {
-            tier = 1;
-        }
-        return kind + tier;
+        // 判定与禁用名单都在零依赖的 WeaponPolicy 里（重锤/矛 = 0 ⇒ 不会被选中）。
+        return WeaponPolicy.score(itemId);
     }
 
     /** 绝不自吃的有害食物（参考项目黑名单：腐肉/蜘蛛眼/毒马铃薯/河豚/紫颂果）。 */

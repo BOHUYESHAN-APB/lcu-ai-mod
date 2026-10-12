@@ -223,7 +223,9 @@ public final class ControlStream {
                     if (mc.hitResult instanceof BlockHitResult bh
                             && !mc.level.getBlockState(bh.getBlockPos()).isAir()) {
                         mc.gameMode.continueDestroyBlock(bh.getBlockPos(), bh.getDirection());
-                    } else if (mc.hitResult instanceof EntityHitResult eh) {
+                    } else if (mc.hitResult instanceof EntityHitResult eh
+                            && AttackRules.canHit(mc, eh.getEntity())) {
+                        // 统一安全检查（AttackRules）：隔墙 / 旁边有别的玩家（横扫误伤）⇒ 这一 tick 不挥。
                         mc.gameMode.attack(mc.player, eh.getEntity());
                         mc.player.swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, true);
                     }
@@ -293,7 +295,8 @@ public final class ControlStream {
 
         boolean attackReady = mc.player.getAttackStrengthScale(0.5f) >= 1.0f;
         if (attackTrigger.shouldFire(attackReady)) {
-            if (mc.hitResult instanceof EntityHitResult hit) {
+            if (mc.hitResult instanceof EntityHitResult hit && AttackRules.canHit(mc, hit.getEntity())) {
+                // 统一安全检查（AttackRules）：隔墙 / 旁边有别的玩家 ⇒ 不造成伤害（仍保留挥手动画）。
                 mc.gameMode.attack(mc.player, hit.getEntity());
             }
             mc.player.swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, true);
