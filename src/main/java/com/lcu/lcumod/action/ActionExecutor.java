@@ -17,7 +17,9 @@ import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
 import net.minecraft.util.Prediction;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.inventory.AbstractContainerMenu;
 import net.minecraft.world.inventory.ContainerInput;
 import net.minecraft.world.inventory.MerchantMenu;
@@ -586,6 +588,8 @@ public class ActionExecutor {
                 case "trade" -> handleTrade(cmd);
                 case "sleep" -> handleSleep(cmd);
                 case "find_block" -> handleFindBlock(cmd);
+                // 按需实体扫描（只读）：摘要里**默认屏蔽掉**的坐标，需要时再取回来
+                case "scan_entities" -> handleScanEntities(cmd);
                 case "go_to_block" -> handleGoToBlock(cmd);
                 case "remember_poi" -> handleRememberPoi(cmd);
                 // 站点记忆：精准 xyz + 朝向 + 水平容差（"让 AI 去刷怪塔挂机"）
@@ -2295,6 +2299,54 @@ public class ActionExecutor {
             data.addProperty("message", "no " + block + " within " + radius + "m");
         }
         sendResponse(cmd.id(), !hits.isEmpty(), data);
+    }
+
+    /**
+     * 按需实体扫描（{@code scan_entities}，**只读**）：把 {@code state_update} 里**默认屏蔽掉的
+     * 逐条坐标**在需要的时候取回来（用户口径："有些东西需要的时候再获取坐标"）——只扫、只回报，
+     * **不移动、不点击、不改状态**（不碰 {@link Pathfinder} / {@link InputIsolation}）。
+     *
+     * <p>参数 {@code {radius?, kind?, limit?}}：{@code radius} 默认 {@link EntityScan#DEFAULT_RADIUS}、
+     * 上限 {@link EntityScan#MAX_RADIUS}（超过 ⇒ **如实报错** {@code radius_too_large}，不偷偷放大）；
+     * {@code kind} 见 {@link EntityScan.Pure#KIND_FILTERS}（认不出 ⇒ {@code bad_kind}）；
+     * {@code limit} 默认 {@link EntityScan#DEFAULT_LIMIT}、上限 {@link EntityScan#MAX_LIMIT}
+     * （超过**钳到上限**，截断后 {@code total} 仍是真实总数）。
+     *
+     * <p>不在世界里 / 世界没加载 ⇒ {@code ok:false + not_in_world}，**不编空列表冒充成功**。
+     */
+    private void handleScanEntities(WireServer.WireCommand cmd) {
+        var mc = Minecraft.getInstance();
+        if (mc.player == null || mc.level == null) {
+            JsonObject data = new JsonObject();
+            data.addProperty("ok", false);
+            data.addProperty("reason", "not_in_world");
+            sendResponse(cmd.id(), false, data, "not_in_world");
+            return;
+        }
+        JsonObject args = cmd.args();
+        int radius = args != null && args.has("radius")
+                ? args.get("radius").getAsInt() : EntityScan.DEFAULT_RADIUS;
+        int limit = args != null && args.has("limit")
+                ? args.get("limit").getAsInt() : EntityScan.DEFAULT_LIMIT;
+        String kind = EntityScan.Pure.canonicalKind(
+                args != null && args.has("kind") ? args.get("kind").getAsString() : null);
+
+        String code = EntityScan.Pure.radiusErrorCode(radius);
+        if (code == null && kind == null) {
+            code = "bad_kind";
+        }
+        if (code == null && limit < 1) {
+            code = "bad_limit";
+        }
+        if (code != null) {
+            JsonObject data = new JsonObject();
+            data.addProperty("ok", false);
+            data.addProperty("reason", code);
+            sendResponse(cmd.id(), false, data, code);
+            return;
+        }
+        sendResponse(cmd.id(), true,
+                EntityScan.scan(mc, radius, kind, EntityScan.Pure.clampLimit(limit)));
     }
 
     /** 找到最近的目标方块并**自动寻路过去**；到达后（可选）写入持久记忆。 */

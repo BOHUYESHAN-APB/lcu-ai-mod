@@ -1,11 +1,14 @@
 package com.lcu.lcumod.state;
 
 import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import com.lcu.lcumod.action.AttackRules;
 import com.lcu.lcumod.action.BlockFinder;
 import com.lcu.lcumod.action.GearReport;
 import com.lcu.lcumod.action.MobPolicy;
+import com.lcu.lcumod.action.PerceptionView;
 import com.lcu.lcumod.action.PoiMemory;
 import com.lcu.lcumod.LCUMod;
 import com.lcu.lcumod.config.ModConfig;
@@ -53,7 +56,8 @@ public class StateCollector {
     private static JsonArray cachedBeds = new JsonArray();
 
     // 周边方块感知：**限半径 + 定期探测**（参考项目也是"每轮现算 + 冷却"，不是每 tick 全扫）。
-    private static JsonArray cachedNearbyBlocks = null;
+    // 缓存的是**聚合摘要**（计数 + by_block + nearest），不是逐方块坐标。
+    private static JsonObject cachedNearbyBlocks = null;
     private static BlockPos cachedNearbyBlocksOrigin = null;
     private static int cachedNearbyBlocksTick = 0;
     private static final int NEARBY_BLOCKS_TTL_TICKS = 20;   // 最长一秒重扫一次；走出一格则立刻重扫
@@ -73,8 +77,11 @@ public class StateCollector {
      * 不是每 tick 全扫。这里缓存 {@value #NEARBY_BLOCKS_TTL_TICKS} tick，玩家**走出一格**立刻重扫
      * （站着不动时就没必要一秒扫几十次）；半径与总开关走 {@code ModConfig}
      * —— 这两个配置项以前**声明了却没人读**，等于摆设，现在真的生效。
+     * <p>返回的是**聚合摘要**（{@code count} + {@code by_block} + {@code nearest}，见
+     * {@link PerceptionView.Pure#summarizeBlocks}）—— **不给逐方块坐标**（用户口径：默认把无关的
+     * 周边细节屏蔽掉）。要知道某一种方块具体在哪，走按需查询（后端 {@code find_block}）。
      */
-    private static JsonArray collectNearbyBlocks(Minecraft mc, Player p, BlockPos origin) {
+    private static JsonObject collectNearbyBlocks(Minecraft mc, Player p, BlockPos origin) {
         boolean enabled;
         int radius;
         try {
@@ -85,7 +92,7 @@ public class StateCollector {
             radius = 8;
         }
         if (!enabled) {
-            return new JsonArray();
+            return PerceptionView.blocks(List.of());
         }
         if (cachedNearbyBlocks != null
                 && tickCounter - cachedNearbyBlocksTick < NEARBY_BLOCKS_TTL_TICKS
@@ -94,7 +101,7 @@ public class StateCollector {
             return cachedNearbyBlocks;
         }
 
-        List<JsonObject> nearbyBlocks = new ArrayList<>();
+        List<PerceptionView.Pure.BlockRow> nearbyBlocks = new ArrayList<>();
         for (int dx = -radius; dx <= radius; dx++) {
             for (int dy = -2; dy <= 2; dy++) {
                 for (int dz = -radius; dz <= radius; dz++) {
@@ -112,28 +119,15 @@ public class StateCollector {
                     );
                     if (distance > radius) continue;
 
-                    JsonObject block = new JsonObject();
                     String blockId = BuiltInRegistries.BLOCK.getKey(blockState.getBlock()).toString();
-                    block.addProperty("name", blockState.getBlock().getName().getString());
-                    block.addProperty("block_id", blockId);
-                    block.addProperty("item_id", BuiltInRegistries.ITEM.getKey(blockState.getBlock().asItem()).toString());
-                    block.addProperty("distance", Math.round(distance * 10.0) / 10.0);
-                    block.addProperty("x", pos.getX());
-                    block.addProperty("y", pos.getY());
-                    block.addProperty("z", pos.getZ());
-                    nearbyBlocks.add(block);
+                    nearbyBlocks.add(new PerceptionView.Pure.BlockRow(blockId, distance));
                 }
             }
         }
-        nearbyBlocks.sort(Comparator.comparingDouble(block -> block.get("distance").getAsDouble()));
-        JsonArray nearbyBlocksJson = new JsonArray();
-        for (int i = 0; i < Math.min(32, nearbyBlocks.size()); i++) {
-            nearbyBlocksJson.add(nearbyBlocks.get(i));
-        }
-        cachedNearbyBlocks = nearbyBlocksJson;
+        cachedNearbyBlocks = PerceptionView.blocks(nearbyBlocks);
         cachedNearbyBlocksOrigin = origin.immutable();
         cachedNearbyBlocksTick = tickCounter;
-        return nearbyBlocksJson;
+        return cachedNearbyBlocks;
     }
 
     /** Force the next collector tick (next client tick, bypassing the interval and
@@ -397,6 +391,56 @@ public class StateCollector {
         // 三元组自洽 durability = max_durability - damage。贴图走 item_icons 事件（不在每帧状态里）。
         state.add("gear", GearReport.build(mc));
 
+        // 家的那张床 + "绑上了没"（**事实字段，放在 gear 旁边**）：
+        //   home_bed       = 我们记着的那张床（PoiMemory 里带 `bed` 标签的点中最远…最近的一个）；
+        //                    没记过 ⇒ null（不许编）。
+        //   home_bed_bound = 原版当前重生点（getRespawnData().pos()）**==** home_bed ⇒ true；
+        //                    没记过床 / 拿不到重生点 ⇒ false（不许编）。
+        //
+        // **语义边界（别读错）**：原版右键点一次床就绑定重生点（任何时候、白天晴天也一样）；"现在不能睡"
+        // 只是不睡、**不影响绑定**。所以 home_bed_bound=false **只代表"没绑上"**，**不代表床没了** ——
+        // 床没了的判据是"那个位置已经不是床方块"，见 PoiMemory.invalidateBedIfGone（它会把 bed 标签摘掉，
+        // 那个点自然也就不再算作 home_bed）。
+        {
+            int bedX = 0, bedY = 0, bedZ = 0;
+            boolean haveBed = false;
+            for (JsonObject poi : PoiMemory.snapshotRemembered(mc, Integer.MAX_VALUE)) {
+                if (hasTag(poi, "bed")) {
+                    // snapshotRemembered 按距离排序 ⇒ 第一个带 bed 标签的就是最近的那张床。
+                    bedX = poi.get("x").getAsInt();
+                    bedY = poi.get("y").getAsInt();
+                    bedZ = poi.get("z").getAsInt();
+                    haveBed = true;
+                    break;
+                }
+            }
+            int resX = 0, resY = 0, resZ = 0;
+            boolean haveRespawn = false;
+            try {
+                var respawnData = mc.level.getRespawnData();
+                if (respawnData != null && respawnData.pos() != null) {
+                    resX = respawnData.pos().getX();
+                    resY = respawnData.pos().getY();
+                    resZ = respawnData.pos().getZ();
+                    haveRespawn = true;
+                }
+            } catch (Exception ignored) {
+                // 拿不到重生点 ⇒ 如实报"没绑上"，不编。
+            }
+            PerceptionView.Pure.HomeBed homeBed = PerceptionView.Pure.homeBed(
+                    haveBed, bedX, bedY, bedZ, haveRespawn, resX, resY, resZ);
+            if (homeBed.haveBed()) {
+                JsonObject bed = new JsonObject();
+                bed.addProperty("x", homeBed.x());
+                bed.addProperty("y", homeBed.y());
+                bed.addProperty("z", homeBed.z());
+                state.add("home_bed", bed);
+            } else {
+                state.add("home_bed", JsonNull.INSTANCE);
+            }
+            state.addProperty("home_bed_bound", PerceptionView.homeBedBound(homeBed));
+        }
+
         // World
         JsonObject world = new JsonObject();
         world.addProperty("time", mc.level.getOverworldClockTime());
@@ -452,17 +496,20 @@ public class StateCollector {
         state.addProperty("last_speaker", speaker);
         state.addProperty("hud_note", com.lcu.lcumod.client.HudNote.current());
 
-        // Nearby entities (players, mobs, items)
-        JsonArray entities = new JsonArray();
-        var players = mc.level.players();
-        for (var other : players) {
+        // ── Nearby entities：**分级摘要**（不是逐条带坐标的清单）────────────────────
+        // 用户口径：默认把无关的周边实体屏蔽掉，只有"要处理的/人"才给坐标 —— 村庄/繁殖基地附近
+        // 大量生物移动不会再把 prompt 刷屏。规则见 PerceptionView.Pure#summarizeEntities：
+        //   count + by_kind（七档自洽）+ nearest（不带坐标）+ threats（危险/敌对且 ≤16 格，最多 3 条，
+        //   按距离升序，**才带坐标**）+ players（**总是带坐标**，≤8）+ items（聚合 + 最近一件，不带坐标）。
+        // 要某一只的具体坐标/血量时走**按需**路径（后端 find_entity / where_is），这里删坐标不丢能力。
+        List<PerceptionView.Pure.Row> entityRows = new ArrayList<>();
+        for (var other : mc.level.players()) {
             if (other == p) continue;
-            JsonObject e = new JsonObject();
-            e.addProperty("name", other.getName().getString());
-            e.addProperty("uuid", other.getUUID().toString());
-            e.addProperty("distance", p.distanceTo(other));
-            e.addProperty("type", "player");
-            entities.add(e);
+            entityRows.add(new PerceptionView.Pure.Row(
+                    other.getName().getString(), "", true, false,
+                    other.getX(), other.getY(), other.getZ(), p.distanceTo(other),
+                    true, other.getHealth(),
+                    "", 0, "", 0, 0));
         }
 
         // Scan for nearby mobs and items within 16 blocks
@@ -472,49 +519,33 @@ public class StateCollector {
             // Skip other players (already handled above)
             if (entity instanceof Player) continue;
 
-            JsonObject e = new JsonObject();
-            e.addProperty("id", entity.getId());
-            e.addProperty("name", entity.getName().getString());
-            e.addProperty("distance", p.distanceTo(entity));
-            e.addProperty("x", entity.getX());
-            e.addProperty("y", entity.getY());
-            e.addProperty("z", entity.getZ());
-
-            if (entity instanceof ItemEntity) {
-                e.addProperty("type", "item");
-                var stack = ((ItemEntity) entity).getItem();
-                e.addProperty("item_id", BuiltInRegistries.ITEM.getKey(stack.getItem()).toString());
-                e.addProperty("item_count", stack.getCount());
-                e.addProperty("display", stack.getDisplayName().getString());
+            double distance = p.distanceTo(entity);
+            if (entity instanceof ItemEntity item) {
+                var stack = item.getItem();
                 // 谁丢的 + 掉多久了 + 还有多久消失：**判断该不该捡的是模型**（用户口径），
                 // 我们只把事实摆出来。owner 为空 = 方块/发射器掉的（不是谁丢的）。
-                ItemEntity item = (ItemEntity) entity;
                 Entity owner = item.getOwner();
-                e.addProperty("owner", owner == null ? "" : owner.getName().getString());
-                e.addProperty("owner_type", owner == null ? ""
-                        : (owner instanceof Player ? "player" : "other"));
                 int age = item.getAge();
-                e.addProperty("age", age);
-                e.addProperty("despawn_in", Math.max(0, item.lifespan - age));
+                entityRows.add(new PerceptionView.Pure.Row(
+                        entity.getName().getString(), "", false, true,
+                        entity.getX(), entity.getY(), entity.getZ(), distance,
+                        false, 0.0,
+                        BuiltInRegistries.ITEM.getKey(stack.getItem()).toString(), stack.getCount(),
+                        owner == null ? "" : owner.getName().getString(), age,
+                        Math.max(0, item.lifespan - age)));
             } else {
                 // 生物对待档位：**与本地反射 / 后端模型同一张表**（用户口径：高危险的不主动打、
-                // 中立的不惹、只有该处理的才处理）。认不出 ⇒ UNKNOWN，**不默认 hostile**；
-                // 后端优先信任这个字段，认不出/旧客户端才回落到自己的关键词兜底。
+                // 中立的不惹、只有该处理的才处理）。认不出 ⇒ UNKNOWN，**不默认 hostile**。
                 MobPolicy.Tier tier = MobPolicy.tier(AttackRules.entityTypeId(entity));
-                e.addProperty("tier", tier.name());
-                // 旧字段 `type` 保留（老后端/旧工具还在读），按档位映射回"敌对/动物/其他"。
-                e.addProperty("type", legacyType(tier));
+                boolean living = entity instanceof LivingEntity;
+                entityRows.add(new PerceptionView.Pure.Row(
+                        entity.getName().getString(), tier.name(), false, false,
+                        entity.getX(), entity.getY(), entity.getZ(), distance,
+                        living, living ? ((LivingEntity) entity).getHealth() : 0.0,
+                        "", 0, "", 0, 0));
             }
-
-            // Health info for living entities
-            if (entity instanceof LivingEntity le) {
-                e.addProperty("health", le.getHealth());
-                e.addProperty("max_health", le.getMaxHealth());
-            }
-
-            entities.add(e);
         }
-        state.add("entities", entities);
+        state.add("entities", PerceptionView.entities(entityRows));
 
         // Nearby blocks/resources — compact perception map for planning
         state.add("nearby_blocks", collectNearbyBlocks(mc, p, p.blockPosition()));
@@ -598,17 +629,18 @@ public class StateCollector {
     }
 
     /**
-     * 旧字段 `type` 的兼容映射：{@link MobPolicy.Tier} → `hostile` / `animal` / `mob`。
-     *
-     * <p>为什么不直接删掉旧字段：后端别处（`entities.py` 的 kind 归一、prompt 渲染"附近实体"）
-     * 与旧版客户端都在读 `type`。**新字段 `tier` 才是权威**，后端优先信任它；这里只是让老读法
-     * 不至于把中立怪（末影人/狼/铁傀儡）继续当"hostile"。
+     * 判断一条 {@link PoiMemory} 记忆点是否带某个标签（`home_bed` 取"带 bed 标签"的那张床）。
      */
-    private static String legacyType(MobPolicy.Tier tier) {
-        return switch (tier) {
-            case DANGEROUS, HOSTILE -> "hostile";
-            case PASSIVE -> "animal";
-            case NEUTRAL, UNKNOWN -> "mob";
-        };
+    private static boolean hasTag(JsonObject poi, String tag) {
+        JsonElement tags = poi.get("tags");
+        if (tags == null || !tags.isJsonArray()) {
+            return false;
+        }
+        for (JsonElement t : tags.getAsJsonArray()) {
+            if (tag.equals(t.getAsString())) {
+                return true;
+            }
+        }
+        return false;
     }
 }

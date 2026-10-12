@@ -47,6 +47,8 @@ public final class WalkCheck {
         inputOwnershipChecks();
         inputBlockingChecks();
         gearReportChecks();
+        perceptionTieringChecks();
+        entityScanChecks();
 
         System.out.println("[WalkCheck] " + passed + " checks passed, " + failed + " failed");
         if (failed > 0) {
@@ -546,10 +548,11 @@ public final class WalkCheck {
 
         // ⑩ 静态扫描：状态里真的带 tier（后端优先信任它，关键词只是兜底）
         String state = read(collector);
+        String perception = read(root.resolve("PerceptionView.java"));
         check("mob: state publishes the tier name", state.contains("MobPolicy.tier(AttackRules.entityTypeId(")
-                && state.contains("e.addProperty(\"tier\", tier.name())"));
-        check("mob: state keeps the legacy type field for old readers",
-                state.contains("legacyType(tier)") && state.contains("case DANGEROUS, HOSTILE -> \"hostile\""));
+                && state.contains("tier.name()"));
+        check("mob: the tier rides along in the tiered entity summary",
+                perception.contains("\"tier\"") && perception.contains("tier()"));
         check("mob: entity type id comes from the registry (one place)",
                 read(root.resolve("AttackRules.java")).contains("BuiltInRegistries.ENTITY_TYPE"));
     }
@@ -963,6 +966,398 @@ public final class WalkCheck {
                         && countOf(stateSrc, "player.addProperty(\"hunger\"") == 1
                         && countOf(stateSrc, "player.addProperty(\"saturation\"") == 1
                         && stateSrc.contains("p.getFoodData().getSaturationLevel()"));
+    }
+
+    // ── 13. 感知分层：实体/方块默认只给计数+最近+威胁（威胁才带坐标）──
+
+    /**
+     * 用户口径："不要把周围生物的坐标动态全都传给他 —— 村庄/繁殖基地/农场附近大量生物移动就会大量刷屏。
+     * 要设计一个**层级**：有些东西需要的时候再获取坐标，不需要的默认当**无关信息屏蔽**掉。"
+     *
+     * <p>行为断言打在零依赖的 {@link PerceptionView.Pure} 上（分档聚合 / 计数自洽 / threats 截断到 3 /
+     * 坐标只挂在 threats+players / by_block 稳定排序 / home_bed 绑定判定），形态用静态扫描钉住
+     * （state 真的发摘要、逐实体 x/y/z 的旧写法已不在、纯逻辑那半不碰游戏类）。
+     */
+    private static void perceptionTieringChecks() {
+        Path actionRoot = Path.of("src", "main", "java", "com", "lcu", "lcumod", "action");
+        Path collector = Path.of("src", "main", "java", "com", "lcu", "lcumod", "state",
+                "StateCollector.java");
+
+        // ① 10 只被动：passive=10、count 自洽、没有威胁、没有被当坐标携带者
+        List<PerceptionView.Pure.Row> passive = new java.util.ArrayList<>();
+        for (int i = 0; i < 10; i++) {
+            passive.add(mobRow("cow" + i, "PASSIVE", 5.0 + i));
+        }
+        PerceptionView.Pure.EntitySummary s10 = PerceptionView.Pure.summarizeEntities(passive);
+        check("perception: 10 passive mobs -> by_kind.passive == 10",
+                s10.byKind().get("passive") == 10);
+        check("perception: count equals the sum of by_kind",
+                s10.count() == 10 && sumKinds(s10.byKind()) == s10.count());
+        check("perception: passive mobs raise no threats", s10.threats().isEmpty());
+        check("perception: passive mobs carry no coordinates anywhere (threats/players empty)",
+                s10.threats().isEmpty() && s10.players().isEmpty());
+
+        // ② 3 只敌对 + 5 只被动 + 1 只 20 格外的敌对：threats 正好 3 条、按距离升序、16 格外的不进来
+        List<PerceptionView.Pure.Row> mixed = new java.util.ArrayList<>();
+        mixed.add(mobRow("zombie-a", "HOSTILE", 3.0));
+        mixed.add(mobRow("zombie-b", "HOSTILE", 6.0));
+        mixed.add(mobRow("zombie-c", "HOSTILE", 9.0));
+        mixed.add(mobRow("zombie-far", "HOSTILE", 20.0));   // > 16 ⇒ 不算威胁（但仍计入 by_kind）
+        for (int i = 0; i < 5; i++) {
+            mixed.add(mobRow("cow" + i, "PASSIVE", 4.0 + i));
+        }
+        PerceptionView.Pure.EntitySummary sm = PerceptionView.Pure.summarizeEntities(mixed);
+        check("perception: exactly 3 threats are kept", sm.threats().size() == 3);
+        check("perception: threats are sorted by distance ascending",
+                sm.threats().size() == 3
+                        && sm.threats().get(0).name().equals("zombie-a")
+                        && sm.threats().get(1).name().equals("zombie-b")
+                        && sm.threats().get(2).name().equals("zombie-c"));
+        check("perception: a hostile beyond 16 blocks is not a threat (but still counted)",
+                sm.threats().size() == 3 && sm.byKind().get("hostile") == 4);
+        check("perception: hostile threats carry the tier and the kind",
+                sm.threats().get(0).type().equals("hostile")
+                        && sm.threats().get(0).tier().equals("HOSTILE"));
+        check("perception: mixed count is self-consistent",
+                sm.count() == 9 && sumKinds(sm.byKind()) == sm.count()
+                        && sm.byKind().get("passive") == 5);
+
+        // ③ 玩家**总在** players 里、总带坐标；超过 8 个只留最近的 8 个
+        List<PerceptionView.Pure.Row> withPlayers = new java.util.ArrayList<>();
+        withPlayers.add(playerRow("BoHuYeShan", 850.6, 63.0, -2190.2, 4.0));
+        for (int i = 0; i < 9; i++) {
+            withPlayers.add(playerRow("p" + i, 0, 0, 0, 30.0 + i));
+        }
+        PerceptionView.Pure.EntitySummary sp = PerceptionView.Pure.summarizeEntities(withPlayers);
+        check("perception: the player is always present in players",
+                sp.players().stream().anyMatch(pl -> pl.name().equals("BoHuYeShan")));
+        check("perception: players always carry coordinates",
+                sp.players().get(0).name().equals("BoHuYeShan") && sp.players().get(0).x() == 851
+                        && sp.players().get(0).y() == 63 && sp.players().get(0).z() == -2190);
+        check("perception: players are capped at the 8 nearest", sp.players().size() == 8);
+
+        // ④ items 只给 count + nearest（nearest 带 owner/age/despawn_in，不带坐标）
+        List<PerceptionView.Pure.Row> items = new java.util.ArrayList<>();
+        items.add(itemRow("minecraft:oak_log", 1, 3.1, "", 240, 5760));
+        items.add(itemRow("minecraft:stick", 2, 8.0, "BoHuYeShan", 10, 5990));
+        PerceptionView.Pure.EntitySummary si = PerceptionView.Pure.summarizeEntities(items);
+        check("perception: items are aggregated (count only)", si.items().count() == 2);
+        check("perception: items.nearest is the closest one with its facts",
+                si.items().nearest() != null
+                        && si.items().nearest().itemId().equals("minecraft:oak_log")
+                        && si.items().nearest().itemCount() == 1
+                        && si.items().nearest().owner().isEmpty()
+                        && si.items().nearest().age() == 240
+                        && si.items().nearest().despawnIn() == 5760);
+
+        // ⑤ by_block 稳定排序：同数量按名字升序、最多 12 种，count 是**总数**（不只 top-12）
+        List<PerceptionView.Pure.BlockRow> blocks = new java.util.ArrayList<>();
+        blocks.add(new PerceptionView.Pure.BlockRow("minecraft:oak_log", 1.0));
+        blocks.add(new PerceptionView.Pure.BlockRow("minecraft:oak_log", 2.0));
+        blocks.add(new PerceptionView.Pure.BlockRow("minecraft:oak_log", 3.0));
+        for (int i = 0; i < 12; i++) {
+            blocks.add(new PerceptionView.Pure.BlockRow("minecraft:b" + (char) ('a' + i), 5.0));
+        }
+        PerceptionView.Pure.BlockSummary sb = PerceptionView.Pure.summarizeBlocks(blocks);
+        check("perception: block count is the total, not the listed kinds", sb.count() == 15);
+        check("perception: by_block lists at most 12 kinds", sb.byBlock().size() == 12);
+        check("perception: by_block is sorted by count desc, then name asc (stable)",
+                sb.byBlock().keySet().iterator().next().equals("minecraft:oak_log")
+                        && sb.byBlock().get("minecraft:oak_log") == 3
+                        && new java.util.ArrayList<>(sb.byBlock().keySet()).subList(1, 12)
+                                .equals(sortedNames("minecraft:b", 11)));
+        check("perception: blocks.nearest is the closest block id (no coordinates)",
+                sb.nearest() != null && sb.nearest().blockId().equals("minecraft:oak_log")
+                        && sb.nearest().distance() == 1.0);
+
+        // ⑥ 坐标只出现在 threats/players 上（记录形状层面 nearest/items/by_block 就没有 x/y/z）
+        check("perception: only threat/player records carry x/y/z components",
+                hasCoord(PerceptionView.Pure.Threat.class) && hasCoord(PerceptionView.Pure.PlayerRow.class)
+                        && !hasCoord(PerceptionView.Pure.Nearest.class)
+                        && !hasCoord(PerceptionView.Pure.ItemNearest.class)
+                        && !hasCoord(PerceptionView.Pure.BlockNearest.class));
+
+        // ⑦ home_bed：没记过 ⇒ 没绑；重生点就是它 ⇒ 绑上；重生点在别处 / 读不到 ⇒ 没绑
+        PerceptionView.Pure.HomeBed none =
+                PerceptionView.Pure.homeBed(false, 0, 0, 0, true, 851, 63, -2191);
+        check("perception: no remembered bed -> home_bed absent and not bound",
+                !none.haveBed() && !none.bound());
+        PerceptionView.Pure.HomeBed boundBed =
+                PerceptionView.Pure.homeBed(true, 851, 63, -2191, true, 851, 63, -2191);
+        check("perception: respawn == remembered bed -> bound",
+                boundBed.haveBed() && boundBed.bound());
+        check("perception: respawn elsewhere -> not bound",
+                !PerceptionView.Pure.homeBed(true, 851, 63, -2191, true, 100, 64, 200).bound());
+        check("perception: bed remembered but respawn unreadable -> not bound (no fabrication)",
+                !PerceptionView.Pure.homeBed(true, 851, 63, -2191, false, 0, 0, 0).bound());
+
+        // ⑧ 静态扫描：state 真的发摘要；逐实体 x/y/z 的旧写法已不在
+        String stateSrc = read(collector);
+        String pvSrc = read(actionRoot.resolve("PerceptionView.java"));
+        check("perception: PerceptionView source found", !pvSrc.isEmpty());
+        check("perception: state publishes the tiered entity summary",
+                stateSrc.contains("state.add(\"entities\", PerceptionView.entities("));
+        check("perception: nearby_blocks goes through the block summary",
+                stateSrc.contains("PerceptionView.blocks(")
+                        && stateSrc.contains("state.add(\"nearby_blocks\", collectNearbyBlocks("));
+        check("perception: the old per-entity x/y/z JSON writing is gone",
+                !stateSrc.contains("e.addProperty(\"x\"") && !stateSrc.contains("\"x\", entity.getX()")
+                        && !stateSrc.contains("\"y\", entity.getY()")
+                        && !stateSrc.contains("\"z\", entity.getZ()"));
+        check("perception: home_bed is published beside gear",
+                stateSrc.contains("state.add(\"home_bed\"") && stateSrc.contains("home_bed_bound")
+                        && stateSrc.contains("getRespawnData()"));
+
+        // ⑨ 零依赖界线 + JSON 里坐标只写在 threats/players
+        int pureStart = pvSrc.indexOf("public static final class Pure {");
+        int pureEnd = pvSrc.indexOf("// ── Minecraft 侧");
+        String pureSrc = pureStart >= 0 && pureEnd > pureStart ? pvSrc.substring(pureStart, pureEnd) : "";
+        check("perception: the tested half carries no game classes at all",
+                !pureSrc.isEmpty() && !pureSrc.contains("net.minecraft") && !pureSrc.contains("Minecraft"));
+        check("perception: nearest/item/block JSON carry no x/y/z",
+                !methodBody(pvSrc, "private static JsonObject nearestJson(").contains("\"x\"")
+                        && !methodBody(pvSrc, "private static JsonObject itemJson(").contains("\"x\"")
+                        && !methodBody(pvSrc, "private static JsonObject blocksJson(").contains("\"x\""));
+        check("perception: threat/player JSON do carry x/y/z",
+                methodBody(pvSrc, "private static JsonObject threatJson(").contains("\"x\"")
+                        && methodBody(pvSrc, "private static JsonObject playerJson(").contains("\"x\""));
+    }
+
+    /** 一条生物行（零依赖）：tier 名 + 距离。 */
+    private static PerceptionView.Pure.Row mobRow(String name, String tier, double distance) {
+        return new PerceptionView.Pure.Row(name, tier, false, false, 0, 64, 0, distance, true, 20.0,
+                "", 0, "", 0, 0);
+    }
+
+    /** 一条玩家行（零依赖）：永远带坐标。 */
+    private static PerceptionView.Pure.Row playerRow(String name, double x, double y, double z,
+                                                     double distance) {
+        return new PerceptionView.Pure.Row(name, "", true, false, x, y, z, distance, true, 20.0,
+                "", 0, "", 0, 0);
+    }
+
+    /** 一条掉落物行（零依赖）：物品事实，不带坐标。 */
+    private static PerceptionView.Pure.Row itemRow(String itemId, int count, double distance,
+                                                   String owner, int age, int despawnIn) {
+        return new PerceptionView.Pure.Row(itemId, "", false, true, 0, 64, 0, distance, false, 0.0,
+                itemId, count, owner, age, despawnIn);
+    }
+
+    private static int sumKinds(java.util.Map<String, Integer> byKind) {
+        int sum = 0;
+        for (int value : byKind.values()) {
+            sum += value;
+        }
+        return sum;
+    }
+
+    /** 记录形状里有没有 x/y/z 分量（"坐标只出现在 threats/players 上"的机器可验证表述）。 */
+    private static boolean hasCoord(Class<?> recordClass) {
+        for (java.lang.reflect.RecordComponent component : recordClass.getRecordComponents()) {
+            String name = component.getName();
+            if (name.equals("x") || name.equals("y") || name.equals("z")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static List<String> sortedNames(String prefix, int count) {
+        List<String> names = new java.util.ArrayList<>();
+        for (int i = 0; i < count; i++) {
+            names.add(prefix + (char) ('a' + i));
+        }
+        return names;
+    }
+
+    // ── 13. 按需实体扫描（scan_entities）──
+
+    /**
+     * 用户口径："有些东西**需要的时候再获取坐标**，不需要的默认当无关信息屏蔽掉。"
+     * 于是 {@code state_update.entities} 变成了分级摘要（只有威胁/玩家/最近掉落物带坐标，
+     * 见 {@link PerceptionView.Pure}）。这条按需回路就是补回来的那一半：模型问"附近有没有牛"
+     * 时才用 {@code scan_entities} 把那一片的**具体坐标**取回来。
+     *
+     * <p>行为断言打在零依赖的 {@link EntityScan.Pure} 上（all 不筛档 / passive 只留 PASSIVE /
+     * hostile 不含 DANGEROUS 与 NEUTRAL（DANGEROUS 单独一档）/ radius 边界包含 / 距离升序 /
+     * limit 截断且 total 是真实总数 / limit 超上限钳到 48、radius 超上限如实拒绝 / 认不出的实体归
+     * unknown），形态用静态扫描钉住（分发表里有这个 case、handler 读 radius/kind/limit、
+     * **只读**（不碰 Pathfinder/InputIsolation）、纯逻辑那半不碰游戏类、分档复用 MobPolicy、
+     * 只读命令**不**进 NEW_TASK_COMMANDS）。
+     */
+    private static void entityScanChecks() {
+        Path actionRoot = Path.of("src", "main", "java", "com", "lcu", "lcumod", "action");
+        Path executor = actionRoot.resolve("ActionExecutor.java");
+        Path entityScan = actionRoot.resolve("EntityScan.java");
+
+        // ① kind=all 不筛档：四档生物 + 认不出的 + 玩家 + 掉落物，一个不落
+        java.util.List<EntityScan.Pure.Row> mixed = new java.util.ArrayList<>();
+        mixed.add(scanMob(1, "PASSIVE", 2.0));
+        mixed.add(scanMob(2, "HOSTILE", 3.0));
+        mixed.add(scanMob(3, "DANGEROUS", 4.0));
+        mixed.add(scanMob(4, "NEUTRAL", 5.0));
+        mixed.add(scanMob(5, "UNKNOWN", 6.0));
+        mixed.add(scanPlayer(6, 7.0));
+        mixed.add(scanItem(7, 8.0));
+        EntityScan.Pure.Result all = EntityScan.Pure.scan(mixed, "all", 16, 24);
+        check("entity-scan: kind=all filters nothing (7 of 7)",
+                all.total() == 7 && all.rows().size() == 7 && !all.truncated());
+
+        // ② kind=passive 只留 PASSIVE（认不出的 / 玩家 / 掉落物都不在）
+        EntityScan.Pure.Result passive = EntityScan.Pure.scan(mixed, "passive", 16, 24);
+        check("entity-scan: kind=passive keeps exactly the PASSIVE rows",
+                passive.total() == 1 && passive.rows().get(0).name().equals("mob1"));
+        check("entity-scan: kind=passive excludes unknown/player/item",
+                passive.rows().stream().noneMatch(r -> r.kind().equals("unknown")
+                        || r.player() || r.item()));
+
+        // ③ 每档各归各的：hostile **不含** DANGEROUS/NEUTRAL（DANGEROUS 是单独一档）
+        EntityScan.Pure.Result hostile = EntityScan.Pure.scan(mixed, "hostile", 16, 24);
+        check("entity-scan: kind=hostile is exactly HOSTILE (not dangerous, not neutral)",
+                hostile.total() == 1 && hostile.rows().get(0).tier().equals("HOSTILE")
+                        && hostile.rows().stream().noneMatch(r -> r.tier().equals("DANGEROUS")
+                                || r.tier().equals("NEUTRAL")));
+        check("entity-scan: dangerous is its own filter",
+                EntityScan.Pure.scan(mixed, "dangerous", 16, 24).total() == 1
+                        && EntityScan.Pure.scan(mixed, "dangerous", 16, 24).rows().get(0)
+                                .tier().equals("DANGEROUS"));
+        check("entity-scan: neutral is its own filter",
+                EntityScan.Pure.scan(mixed, "neutral", 16, 24).total() == 1
+                        && EntityScan.Pure.scan(mixed, "neutral", 16, 24).rows().get(0)
+                                .tier().equals("NEUTRAL"));
+        check("entity-scan: player/item are their own filters",
+                EntityScan.Pure.scan(mixed, "player", 16, 24).total() == 1
+                        && EntityScan.Pure.scan(mixed, "player", 16, 24).rows().get(0).player()
+                        && EntityScan.Pure.scan(mixed, "item", 16, 24).total() == 1
+                        && EntityScan.Pure.scan(mixed, "item", 16, 24).rows().get(0).item());
+
+        // ④ radius 边界：**刚好等于半径算在内**、超一点排除
+        java.util.List<EntityScan.Pure.Row> edge = new java.util.ArrayList<>();
+        edge.add(scanMob(1, "PASSIVE", 15.9));
+        edge.add(scanMob(2, "PASSIVE", 16.0));
+        edge.add(scanMob(3, "PASSIVE", 16.1));
+        EntityScan.Pure.Result bounded = EntityScan.Pure.scan(edge, "all", 16, 24);
+        check("entity-scan: radius boundary is inclusive (16.0 in, 16.1 out)",
+                bounded.total() == 2 && bounded.rows().stream().noneMatch(r -> r.distance() > 16.0));
+
+        // ⑤ 排序：距离升序（同距离按 id 升序 —— 稳定，不让输出抖）
+        java.util.List<EntityScan.Pure.Row> messy = new java.util.ArrayList<>();
+        messy.add(scanMob(9, "PASSIVE", 9.0));
+        messy.add(scanMob(3, "PASSIVE", 1.0));
+        messy.add(scanMob(7, "PASSIVE", 5.0));
+        messy.add(scanMob(2, "PASSIVE", 5.0));
+        EntityScan.Pure.Result sorted = EntityScan.Pure.scan(messy, "all", 16, 24);
+        boolean ascending = true;
+        for (int i = 1; i < sorted.rows().size(); i++) {
+            ascending &= sorted.rows().get(i - 1).distance() <= sorted.rows().get(i).distance();
+        }
+        check("entity-scan: rows come back sorted by distance ascending", ascending);
+        check("entity-scan: equal distances break ties by id (stable)",
+                sorted.rows().get(1).id() == 2 && sorted.rows().get(2).id() == 7);
+
+        // ⑥ limit 截断：total 是**截断前**的真实总数、truncated 如实
+        java.util.List<EntityScan.Pure.Row> many = new java.util.ArrayList<>();
+        for (int i = 0; i < 60; i++) {
+            many.add(scanMob(i, "PASSIVE", 1.0 + i * 0.1));
+        }
+        EntityScan.Pure.Result cut = EntityScan.Pure.scan(many, "all", 32, 24);
+        check("entity-scan: limit truncates the returned rows", cut.rows().size() == 24);
+        check("entity-scan: total is the real pre-truncation count", cut.total() == 60);
+        check("entity-scan: truncated is reported truthfully", cut.truncated());
+        EntityScan.Pure.Result fits = EntityScan.Pure.scan(many.subList(0, 10), "all", 32, 48);
+        check("entity-scan: nothing is truncated when everything fits",
+                fits.total() == 10 && fits.rows().size() == 10 && !fits.truncated());
+
+        // ⑦ limit 超上限**钳到上限**（不放大、也不静默改成别的数）
+        check("entity-scan: limit is clamped to the 48 cap",
+                EntityScan.Pure.clampLimit(1000) == 48 && EntityScan.Pure.clampLimit(48) == 48
+                        && EntityScan.Pure.clampLimit(24) == 24 && EntityScan.Pure.clampLimit(0) == 1);
+
+        // ⑧ radius 超上限**如实拒绝**（绝不偷偷放大成 32）
+        check("entity-scan: radius over the 32 cap is refused, never silently enlarged",
+                "radius_too_large".equals(EntityScan.Pure.radiusErrorCode(33))
+                        && EntityScan.Pure.radiusErrorCode(32) == null
+                        && "bad_radius".equals(EntityScan.Pure.radiusErrorCode(0)));
+
+        // ⑨ kind 认不出 ⇒ 如实拒绝；**实体**认不出 ⇒ unknown（all 里在、passive 里不在）
+        check("entity-scan: an unknown kind filter is refused (bad_kind)",
+                EntityScan.Pure.canonicalKind("cow") == null
+                        && "all".equals(EntityScan.Pure.canonicalKind(null))
+                        && "all".equals(EntityScan.Pure.canonicalKind("  "))
+                        && "passive".equals(EntityScan.Pure.canonicalKind("  PASSIVE ")));
+        check("entity-scan: an unrecognized entity tier lands in unknown",
+                scanMob(1, "UNKNOWN", 1.0).kind().equals("unknown")
+                        && scanMob(2, "WEIRD_NEW_TIER", 1.0).kind().equals("unknown"));
+        check("entity-scan: kind=unknown selects only the unrecognized rows",
+                EntityScan.Pure.scan(mixed, "unknown", 16, 24).total() == 1
+                        && EntityScan.Pure.scan(mixed, "unknown", 16, 24).rows().get(0)
+                                .tier().equals("UNKNOWN"));
+        check("entity-scan: unknown entities are in kind=all but not in kind=passive",
+                EntityScan.Pure.scan(mixed, "all", 16, 24).rows().stream()
+                        .anyMatch(r -> r.kind().equals("unknown"))
+                        && EntityScan.Pure.scan(mixed, "passive", 16, 24).rows().stream()
+                                .noneMatch(r -> r.kind().equals("unknown")));
+
+        // ⑩ 静态扫描：分发表 / handler 形态 / 只读 / 纯逻辑那半零依赖 / 复用分档表 / 不当新任务
+        String aeSrc = read(executor);
+        String esSrc = read(entityScan);
+        check("entity-scan: EntityScan source found", !esSrc.isEmpty());
+        check("entity-scan: the command is dispatched",
+                aeSrc.contains("case \"scan_entities\" -> handleScanEntities(cmd);"));
+
+        String body = methodBody(aeSrc, "private void handleScanEntities(");
+        check("entity-scan: handler reads radius/kind/limit",
+                !body.isEmpty() && body.contains("\"radius\"") && body.contains("\"kind\"")
+                        && body.contains("\"limit\""));
+        check("entity-scan: handler uses the defaults and the pure validators",
+                body.contains("EntityScan.DEFAULT_RADIUS") && body.contains("EntityScan.DEFAULT_LIMIT")
+                        && body.contains("EntityScan.Pure.radiusErrorCode(")
+                        && body.contains("EntityScan.Pure.clampLimit("));
+        check("entity-scan: the caps are declared once (16/32 radius, 24/48 limit)",
+                esSrc.contains("DEFAULT_RADIUS = 16") && esSrc.contains("MAX_RADIUS = 32")
+                        && esSrc.contains("DEFAULT_LIMIT = 24") && esSrc.contains("MAX_LIMIT = 48"));
+        check("entity-scan: the handler is read-only (no pathfinding, no input writes)",
+                !body.contains("Pathfinder.") && !body.contains("InputIsolation.")
+                        && !body.contains("navigateTo") && !body.contains("setControlState"));
+        check("entity-scan: not in the world is honest (code + ok:false), never an empty list",
+                body.contains("\"not_in_world\"") && body.contains("data.addProperty(\"ok\", false)"));
+
+        int pureStart = esSrc.indexOf("public static final class Pure {");
+        int pureEnd = esSrc.indexOf("// ── Minecraft 侧");
+        String pureSrc = pureStart >= 0 && pureEnd > pureStart ? esSrc.substring(pureStart, pureEnd) : "";
+        check("entity-scan: the tested half carries no game classes at all",
+                !pureSrc.isEmpty() && !pureSrc.contains("net.minecraft") && !pureSrc.contains("Minecraft"));
+        check("entity-scan: tiering reuses the one shared table",
+                esSrc.contains("MobPolicy.tier(AttackRules.entityTypeId("));
+        check("entity-scan: coordinates are block coords (same rounding as the summary)",
+                esSrc.contains("o.addProperty(\"x\", (int) Math.round(row.x()))")
+                        && esSrc.contains("o.addProperty(\"z\", (int) Math.round(row.z()))"));
+        check("entity-scan: the response carries the frozen fields",
+                esSrc.contains("data.addProperty(\"total\", result.total())")
+                        && esSrc.contains("data.addProperty(\"returned\", result.rows().size())")
+                        && esSrc.contains("data.addProperty(\"truncated\", result.truncated())")
+                        && esSrc.contains("data.add(\"entities\", entities)"));
+        String newTasks = methodBody(aeSrc, "private static final java.util.Set<String> NEW_TASK_COMMANDS");
+        check("entity-scan: a read-only command is not marked as a new task",
+                !newTasks.isEmpty() && !newTasks.contains("scan_entities"));
+    }
+
+    /** 一条扫描行（零依赖）：id + tier 名 + 距离。 */
+    private static EntityScan.Pure.Row scanMob(int id, String tier, double distance) {
+        return new EntityScan.Pure.Row(id, "mob" + id, tier, false, false, 0, 64, 0, distance,
+                true, 20.0, "", 0, "", 0, 0);
+    }
+
+    /** 一条玩家行（零依赖）：person 类。 */
+    private static EntityScan.Pure.Row scanPlayer(int id, double distance) {
+        return new EntityScan.Pure.Row(id, "p" + id, "", true, false, 0, 64, 0, distance,
+                true, 20.0, "", 0, "", 0, 0);
+    }
+
+    /** 一条掉落物行（零依赖）：item 类（物品事实与摘要同口径）。 */
+    private static EntityScan.Pure.Row scanItem(int id, double distance) {
+        return new EntityScan.Pure.Row(id, "minecraft:oak_log", "", false, true, 0, 64, 0, distance,
+                false, 0.0, "minecraft:oak_log", 1, "", 240, 5760);
     }
 
     // ── 12. 键盘/鼠标屏蔽（fail-open，ESC/F12 永不拦）──
