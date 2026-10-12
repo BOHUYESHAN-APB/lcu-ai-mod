@@ -202,15 +202,22 @@ _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 _ITEM_ID_RE = re.compile(r"^[A-Za-z0-9_.\-]+(?::[A-Za-z0-9_.\-/]+)?$")
 MAX_ICON_BYTES = 4 * 1024 * 1024
 MAX_ICONS = 4096
+# 单条 PNG 上限 4MB 并不意味着"4096 条最多 4MB" —— 条数封顶时理论上限是 4096×4MB=16GB。
+# 所以在**条数**之外再加一道**总字节**预算：超了就按插入顺序淘汰最早收到的贴图（后到的更可能
+# 还要用）。正常模组贴图每张几 KB，32MB 够放几千张；坏客户端也撑不爆内存。
+MAX_ICON_TOTAL_BYTES = 32 * 1024 * 1024
 
 _icons_lock = threading.Lock()
 _icon_pngs: dict[str, bytes] = {}  # item_id → PNG 字节（插入顺序 = 收到顺序）
+_icon_bytes_total = 0              # 上面这份字典的字节总量（配合 MAX_ICON_TOTAL_BYTES）
 
 
 def reset_icon_cache() -> None:
     """清空贴图缓存（测试用；进程里只有模组推的贴图，不会自带任何东西）。"""
+    global _icon_bytes_total
     with _icons_lock:
         _icon_pngs.clear()
+        _icon_bytes_total = 0
 
 
 def safe_item_id(item_id: Any) -> bool:
@@ -252,6 +259,7 @@ def note_item_icons(payload: Any) -> int:
     if not isinstance(icons, dict):
         icons = payload
 
+    global _icon_bytes_total
     accepted = 0
     with _icons_lock:
         for item_id, value in icons.items():
@@ -262,8 +270,16 @@ def note_item_icons(payload: Any) -> int:
             raw = _decode_icon(value)
             if raw is None:
                 continue
+            old = _icon_pngs.get(item_id)
+            if old is not None:                 # 覆盖式更新：先把旧字节从总量里扣掉
+                _icon_bytes_total -= len(old)
             _icon_pngs[item_id] = raw  # 覆盖式更新，天然跨事件累积
+            _icon_bytes_total += len(raw)
             accepted += 1
+        # 总字节预算：条数没超但总量超了 → 按插入顺序（最早收到的最先）淘汰。
+        while _icon_bytes_total > MAX_ICON_TOTAL_BYTES and _icon_pngs:
+            oldest_id = next(iter(_icon_pngs))
+            _icon_bytes_total -= len(_icon_pngs.pop(oldest_id))
     return accepted
 
 

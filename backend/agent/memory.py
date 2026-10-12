@@ -23,6 +23,17 @@ logger = logging.getLogger("memory")
 # 绝不自动往回走 —— 回不回去由模型调 `go_to_death_point` 决定（用户口径）。
 DEATH_POINT_LIMIT = 3
 
+# 内存上界（保留功能、只封顶）：短期交互、事件台账、玩家画像词表、POI 记忆。
+# 这些是"长期跑的后端"里唯一会随运行时间/世界规模线性长的东西；封顶后内存不再增长，
+# 超出的历史仍在各自的落盘文件里（memory json / poi json），只是不再常驻。
+MAX_RECENT_MESSAGES = 50
+MAX_EVENTS = 500
+# 玩家画像里的常用词：只用于画像统计，留最常见的 N 个（否则一个话痨能把词表撑到几千条）。
+PROFILE_WORD_LIMIT = 200
+# POI 记忆：一个世界里唯一的箱子/工作站/记录点条目数上限（按 last_seen 淘汰最旧的）。
+# 500 条 ≈ 190KB；4096 条 ≈ 1.5MB —— 足够覆盖正常存档，又不随"玩多久"无限长。
+MAX_POI_ENTRIES = 4096
+
 
 def _number(value: Any) -> Optional[float]:
     """数值字段归一化；bool / 字符串 / 缺值一律 None（**不猜**，也不硬转）。"""
@@ -89,11 +100,11 @@ class Memory:
         
         # 短期记忆：最近对话
         self.recent_messages: list[dict] = []
-        self.max_recent = 50  # 保留最近 50 条消息
+        self.max_recent = MAX_RECENT_MESSAGES  # 保留最近 50 条消息
         
         # 长期记忆：重要事件
         self.events: list[dict] = []
-        self.max_events = 500
+        self.max_events = MAX_EVENTS
         
         # 人物画像：玩家档案
         self.player_profiles: dict[str, dict] = {}
@@ -149,7 +160,7 @@ class Memory:
         }
         self.events.append(event)
         if len(self.events) > self.max_events:
-            self.events.pop(0)
+            del self.events[:len(self.events) - self.max_events]
         
         logger.info("[Memory] 记录事件: %s - %s", event_type, description[:50])
     
@@ -161,6 +172,10 @@ class Memory:
             "type": "action",
             "description": f"{action} ({'成功' if success else '失败'})",
         })
+        # 和 `record_event` 同一套上界：动作记录此前**没**封顶，长期跑会一直长
+        # （mode 切换、指令回执都往这里写），而 `_build_action_insights` 每轮还要整表扫一遍。
+        if len(self.events) > self.max_events:
+            del self.events[:len(self.events) - self.max_events]
     
     # ── 人物画像 ──
     
@@ -186,11 +201,15 @@ class Memory:
             / profile["message_count"]
         )
         
-        # 更新常用词（简单实现）
+        # 更新常用词（简单实现）：留最常见的 `PROFILE_WORD_LIMIT` 个 —— 词表不封顶的话，
+        # 一个话痨玩家的画像能长到几千条（没人读它，纯占内存）。
         words = message.lower().split()
         for word in words:
             if len(word) > 1:
                 profile["common_words"][word] = profile["common_words"].get(word, 0) + 1
+        if len(profile["common_words"]) > PROFILE_WORD_LIMIT:
+            top = sorted(profile["common_words"].items(), key=lambda kv: kv[1], reverse=True)
+            profile["common_words"] = dict(top[:PROFILE_WORD_LIMIT])
     
     def get_player_profile(self, sender: str) -> Optional[dict]:
         """获取玩家画像。"""
@@ -298,9 +317,21 @@ class Memory:
         
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
-            self.recent_messages = data.get("recent_messages", [])
-            self.events = data.get("events", [])
+            # 落盘文件可能很大（历史版本没有上界）：载入时**就地裁到上界**，
+            # 否则一次重启就把整份旧账重新常驻内存（并让每轮的动作统计更慢）。
+            recent = data.get("recent_messages", [])
+            self.recent_messages = list(recent)[-self.max_recent:] if isinstance(recent, list) else []
+            events = data.get("events", [])
+            self.events = list(events)[-self.max_events:] if isinstance(events, list) else []
             self.player_profiles = data.get("player_profiles", {})
+            # 老文件里的词表同样可能没封顶：载入时就地裁到上界。
+            if isinstance(self.player_profiles, dict):
+                for profile in self.player_profiles.values():
+                    if isinstance(profile, dict) and isinstance(profile.get("common_words"), dict):
+                        words_map = profile["common_words"]
+                        if len(words_map) > PROFILE_WORD_LIMIT:
+                            top = sorted(words_map.items(), key=lambda kv: kv[1], reverse=True)
+                            profile["common_words"] = dict(top[:PROFILE_WORD_LIMIT])
             self.locations = data.get("locations", {})
             self.interaction_count = data.get("interaction_count", 0)
             self.total_actions = data.get("total_actions", 0)
@@ -414,6 +445,11 @@ class WorldPoiMemory:
             return False
         self._entries[key] = entry
         self._dirty = True
+        # 上界（保留功能、只封顶）：一个世界里观测到的 POI 已经很多时，
+        # 淘汰 last_seen 最旧的那条 —— 新建/最近见过的留下，久未再见的让位。
+        if len(self._entries) > MAX_POI_ENTRIES:
+            oldest = min(self._entries.items(), key=lambda kv: kv[1].get("last_seen", 0.0))
+            self._entries.pop(oldest[0], None)
         return True
 
     def observe_state(self, state: dict) -> int:
@@ -538,6 +574,11 @@ class WorldPoiMemory:
             data = json.loads(path.read_text(encoding="utf-8"))
             entries = data.get("entries", {})
             self._entries = entries if isinstance(entries, dict) else {}
+            # 老文件可能超过上界：载入时就地保留 last_seen 最新的 `MAX_POI_ENTRIES` 条。
+            if len(self._entries) > MAX_POI_ENTRIES:
+                keep = sorted(self._entries.items(),
+                              key=lambda kv: kv[1].get("last_seen", 0.0), reverse=True)[:MAX_POI_ENTRIES]
+                self._entries = dict(keep)
             # 死亡点（跨重启还在）：坏条目一律丢掉（宁可少记，也不留半条假记录）。
             deaths = data.get("deaths")
             rows = [row for row in (normalize_death_point(item) for item in deaths or [])

@@ -35,6 +35,10 @@ UNKNOWN_KEY = "unknown"
 EVENT_TYPES = ("chat", "death", "join", "leave", "system", "whisper", "emote")
 # 摘要走独立角色，方便按角色配便宜的小模型，且不与 planner 的 prompt 缓存互相干扰。
 SUMMARY_AGENT = "summarizer"
+# 待摘要队列（被窗口挤出、还没压成 L3）的内存上界。正常情况它一满就被摘要清空；
+# 没有 LLM / 模型一直报错时它会**只增不减**（长期跑 = 慢漏），所以留一个安全阀：
+# 超出的最旧条目直接丢弃 —— 它们仍在 L1 的 jsonl 里，只是不再参与下一次摘要。
+PENDING_SUMMARY_LIMIT = 500
 
 
 def server_key(server, world_name) -> str:
@@ -274,6 +278,10 @@ class ConversationStore:
         limit = self.window_limit()
         while len(self._window) > limit:
             self._pending.append(self._window.pop(0))
+        # 安全阀：没有 LLM / 摘要一直失败时 pending 只增不减 —— 封顶，最旧的先丢
+        # （盘子上的 L1 jsonl 里仍有原文，丢的只是"还没摘要的候选"）。
+        if len(self._pending) > PENDING_SUMMARY_LIMIT:
+            del self._pending[:len(self._pending) - PENDING_SUMMARY_LIMIT]
 
     def record_chat(self, sender, message, *, is_system=False, x=None, y=None, z=None,
                     distance=None, ts=None, kind="") -> dict | None:
@@ -445,6 +453,9 @@ class ConversationStore:
         removed = max(0, len(self._window) - keep)
         for _ in range(removed):
             self._pending.append(self._window.pop(0))
+        # 同 `_push_window` 的安全阀：主动压缩也不能让 pending 无界。
+        if len(self._pending) > PENDING_SUMMARY_LIMIT:
+            del self._pending[:len(self._pending) - PENDING_SUMMARY_LIMIT]
         result = self.summarize_pending(llm) if removed else None
         return {
             "summarized": bool(result),
