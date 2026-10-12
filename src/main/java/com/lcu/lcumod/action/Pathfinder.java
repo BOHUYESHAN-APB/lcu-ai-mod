@@ -127,6 +127,16 @@ public class Pathfinder {
     private static BlockPos refusalCell = null;
     private static String refusalReason = null;
     private static double refusalScore = Double.POSITIVE_INFINITY;
+    /**
+     * 最近一次"找可站落脚点"搜索里离目标最近的**被拒格**（起点/终点解析失败时上报用；
+     * 每次搜索开头重置）。这样"could not resolve target stand position"不再是一句空话：
+     * 用户一眼能看到**哪一格、为什么**（空气/未加载区块 / 净空不足 / 站不下人 / 危险方块）。
+     */
+    private static BlockPos standingRefusalCell = null;
+    private static String standingRefusalReason = null;
+    private static double standingRefusalDistance = Double.POSITIVE_INFINITY;
+    /** 上一个被拒候选的原因（{@link #createStandingNode} 写、搜索层紧跟其后取走）。 */
+    private static String lastStandingReason = null;
     /** 收敛保护：转不过去就如实停步，不原地无限转。 */
     private static final AlignmentGuard ALIGNMENT = new AlignmentGuard(ALIGN_TIMEOUT_TICKS);
     /** 卡住后"重算同一个目标"的退避 + 结果去重（治每秒多条 Calculated path 的抖动）。 */
@@ -430,16 +440,23 @@ public class Pathfinder {
         if (mc.player == null || mc.level == null || goalPos == null) return false;
 
         StandingNode start = findClosestStandingNode(mc.level, mc.player, mc.player.position(), 2, 4);
+        // 诊断必须紧跟各自那次搜索取走（搜索开头会重置"最近被拒格"）；解析成功就不必构造字符串。
+        String startDiagnosis = start == null
+                ? describeUnresolvedStandPosition(mc.level, mc.player.position(), 2, 4,
+                        "could not resolve current stand position")
+                : null;
         StandingNode goal = findClosestStandingNode(mc.level, mc.player, goalPos, 3, 6);
+        String goalDiagnosis = goal == null
+                ? describeUnresolvedStandPosition(mc.level, goalPos, 3, 6,
+                        "could not resolve target stand position")
+                : null;
         currentPath.clear();
         currentPathIndex = 0;
 
         if (start == null || goal == null) {
             lastFailureReason = start == null && goal == null
-                ? "could not resolve start and goal stand positions"
-                : start == null
-                    ? "could not resolve current stand position"
-                    : "could not resolve target stand position";
+                ? startDiagnosis + " ; " + goalDiagnosis
+                : start == null ? startDiagnosis : goalDiagnosis;
             if (REPLAN.allowOnce("fail:" + failureKey() + "#" + lastFailureReason)) {
                 LCUMod.LOGGER.warn("[Pathfinder] {}", lastFailureReason);
             }
@@ -706,6 +723,9 @@ public class Pathfinder {
     /**
      * 离给定位置最近的**可站**落脚点（起点 / 终点都要落在真能站的位置上，否则会出现
      * "路点永远到不了"的假卡住）。
+     *
+     * <p>顺带记下"离目标最近的被拒格 + 原因"（{@link #standingRefusalCell}），供
+     * {@link #describeUnresolvedStandPosition} 在解析失败时给出**具体**理由。
      */
     private static StandingNode findClosestStandingNode(Level level, Player player, Vec3 pos,
                                                         int horizontalRadius, int verticalRadius) {
@@ -714,6 +734,9 @@ public class Pathfinder {
         int centerX = (int) Math.floor(pos.x);
         int centerY = (int) Math.floor(pos.y);
         int centerZ = (int) Math.floor(pos.z);
+        standingRefusalCell = null;
+        standingRefusalReason = null;
+        standingRefusalDistance = Double.POSITIVE_INFINITY;
 
         for (int dx = -horizontalRadius; dx <= horizontalRadius; dx++) {
             for (int dz = -horizontalRadius; dz <= horizontalRadius; dz++) {
@@ -721,6 +744,13 @@ public class Pathfinder {
                     BlockPos support = new BlockPos(centerX + dx, centerY + dy, centerZ + dz);
                     StandingNode candidate = createStandingNode(level, player, support);
                     if (candidate == null) {
+                        // 记"最靠近目标的那一次拒绝"：越靠近目标越能说明病根在哪一格。
+                        double refusalDistance = support.distToCenterSqr(pos.x, pos.y, pos.z);
+                        if (standingRefusalCell == null || refusalDistance < standingRefusalDistance) {
+                            standingRefusalDistance = refusalDistance;
+                            standingRefusalCell = support;
+                            standingRefusalReason = lastStandingReason;
+                        }
                         continue;
                     }
 
@@ -733,6 +763,49 @@ public class Pathfinder {
             }
         }
         return best;
+    }
+
+    /** "最近被拒格 + 原因"的单行文本（诊断用；没记到就说 fallback）。 */
+    private static String lastStandingReasonOr(String fallback) {
+        if (standingRefusalCell != null && standingRefusalReason != null) {
+            return String.format("nearest cell %d,%d,%d: %s",
+                    standingRefusalCell.getX(), standingRefusalCell.getY(), standingRefusalCell.getZ(),
+                    standingRefusalReason);
+        }
+        return standingRefusalReason == null ? fallback : standingRefusalReason;
+    }
+
+    /**
+     * 解析不出落脚点时给用户的**具体诊断**（用户就是靠这种字符串定位问题的）：
+     * 目标坐标 + 搜过的盒子 + 那一列是否在**已加载区域** + 离它最近的被拒格和原因。
+     *
+     * <p>读了 {@link #standingRefusalCell}，所以必须在对应的 {@link #findClosestStandingNode}
+     * 之后**立刻**调用（下一次搜索会重置它）。
+     */
+    private static String describeUnresolvedStandPosition(Level level, Vec3 pos, int horizontalRadius,
+                                                          int verticalRadius, String label) {
+        int centerX = (int) Math.floor(pos.x);
+        int centerY = (int) Math.floor(pos.y);
+        int centerZ = (int) Math.floor(pos.z);
+        StringBuilder sb = new StringBuilder(label);
+        sb.append(String.format(" at %.1f,%.1f,%.1f", pos.x, pos.y, pos.z));
+        sb.append(String.format(" (searched x %d..%d y %d..%d z %d..%d",
+                centerX - horizontalRadius, centerX + horizontalRadius,
+                centerY - verticalRadius, centerY + verticalRadius,
+                centerZ - horizontalRadius, centerZ + horizontalRadius));
+        if (!level.isLoaded(new BlockPos(centerX, centerY, centerZ))) {
+            // 客户端看不到的区块：方块状态读出来就是空气 ⇒ 没有支撑面。跟"地面不好"是两回事。
+            sb.append("; that column is NOT in the loaded area (unloaded chunk or outside build height)");
+        }
+        if (standingRefusalCell != null) {
+            sb.append(String.format("; nearest rejected cell %d,%d,%d: %s",
+                    standingRefusalCell.getX(), standingRefusalCell.getY(), standingRefusalCell.getZ(),
+                    standingRefusalReason == null ? "not standable" : standingRefusalReason));
+        } else {
+            sb.append("; no candidate cell in the searched box");
+        }
+        sb.append(")");
+        return sb.toString();
     }
 
     /** 这一列（x,z）里离参考高度最近的可站落脚点。 */
@@ -763,33 +836,32 @@ public class Pathfinder {
      * <p>判据全部来自**玩家脚印内的真实碰撞形状**（{@link #columnProfile}）：
      * 脚部支撑高度 + 头部净空 + 是否可攀爬（梯子/藤蔓/脚手架/垂泪藤…），最后用真实碰撞盒
      * （{@code level.noCollision}）兜底确认一次 —— 所以路点一定落在真能站的位置上。
+     *
+     * <p>"能不能站"的**规则本身**在零依赖纯逻辑 {@link Pure#classifyStanding} 里（只有那里
+     * 一处口径 ⇒ 自检可以直接拿剖面做行为断言，也保证"平地/半砖/楼梯"这类判据不会被悄悄收紧）。
      */
     private static StandingNode createStandingNode(Level level, Player player, BlockPos supportPos) {
         if (player == null) {
+            lastStandingReason = "no client player to test the standing box";
             return null;
         }
         ColumnProfile profile = columnProfile(level, player, supportPos);
-        if (!profile.hasFoot()) {
-            return null;
+        Vec3 standingPos = profile.hasFoot()
+                ? new Vec3(supportPos.getX() + 0.5, profile.footY(), supportPos.getZ() + 0.5)
+                : null;
+        boolean collideFree = standingPos != null && hasHeadroom(level, player, standingPos);
+        double climbRise = profile.climbable() ? profile.climbTop() - profile.footY() : 0.0;
+        Pure.Standing verdict = Pure.classifyStanding(new Pure.StandingQuery(
+                profile.hasFoot(), profile.headroom(), collideFree,
+                isDangerousSupport(level.getBlockState(supportPos)),
+                profile.climbable(), climbRise));
+        if (!verdict.allowed()) {
+            lastStandingReason = verdict.reason();
+            return null;   // 不能站：原因留给 findClosestStandingNode 做"最近被拒格"诊断。
         }
-        Vec3 standingPos = new Vec3(supportPos.getX() + 0.5, profile.footY(), supportPos.getZ() + 0.5);
-        if (!hasHeadroom(level, player, standingPos)) {
-            return null;   // 脚下站不住人（头上有东西/脚下被占）
-        }
-        boolean climbable = profile.climbable();
-        double climbTop = climbable ? profile.climbTop() : Double.NaN;
-        if (climbable && profile.climbTop() - profile.footY() >= MIN_CLIMB_RISE) {
-            // 可攀爬柱：节点就是"攀爬入口"，靠近后按"前进 + 跳"爬上去。
-            return new StandingNode(supportPos, standingPos, profile.headroom(), true, climbTop);
-        }
-        if (isDangerousSupport(level.getBlockState(supportPos))) {
-            return null;
-        }
-        if (profile.headroom() + 1.0e-6 < PLAYER_HEIGHT) {
-            return null;   // 净空不足 ⇒ 站不下人（这是"能走/不能走"最常见的分界）
-        }
+        double climbTop = profile.climbable() ? profile.climbTop() : Double.NaN;
         // 普通落脚点（脚手架顶这类"既能站又能爬"的格子也走这里：站得住就站，柱高照样记着）。
-        return new StandingNode(supportPos, standingPos, profile.headroom(), false, climbTop);
+        return new StandingNode(supportPos, standingPos, profile.headroom(), verdict.climb(), climbTop);
     }
 
     // ── 脚印剖面：把"一格一个高度"换成"玩家脚印内看到的那一小块碰撞形状" ──
@@ -1296,13 +1368,13 @@ public class Pathfinder {
         Vec3 waypoint = currentPath.get(currentPathIndex).pos();
         StandingNode from = findClosestStandingNode(mc.level, mc.player, playerPos, 1, 3);
         if (from == null) {
-            return String.format("no standable node under the player at %.1f,%.1f,%.1f (not on walkable ground)",
-                    playerPos.x, playerPos.y, playerPos.z);
+            return String.format("no standable node under the player at %.1f,%.1f,%.1f (not on walkable ground): %s",
+                    playerPos.x, playerPos.y, playerPos.z, lastStandingReasonOr("unknown"));
         }
         StandingNode to = findClosestStandingNode(mc.level, mc.player, waypoint, 1, 3);
         if (to == null) {
-            return String.format("waypoint %s has no standable node (path point is not walkable ground)",
-                    targetKey(waypoint));
+            return String.format("waypoint %s has no standable node (path point is not walkable ground): %s",
+                    targetKey(waypoint), lastStandingReasonOr("unknown"));
         }
         int dirIndex = directionIndex(to.supportPos.getX() - from.supportPos.getX(),
                 to.supportPos.getZ() - from.supportPos.getZ());
@@ -1479,6 +1551,76 @@ public class Pathfinder {
                 return allow(Move.DROP_DOWN);
             }
             return allow(Move.WALK);
+        }
+
+        // ── 落脚点（"这一格能不能站人"）的判据：同样零依赖，跟步子判据同一处口径 ──
+
+        /**
+         * 一格"能不能站人"的**剖面输入**（世界无关的纯数据；由 {@code Pathfinder.columnProfile}
+         * 从玩家脚印内的碰撞形状量出来）。
+         *
+         * @param footPresent 脚印内有支撑面（不是空气 / 未加载区块 / 无碰撞形状）
+         * @param headroom    从脚底起的连续净空（格）
+         * @param collideFree 玩家碰撞盒放在落脚点上时不撞任何东西（真实 {@code noCollision}）
+         * @param dangerous   支撑方块本身危险（岩浆/火/仙人掌/营火）
+         * @param climbable   这一格可攀爬（原版 {@code BlockState.isLadder}）
+         * @param climbRise   能从这根攀爬柱拿到的抬升（格；不可攀爬传 0）
+         */
+        public record StandingQuery(boolean footPresent, double headroom, boolean collideFree,
+                                    boolean dangerous, boolean climbable, double climbRise) {
+        }
+
+        /**
+         * "这一格能不能站"的判据结果。
+         *
+         * @param allowed 接受（可以在这格落脚）
+         * @param climb   接受且是**攀爬柱入口**（靠近后按前进 + 跳往上爬）
+         * @param reason  拒绝原因（机器可读、可进日志/上报）；接受时为空串
+         */
+        public record Standing(boolean allowed, boolean climb, String reason) {
+        }
+
+        private static Standing acceptStanding(boolean climb) {
+            return new Standing(true, climb, "");
+        }
+
+        private static Standing refuseStanding(String reason) {
+            return new Standing(false, false, reason);
+        }
+
+        /**
+         * 这一格能不能站人（普通平地 / 半砖 / 楼梯 / 闭合活板门 / 地毯都走"普通落脚点"这条路）。
+         *
+         * <p>口径与 {@link #classifyStep} 一致，且只有这一处：
+         * <ul>
+         *   <li>脚印内没有支撑面（空气 / **未加载区块** / 没有碰撞形状）⇒ 拒绝
+         *       {@code no support within footprint ...}；</li>
+         *   <li>落脚点上放不下玩家碰撞盒 ⇒ 拒绝 {@code standing box collides ...}；</li>
+         *   <li>可攀爬且真能抬升（≥ {@link #MIN_CLIMB_RISE}）⇒ 接受为**攀爬柱入口**；</li>
+         *   <li>支撑方块危险 ⇒ 拒绝；</li>
+         *   <li>净空不够站人（&lt; {@link #PLAYER_HEIGHT}）⇒ 拒绝；</li>
+         *   <li>其余 ⇒ 接受为普通落脚点。</li>
+         * </ul>
+         * <b>绝不搭方块</b>：站不住就是站不住，如实拒绝。
+         */
+        public static Standing classifyStanding(StandingQuery q) {
+            if (!q.footPresent()) {
+                return refuseStanding("no support within footprint (air, chunk not loaded, or no collider)");
+            }
+            if (!q.collideFree()) {
+                return refuseStanding("standing box collides (the player does not fit here)");
+            }
+            if (q.climbable() && q.climbRise() >= MIN_CLIMB_RISE) {
+                return acceptStanding(true);
+            }
+            if (q.dangerous()) {
+                return refuseStanding("dangerous support (lava/fire/cactus/campfire)");
+            }
+            if (q.headroom() + 1.0e-6 < PLAYER_HEIGHT) {
+                return refuseStanding(String.format("insufficient headroom (%.2f < %.1f)",
+                        q.headroom(), PLAYER_HEIGHT));
+            }
+            return acceptStanding(false);
         }
     }
 

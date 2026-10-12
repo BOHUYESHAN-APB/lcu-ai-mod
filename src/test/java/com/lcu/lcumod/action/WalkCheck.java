@@ -41,6 +41,7 @@ public final class WalkCheck {
         gradualTurnChecks();
         motionCurveChecks();
         stepClassifyChecks();
+        standingClassifyChecks();
         nonFullBlockChecks();
         alignmentGuardChecks();
         replanGateChecks();
@@ -650,6 +651,87 @@ public final class WalkCheck {
         return Pathfinder.Pure.classifyStep(q).reason();
     }
 
+    // ── 2c2. 落脚点判据（"这一格能不能站人"）────────────────────
+
+    /**
+     * 用户实机 2026-10-12 的根因复盘：{@code move_to} 回 {@code could not resolve target stand
+     * position}。逐条查过那笔"脚印剖面"改造后确认：**普通平地的判据并没有被收紧**（同一片地上
+     * {@code come_to_player} 当时是成功的）；真正的原因是目标落在客户端**没加载的区块**里
+     * （玩家进下界后仍按主世界坐标下发目标 ⇒ 读出来全是空气 ⇒ 没有支撑面）。
+     *
+     * <p>所以这里把"能不能站"的每一条判据钉成**行为断言**：平地/半砖/楼梯/活板门/梯子必须被接受，
+     * 净空不足/没支撑面/站不下人/危险方块必须被拒绝（且带机器可读原因）—— 以后谁把平地判死，
+     * 这条自检立刻红；同时静态扫描保证"能不能站"的规则只有 {@link Pathfinder.Pure#classifyStanding}
+     * 一处口径，失败上报必须带坐标与区块加载状态。
+     */
+    private static void standingClassifyChecks() {
+        // 平地：脚下一格实心（脚印内 top=1.0）、上方一路空气 ⇒ 必须被接受成普通落脚点。
+        Pathfinder.Pure.Standing flat = standing(true, 4.0, true, false, false, 0.0);
+        check("stand: plain flat ground is accepted as a normal node",
+                flat.allowed() && !flat.climb() && flat.reason().isEmpty());
+
+        // 半砖（脚印内 top=0.5）⇒ 一样能站。
+        check("stand: bottom slab (foot 0.5, clear above) is accepted",
+                standing(true, 3.5, true, false, false, 0.0).allowed());
+        // 楼梯（脚印内 top=那一级踏面）⇒ 能站；低矮走廊里也一样（净空 2.5 ≥ 1.8）。
+        check("stand: stair tread under a 2.5-high corridor is accepted",
+                standing(true, 2.5, true, false, false, 0.0).allowed());
+        // 上半砖顶 / 闭合活板门（平放 0.1875）⇒ 能站。
+        check("stand: upper-slab top / closed trapdoor is accepted",
+                standing(true, 3.8, true, false, false, 0.0).allowed());
+
+        // 攀爬柱（梯子/藤蔓/脚手架）：真能抬升 ⇒ 接受为 CLIMB 入口（不是普通落脚点）。
+        Pathfinder.Pure.Standing climb = standing(true, 4.0, true, false, true, 3.0);
+        check("stand: a climbable column with real rise is a CLIMB node",
+                climb.allowed() && climb.climb());
+        // 可攀爬但一点都抬不起来 ⇒ 不按攀爬入口算，格子本身仍能站（与改造前口径一致）。
+        Pathfinder.Pure.Standing lowClimb = standing(true, 4.0, true, false, true, 0.5);
+        check("stand: a climbable cell with no rise still stands as a normal node",
+                lowClimb.allowed() && !lowClimb.climb());
+
+        // 净空不足：1.5 < 1.8 ⇒ 拒绝，且理由必须点明 net headroom（用户能看到"是哪条判据"）。
+        Pathfinder.Pure.Standing low = standing(true, 1.5, true, false, false, 0.0);
+        check("stand: insufficient headroom (1.5 < 1.8) is refused with a headroom reason",
+                !low.allowed() && low.reason().contains("headroom"));
+        // 边界：正好 1.8 净空 ⇒ 接受；1.7999 ⇒ 拒绝。
+        check("stand: exactly 1.8 of headroom is accepted, 1.7999 is not",
+                standing(true, 1.8, true, false, false, 0.0).allowed()
+                        && !standing(true, 1.7999, true, false, false, 0.0).allowed());
+
+        // 脚印内没有支撑面（空气 / **未加载区块** / 没有碰撞形状）⇒ 拒绝，理由点明"没支撑面"。
+        Pathfinder.Pure.Standing noSupport = standing(false, 4.0, true, false, false, 0.0);
+        check("stand: no support in the footprint is refused (air / chunk not loaded)",
+                !noSupport.allowed() && noSupport.reason().contains("no support")
+                        && noSupport.reason().contains("chunk not loaded"));
+        // 落脚点上放不下玩家碰撞盒 ⇒ 拒绝。
+        Pathfinder.Pure.Standing blocked = standing(true, 4.0, false, false, false, 0.0);
+        check("stand: a colliding standing box is refused",
+                !blocked.allowed() && blocked.reason().contains("collides"));
+        // 危险支撑（岩浆/火/仙人掌/营火）⇒ 拒绝。
+        Pathfinder.Pure.Standing danger = standing(true, 4.0, true, true, false, 0.0);
+        check("stand: a dangerous support is refused",
+                !danger.allowed() && danger.reason().contains("dangerous"));
+        // 判据顺序与改造前一致：可攀爬且能抬升时，危险/净空不再挡路。
+        check("stand: a real climb column wins over the dangerous/headroom checks (same order as before)",
+                standing(true, 1.0, true, true, true, 3.0).allowed());
+
+        // "附近一格有墙"不该把**能站的那一格**判死：判据的结构里**根本没有邻居输入**
+        // （剖面 6 项全是这一格自己的）⇒ 隔壁是墙/水不会改变本格结论；搜索本身按半径扫，
+        // 不是只看目标那一格（见非完整方块小节的静态扫描）。
+        check("stand: the verdict cannot depend on neighbours (the profile has no neighbour input)",
+                Pathfinder.Pure.StandingQuery.class.getRecordComponents().length == 6 && flat.allowed());
+
+        check("stand: thresholds are the documented ones (height 1.8 / climb rise 1.0)",
+                Pathfinder.Pure.PLAYER_HEIGHT == 1.8 && Pathfinder.Pure.MIN_CLIMB_RISE == 1.0);
+    }
+
+    private static Pathfinder.Pure.Standing standing(boolean footPresent, double headroom,
+                                                     boolean collideFree, boolean dangerous,
+                                                     boolean climbable, double climbRise) {
+        return Pathfinder.Pure.classifyStanding(new Pathfinder.Pure.StandingQuery(
+                footPresent, headroom, collideFree, dangerous, climbable, climbRise));
+    }
+
     // ── 2d. 非完整方块的实现形状（源码扫描）──────────────────────
 
     /**
@@ -689,6 +771,23 @@ public final class WalkCheck {
                 pf.contains("createStandingNode(") && pf.contains("hasHeadroom(level, player, standingPos)"));
         check("footprint: one single classifier drives walk/jump/drop/climb",
                 pf.contains("Pure.classifyStep("));
+
+        // 落脚点判据必须只有一处（纯逻辑），且解析失败要说得**具体**：坐标 + 搜过的盒子 +
+        // 目标列是否已加载 + 最近的被拒格为什么。
+        check("standing: node acceptance lives in the pure classifier (one single place)",
+                pf.contains("Pure.classifyStanding(") && pf.contains("Pure.StandingQuery("));
+        check("standing: the search scans a radius around the point (a wall next door cannot kill the cell)",
+                pf.contains("standingRefusalCell") && pf.contains("distToCenterSqr("));
+        check("standing: an unresolved stand position names coordinates, searched box and reason",
+                pf.contains("could not resolve target stand position")
+                        && pf.contains("could not resolve current stand position")
+                        && pf.contains("describeUnresolvedStandPosition(")
+                        && pf.contains("isLoaded(")
+                        && pf.contains("nearest rejected cell"));
+        check("standing: the unloaded-chunk case is spelled out (not blamed on the ground)",
+                pf.contains("NOT in the loaded area"));
+        check("standing: progress-block diagnosis also carries the refusal reason",
+                pf.contains("lastStandingReasonOr("));
 
         // 卡住必须说清"哪一格、为什么"，并进现有 stuck 上报文案
         check("diagnosis: pathfinder keeps the nearest refusal with its cell",
