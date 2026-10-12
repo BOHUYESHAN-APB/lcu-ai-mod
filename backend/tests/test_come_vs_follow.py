@@ -184,34 +184,62 @@ def _full_text(payload: dict) -> str:
 
 
 class PeriodicLogCompressionTests(unittest.TestCase):
-    def test_fingerprint_still_uses_the_full_payload(self):
-        """指纹走完整负载：同一份不变、深处坐标一变就判"变了"（灵敏度不减）。"""
+    def test_fingerprint_follows_the_printed_view(self):
+        """指纹 = **打印内容的哈希**：摘要没变就不打，摘要变了才打（用户实机："得限定"）。
+
+        这取代了旧口径（指纹走完整负载 ⇒ 远端坐标抖一下也刷一行）。
+        """
         payload = _state_payload()
         self.assertEqual(event_fingerprint(payload), event_fingerprint(_state_payload()))
 
-        moved = _state_payload()
-        moved["nearby_blocks"][31]["z"] = 7        # 只动最远那条方块的一个坐标
-        self.assertNotEqual(event_fingerprint(payload), event_fingerprint(moved),
-                            "深处坐标变化必须仍能被指纹判出来")
+        # ① 远处方块的一个坐标动了 ⇒ 摘要里没有它 ⇒ **不算变化**（这正是"限定"）。
+        #    注意 B31 是**最近**那条（会被当作样本打印），所以这里动 index 0（远处）。
+        far = _state_payload()
+        far["nearby_blocks"][0]["z"] = 7
+        self.assertEqual(event_fingerprint(payload), event_fingerprint(far),
+                         "远端坐标抖动不该再刷日志")
+
+        # ② 位置挪一点点、视角转 1 度 ⇒ 取整 / 剔除后不算变化。
+        #    注意取整是"按格"：跨过 .5 边界才算变化，所以这里往下抖（10.5 → 10.45 → 仍是 10.0）。
+        jitter = _state_payload()
+        jitter["player"]["x"] = jitter["player"]["x"] - 0.05
+        jitter["player"]["yaw"] = 42.0
+        self.assertEqual(event_fingerprint(payload), event_fingerprint(jitter),
+                         "零点几格与朝向抖动不该算变化")
+
+        # ③ 真的变了 ⇒ 必须判得出来：血量、走过一格、附近东西变少。
+        hurt = _state_payload()
+        hurt["player"]["health"] = 12.0
+        self.assertNotEqual(event_fingerprint(payload), event_fingerprint(hurt))
+        walked = _state_payload()
+        walked["player"]["x"] = 13.4
+        self.assertNotEqual(event_fingerprint(payload), event_fingerprint(walked))
+        self.assertNotEqual(event_fingerprint(payload),
+                            event_fingerprint(_state_payload(
+                                nearby_blocks=_state_payload()["nearby_blocks"][:5])))
 
     def test_printed_content_is_compact_and_keeps_key_fields(self):
         payload = _state_payload()
-        compact = format_event_content({"type": "event", "event": "state_update",
-                                        "data": payload})
+        obj = {"type": "event", "event": "state_update", "data": payload}
+        compact = format_event_content(obj)          # 默认上限（= 实际日志里的那行）
         full = _full_text(payload)
 
         self.assertLess(len(compact), len(full) * 0.4, "满屏坐标必须被压掉")
         self.assertGreater(len(full) - len(compact), 1000, "压缩量要实打实")
-        # 关键字段仍在：位置 / 血量 / 饥饿 / 维度。
-        for token in ('"health":20.0', '"hunger":18', "minecraft:overworld", '"x":10.5'):
-            self.assertIn(token, compact)
-        # 数组只留条数 + 空间类附最近一条样本（不再是 32 条全量）。
-        self.assertIn('"nearby_blocks":{"count":32,"nearest"', compact)
-        self.assertIn('"inventory":{"count":9}', compact)
-        self.assertIn('"entities":{"count":1,"nearest"', compact)
+        self.assertLess(len(compact), 500, "单行要短（用户实机：日志被坐标刷屏）")
+
+        # 关键字段仍在（这里把上限调大，避免"被截断"干扰断言；空间标量按格取整 ⇒ 10.5 → 10.0）。
+        untruncated = format_event_content(obj, limit=5000)
+        for token in ('"health":20.0', '"hunger":18', "minecraft:overworld", '"x":10.0'):
+            self.assertIn(token, untruncated)
+        # 数组只留条数 + 空间类附最近一条样本（不再是 32 条全量），样本只留身份 + 距离。
+        self.assertIn('"nearby_blocks":{"count":32,"nearest"', untruncated)
+        self.assertIn('"inventory":{"count":9}', untruncated)
+        self.assertIn('"entities":{"count":1,"nearest"', untruncated)
         # 最近一条方块 = distance 最小者（B31，distance=1.0）。
-        self.assertIn('"B31"', compact)
-        self.assertNotIn('"B0"', compact, "远的方块只留条数、不再逐条打印")
+        self.assertIn('"B31"', untruncated)
+        self.assertNotIn('"B0"', untruncated, "远的方块只留条数、不再逐条打印")
+        self.assertNotIn('"x":11.0', untruncated, "样本里的坐标不再逐字打出来")
 
     def test_sample_is_the_nearest_when_no_distance_field(self):
         compact = format_event_content({"data": {"entities": [{"name": "A"}, {"name": "B"}]}})

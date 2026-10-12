@@ -42,11 +42,14 @@ _VOLATILE_KEYS = frozenset({
     "ts", "timestamp", "time", "now", "server_time", "sent_at", "received_at",
     "day_time", "game_time", "world_time", "uptime", "uptime_ms",
     "tick", "ticks", "seq", "seq_id", "sequence", "frame", "elapsed",
+    # 朝向：转 1 度不该算"状态变了"（用户实机：日志被这类抖动刷屏）。模型照旧拿得到 yaw/pitch，
+    # 只是**日志视图**不看它们。
+    "yaw", "pitch", "head_yaw", "body_yaw", "rotation",
 })
 _VOLATILE_SUFFIXES = ("_ms", "_at", "_ts", "_tick", "_ticks")
 
 # 单行里回显"新内容"的最大长度；超出用 `…(+N 字)` 诚实标注（不隐藏"被截断"这件事）。
-MAX_LOG_CONTENT_CHARS = 1500
+MAX_LOG_CONTENT_CHARS = 400
 
 
 def _is_volatile_key(key: str) -> bool:
@@ -64,9 +67,12 @@ def _normalize_for_key(value: Any) -> Any:
 
 
 def event_fingerprint(obj: dict) -> str:
-    """周期性事件的去重指纹：规范化 JSON 的哈希（字段顺序无关、剔除时间戳/计数器）。"""
-    normalized = _normalize_for_key(obj)
-    blob = json.dumps(normalized, ensure_ascii=False, sort_keys=True,
+    """周期性事件的去重指纹 = **打印内容的哈希**（与 `format_event_content` 共用 `_log_view`）。
+
+    以前指纹走**完整负载**：目标挪 0.05 格、视角转 1 度都算"变了"，于是"变化才打"退化成
+    每分钟好几行、每行上千字坐标（用户实机："后台频繁在刷这些坐标位置，我们得限定"）。
+    """
+    blob = json.dumps(_log_view(obj), ensure_ascii=False, sort_keys=True,
                       separators=(",", ":"), default=str)
     return hashlib.sha1(blob.encode("utf-8", "replace")).hexdigest()
 
@@ -93,9 +99,20 @@ _SAMPLE_LIST_KEYS = frozenset({
     "stations", "routes",
 })
 
+# 样本里**只保留**这些字段：身份 + 距离 + 血量/数量。坐标（x/y/z/uuid…）不进日志视图 ——
+# 那是用户点名要压掉的东西，而模型照旧从完整负载里拿得到。
+_SAMPLE_KEEP = frozenset({
+    "name", "block_id", "item_id", "display", "type", "kind",
+    "distance", "health", "count", "id",
+})
+
 
 def _nearest_sample(items: list) -> Any:
-    """数组里距离最近的一条作样本：带 distance 的取最小，否则第一条 dict、再退到首个非 dict。"""
+    """数组里距离最近的一条作样本：带 distance 的取最小，否则第一条 dict、再退到首个非 dict。
+
+    **只留身份 + 距离**（`_SAMPLE_KEEP`）：坐标/血量之类逐字打出来就是用户说的"刷坐标"，
+    而模型那边照旧拿得到完整负载 —— 日志只需要回答"最近的那个是什么、多远"。
+    """
     best = None
     best_distance = None
     for item in items:
@@ -107,12 +124,12 @@ def _nearest_sample(items: list) -> Any:
                 best, best_distance = item, distance
         elif best is None:
             best = item
-    if best is not None:
-        return best
-    for item in items:
-        if not isinstance(item, dict):
-            return item
-    return None
+    if best is None:
+        for item in items:
+            if not isinstance(item, dict):
+                return item
+        return None
+    return {k: v for k, v in best.items() if k in _SAMPLE_KEEP}
 
 
 def summarize_periodic_payload(payload: Any) -> Any:
@@ -133,17 +150,55 @@ def summarize_periodic_payload(payload: Any) -> Any:
     return summary
 
 
-def format_event_content(obj: dict, limit: int = MAX_LOG_CONTENT_CHARS) -> str:
-    """把事件负载压成单行（紧凑 JSON），用于变化日志里的"新内容"。
+# 空间/数值标量在**日志视图**里的取整位数（0 = 取整到格）：避免"挪了 0.05 格"被当成"变化"。
+# 只影响日志（指纹 + 打印），发给模型的数据一字不动。
+_QUANTIZE_DECIMALS = {
+    "x": 0, "y": 0, "z": 0, "distance": 0,
+    "health": 1, "max_health": 1, "saturation": 1, "fall_distance": 1,
+}
 
-    周期状态负载先过 `summarize_periodic_payload` 压成摘要（数组只留条数 + 最近样本），
-    避免"内容一变就打印满屏坐标"；**判变化的指纹仍用完整负载**（`event_fingerprint`），
-    所以灵敏度不减、"到底变没变"照样能答。
+
+def _quantize(value: Any) -> Any:
+    """按 `_QUANTIZE_DECIMALS` 递归取整（**只影响日志视图**，不动发给模型的数据）。"""
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            decimals = _QUANTIZE_DECIMALS.get(str(key).lower())
+            if decimals is not None and isinstance(item, (int, float)) and not isinstance(item, bool):
+                out[key] = round(float(item), decimals)
+            else:
+                out[key] = _quantize(item)
+        return out
+    if isinstance(value, list):
+        return [_quantize(v) for v in value]
+    return value
+
+
+def _log_view(obj: Any) -> Any:
+    """周期性事件在**日志里**的样子：剔除易变字段 → 数组压成条数(+最近一条) → 空间标量取整。
+
+    指纹与打印**共用这个视图** ⇒ "变了才打"就等于"**打出来的东西**变了才打"：
+    · 易变字段（时间戳 / 计数器 / `yaw` / `pitch` …）不进视图；
+    · `x/y/z/distance` 取整到**格**，`health/saturation` 到 0.1；
+    · 大数组（`nearby_blocks`/`entities`/`players`/…）只留**条数 + 距离最近的一条**。
+
+    诚实边界：日志回答"**摘要**变了没变"，不回答"哪一格方块出现了" —— 完整负载照旧喂给模型，
+    能力不减，只是不再逐字刷坐标。
     """
     payload = obj.get("data") if isinstance(obj, dict) else None
     if payload is None:
         payload = obj
-    payload = summarize_periodic_payload(payload)
+    return _quantize(summarize_periodic_payload(_normalize_for_key(payload)))
+
+
+def format_event_content(obj: dict, limit: int = MAX_LOG_CONTENT_CHARS) -> str:
+    """把事件负载压成单行（紧凑 JSON），用于变化日志里的"新内容"。
+
+    与指纹**同源**（`_log_view`）：数组只留条数 + 最近一条样本，空间标量取整到格，
+    易变字段（时间戳/计数器/yaw/pitch…）不进视图。所以打印出来的就是"判变化时看的东西"，
+    不会再出现"内容变了但打印的摘要一模一样"这种自相矛盾的行。
+    """
+    payload = _log_view(obj)
     try:
         text = json.dumps(payload, ensure_ascii=False, sort_keys=True,
                           separators=(",", ":"), default=str)
