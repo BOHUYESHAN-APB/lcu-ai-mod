@@ -1,14 +1,23 @@
 # LCU Vanilla Capability Matrix
 
-Updated: 2026-07-19
+Updated: 2026-10-12
 
 This document defines the intended vanilla Minecraft capability surface for an
 LCU headed body. It is the implementation checklist for deterministic Java
 primitives and the composition boundary for Python tasks and agents.
 
+> **Reading guide.** The design-oriented sections — Body Blackboard And
+> Activities, Behavior Phase Pattern, Capability Layers, Common Operation
+> Contract, Required Java Primitives (P0–P4), Farming Transaction, Item Target
+> Model, Navigation Model, and Implementation Order — are a target checklist:
+> they describe what should exist, not necessarily what ships today. The
+> "Current Coverage Matrix" and every "Implemented …" list describe the code
+> shipped on branch 26.3 (Minecraft 26.3 / NeoForge 26.3.0.57-beta).
+
 ## Reference Baseline
 
-The design is informed by:
+The design is informed by the following projects, read as inspiration only —
+none of them is a dependency of, or copied into, this branch:
 
 - Mineflayer core and plugins for complete primitive APIs, server-backed events,
   inventory windows, pathfinding, collection, combat, equipment, and food.
@@ -21,8 +30,8 @@ The design is informed by:
 - TouhouLittleMaid for typed Brain memories, activity groups, registered work-mode
   behavior packages, bounded candidate scanning, cached reachability, farming phases,
   inventory routing, target cleanup, and randomized retry cooldowns.
-- Mojang-mapped 1.21.1 menu classes and NeoForge menu synchronization for
-  workstation slot layouts and completion evidence.
+- Mojang-mapped Minecraft 26.3 menu classes and NeoForge 26.3.0.57-beta menu
+  synchronization for workstation slot layouts and completion evidence.
 
 LCU must not copy arbitrary generated-code execution, unrestricted raw packet
 access, command cheating, or text-only success detection from reference projects.
@@ -203,28 +212,28 @@ Status values: `implemented`, `partial`, `missing`, `unsupported`.
 
 | Domain | Capability | Status | Main gap |
 |---|---|---:|---|
-| Lifecycle | Wire capability discovery | implemented | Schema/version compatibility enforcement |
+| Lifecycle | Wire capability discovery | partial | `Protocol.java` fixes the version/capability constants (`PROTOCOL_VERSION=1`, 6 bits); no handshake or version enforcement runs yet |
 | Lifecycle | Accepted/progress/outcome/cancel | partial | Core move/mine/craft/collect/eat paths support outcomes; remaining operations must migrate |
 | Movement | Coordinate navigation | implemented | Only one coordinate goal shape |
 | Movement | Radius/adjacent/any/flee/follow goals | partial | Formal `NavigationGoal` abstraction missing |
 | Movement | Terrain-modifying paths | missing | Break/place transitions and policy costs |
-| Movement | Swim/climb/vehicle/portal | missing | Separate locomotion modes |
+| Movement | Swim/climb/vehicle/portal | partial | Automatic swim reflex ships; no climb/vehicle/portal locomotion goals |
 | Targeting | Look at coordinate/entity | implemented | Durable target tracking and visible face result |
-| Blocks | Break current/addressed block | implemented | Headed-body verification pending for addressed mining |
-| Blocks | Place requested block at position | partial | Current implementation depends on client hit result |
-| Blocks | Use addressed block | implemented | Headed-body verification pending |
+| Blocks | Break current/addressed block | partial | `mine_block`/`dig_block` only mine the block under the client crosshair; no coordinate addressing |
+| Blocks | Place requested block at position | partial | Coordinate placement ships (`x,y,z` + `dir`); result verification still relies on the client-context use packet |
+| Blocks | Use addressed block | partial | `interact`/`interact_block` is a generic right-click at the current aim; no block addressing |
 | Entities | Use addressed entity | implemented | Durable UUID validation |
-| Entities | Attack addressed entity | implemented | Hit verification remains a future stateful combat operation |
-| Inventory | Observe inventory/equipment | implemented | Components, reservations, capacity diagnostics |
+| Entities | Attack addressed entity | partial | `attack`/`attack_entity` swing at the nearest entity in the crosshair; no `entity_id` targeting; hit verification is still future |
+| Inventory | Observe inventory/equipment | partial | `get_inventory`/`get_state` expose main slots, selected slot and self state; armor/offhand equipment and component/capacity diagnostics are not read |
 | Inventory | Select hotbar | implemented | Dynamic tool and Skill are advertised |
-| Inventory | Equip by item and slot | partial | Main-hand hotbar selection implemented; inventory swaps/armor/offhand remain |
-| Inventory | Exact move/swap/split/drop | partial | Only quick-move and coarse drop behavior |
+| Inventory | Equip by item and slot | partial | Hotbar selection, armor auto-equip and best-weapon equip ship; offhand and arbitrary inventory-swap by item remain |
+| Inventory | Exact move/swap/split/drop | partial | `container_move`(count)/`container_click`/`drop_item` cover move/split/swap/throw; no verified transaction postcondition, drag remains |
 | Menus | Read scoped slots | implemented | Menu state ID and carried item not exposed |
 | Menus | Quick transfer with menu ID | implemented | Exact quantity and partial transfer |
 | Menus | Generic serialized click | partial | Pickup/quick-move/swap/throw implemented; drag and verified transaction operation remain |
 | Storage | Indexed chest/barrel snapshots | implemented | Persistence and richer slot/components metadata |
-| Storage | Vanilla double chest identity | implemented | Headed-body verification pending |
-| Storage | Iron Chests/Sophisticated Storage | partial | Dedicated adapters for auxiliary slots |
+| Storage | Vanilla double chest identity | partial | Handled only through the generic vanilla menu; no dedicated double-chest half/merge identity in the code |
+| Storage | Iron Chests/Sophisticated Storage | partial | Reached only through the generic menu path; no dedicated auxiliary-slot adapters |
 | Storage | Ender chest/shulker/entity storage | missing | POI and menu adapters |
 | Recipes | Recursive crafting graph | implemented | Headed-body route verification pending |
 | Recipes | Crafting table operation | partial | Full grid cleanup and exact batch control |
@@ -236,9 +245,9 @@ Status values: `implemented`, `partial`, `missing`, `unsupported`.
 | Processing | Loom/cartography/enchanting | partial | Menu/slots/button primitive exposed; verified result transaction remains |
 | Food | Eat suitable hotbar food | partial | Full inventory selection and food policy |
 | Equipment | Best mining tool | partial | Hotbar-only, no durability/reservation policy |
-| Survival | Sleep/wake | unsupported | Bed selection, navigation, state verification |
+| Survival | Sleep/wake | implemented | `sleep` scans for a bed, pathfinds to it and uses it; wake handling and headed-body state verification remain |
 | Social | Send chat | implemented | Structured delivery/echo distinction |
-| Villagers | Observe/trade offers | unsupported | Merchant entity/menu adapter |
+| Villagers | Observe/trade offers | implemented | `trade` opens the merchant menu (never a client screen), picks an offer and verifies the result slot emptied; no durable multi-offer/merchant cache |
 | Combat | One melee attack | partial | Cooldown, target lifecycle, verified hit result |
 | Combat | Sustained combat/defense | missing | Policy, pursuit, shield/projectiles, terminal state |
 | Farming | Harvest/replant | missing | Mature-state filters and restoration ledger |
@@ -247,6 +256,9 @@ Status values: `implemented`, `partial`, `missing`, `unsupported`.
 | Safety | Hazard escape chains | missing | Priority arbiter and deterministic reflex tasks |
 
 ## Required Java Primitives
+
+The signatures and lists in P0–P4 are the design target. Only the code named in
+an "Implemented …" list ships today; everything else is future work.
 
 ### P0: Contract And Ownership
 
@@ -258,14 +270,16 @@ Status values: `implemented`, `partial`, `missing`, `unsupported`.
   `world.place`, `world.interact`, `entity.attack`, `inventory.ui`, and
   `inventory.transfer`.
 
-Implemented locally in the current development batch:
+Implemented in the shipped 26.3 code:
 
-- explicit Wire `outcome` messages;
-- `cancel_operation(operation_id)` and correlated backend cancellation;
-- durable-run outcome persistence for succeeded/failed/cancelled;
-- terminal outcomes for coordinate navigation, addressed/current mining, crafting,
-  collection, and eating;
-- compatibility progress events retained for the previously deployed body.
+- explicit Wire `outcome` messages and progress events (`sendOutcome`, `sendProgress`);
+- cancellation through `stop_all` and `stop_digging` (whole-body stop, not per-operation IDs);
+- terminal outcomes for coordinate navigation, current-target mining, crafting,
+  collection, and eating.
+
+Still design, not implemented: per-operation `cancel_operation(operation_id)`,
+the shared tool manifest, the `active_operation` record with deadline/blocker,
+and effect arbitration.
 
 ### P1: Addressable World And Inventory
 
@@ -281,20 +295,27 @@ Implemented locally in the current development batch:
 - `move_item(source, destination, quantity)` and exact `drop_item`;
 - menu state including type, ID, state ID, carried item, and scoped slots.
 
-Implemented locally in the current development batch:
+Implemented in the shipped 26.3 code (real dispatch labels):
 
-- `attack_entity(entity_id)` now resolves the supplied entity;
-- `mine_block_at(x,y,z,face)` and `interact_block_at(x,y,z,face)`;
-- `select_hotbar`, main-hand `equip_item`, and exact registry/tag `drop_item`;
-- `get_state`, `get_inventory`, `get_container`, and live `get_recipes`;
-- validated `inventory_click` for pickup, quick-move, swap, and throw;
-- `container_button` and `place_recipe` primitives;
-- menu class, adapter, state ID, carried item, and semantic slot roles.
+- `mine_block`/`dig_block`, `place_block`, `interact_block`/`interact`, `use_on`;
+- `attack`/`attack_entity` (crosshair nearest target), `select_hotbar`;
+- `equip`/`auto_equip`/`equip_armor`/`equip_weapon`;
+- `drop`/`drop_item`, `container_move`, `container_click`, `take_item`/`put_item`, `sort_inventory`;
+- `get_state`, `get_inventory`, `get_container`, `resolve_item`, `search_recipes`.
 
-### P2: Vanilla Menu Adapters
+Still design, not implemented: `navigate(goal, policy)` goal types, coordinate-addressed
+`break_block`/`use_block`, `target_block`/`target_entity`, entity-addressed
+`attack_entity(entity_id)`, `equip_item(item_target, destination)`,
+`inventory_click(container_id, slot, click_type, button, expected_revision)`,
+and `move_item(source, destination, quantity)` with verified transactions.
 
-Each adapter owns menu validation, slot layout, selection/data properties,
-input placement, output extraction, completion, timeout, and cleanup.
+### P2: Vanilla Menu Adapters (design — not implemented)
+
+Each adapter should own menu validation, slot layout, selection/data properties,
+input placement, output extraction, completion, timeout, and cleanup. Shipped
+today are only the generic menu primitives (`get_container`, `container_move`,
+`container_click`, `take_item`/`put_item`, `click_screen_button`); the
+per-station adapters below are the target.
 
 | Adapter | Key slots/data |
 |---|---|
@@ -311,7 +332,9 @@ input placement, output extraction, completion, timeout, and cleanup.
 | Merchant | payment 0-1, result 2, offers/select-trade packet |
 | Shulker/ender chest | scoped storage slots and transfer reconciliation |
 
-### P3: Core Stateful Operations
+### P3: Core Stateful Operations (design — not implemented)
+
+Closest shipped approximations: `eat`, `sleep`, `trade`, `craft_via_recipe`.
 
 - `acquire_item(ItemTarget, count, source_policy)`;
 - `craft_recipe(recipe_id, operations)`;
@@ -324,9 +347,9 @@ input placement, output extraction, completion, timeout, and cleanup.
 - `harvest_and_replant(region, crop_policy)`;
 - `attack_until(entity_id, stop_condition)`.
 
-### P4: Work-Mode Behavior Packages
+### P4: Work-Mode Behavior Packages (design — not implemented)
 
-LCU's equivalent of TouhouLittleMaid `IMaidTask` is a registered work-mode manifest:
+LCU's equivalent of TouhouLittleMaid `IMaidTask` should be a registered work-mode manifest:
 
 ```text
 mode_id
@@ -444,3 +467,11 @@ implemented only when:
 - automated tests cover success, timeout, stale target/menu, cancellation, and
   server correction where applicable;
 - the relevant headed-body scenario has passed.
+
+On branch 26.3 the Java side is exercised by 18 `verifyXxx` JavaExec tasks wired
+into `check` — `verifyLogic`, `verifyTitle`, `verifyChat`, `verifyFinder`,
+`verifyPhrase`, `verifyGate`, `verifyHold`, `verifyContainer`, `verifyRoute`,
+`verifyRecipe`, `verifyGuard`, `verifyProto`, `verifyMlg`, `verifyWalk`,
+`verifyTrade`, `verifyBuild`, `verifyMixin`, `verifyLang` — with the per-task
+check counts recorded in `TEST_TABLE.md`. A capability is not `implemented`
+until its matrix row and the corresponding self-check agree.

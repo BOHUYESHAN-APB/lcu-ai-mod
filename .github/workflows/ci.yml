@@ -22,10 +22,12 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
       # `sh gradlew` works on both OS and does not depend on the exec bit
       # (gradlew is committed as 100644). `build` runs `check`, which on this
-      # branch is wired to the 15 zero-dependency `verifyXxx` JavaExec
+      # branch is wired to the zero-dependency `verifyXxx` JavaExec
       # self-checks instead of JUnit (26.3 dropped JUnit — maven.neoforged.net
-      # is unreachable from the build machine). Compiles against the real
-      # MC 26.3 classes from the neoform dev runtime — no game client needed.
+      # is unreachable from the build machine). The authoritative list of
+      # self-checks is `build.gradle`'s `check` wiring — do not restate a
+      # count here, it only rots. Compiles against the real MC 26.3 classes
+      # from the neoform dev runtime — no game client needed.
       - name: Build + tests
         shell: bash
         run: sh gradlew build
@@ -79,21 +81,23 @@ jobs:
       # the mod jar) runs the **production** WireServer with no game client —
       # and drives it through the real `protocol.wire_client.WireClient`.
       # No `tests/integration/__init__.py` on purpose: `discover -s tests`
-      # skips non-package directories, so the 1103-test unit suite keeps its
-      # "zero skips" baseline and this heavier test is run here, explicitly.
+      # skips non-package directories, so the unit suite keeps its "zero skips"
+      # baseline and this heavier test is run here, explicitly. The exact unit
+      # count is whatever the suite reports — it is deliberately not restated
+      # here, because a second copy of that number only drifts.
       # The integration test itself needs no third-party packages (stdlib plus
       # protocol.wire_client), but this job ALSO runs the unit suite first, and
       # that one imports httpx/PIL — so installing requirements is mandatory
-      # here too. Without it the job died on 52 ImportErrors (only 165 tests
-      # collected) before the fixture was ever reached.
+      # here too. Without it the job died on ImportErrors before the fixture
+      # was ever reached.
       #
       # The unit suite runs *first, in this same job* on purpose: if the wire
-      # fixture fails, the transcript above it still shows whether the 1103
-      # unit tests were green, so "unit green / integration red" is readable
-      # instead of being hidden by a broken fixture.
+      # fixture fails, the transcript above it still shows whether the unit
+      # suite was green, so "unit green / integration red" is readable instead
+      # of being hidden by a broken fixture.
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
-      - name: Backend unit suite (baseline, 1103 tests, zero skips)
+      - name: Backend unit suite (zero skips)
         shell: bash
         run: python -m unittest discover -s tests
       - name: Boot the real WireServer and drive it from the backend

@@ -23,8 +23,10 @@
 | 右侧蓝列 | (1400, 76) | 500×470 | 下沿 546，避开 POV 外壳 |
 | 底边蓝条 | (48, 1024) | 1040×40 | 右端 1088，避开 POV 外壳 |
 
+以上与 `overlay/render.py` 的 `GEOM` 常量一一对应（`render.py:26-31`）：`ai_inner (48,76,1312,738)`、`pov_inner (1144,619,720,405)`、`pov_outer (1100,575,808,493)`、`right_col (1400,76,500,470)`、`bottom_bar (48,1024,1040,40)`。
+
 **层次（用户明确要求）**：右下 POV 是**完整的长方框**（四条边都在，画在最上层）；左上大框被它压着，
-所以**大框在交叠区是残缺的**（大框的笔画不进入 POV 外壳矩形内）。交叠带 = x 1144–1360 / y 619–814。
+所以**大框在交叠区是残缺的**（大框的笔画不进入 POV 外壳矩形内）。交叠带 = x 1144–1360 / y 619–814（`render.py:34` 的 `OVERLAP`）。
 
 ## 面板是纯色，文字你自己叠
 
@@ -38,18 +40,28 @@
 
 要改配色/形状才需要动 SVG：源文件是 `lcumod_overlay_base.svg` / `lcumod_overlay_top.svg`，
 改完跑 `python overlay/render.py` 一条命令重渲染 + 自检 + 出预览（本机没有 ImageMagick，
-渲染走 Chromium headless，透明底靠 `--default-background-color=00000000`）。
+渲染走 Chromium headless，透明底靠 `--default-background-color=00000000`；
+只想对现有 PNG 自检用 `python overlay/render.py --check`）。
 
-## 后期：OBS 浏览器源接后端（还没做，先记设计）
+## OBS 浏览器源接后端（已实现）
 
-后端已经有 Web 服务（`backend/web/static/` + `/ws`）。计划加几个**专用子页面**，每个页面就是一块面板：
+后端已经有 Web 服务（`backend/web/static/` + `/ws`）。**组件名以注册表为准**：`backend/server.py:94-102` 的
+`OVERLAY_COMPONENTS` 定义了 5 个组件，每个对应一个 `/overlay/<name>` 页面，页面是 `overlay.html`，
+数据来自 `GET /api/status` 加 `/ws` 推送（`OVERLAY_PUSH_INTERVAL = 2.0` 秒）。
 
-| 子页面 | 对应区域 | OBS 里的宽×高 | 数据来源 |
-|---|---|---|---|
-| `/overlay/right` | 右侧蓝列 | 500×470 | `/ws` 的任务列表、当前动作、后端连接状态、版本 |
-| `/overlay/bottom` | 底边蓝条 | 1040×40 | `/ws` 一句话现状（HUD note / 当前任务） |
-| `/overlay/topbar` | 品牌条 | 1920×56 | 会话信息、端口、玩家数 |
+| 子页面 | 含义 | 可放区域（建议 OBS 尺寸） |
+|---|---|---|
+| `/overlay/status` | 当前动作状态词 + HUD 描述词 | 右侧蓝列 500×470 |
+| `/overlay/task` | 当前任务与进度（含队列条数） | 右侧蓝列 500×470 |
+| `/overlay/players` | 在线玩家，最近发话者高亮 | 右侧蓝列 500×470 |
+| `/overlay/state` | 位置 / 生命 / 饥饿 / 维度 / 时间 | 底边蓝条 1040×40（或自选） |
+| `/overlay/backend` | 在场门 / 模态 / 联系人数 / Token 用量 | 品牌条 1920×56（或自选） |
 
-用法：OBS → 添加"浏览器"源 → URL 填 `http://127.0.0.1:8080/overlay/right`（本机后端）→ 宽高照上表填 → 背景透明
-（页面自身 `body{background:transparent;margin:0;overflow:hidden}`，OBS 默认自定义 CSS 已经含这个）。
+另有整屏舞台 `/overlay`（`stage.html`）与布局编辑器 `/overlay/editor`。
+`/overlay/{name}` 的 `{name}` 不在注册表里会直接 **404**（`server.py:319-320`，免得 OBS 源静默挂在空白页上）。
+
+用法：OBS → 添加"浏览器"源 → URL 填 `http://127.0.0.1:8080/overlay/status`（本机后端）→ 宽高由你在 OBS 里定 →
+背景透明（页面自身 `body{background:transparent;margin:0;overflow:hidden}`，OBS 默认自定义 CSS 已经含这个）。
 这样后端/AI 一改数据，OBS 里的进度条与文字就是实时的 —— 面板尺寸由 OBS 决定，页面只需 `100%` 自适应填满。
+
+> **注意**：本文件早先写的 `/overlay/right`、`/overlay/bottom`、`/overlay/topbar` 是当时的计划名，**从未注册**，填进 OBS 就是 404。用上表这 5 个名字。
