@@ -782,7 +782,8 @@ class Planner:
             for block in nearby_blocks[:8]
         ) or "无"
         nearby_entity_text = ", ".join(
-            f"{entity.get('type', '?')}:{entity.get('name', '?')}@{entity.get('distance', '?')}m"
+            f"{str(entity.get('tier') or entity.get('type') or '?').lower()}"
+            f":{entity.get('name', '?')}@{entity.get('distance', '?')}m"
             for entity in nearby_entities[:8]
         ) or "无"
         nearby_item_text = ", ".join(
@@ -1049,7 +1050,9 @@ class Planner:
 已知记录点（你自己记住的持久记忆，可能在很远的地方）：
 {remembered_text}
 
-附近实体：
+附近实体（`tier:名字@距离`；tier 是模组按同一张表算的对待档：
+dangerous 高危险=不主动打也不还手、hostile 敌对=该处理、neutral 中立=不惹（它先动手才还手）、
+passive 被动=能猎的肉、unknown 认不出=先别当敌人）：
 {nearby_entity_text}
 
 画面观察（来自截图，可能略有延迟）：

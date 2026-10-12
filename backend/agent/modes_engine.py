@@ -21,6 +21,7 @@ from typing import Any, Optional
 from .control_lease import (HOLDER_REFLEX_EAT, REASON_SURVIVAL_EAT, ControlLease,
                             register_reflex_preemption)
 from .resource_lease import MODE_RESOURCES, PRIORITY_DEFAULT, PRIORITY_SURVIVAL
+from .territory import TIER_DANGEROUS, TIER_HOSTILE, tier_of
 
 logger = logging.getLogger("modes_engine")
 
@@ -240,6 +241,35 @@ class SelfPreservationMode(Mode):
         return min(water, key=lambda b: b.get("distance", 999))
 
 
+# ── 生物对待策略的读法（与 Java `MobPolicy` / `territory` 同一张表）────
+#
+# 状态里每行实体都带模组算的 `tier`（DANGEROUS/HOSTILE/NEUTRAL/PASSIVE/UNKNOWN）；
+# `tier_of` 优先信任它，缺字段（旧客户端）才按名字兜底。生存反射只认两张名单：
+#   * 威胁 = 高危险 + 敌对 → 低血逃跑 / 还手；
+#   * 还手名单**只有敌对**（中立与被动不是它的活，高危险更不许碰 —— 用户口径
+#     "高危险的不主动打；中立的不惹；只有该处理的才处理"）。
+
+def _distance(entry: dict, default: float = 999.0) -> float:
+    """实体距离（认不出就给默认值 —— 状态里偶发缺字段不该让模式崩掉）。"""
+    try:
+        return float(entry.get("distance", default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _threats(entities: Any, within: float) -> list[dict]:
+    """近处的**威胁**（高危险 + 敌对，按距离升序）；中立/被动/认不出都不进来。"""
+    found = [entry for entry in entities or []
+             if isinstance(entry, dict) and tier_of(entry) in (TIER_DANGEROUS, TIER_HOSTILE)
+             and _distance(entry) < within]
+    return sorted(found, key=_distance)
+
+
+def _is_dangerous(entry: Any) -> bool:
+    """**高危险**（监守者/凋灵/末影龙）：不贴脸、优先拉开距离，绝不还手。"""
+    return isinstance(entry, dict) and tier_of(entry) == TIER_DANGEROUS
+
+
 class SelfHealMode(Mode):
     """P1 — Use healing items when health is low."""
 
@@ -264,29 +294,35 @@ class SelfHealMode(Mode):
 
 
 class CowardiceMode(Mode):
-    """P2 — Flee from hostiles when low health."""
+    """P2 — 低血遇到威胁就跑；**高危险不管血量先拉开距离**（用户口径：不贴脸）。"""
+
+    # 高危险进这个距离就退（监守者/凋灵/末影龙：跟它们近战是拿命换血，先拉开再说）
+    DANGEROUS_STANDOFF = 12.0
 
     def __init__(self):
         super().__init__("cowardice", priority=2, interrupts=True, cooldown=5.0)
 
     def should_activate(self, state: dict) -> bool:
+        entities = state.get("entities", [])
+        # 高危险：不看血量，先进后退（"优先拉开距离"）。
+        if any(_is_dangerous(e) and _distance(e) < self.DANGEROUS_STANDOFF for e in entities):
+            return True
         player = state.get("player", {})
         health = player.get("health", 20)
         if health > 8:
             return False
-        entities = state.get("entities", [])
-        return any(e.get("type") == "hostile" for e in entities)
+        # 低血 + 附近有威胁（敌对/高危险）才逃；中立（末影人/狼/村民）不吓唬自己。
+        return bool(_threats(entities, 16.0))
 
     def tick(self, skills, state: dict) -> str | None:
         player = state.get("player", {})
         px = player.get("x", 0)
         py = player.get("y", 0)
         pz = player.get("z", 0)
-        hostiles = [e for e in state.get("entities", [])
-                    if e.get("type") == "hostile" and e.get("distance", 999) < 16]
-        if not hostiles:
+        threats = _threats(state.get("entities", []), 16.0)
+        if not threats:
             return None
-        nearest = min(hostiles, key=lambda e: e.get("distance", 999))
+        nearest = threats[0]
         # 逃跑目标每秒重算一次就够；每 tick 重发 move_to 只会把寻路刷屏。
         target = (f"flee:{nearest.get('name', '?')}:"
                   f"{nearest.get('entity_id') or nearest.get('id') or ''}")
@@ -295,13 +331,13 @@ class CowardiceMode(Mode):
         dx = px - nearest.get("x", px)
         dz = pz - nearest.get("z", pz)
         mag = (dx * dx + dz * dz) ** 0.5 or 1.0
-        # Flee 12 blocks directly away from the nearest hostile
+        # Flee 12 blocks directly away from the nearest threat
         skills.move_to(px + dx / mag * 12, py, pz + dz / mag * 12, 1.0)
         return f"cowardice: fleeing {nearest.get('name', 'hostile')} (dist {nearest.get('distance', '?')}m)"
 
 
 class SelfDefenseMode(Mode):
-    """P3 — Attack nearby hostiles."""
+    """P3 — 还手：**只打敌对档**（中立不惹、被动不是它的活、高危险不许碰）。"""
 
     def __init__(self):
         super().__init__("self_defense", priority=3, interrupts=True, cooldown=2.0)
@@ -311,16 +347,14 @@ class SelfDefenseMode(Mode):
         # 两边一起发 attack/look_at 就是用户实机日志里那个 2 秒一抖的循环。
         if state.get("reflex_combat"):
             return False
-        entities = state.get("entities", [])
-        return any(e.get("type") == "hostile" and e.get("distance", 999) < 8
-                   for e in entities)
+        return any(tier_of(e) == TIER_HOSTILE and _distance(e) < 8
+                   for e in state.get("entities", []))
 
     def tick(self, skills, state: dict) -> str | None:
         if state.get("reflex_combat"):
             return None
         entities = state.get("entities", [])
-        hostiles = [e for e in entities if e.get("type") == "hostile"
-                    and e.get("distance", 999) < 8]
+        hostiles = [e for e in entities if tier_of(e) == TIER_HOSTILE and _distance(e) < 8]
         if hostiles:
             nearest = hostiles[0]
             # 同一目标（名字 + 位置）在 redispatch_interval 内不重复下发：

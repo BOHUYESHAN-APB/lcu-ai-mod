@@ -88,12 +88,89 @@ HOME_LEAVE_SECONDS = 600.0
 BED_WOOL = 3
 BED_PLANKS = 3
 
-# 敌对生物关键词（评估"周围安全"用；只按名字认，认不出就不当敌人）
+# ── 生物对待策略（四档）────────────────────────────────────────
+#
+# 用户口径（他拍的板）：**高危险的不主动打；中立的不惹；只有该处理的才处理**。
+#
+# **权威那一份在模组侧**：`MobPolicy.java` 算完把每个实体的 `tier` 一起放进状态
+# （`DANGEROUS` / `HOSTILE` / `NEUTRAL` / `PASSIVE` / `UNKNOWN`）。后端**优先信任这个字段** ——
+# 本地反射、模型看到的是同一张表，不会两边各说各话。
+#
+# 下面这些关键词**只是兜底**：旧客户端（没有 `tier` 字段）或字段认不出时才用，**就是一条兼容路径**
+# （诚实说明：它按名字猜，猜不中就一律 UNKNOWN = 不当敌人；绝不是第二套分类逻辑）。
+# 兜底也认这四档，所以末影人这类**中立**怪即使在旧名单里出现过，也不会被当成"可以主动打"的敌人。
+TIER_DANGEROUS = "dangerous"
+TIER_HOSTILE = "hostile"
+TIER_NEUTRAL = "neutral"
+TIER_PASSIVE = "passive"
+TIER_UNKNOWN = "unknown"
+TIERS: tuple[str, ...] = (TIER_DANGEROUS, TIER_HOSTILE, TIER_NEUTRAL, TIER_PASSIVE, TIER_UNKNOWN)
+
+# 高危险：不主动打、也不还手（与 Java `MobPolicy.DANGEROUS` 同表）。
+DANGEROUS_KEYWORDS: tuple[str, ...] = ("warden", "wither", "ender_dragon")
+# 中立：不惹（与 Java `MobPolicy.NEUTRAL` 同表）。村民/流浪商人也在这里 —— **村民不惹**
+# （交易对象；打了会激怒铁傀儡、刷袭击），放中立等于"永久不许作为猎物"。
+# 中文显示名一起列上：中文客户端上报的 `name` 是显示名（"末影人"），
+# 与 `entities.py` 的 kind 别名表同口径。
+NEUTRAL_KEYWORDS: tuple[str, ...] = (
+    "enderman", "zombified_piglin", "piglin", "wolf", "bee", "polar_bear", "iron_golem",
+    "snow_golem", "llama", "trader_llama", "dolphin", "villager", "wandering_trader",
+    "goat", "panda", "pufferfish", "copper_golem",
+    "末影人", "僵尸猪灵", "猪灵", "狼", "蜜蜂", "北极熊", "铁傀儡", "雪傀儡", "羊驼",
+    "流浪羊驼", "海豚", "村民", "流浪商人", "山羊", "熊猫", "河豚", "铜傀儡",
+)
+# 被动：能猎的肉/资源（与 Java `MobPolicy.PASSIVE` 同表的口径一致）。
+PASSIVE_KEYWORDS: tuple[str, ...] = (
+    "cow", "mooshroom", "pig", "sheep", "chicken", "rabbit", "cod", "salmon",
+    "tropical_fish", "squid", "glow_squid", "bat", "horse", "donkey", "mule", "camel",
+    "cat", "ocelot", "fox", "turtle", "parrot", "frog", "tadpole", "axolotl", "allay",
+    "sniffer", "armadillo", "strider", "nautilus", "happy_ghast", "camel_husk",
+)
+# 例外：名字里含着上面的词，但**不属于**那一档（先查例外，再查关键词）。
+# `wither_skeleton`（凋灵骷髅）里含 `wither`，但它只是普通敌对；`piglin_brute`（猪灵蛮兵）里含
+# `piglin`（中立），但它见到玩家就打。
+TIER_EXCEPTIONS: tuple[tuple[str, str], ...] = (
+    ("wither skeleton", TIER_HOSTILE),
+    ("wither_skeleton", TIER_HOSTILE),
+    ("凋灵骷髅", TIER_HOSTILE),
+    ("piglin brute", TIER_HOSTILE),
+    ("piglin_brute", TIER_HOSTILE),
+    ("猪灵蛮兵", TIER_HOSTILE),
+    # 名字里含中立词 `villager`（村民），但僵尸村民是怪
+    ("zombie villager", TIER_HOSTILE),
+    ("zombie_villager", TIER_HOSTILE),
+    ("僵尸村民", TIER_HOSTILE),
+    # 名字里含敌对词 `zombie`/`skeleton`，但僵尸马/骷髅马是无害坐骑
+    ("zombie horse", TIER_PASSIVE),
+    ("zombie_horse", TIER_PASSIVE),
+    ("僵尸马", TIER_PASSIVE),
+    ("skeleton horse", TIER_PASSIVE),
+    ("skeleton_horse", TIER_PASSIVE),
+    ("骷髅马", TIER_PASSIVE),
+)
+# 旧字段 `type` 的取值 → 档位（模组没给 `tier` 时的第一顺位兜底）：
+# "hostile"/"animal"/"mob" 是旧二分口径，仍然照它的原意翻译。
+LEGACY_TYPE_TIERS: dict[str, str] = {
+    "dangerous": TIER_DANGEROUS,
+    "hostile": TIER_HOSTILE,
+    "monster": TIER_HOSTILE,
+    "neutral": TIER_NEUTRAL,
+    "animal": TIER_PASSIVE,
+    "passive": TIER_PASSIVE,
+}
+# 这些 `type` 根本不是生物（掉落物/玩家）：**永远不参与**"附近有没有威胁"的判断
+# （旧关键词兜底会把名叫 `creeper_fan` 的玩家、`creeper_head` 掉落物误判成威胁）。
+NON_MOB_TYPES: tuple[str, ...] = ("item", "player", "projectile", "vehicle")
+
+# 旧客户端兼容的敌对关键词（历史名单，**只作为缺 `tier` 字段时的兜底**）。
+# 注：`warden` / `enderman` / `piglin` 这些名字仍在表里，但高危险与中立两档**先判**，
+# 所以它们不会被当成"可以主动打"的敌人。
 HOSTILE_KEYWORDS: tuple[str, ...] = (
     "zombie", "skeleton", "creeper", "spider", "enderman", "witch", "slime",
     "pillager", "phantom", "blaze", "ghast", "drowned", "husk", "stray",
     "piglin", "hoglin", "magma", "silverfish", "warden", "ravager", "vex",
     "evoker", "vindicator", "guardian", "shulker", "bogged", "breeze",
+    "creaking", "parched",
 )
 
 AUDIT_MAX_LINES = 500
@@ -506,22 +583,94 @@ def _count_items(inventory: Any, suffix: str) -> int:
     return total
 
 
+def normalize_tier(value: Any) -> str:
+    """tier 归一化：认得出（大小写无关）就返回小写档名；**缺字段/认不出返回空串**（不猜）。"""
+    text = str(value or "").strip().lower()
+    return text if text in TIERS else ""
+
+
+def _probe(entry: dict) -> str:
+    """一行实体用来兜底匹配的文本：`type name`（都小写）。"""
+    return f"{str(entry.get('type') or '').lower()} {str(entry.get('name') or '').lower()}"
+
+
+def keyword_tier(entry: Any) -> str:
+    """**旧客户端兼容兜底**：模组没报 `tier` 时按名字/旧 `type` 认档（认不出 → UNKNOWN）。
+
+    顺序：旧 `type`（模组那时算的那一份）→ 例外 → 高危险 → 中立 → 敌对 → 被动 → UNKNOWN。
+    先判高危险与中立，是为了"中立的不惹"：末影人即使在旧敌对名单里，也不会被当成敌人。
+    """
+    if not isinstance(entry, dict):
+        return TIER_UNKNOWN
+    kind = str(entry.get("type") or "").strip().lower()
+    if kind in NON_MOB_TYPES:
+        return TIER_UNKNOWN            # 掉落物/玩家：不是生物，谈不上"打不打它"
+    if kind in LEGACY_TYPE_TIERS:
+        return LEGACY_TYPE_TIERS[kind]
+    probe = _probe(entry)
+    for word, tier in TIER_EXCEPTIONS:
+        if word in probe:
+            return tier
+    if any(word in probe for word in DANGEROUS_KEYWORDS):
+        return TIER_DANGEROUS
+    if any(word in probe for word in NEUTRAL_KEYWORDS):
+        return TIER_NEUTRAL
+    if any(word in probe for word in HOSTILE_KEYWORDS):
+        return TIER_HOSTILE
+    if any(word in probe for word in PASSIVE_KEYWORDS):
+        return TIER_PASSIVE
+    return TIER_UNKNOWN
+
+
+def tier_of(entry: Any) -> str:
+    """一行实体的对待档位：**优先信任模组算的 `tier` 字段**，缺字段/认不出才走关键词兜底。
+
+    这是"本地反射与模型共用同一张表"的后端入口 —— 模组已经把 `MobPolicy` 的结果发过来了，
+    这里再按名字猜一遍只会两边打架（例如把末影人当敌对）。
+    """
+    if not isinstance(entry, dict):
+        return TIER_UNKNOWN
+    given = normalize_tier(entry.get("tier"))
+    if given:
+        return given
+    return keyword_tier(entry)
+
+
+def may_initiate(tier: Any) -> bool:
+    """能不能**主动**开打 —— 与 Java `MobPolicy.mayInitiate` 同口径（高危险/中立 ⇒ False）。"""
+    resolved = normalize_tier(tier) or TIER_UNKNOWN
+    return resolved not in (TIER_DANGEROUS, TIER_NEUTRAL)
+
+
+def may_retaliate(tier: Any, it_hit_us_first: bool) -> bool:
+    """能不能**还手** —— 与 Java `MobPolicy.mayRetaliate` 同口径。
+
+    高危险 ⇒ 如实 False（不还手，交回模型/逃生）；敌对/未知 ⇒ True；中立/被动 ⇒ 只有它先动手。
+    """
+    resolved = normalize_tier(tier) or TIER_UNKNOWN
+    if resolved == TIER_DANGEROUS:
+        return False
+    if resolved in (TIER_HOSTILE, TIER_UNKNOWN):
+        return True
+    return bool(it_hit_us_first)
+
+
+def threatens_us(entry: Any) -> bool:
+    """这行实体算不算"威胁"：**高危险 + 敌对**（中立/被动/未知都不算 —— 未知不当敌人）。"""
+    return tier_of(entry) in (TIER_DANGEROUS, TIER_HOSTILE)
+
+
 def hostiles_in(entities: Any) -> list[str]:
-    """附近的敌对生物（只按名字认；认不出就不当敌人，绝不乱报）。"""
+    """附近的**威胁**（敌对 + 高危险）：优先按模组报的 `tier`，缺字段才按关键词兜底。
+
+    中立（末影人/狼/铁傀儡/村民）与被动（牛羊）**不算威胁** —— 用户口径"中立的不惹"；
+    认不出的也不算（**不许默认 hostile**）。
+    """
     out: list[str] = []
     for entry in entities or []:
-        if not isinstance(entry, dict):
+        if not isinstance(entry, dict) or not threatens_us(entry):
             continue
-        if str(entry.get("type") or "").lower() not in ("", "mob", "monster", "hostile", "entity"):
-            kind = str(entry.get("type") or "").lower()
-            name = str(entry.get("name") or "").lower()
-        else:
-            kind = str(entry.get("name") or "").lower()
-            name = kind
-        probe = f"{kind} {name}"
-        if any(word in probe for word in HOSTILE_KEYWORDS):
-            label = str(entry.get("name") or entry.get("type") or "?")
-            out.append(label)
+        out.append(str(entry.get("name") or entry.get("type") or "?"))
     return out
 
 
