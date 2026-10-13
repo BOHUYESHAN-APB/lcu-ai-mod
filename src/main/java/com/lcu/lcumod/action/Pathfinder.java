@@ -58,6 +58,14 @@ public class Pathfinder {
     private static final double MIN_CLIMB_RISE = Pure.MIN_CLIMB_RISE;
     /** 净空探测上限（格）：够判定"能不能站人"就行，不用扫到天上。 */
     private static final double HEADROOM_CAP = 4.0;
+    /**
+     * "目标还没解析出来（太远/那一列还没加载/那边没有可站格）时先朝目标走一段"的上限。
+     * 单段 {@link Pure#APPROACH_SEGMENT_LENGTH} 格，总共最多朝目标走
+     * {@link Pure#APPROACH_MAX_WALKED} 格；走满还没到 ⇒ **如实失败**（原因写清距离与"未加载"），
+     * 绝不假装到达、也绝不"随便在附近找一格站住"当成功。
+     */
+    private static final double APPROACH_SEGMENT_LENGTH = Pure.APPROACH_SEGMENT_LENGTH;
+    private static final double APPROACH_MAX_WALKED = Pure.APPROACH_MAX_WALKED;
     private static final double WAYPOINT_REACH_XZ = 0.62;
     private static final double WAYPOINT_REACH_Y = 0.9;
     /**
@@ -137,6 +145,13 @@ public class Pathfinder {
     private static double standingRefusalDistance = Double.POSITIVE_INFINITY;
     /** 上一个被拒候选的原因（{@link #createStandingNode} 写、搜索层紧跟其后取走）。 */
     private static String lastStandingReason = null;
+    /**
+     * 是不是"目标还没解析出来 ⇒ 先分段接近"的回合（{@link #calculatePath}）。
+     * 这个回合里**每一段仍然是真路**（A* + 可站落脚点），到达判定仍只看真目标 ⇒ 绝不假到达。
+     */
+    private static boolean approaching = false;
+    /** 进入分段接近时离目标的距离（预算基准）；NaN = 不在分段接近。 */
+    private static double approachStartDistance = Double.NaN;
     /** 收敛保护：转不过去就如实停步，不原地无限转。 */
     private static final AlignmentGuard ALIGNMENT = new AlignmentGuard(ALIGN_TIMEOUT_TICKS);
     /** 卡住后"重算同一个目标"的退避 + 结果去重（治每秒多条 Calculated path 的抖动）。 */
@@ -169,6 +184,9 @@ public class Pathfinder {
         // 新指令：上一次的绕行点与本卡住回合的绕行额度都与本条指令无关，一并归零。
         detourPoint = null;
         DETOUR.reset();
+        // 新指令：分段接近的预算与回合也归零（换目标就是新回合）。
+        approaching = false;
+        approachStartDistance = Double.NaN;
         // 新指令：退避/去重状态归零（每次导航至多上报一次相同结果），收敛计数归零。
         REPLAN.reset();
         ALIGNMENT.reset();
@@ -211,6 +229,8 @@ public class Pathfinder {
         // 目标挪出了迟滞带：上一次的绕行点是为"旧几何"算的，作废；本卡住回合的绕行额度保留
         // （同一个回合里不该因为目标动了一下就把预算刷新，否则会失去"有界"的意义）。
         detourPoint = null;
+        // 目标换了 ⇒ 分段接近的预算是为旧目标算的，作废（新目标重新计预算）。
+        approachStartDistance = Double.NaN;
         return calculatePath();
     }
 
@@ -339,6 +359,9 @@ public class Pathfinder {
         // 收工：绕行点/绕行额度一起清（下一段导航是新回合）。
         detourPoint = null;
         DETOUR.reset();
+        // 收工：分段接近回合也结束（下次导航重新算预算）。
+        approaching = false;
+        approachStartDistance = Double.NaN;
         ALIGNMENT.reset();
         SPRINT_GATE.reset();
         // 交还视角：导航结束后，后端的 look（若有）从下一 tick 起重新生效（见 LookArbiter）。
@@ -394,7 +417,9 @@ public class Pathfinder {
 
         if (currentPath.isEmpty() || currentPathIndex >= currentPath.size()) {
             String key = targetKey(targetPos);
-            boolean allowed = REPLAN.allow(key, System.currentTimeMillis());
+            // 分段接近回合里，走到这一段的头就立刻算下一段（每段都要真走 24 格，天然限速；
+            // 被退避挡住会停在半路，反而像"罚站"）。普通回合仍守 2s 退避。
+            boolean allowed = approaching || REPLAN.allow(key, System.currentTimeMillis());
             if (allowed) {
                 calculatePath();
             }
@@ -453,17 +478,50 @@ public class Pathfinder {
         currentPath.clear();
         currentPathIndex = 0;
 
-        if (start == null || goal == null) {
-            lastFailureReason = start == null && goal == null
-                ? startDiagnosis + " ; " + goalDiagnosis
-                : start == null ? startDiagnosis : goalDiagnosis;
+        if (start == null) {
+            // 脚下都解析不出落脚点：没有"接近"的起点，如实失败（原因带坐标与最近被拒格）。
+            lastFailureReason = goal == null ? startDiagnosis + " ; " + goalDiagnosis : startDiagnosis;
             if (REPLAN.allowOnce("fail:" + failureKey() + "#" + lastFailureReason)) {
                 LCUMod.LOGGER.warn("[Pathfinder] {}", lastFailureReason);
             }
             return false;
         }
 
+        approaching = goal == null;
+        String approachProgress = null;
+        if (approaching) {
+            // 目标解析不出来（太远 / 那一列还没加载 / 那边没有可站格）：**不许直接报失败**，
+            // 先朝目标方向走一段（每段仍然是真路：A* + 可站落脚点）；走满预算才如实失败。
+            ApproachResolution step = resolveApproachGoal(mc, goalPos, goalDiagnosis);
+            if (step.node() == null) {
+                lastFailureReason = step.failure();
+                if (REPLAN.allowOnce("fail:" + failureKey() + "#" + lastFailureReason)) {
+                    LCUMod.LOGGER.warn("[Pathfinder] {}", lastFailureReason);
+                }
+                return false;
+            }
+            goal = step.node();
+            approachProgress = step.progress();
+            if (REPLAN.allowOnce("approach:" + failureKey() + "#" + step.segmentKey())) {
+                LCUMod.LOGGER.info("[Pathfinder] {}", approachProgress);
+            }
+            // 如实报进度（分母是"离目标还有多远"，不是"这一小段"）：后端据此知道它在干活。
+            reportProgress(step.progressFraction(), approachProgress);
+        } else {
+            approachStartDistance = Double.NaN;   // 目标解析出来了：离开分段接近回合。
+        }
+
         if (isGoal(start, goal)) {
+            if (approaching) {
+                // 分段接近却"下一格就是我站的地方" ⇒ 再走也不会更近，如实失败（绝不原地空转）。
+                lastFailureReason = String.format(
+                        "cannot approach target: the next standable step is the cell I already stand on (%s)",
+                        goalDiagnosis);
+                if (REPLAN.allowOnce("fail:" + failureKey() + "#" + lastFailureReason)) {
+                    LCUMod.LOGGER.warn("[Pathfinder] {}", lastFailureReason);
+                }
+                return false;
+            }
             currentPath.add(new Waypoint(goal.standingPos, Pure.Move.WALK));
             if (REPLAN.allowOnce("direct:" + failureKey())) {
                 LCUMod.LOGGER.info("[Pathfinder] Start and goal share the same stand node; using direct target point");
@@ -479,9 +537,13 @@ public class Pathfinder {
             // 顺带把"最靠近目标的那个被拒绝的格子 + 原因"带上：用户看到"有时能走有时不能"时，
             // 一眼就能看出病根在哪一格（例：step 1.00 needs jump, no headroom）。
             String blocked = getLastBlockedReport();
-            lastFailureReason = String.format("no path from %s to %s (%s)%s",
-                    start.supportPos, goal.supportPos, NO_RESCUE_POLICY,
-                    blocked.isEmpty() ? "" : "; " + blocked);
+            lastFailureReason = approaching
+                    ? String.format("cannot approach target: no path to the next standable step %s (%s)%s ; %s",
+                            goal.supportPos, NO_RESCUE_POLICY,
+                            blocked.isEmpty() ? "" : "; " + blocked, goalDiagnosis)
+                    : String.format("no path from %s to %s (%s)%s",
+                            start.supportPos, goal.supportPos, NO_RESCUE_POLICY,
+                            blocked.isEmpty() ? "" : "; " + blocked);
             if (REPLAN.allowOnce("fail:" + failureKey() + "#" + lastFailureReason)) {
                 LCUMod.LOGGER.warn("[Pathfinder] {}", lastFailureReason);
             }
@@ -490,10 +552,104 @@ public class Pathfinder {
 
         currentPath.addAll(solved);
         // 相同目标的相同结果只打一次（与后端"变了才打日志"同一原则）——治每秒多条刷屏。
-        if (REPLAN.allowOnce("path:" + failureKey() + "#" + currentPath.size())) {
-            LCUMod.LOGGER.info("[Pathfinder] Calculated path with {} waypoints", currentPath.size());
+        if (REPLAN.allowOnce("path:" + failureKey() + "#" + (approaching ? "approach" : "direct") + "#"
+                + currentPath.size())) {
+            LCUMod.LOGGER.info("[Pathfinder] Calculated path with {} waypoints{}", currentPath.size(),
+                    approachProgress == null ? "" : " (approaching the target: " + approachProgress + ")");
         }
         return true;
+    }
+
+    /** {@link #resolveApproachGoal} 的结果：下一段的落脚点 + 如实进度，或如实失败原因。 */
+    private record ApproachResolution(StandingNode node, String progress, double progressFraction,
+                                      String failure, String segmentKey) {
+
+        static ApproachResolution fail(String failure) {
+            return new ApproachResolution(null, "", 0.0, failure, "");
+        }
+    }
+
+    /**
+     * 移动类命令的**跨维度防线**：目标声明的维度与自己的维度不同 ⇒ 返回可读拒绝原因
+     * （{@code wrong_dimension: target in X, I am in Y}），否则 null（放行）。
+     *
+     * <p>为什么必须有：跨维度坐标在本地只会以"未加载区块 / 没有支撑面"的形式失败，
+     * 把诊断带偏（2026-10-12 真机事故：玩家进下界后命令仍带主世界坐标）。**绝不当同维度坐标去走**。
+     *
+     * <p>目标没声明维度（null/空）⇒ 放行：本地无从判断，宁愿走"远距离分段接近"也不要瞎拒绝。
+     */
+    public static String dimensionRefusal(String declaredDimension) {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc == null || mc.level == null) {
+            return null;
+        }
+        return Pure.dimensionRefusal(declaredDimension, mc.level.dimension().identifier().toString());
+    }
+
+    /** 自己现在在哪个维度（拒绝原因/上报用）。 */
+    public static String currentDimension() {
+        Minecraft mc = Minecraft.getInstance();
+        return mc == null || mc.level == null ? "unknown" : mc.level.dimension().identifier().toString();
+    }
+
+    /** 是不是"目标还没解析出来 ⇒ 先朝它分段接近"的回合（回执/上报文案用）。 */
+    public static boolean isApproaching() {
+        return approaching;
+    }
+
+    /**
+     * 目标解析不出来时的**分段接近**：朝目标方向取一小段（{@link #APPROACH_SEGMENT_LENGTH} 格），
+     * 在这一段上找真能站的落脚点，交给 A* 走过去 —— 目标通常会在走过去的过程中被客户端加载出来，
+     * 下一轮 {@link #calculatePath} 就能解析真目标了。
+     *
+     * <p>三条底线：
+     * <ul>
+     *   <li><b>不盲走</b>：这一段也必须有可站落脚点 + 可走路径，否则如实失败；</li>
+     *   <li><b>不假到达</b>：到达判定始终只认真目标（{@link #isAtDestination}），这一段只是"接近"；</li>
+     *   <li><b>有界</b>：朝目标累计走 {@link #APPROACH_MAX_WALKED} 格（预算按"真走掉的格数"算，
+     *       被推远不消耗预算）或贴到目标 {@link Pure#APPROACH_MIN_PROGRESS} 格内还解析不出来 ⇒ 如实失败。</li>
+     * </ul>
+     */
+    private static ApproachResolution resolveApproachGoal(Minecraft mc, Vec3 goalPos, String goalDiagnosis) {
+        Vec3 playerPos = mc.player.position();
+        double distance = playerPos.distanceTo(goalPos);
+        if (Double.isNaN(approachStartDistance)) {
+            approachStartDistance = distance;
+        }
+        if (distance <= Pure.APPROACH_MIN_PROGRESS) {
+            return ApproachResolution.fail(String.format(
+                    "cannot approach target: I am already within %.1f block(s) of it and it still has no standable"
+                            + " node; %s", distance, goalDiagnosis));
+        }
+        if (Pure.planForUnresolved(approachStartDistance, distance, APPROACH_MAX_WALKED,
+                Pure.APPROACH_MIN_PROGRESS) != Pure.UnresolvedPlan.APPROACH) {
+            return ApproachResolution.fail(String.format(
+                    "cannot approach target: walked %.0f block(s) toward it (cap %.0f) and it is still %.0f block(s)"
+                            + " away; %s",
+                    Math.max(0.0, approachStartDistance - distance), APPROACH_MAX_WALKED, distance, goalDiagnosis));
+        }
+        double[] ahead = Pure.approachPoint(playerPos.x, playerPos.z, goalPos.x, goalPos.z,
+                APPROACH_SEGMENT_LENGTH);
+        if (ahead == null) {
+            return ApproachResolution.fail(String.format(
+                    "cannot approach target: no horizontal direction to walk toward it; %s", goalDiagnosis));
+        }
+        Vec3 sample = new Vec3(ahead[0], playerPos.y, ahead[1]);
+        StandingNode node = findClosestStandingNode(mc.level, mc.player, sample, 2, 4);
+        if (node == null) {
+            return ApproachResolution.fail(String.format(
+                    "cannot approach target: no standable node on the way (%.1f,%.1f, band %.1f..%.1f); %s",
+                    sample.x, sample.z, sample.y - 4.0, sample.y + 4.0,
+                    lastStandingReasonOr(goalDiagnosis)));
+        }
+        double walked = Math.max(0.0, approachStartDistance - distance);
+        double fraction = approachStartDistance <= 1.0e-6
+                ? 0.9 : Math.min(0.9, walked / approachStartDistance);
+        String progress = String.format(
+                "approaching target: walked %.0f block(s) toward it, %.0f block(s) to go (%.1f,%.1f,%.1f);"
+                        + " %s", walked, distance, goalPos.x, goalPos.y, goalPos.z, goalDiagnosis);
+        return new ApproachResolution(node, progress, fraction, null,
+                String.format("%d", (int) Math.floor(walked / APPROACH_SEGMENT_LENGTH)));
     }
 
     /** 当前目标的整数格键 + 出发点格键（日志/上报去重用）。 */
@@ -1621,6 +1777,175 @@ public class Pathfinder {
                         q.headroom(), PLAYER_HEIGHT));
             }
             return acceptStanding(false);
+        }
+
+        // ── 跨维度拒绝 + 远距离"分段接近"（同样零依赖，能直接做行为断言）──
+
+        /** 单段接近的长度（格）。目标解析不出来时先朝它走这么远，再重算。 */
+        public static final double APPROACH_SEGMENT_LENGTH = 24.0;
+        /** 朝目标累计走这么多格还解析不出目标 ⇒ 如实失败（有界：绝不无限接近）。 */
+        public static final double APPROACH_MAX_WALKED = 192.0;
+        /** 离目标已经这么近还解析不出落脚点 ⇒ 再走也没意义，如实失败。 */
+        public static final double APPROACH_MIN_PROGRESS = 3.0;
+
+        /**
+         * 目标声明的维度与自己的维度**不一样**时的拒绝文案；相同（或任一边未知）⇒ null（放行）。
+         *
+         * <p>跨维度坐标**绝不许**当同维度坐标去走：那样只会以"未加载区块 / 没有支撑面"失败，
+         * 把诊断带偏。文案里的两个维度名都可读（{@code wrong_dimension: target in X, I am in Y}）。
+         */
+        public static String dimensionRefusal(String targetDimension, String myDimension) {
+            if (targetDimension == null || targetDimension.isBlank()) {
+                return null;   // 目标没声明维度：无从判断，放行（宁可走"分段接近"也不瞎拒绝）。
+            }
+            if (myDimension == null || myDimension.isBlank()) {
+                return null;   // 自己都不知道自己在哪：不拒绝（真机不会走到这里）。
+            }
+            if (targetDimension.equals(myDimension)) {
+                return null;
+            }
+            return "wrong_dimension: target in " + targetDimension + ", I am in " + myDimension;
+        }
+
+        /**
+         * 朝目标走的**下一段落点**（水平方向；返回 {@code {x, z}}，绝不越过目标）。
+         * 与目标水平重合（没有方向）或 {@code maxStep <= 0} ⇒ null。
+         */
+        public static double[] approachPoint(double fromX, double fromZ, double toX, double toZ,
+                                             double maxStep) {
+            double dx = toX - fromX;
+            double dz = toZ - fromZ;
+            double horizontal = Math.sqrt(dx * dx + dz * dz);
+            if (!(horizontal > 1.0e-6) || !(maxStep > 0.0)) {
+                return null;
+            }
+            double step = Math.min(maxStep, horizontal);
+            return new double[] {fromX + dx / horizontal * step, fromZ + dz / horizontal * step};
+        }
+
+        /**
+         * 分段接近还有预算吗：**真朝目标走掉的格数** &lt; {@code maxWalked}（被推远/绕路不消耗
+         * 预算 —— 预算是"朝目标推进的距离"，不是"走过的路程"）。
+         */
+        public static boolean approachBudgetLeft(double startDistance, double currentDistance, double maxWalked) {
+            if (!(maxWalked > 0.0)) {
+                return false;
+            }
+            return startDistance - currentDistance < maxWalked;
+        }
+
+        /** 目标解析不出来时的处置。 */
+        public enum UnresolvedPlan {
+            /** 先朝目标走一段（远 / 那一列还没加载）。 */
+            APPROACH,
+            /** 如实失败（已经贴脸，或朝目标推进的预算用光了）。 */
+            FAIL
+        }
+
+        /**
+         * 目标解析不出来 ⇒ 先分段接近，还是如实失败。
+         *
+         * @param startDistance   进入分段接近时离目标的距离（预算基准）
+         * @param currentDistance 现在离目标的距离
+         * @param maxWalked       允许朝目标推进的最大格数
+         * @param minProgress     贴到这么近还解析不出来就放弃（格）
+         */
+        public static UnresolvedPlan planForUnresolved(double startDistance, double currentDistance,
+                                                       double maxWalked, double minProgress) {
+            if (!(currentDistance > minProgress)) {
+                return UnresolvedPlan.FAIL;   // 贴脸了：再走不会让目标变得可解析。
+            }
+            return approachBudgetLeft(startDistance, currentDistance, maxWalked)
+                    ? UnresolvedPlan.APPROACH
+                    : UnresolvedPlan.FAIL;    // 预算用光：如实失败（原因里写清距离与"未加载"）。
+        }
+
+        // ── 找地狱门：扫描顺序/边界是纯逻辑，判据仍是**原版** PortalShape ──
+
+        /** 水平扫描半径上限（格）：再大就会在渲染线程上卡顿。 */
+        public static final int PORTAL_RADIUS_MAX = 32;
+        /** 纵向搜索上限（上下各这么多格；够覆盖"顶棚 255 ↔ 地面 64"这种 190 格的落差）。 */
+        public static final int PORTAL_VERTICAL_MAX = 200;
+        /** 默认值（后端不传参数时）。 */
+        public static final int PORTAL_RADIUS_DEFAULT = 24;
+        /**
+         * 纵向默认就取上限：用户真机是"AI 在地狱顶棚 y≈255、门在地面 y≈64"（差 ~190 格），
+         * 默认值小了这条命令就白扫。一次显式命令，边界内的开销可接受（回执里带 millis 可核对）。
+         */
+        public static final int PORTAL_VERTICAL_DEFAULT = 200;
+        public static final int PORTAL_LIMIT_DEFAULT = 4;
+        public static final int PORTAL_LIMIT_MAX = 16;
+
+        /** 一次候选探测的结果（纯数据）。 */
+        public record PortalCandidate(boolean hit, boolean active, String axis) {
+
+            /** 不是地狱门。 */
+            public static final PortalCandidate NONE = new PortalCandidate(false, false, "");
+
+            public static PortalCandidate of(boolean active, String axis) {
+                return new PortalCandidate(true, active, axis);
+            }
+        }
+
+        /**
+         * 候选探测（真机 = {@code level.getBlockState} + 原版 {@code PortalShape} 复核；
+         * 自检 = 一块假网格）。判据**不在这里**：这里只决定"按什么顺序问、问到什么时候停"。
+         */
+        public interface PortalProbe {
+
+            /** 这一列（x,z）在客户端加载了吗？未加载的列**不猜**（绝不编坐标）。 */
+            boolean loaded(int x, int z);
+
+            /** 这一格是不是（合法的）地狱门方块/门框；不是 ⇒ {@link PortalCandidate#NONE}。 */
+            PortalCandidate candidateAt(int x, int y, int z);
+        }
+
+        /** 找到的一个地狱门（位置 + 轴 + 是否已激活）。 */
+        public record PortalHit(int x, int y, int z, String axis, boolean active) {
+        }
+
+        /**
+         * 纵向优先的地狱门搜索：水平按**环**从近到远，每一列按 **y 从近到远上下交替**；
+         * 未加载的列跳过；最多要 {@code limit} 个命中（没有就是空列表 ⇒ 调用方如实回 found=false）。
+         *
+         * <p>为什么必须纵向优先：用户真机场景是 AI 站在地狱顶棚 y≈255、门在地面 y≈64 一带 ——
+         * 只按水平距离扫，那 190 格的高度差永远扫不到（这也正是"感知摘要里看不见门"的原因）。
+         */
+        public static List<PortalHit> findPortals(PortalProbe probe, int centerX, int centerY, int centerZ,
+                                                  int radius, int vertical, int limit) {
+            List<PortalHit> hits = new ArrayList<>();
+            int r = Math.max(0, Math.min(radius, PORTAL_RADIUS_MAX));
+            int v = Math.max(0, Math.min(vertical, PORTAL_VERTICAL_MAX));
+            int cap = Math.max(1, Math.min(limit, PORTAL_LIMIT_MAX));
+            for (int ring = 0; ring <= r; ring++) {
+                for (int dx = -ring; dx <= ring; dx++) {
+                    for (int dz = -ring; dz <= ring; dz++) {
+                        if (Math.max(Math.abs(dx), Math.abs(dz)) != ring) {
+                            continue;   // 只走这一圈（近的先问）
+                        }
+                        int x = centerX + dx;
+                        int z = centerZ + dz;
+                        if (!probe.loaded(x, z)) {
+                            continue;   // 未加载的列不猜
+                        }
+                        for (int dy = 0; dy <= v; dy++) {
+                            int steps = dy == 0 ? 1 : 2;
+                            for (int step = 0; step < steps; step++) {
+                                int y = step == 0 ? centerY + dy : centerY - dy;
+                                PortalCandidate candidate = probe.candidateAt(x, y, z);
+                                if (!candidate.hit()) {
+                                    continue;
+                                }
+                                hits.add(new PortalHit(x, y, z, candidate.axis(), candidate.active()));
+                                if (hits.size() >= cap) {
+                                    return hits;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return hits;
         }
     }
 

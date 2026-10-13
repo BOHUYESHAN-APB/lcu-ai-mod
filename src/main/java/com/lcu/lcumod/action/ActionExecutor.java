@@ -43,7 +43,10 @@ import net.minecraft.core.Direction;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.world.level.block.BedBlock;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.tags.BlockTags;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.portal.PortalShape;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -614,6 +617,7 @@ public class ActionExecutor {
                 case "trade" -> handleTrade(cmd);
                 case "sleep" -> handleSleep(cmd);
                 case "find_block" -> handleFindBlock(cmd);
+                case "scan_portal" -> handleScanPortal(cmd);
                 // 按需实体扫描（只读）：摘要里**默认屏蔽掉**的坐标，需要时再取回来
                 case "scan_entities" -> handleScanEntities(cmd);
                 case "go_to_block" -> handleGoToBlock(cmd);
@@ -706,6 +710,12 @@ public class ActionExecutor {
             sendResponse(cmd.id(), false, "Missing x,z");
             return;
         }
+        // 跨维度防线：命令声明了目标维度且与我的不同 ⇒ **当场拒绝**（绝不当同维度坐标去走）。
+        String wrongDimension = movementDimensionRefusal(args);
+        if (wrongDimension != null) {
+            sendResponse(cmd.id(), false, wrongDimension);
+            return;
+        }
         double x = args.get("x").getAsDouble();
         double y = args.has("y") ? args.get("y").getAsDouble() : Minecraft.getInstance().player.getY();
         double z = args.get("z").getAsDouble();
@@ -719,7 +729,32 @@ public class ActionExecutor {
         if (LCUMod.WIRE != null) {
             LCUMod.WIRE.sendProgress(cmd.id(), 0.05, "path accepted");
         }
-        sendResponse(cmd.id(), true, "Navigating to " + (int)x + "," + (int)y + "," + (int)z);
+        sendResponse(cmd.id(), true, "Navigating to " + (int)x + "," + (int)y + "," + (int)z
+                + (Pathfinder.isApproaching()
+                        ? " (approaching: the target column is not loaded/standable yet)" : ""));
+    }
+
+    /**
+     * 移动类命令的**跨维度防线**（真机事故 2026-10-12：玩家进下界后命令仍带主世界坐标，
+     * 结果以"未加载区块 ⇒ 没有支撑面"的形式失败，把诊断带偏）：命令里声明了目标维度
+     * （{@code dimension} 或 {@code dim}）且与自己的维度不同 ⇒ 当场拒绝，
+     * **绝不**把它当同维度坐标去走。
+     *
+     * <p>目标没声明维度 ⇒ 放行（本地无从判断；宁可走"远距离分段接近"也不瞎拒绝）。
+     *
+     * @return 拒绝原因（非空 = 调用处直接回执并返回）；放行 ⇒ null
+     */
+    private static String movementDimensionRefusal(JsonObject args) {
+        if (args == null) {
+            return null;
+        }
+        String declared = null;
+        if (args.has("dimension") && !args.get("dimension").isJsonNull()) {
+            declared = args.get("dimension").getAsString();
+        } else if (args.has("dim") && !args.get("dim").isJsonNull()) {
+            declared = args.get("dim").getAsString();
+        }
+        return Pathfinder.dimensionRefusal(declared);
     }
 
     private void handleLookAt(WireServer.WireCommand cmd) {
@@ -2250,6 +2285,12 @@ public class ActionExecutor {
             return;
         }
         String playerName = args.get("player").getAsString();
+        // 跨维度防线：命令声明了目标维度且与我的不同 ⇒ 当场拒绝（玩家列表只含当前维度）。
+        String wrongDimension = movementDimensionRefusal(args);
+        if (wrongDimension != null) {
+            sendResponse(cmd.id(), false, wrongDimension);
+            return;
+        }
         pendingCraftItem = null;
         pendingCraftReqId = null;
         pendingCraftTicks = 0;
@@ -2275,7 +2316,10 @@ public class ActionExecutor {
         followTargetName = null;
         followTicks = 0;
         sendBehaviorSnapshot();
-        sendResponse(cmd.id(), false, "Player " + playerName + " not found");
+        // 找不到就如实说清楚**我只看得见当前维度的人**（客户端玩家列表不含维度信息）。
+        sendResponse(cmd.id(), false, String.format(
+                "player_not_found: %s is not in my dimension (%s); the client only sees players in the world it is in",
+                playerName, Pathfinder.currentDimension()));
     }
 
     /**
@@ -2297,6 +2341,12 @@ public class ActionExecutor {
             return;
         }
         String playerName = args.get("player").getAsString();
+        // 跨维度防线：命令声明了目标维度且与我的不同 ⇒ 当场拒绝（玩家列表只含当前维度，走也走不到）。
+        String wrongDimension = movementDimensionRefusal(args);
+        if (wrongDimension != null) {
+            sendResponse(cmd.id(), false, wrongDimension);
+            return;
+        }
         abortEat("new_task");
         // "过来"不是跟随：清掉长驻跟随，避免两条链同时改同一个导航目标。
         followTargetName = null;
@@ -2315,12 +2365,15 @@ public class ActionExecutor {
             sendBehaviorSnapshot();
             sendResponse(cmd.id(), accepted, accepted
                     ? String.format("Walking to %s (%.1f, %.1f, %.1f)", playerName, x, y, z)
-                    : "No path to " + playerName);
+                    : Pathfinder.getLastFailureReason());
             return;
         }
 
         sendBehaviorSnapshot();
-        sendResponse(cmd.id(), false, "Player " + playerName + " not found");
+        // 找不到就如实说清楚**我只看得见当前维度的人**（客户端玩家列表不含维度，别的维度的人根本收不到）。
+        sendResponse(cmd.id(), false, String.format(
+                "player_not_found: %s is not in my dimension (%s); the client only sees players in the world it is in",
+                playerName, Pathfinder.currentDimension()));
     }
 
     private void handleCraftItem(WireServer.WireCommand cmd) {
@@ -2641,6 +2694,135 @@ public class ActionExecutor {
                 EntityScan.scan(mc, radius, kind, EntityScan.Pure.clampLimit(limit)));
     }
 
+    /**
+     * 找附近的**地狱门**（纵向搜索）。
+     *
+     * <p>用户真机场景：AI 站在地狱顶棚 y≈255，门常在地面 y≈64 一带（差 ~190 格）——
+     * 原来的 `find_block` 只扫"以玩家为中心的 ±64 立方体"，而且感知摘要按出现次数取前 12，
+     * 门（1~3 个传送门方块 + 10 块黑曜石）**根本看不见**。这条命令**先同层、再沿 y 上下交替**，
+     * 水平由近及远，扫到就停（有界：半径/纵向/命中数都有上限）。
+     *
+     * <p>判据用**原版口径**：候选方块是 {@code Blocks.NETHER_PORTAL} 或
+     * {@code BlockTags.NETHER_PORTAL_FRAME}，再用 {@code PortalShape.findAnyShape(...).isValid()}
+     * 复核（**不自己造判定**）。**没找到就如实回 {@code found=false} + 搜过的范围**，绝不编坐标。
+     *
+     * <p>边界（水平半径 / 纵向范围 / 命中数上限）由零依赖纯逻辑里的常量钉住（见 verifyWalk 的 portal 自检）。
+     */
+    private void handleScanPortal(WireServer.WireCommand cmd) {
+        var mc = Minecraft.getInstance();
+        if (mc.player == null || mc.level == null) {
+            sendResponse(cmd.id(), false, "No player");
+            return;
+        }
+        JsonObject args = cmd.args();
+        int radius = clampIntArg(args, "radius", Pathfinder.Pure.PORTAL_RADIUS_DEFAULT,
+                1, Pathfinder.Pure.PORTAL_RADIUS_MAX);
+        int vertical = clampIntArg(args, "vertical", Pathfinder.Pure.PORTAL_VERTICAL_DEFAULT,
+                1, Pathfinder.Pure.PORTAL_VERTICAL_MAX);
+        int limit = clampIntArg(args, "limit", Pathfinder.Pure.PORTAL_LIMIT_DEFAULT,
+                1, Pathfinder.Pure.PORTAL_LIMIT_MAX);
+        BlockPos center = mc.player.blockPosition();
+        Level level = mc.level;
+        long started = System.currentTimeMillis();
+
+        List<Pathfinder.Pure.PortalHit> hits = Pathfinder.Pure.findPortals(
+                new Pathfinder.Pure.PortalProbe() {
+                    @Override
+                    public boolean loaded(int x, int z) {
+                        return level.isLoaded(new BlockPos(x, center.getY(), z));
+                    }
+
+                    @Override
+                    public Pathfinder.Pure.PortalCandidate candidateAt(int x, int y, int z) {
+                        // isLoaded = 在世界边界内 **且** 这一列已加载：越界/未加载都直接跳过（不猜）。
+                        BlockPos pos = new BlockPos(x, y, z);
+                        return level.isLoaded(pos)
+                                ? portalCandidateAt(level, pos)
+                                : Pathfinder.Pure.PortalCandidate.NONE;
+                    }
+                },
+                center.getX(), center.getY(), center.getZ(), radius, vertical, limit);
+
+        JsonObject data = new JsonObject();
+        data.addProperty("found", !hits.isEmpty());
+        data.addProperty("count", hits.size());
+        data.addProperty("dimension", Pathfinder.currentDimension());
+        data.addProperty("millis", System.currentTimeMillis() - started);
+        JsonObject searched = new JsonObject();
+        searched.addProperty("center", center.getX() + "," + center.getY() + "," + center.getZ());
+        searched.addProperty("radius", radius);
+        searched.addProperty("vertical", vertical);
+        searched.addProperty("loaded_columns_only", true);
+        data.add("searched", searched);
+
+        JsonArray arr = new JsonArray();
+        double nearest = Double.POSITIVE_INFINITY;
+        for (Pathfinder.Pure.PortalHit hit : hits) {
+            JsonObject o = new JsonObject();
+            o.addProperty("x", hit.x());
+            o.addProperty("y", hit.y());
+            o.addProperty("z", hit.z());
+            o.addProperty("axis", hit.axis());
+            o.addProperty("active", hit.active());
+            o.addProperty("frame_count", countFrameBlocks(level, hit));
+            double distance = mc.player.position()
+                    .distanceTo(new Vec3(hit.x() + 0.5, hit.y(), hit.z() + 0.5));
+            nearest = Math.min(nearest, distance);
+            o.addProperty("nearest", Math.round(distance * 10.0) / 10.0);
+            arr.add(o);
+        }
+        data.add("hits", arr);
+        data.addProperty("message", hits.isEmpty()
+                ? "no nether portal within " + radius + " blocks horizontally and +/-" + vertical
+                        + " blocks vertically of " + center.getX() + "," + center.getY() + "," + center.getZ()
+                : "found " + hits.size() + " nether portal(s); nearest " + Math.round(nearest) + " blocks away");
+        sendResponse(cmd.id(), true, data);
+    }
+
+    /** 这一格是不是地狱门（传送门方块，或**原版 PortalShape 复核过的**门框）；顺带给轴向。 */
+    private static Pathfinder.Pure.PortalCandidate portalCandidateAt(Level level, BlockPos pos) {
+        var state = level.getBlockState(pos);
+        boolean portalBlock = state.is(Blocks.NETHER_PORTAL);
+        if (!portalBlock && !state.is(BlockTags.NETHER_PORTAL_FRAME)) {
+            return Pathfinder.Pure.PortalCandidate.NONE;   // 候选都不是：不问原版判据（省时间）
+        }
+        for (Direction.Axis axis : new Direction.Axis[] {Direction.Axis.X, Direction.Axis.Z}) {
+            if (PortalShape.findAnyShape(level, pos, axis).isValid()) {
+                return Pathfinder.Pure.PortalCandidate.of(portalBlock, axis == Direction.Axis.X ? "x" : "z");
+            }
+        }
+        return Pathfinder.Pure.PortalCandidate.NONE;   // 复核不过：如实不算命中（不自己造判定）
+    }
+
+    /** 命中点周围（±4 水平 / ±3 垂直，有界）的**门框方块**数（黑曜石柱）。 */
+    private static int countFrameBlocks(Level level, Pathfinder.Pure.PortalHit hit) {
+        int count = 0;
+        for (int dx = -4; dx <= 4; dx++) {
+            for (int dy = -3; dy <= 3; dy++) {
+                for (int dz = -4; dz <= 4; dz++) {
+                    if (level.getBlockState(new BlockPos(hit.x() + dx, hit.y() + dy, hit.z() + dz))
+                            .is(BlockTags.NETHER_PORTAL_FRAME)) {
+                        count++;
+                    }
+                }
+            }
+        }
+        return count;
+    }
+
+    /** 读一个整数参数并夹到 [min,max]（缺省/坏值 ⇒ 缺省值）。 */
+    private static int clampIntArg(JsonObject args, String name, int fallback, int min, int max) {
+        int value = fallback;
+        if (args != null && args.has(name) && !args.get(name).isJsonNull()) {
+            try {
+                value = args.get(name).getAsInt();
+            } catch (RuntimeException e) {
+                value = fallback;
+            }
+        }
+        return Math.max(min, Math.min(max, value));
+    }
+
     /** 找到最近的目标方块并**自动寻路过去**；到达后（可选）写入持久记忆。 */
     private void handleGoToBlock(WireServer.WireCommand cmd) {
         var mc = Minecraft.getInstance();
@@ -2656,6 +2838,12 @@ public class ActionExecutor {
         }
         int radius = args.has("radius") ? args.get("radius").getAsInt() : BlockFinder.DEFAULT_RADIUS;
         boolean remember = !args.has("remember") || args.get("remember").getAsBoolean();
+        // 跨维度防线：命令声明了目标维度且与我的不同 ⇒ 当场拒绝（方块扫描只看当前维度）。
+        String wrongDimension = movementDimensionRefusal(args);
+        if (wrongDimension != null) {
+            sendResponse(cmd.id(), false, wrongDimension);
+            return;
+        }
 
         var hits = BlockFinder.scan(mc, block, radius, 1);
         if (hits.isEmpty()) {
@@ -2848,6 +3036,13 @@ public class ActionExecutor {
             return;
         }
         boolean keepalive = args != null && args.has("keepalive") && args.get("keepalive").getAsBoolean();
+        // 跨维度防线：**站点坐标是持久记忆里的**，最容易是别的维度留下的 ⇒ 当场拒绝，绝不照走
+        // （站点记忆本身还没有维度字段——那是站点那一批的事；这里只认命令里声明的维度）。
+        String wrongDimension = movementDimensionRefusal(args);
+        if (wrongDimension != null) {
+            sendResponse(cmd.id(), false, wrongDimension);
+            return;
+        }
 
         followTargetName = null;
         MovementSystem.stop();
@@ -2866,6 +3061,7 @@ public class ActionExecutor {
         data.addProperty("going", true);
         data.addProperty("keepalive", keepalive);
         data.addProperty("distance", round1(distance));
+        data.addProperty("approaching", Pathfinder.isApproaching());
         sendResponse(cmd.id(), true, data);
     }
 

@@ -42,6 +42,8 @@ public final class WalkCheck {
         motionCurveChecks();
         stepClassifyChecks();
         standingClassifyChecks();
+        approachAndDimensionChecks();
+        portalScanChecks();
         nonFullBlockChecks();
         alignmentGuardChecks();
         replanGateChecks();
@@ -725,14 +727,196 @@ public final class WalkCheck {
                 Pathfinder.Pure.PLAYER_HEIGHT == 1.8 && Pathfinder.Pure.MIN_CLIMB_RISE == 1.0);
     }
 
+    // ── 2c3. 跨维度拒绝 + 远距离分段接近（纯逻辑，直接断言判据）─────────
+
+    /**
+     * 真机事故 2026-10-12 的两个坑（用户口径）：
+     * <ul>
+     *   <li>跨维度坐标**绝不许**当同维度坐标去走 ⇒ 命令带维度且不同 ⇒ 当场拒绝、原因两个维度名；</li>
+     *   <li>目标太远/那一列还没加载 ⇒ **不许直接报失败**，先朝目标分段接近（每段仍是真路，
+     *       到达判定仍只看真目标），走满预算才如实失败。</li>
+     * </ul>
+     */
+    private static void approachAndDimensionChecks() {
+        // ① 跨维度拒绝：不同 ⇒ 可读原因（两个维度名都在）；相同/未知 ⇒ 放行。
+        String wrong = Pathfinder.Pure.dimensionRefusal("minecraft:overworld", "minecraft:the_nether");
+        check("dimension: a declared different dimension is refused with both names",
+                wrong != null && wrong.startsWith("wrong_dimension:")
+                        && wrong.contains("minecraft:overworld") && wrong.contains("minecraft:the_nether"));
+        check("dimension: the same dimension is allowed",
+                Pathfinder.Pure.dimensionRefusal("minecraft:the_nether", "minecraft:the_nether") == null);
+        check("dimension: an undeclared target dimension is allowed (unknown, not a mismatch)",
+                Pathfinder.Pure.dimensionRefusal(null, "minecraft:the_nether") == null
+                        && Pathfinder.Pure.dimensionRefusal("  ", "minecraft:the_nether") == null);
+        check("dimension: an unknown own dimension does not refuse",
+                Pathfinder.Pure.dimensionRefusal("minecraft:overworld", null) == null
+                        && Pathfinder.Pure.dimensionRefusal("minecraft:overworld", "") == null);
+
+        // ② 分段接近的取点：朝目标、单段有界、绝不越过目标。
+        double[] ahead = Pathfinder.Pure.approachPoint(0.0, 0.0, 100.0, 0.0, 24.0);
+        check("approach: takes a bounded step toward the target",
+                ahead != null && Math.abs(ahead[0] - 24.0) < 1.0e-9 && Math.abs(ahead[1]) < 1.0e-9);
+        double[] near = Pathfinder.Pure.approachPoint(0.0, 0.0, 10.0, 0.0, 24.0);
+        check("approach: never overshoots a nearer target",
+                near != null && Math.abs(near[0] - 10.0) < 1.0e-9);
+        double[] diagonal = Pathfinder.Pure.approachPoint(0.0, 0.0, 3.0, 4.0, 100.0);
+        check("approach: keeps the direction (diagonal unit vector)",
+                diagonal != null && Math.abs(diagonal[0] - 0.6 * 5.0) < 1.0e-9
+                        && Math.abs(diagonal[1] - 0.8 * 5.0) < 1.0e-9);
+        check("approach: no direction (same spot) yields no point",
+                Pathfinder.Pure.approachPoint(5.0, 5.0, 5.0, 5.0, 24.0) == null
+                        && Pathfinder.Pure.approachPoint(0.0, 0.0, 10.0, 0.0, 0.0) == null);
+
+        // ③ 预算：按"朝目标真走掉的格数"算（被推远不消耗预算）；到上限就没有了。
+        check("approach: budget is spent by real progress toward the target",
+                Pathfinder.Pure.approachBudgetLeft(700.0, 600.0, 192.0)
+                        && !Pathfinder.Pure.approachBudgetLeft(700.0, 700.0 - 192.0, 192.0)
+                        && !Pathfinder.Pure.approachBudgetLeft(700.0, 500.0, 192.0));
+        check("approach: being pushed away does not burn the budget",
+                Pathfinder.Pure.approachBudgetLeft(100.0, 120.0, 192.0));
+        check("approach: a zero/negative cap never allows approach",
+                !Pathfinder.Pure.approachBudgetLeft(100.0, 0.0, 0.0)
+                        && !Pathfinder.Pure.approachBudgetLeft(100.0, 0.0, -1.0));
+
+        // ④ 处置：远 ⇒ 先接近；贴脸 ⇒ 如实失败；预算用光 ⇒ 如实失败。
+        check("approach: a far unresolved target plans an approach (not a failure)",
+                Pathfinder.Pure.planForUnresolved(744.0, 744.0, Pathfinder.Pure.APPROACH_MAX_WALKED,
+                        Pathfinder.Pure.APPROACH_MIN_PROGRESS) == Pathfinder.Pure.UnresolvedPlan.APPROACH);
+        check("approach: running out of budget plans an honest failure",
+                Pathfinder.Pure.planForUnresolved(744.0, 744.0 - Pathfinder.Pure.APPROACH_MAX_WALKED,
+                        Pathfinder.Pure.APPROACH_MAX_WALKED,
+                        Pathfinder.Pure.APPROACH_MIN_PROGRESS) == Pathfinder.Pure.UnresolvedPlan.FAIL);
+        check("approach: standing on top of an unresolvable target plans an honest failure",
+                Pathfinder.Pure.planForUnresolved(2.0, 2.0, Pathfinder.Pure.APPROACH_MAX_WALKED,
+                        Pathfinder.Pure.APPROACH_MIN_PROGRESS) == Pathfinder.Pure.UnresolvedPlan.FAIL);
+        check("approach: the caps are the documented ones (24 per segment, 192 total, 3 close-range)",
+                Pathfinder.Pure.APPROACH_SEGMENT_LENGTH == 24.0 && Pathfinder.Pure.APPROACH_MAX_WALKED == 192.0
+                        && Pathfinder.Pure.APPROACH_MIN_PROGRESS == 3.0);
+
+        // ⑤ 接线（静态扫描）：分段接近真的接在"目标解析不出来"这条路上，且到达判定仍只看真目标；
+        //    五条移动类命令都过跨维度防线，拒绝原因原样回执（不加壳、不改写成"没有路"）。
+        Path root = Path.of("src", "main", "java", "com", "lcu", "lcumod", "action");
+        String pf = read(root.resolve("Pathfinder.java"));
+        String ae = read(root.resolve("ActionExecutor.java"));
+        check("approach (wiring): sources found", !pf.isEmpty() && !ae.isEmpty());
+        check("approach (wiring): an unresolved goal is approached in bounded segments",
+                pf.contains("resolveApproachGoal(") && pf.contains("Pure.approachPoint(")
+                        && pf.contains("Pure.planForUnresolved("));
+        check("approach (wiring): arrival is still judged against the real target only (no fake arrival)",
+                pf.contains("isAtDestination(playerPos, targetPos)") && pf.contains("approaching"));
+        check("approach (wiring): running out of budget fails honestly with the remaining distance",
+                pf.contains("cannot approach target: walked"));
+        check("dimension (wiring): the refusal text carries both dimension names",
+                pf.contains("wrong_dimension: target in "));
+        check("dimension (wiring): every movement command checks the declared dimension",
+                countOf(ae, "movementDimensionRefusal(args);") >= 5);
+        check("dimension (wiring): the refusal is reported verbatim (never reworded)",
+                ae.contains("sendResponse(cmd.id(), false, wrongDimension)"));
+        check("dimension (find-player): a missing player reason names my own dimension",
+                ae.contains("player_not_found:") && ae.contains("Pathfinder.currentDimension()"));
+    }
+
+    // ── 2c4. 找地狱门（纵向搜索；纯逻辑扫描顺序 + 假网格）──────────
+
+    /**
+     * 用户真机场景：AI 在地狱顶棚 y≈255，门在地面 y≈64 一带（差 ~190 格）——`find_block` 的
+     * ±64 立方体 + "摘要取前 12" 都看不见门。这里用**假网格**断言扫描顺序：纵向优先、
+     * 未加载的列不猜、找不到就空列表（如实回 found=false）；并静态扫描钉住判据是**原版 PortalShape**。
+     */
+    private static void portalScanChecks() {
+        int cy = 255;   // 顶棚高度（用户真机的 y）
+        java.util.Map<String, Pathfinder.Pure.PortalCandidate> grid = new java.util.HashMap<>();
+        java.util.Set<String> unloaded = new java.util.HashSet<>();
+        Pathfinder.Pure.PortalProbe probe = new Pathfinder.Pure.PortalProbe() {
+            @Override
+            public boolean loaded(int x, int z) {
+                return !unloaded.contains(x + "," + z);
+            }
+
+            @Override
+            public Pathfinder.Pure.PortalCandidate candidateAt(int x, int y, int z) {
+                return grid.getOrDefault(x + "," + y + "," + z, Pathfinder.Pure.PortalCandidate.NONE);
+            }
+        };
+
+        // ① 门在脚下 40 格（不在同一层）⇒ 纵向搜索必须能扫到。
+        grid.put("2," + (cy - 40) + ",-1", Pathfinder.Pure.PortalCandidate.of(true, "x"));
+        var below = Pathfinder.Pure.findPortals(probe, 0, cy, 0, 24, 64, 4);
+        check("portal: a portal 40 blocks below is found by the vertical search",
+                below.size() == 1 && below.get(0).x() == 2 && below.get(0).y() == cy - 40
+                        && below.get(0).z() == -1 && below.get(0).axis().equals("x") && below.get(0).active());
+
+        // ② 一个都没有 ⇒ 空列表（调用方据此如实回 found=false），绝不编坐标。
+        grid.clear();
+        check("portal: no candidate yields an empty list (honest found=false)",
+                Pathfinder.Pure.findPortals(probe, 0, cy, 0, 24, 64, 4).isEmpty());
+
+        // ③ 未加载的列不猜。
+        grid.put("9," + (cy + 3) + ",9", Pathfinder.Pure.PortalCandidate.of(true, "z"));
+        unloaded.add("9,9");
+        check("portal: a candidate in an unloaded column is not reported",
+                Pathfinder.Pure.findPortals(probe, 0, cy, 0, 24, 64, 4).isEmpty());
+        unloaded.clear();
+
+        // ④ 纵向优先：先报"离自己这一层更近"的那扇门（同层 → 上 → 下交替）。
+        grid.clear();
+        grid.put("0," + (cy + 2) + ",0", Pathfinder.Pure.PortalCandidate.of(true, "z"));
+        grid.put("0," + (cy - 2) + ",0", Pathfinder.Pure.PortalCandidate.of(false, "x"));
+        var vertical = Pathfinder.Pure.findPortals(probe, 0, cy, 0, 24, 64, 4);
+        check("portal: the nearer (in y) portal is reported first",
+                vertical.size() == 2 && vertical.get(0).y() == cy + 2 && vertical.get(1).y() == cy - 2
+                        && !vertical.get(1).active());
+
+        // ⑤ 水平由近及远（环序）。
+        grid.clear();
+        grid.put("6," + cy + ",0", Pathfinder.Pure.PortalCandidate.of(true, "x"));
+        grid.put("2," + cy + ",0", Pathfinder.Pure.PortalCandidate.of(true, "x"));
+        var rings = Pathfinder.Pure.findPortals(probe, 0, cy, 0, 24, 64, 4);
+        check("portal: horizontal rings go near-to-far",
+                rings.size() == 2 && rings.get(0).x() == 2 && rings.get(1).x() == 6);
+
+        // ⑥ 上限与夹取：limit 生效；radius/vertical 超过上限被夹住（绝不无限扫）。
+        grid.clear();
+        for (int i = 0; i < 20; i++) {
+            grid.put(i + "," + cy + ",0", Pathfinder.Pure.PortalCandidate.of(true, "x"));
+        }
+        check("portal: the hit limit is respected",
+                Pathfinder.Pure.findPortals(probe, 0, cy, 0, 24, 64, 2).size() == 2);
+        grid.clear();
+        grid.put((Pathfinder.Pure.PORTAL_RADIUS_MAX + 5) + "," + cy + ",0",
+                Pathfinder.Pure.PortalCandidate.of(true, "x"));
+        check("portal: an out-of-range radius is clamped (never scans beyond the cap)",
+                Pathfinder.Pure.findPortals(probe, 0, cy, 0, 9999, 9999, 4).isEmpty());
+        check("portal: the caps are the documented ones (radius 32 / vertical 200 / hits 16)",
+                Pathfinder.Pure.PORTAL_RADIUS_MAX == 32 && Pathfinder.Pure.PORTAL_VERTICAL_MAX == 200
+                        && Pathfinder.Pure.PORTAL_LIMIT_MAX == 16
+                        && Pathfinder.Pure.PORTAL_RADIUS_DEFAULT == 24
+                        && Pathfinder.Pure.PORTAL_VERTICAL_DEFAULT == 200);
+
+        // ⑦ 接线（静态扫描）：命令真的注册了；判据是**原版** PortalShape（不自己造判定）；
+        //    没找到时回的是"搜过的范围"这种可读结构。
+        Path root = Path.of("src", "main", "java", "com", "lcu", "lcumod", "action");
+        String pf = read(root.resolve("Pathfinder.java"));
+        String ae = read(root.resolve("ActionExecutor.java"));
+        check("portal (wiring): sources found", !pf.isEmpty() && !ae.isEmpty());
+        check("portal (wiring): scan_portal is a registered command",
+                ae.contains("case \"scan_portal\" -> handleScanPortal(cmd)"));
+        check("portal (wiring): the judgement is the vanilla PortalShape (no homemade rule)",
+                ae.contains("PortalShape.findAnyShape(") && ae.contains("BlockTags.NETHER_PORTAL_FRAME")
+                        && ae.contains("Blocks.NETHER_PORTAL"));
+        check("portal (wiring): nothing found is reported honestly with the searched range",
+                ae.contains("no nether portal within ") && ae.contains("\"searched\"")
+                        && ae.contains("data.addProperty(\"found\""));
+        check("portal (wiring): the search is vertical (up/down alternation), not a flat box",
+                pf.contains("centerY + dy") && pf.contains("centerY - dy"));
+    }
+
     private static Pathfinder.Pure.Standing standing(boolean footPresent, double headroom,
                                                      boolean collideFree, boolean dangerous,
                                                      boolean climbable, double climbRise) {
         return Pathfinder.Pure.classifyStanding(new Pathfinder.Pure.StandingQuery(
                 footPresent, headroom, collideFree, dangerous, climbable, climbRise));
     }
-
-    // ── 2d. 非完整方块的实现形状（源码扫描）──────────────────────
 
     /**
      * 判据必须在**脚印内**求、攀爬必须用**原版判据**、路点必须过"能不能站"、卡住必须能说清
