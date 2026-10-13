@@ -200,6 +200,14 @@ def _clamp_confidence(value: Any) -> float:
         return DECISION_DEFAULT_CONFIDENCE
 
 
+def _clamp_float(value: Any, low: float, high: float, default: float) -> float:
+    """数值夹到 [low, high]；非法值回退 default（UI 可能回传字符串）。"""
+    try:
+        return min(max(float(value), float(low)), float(high))
+    except (TypeError, ValueError):
+        return float(default)
+
+
 def _parse_bool(value: Any) -> Optional[bool]:
     """识别布尔语义的值（UI 会以布尔或字符串两种形式回传）；认不出返回 None。"""
     if isinstance(value, bool):
@@ -335,6 +343,21 @@ def _default_config() -> dict[str, Any]:
         # 或按模型覆盖 `llm.agents.<角色>.context_window`（角色级优先）；日志一律按"配置"汇报。
         # 触发线 `compress_at` 是**占用比例**（估算 / 可用输入预算），不是绝对 token 数。
         "context_budget": _default_budget_section(),
+        # 空闲自主活动（`agent/self_prompter.py`）：**真的闲着** `after_seconds` 秒后给模型
+        # 注入一条自提示（"你现在闲着……自己决定"），动不动由模型自己用既有工具决定。
+        # 默认**开**（用户明确要这个）；不是定时器、更不是绕过模型自己动。
+        "idle": _default_idle_section(),
+    }
+
+
+def _default_idle_section() -> dict[str, Any]:
+    """`idle` 默认段（`get_idle_config` 读它；越界值在读侧夹回）。"""
+    return {
+        "enabled": True,
+        "after_seconds": 30.0,        # 无指令、无任务连续多久算"闲着"
+        "min_gap_seconds": 60.0,      # 两次自提示之间至少隔多久
+        "max_per_hour": 12,           # 每小时自提示次数上限
+        "prompt": "",                 # 空 = 用代码里的默认文案（见 self_prompter）
     }
 
 
@@ -624,6 +647,27 @@ class ConfigStore:
         merged = dict(GovernorConfig().as_dict())
         if isinstance(raw, dict):
             merged.update(raw)
+        return merged
+
+    def get_idle_config(self) -> dict[str, Any]:
+        """空闲自主活动（``config.json`` → ``idle``）。
+
+        用户口径（2026-10-12 真机原话）："让这个 AI 有一定的自主活动范围……它不会自主活动了。
+        本来它在一个地方站立发呆的时候，可能会主动往其他地方移动。" —— 所以**默认开**：
+        真的闲着 `after_seconds` 秒后，后端只给模型**注入一条自提示**（走既有 planner/工具），
+        动不动、动什么由模型自己决定；这里给的是节流参数，不是"自己动"的开关：
+        `min_gap_seconds` 两次自提示的最小间隔，`max_per_hour` 每小时的次数上限。
+        """
+        with self._lock:
+            raw = self._data.get("idle")
+        merged = dict(_default_idle_section())
+        if isinstance(raw, dict):
+            merged.update({key: value for key, value in raw.items() if key in merged})
+        merged["enabled"] = _as_bool(merged.get("enabled"), True)
+        merged["after_seconds"] = _clamp_float(merged.get("after_seconds"), 5.0, 3600.0, 30.0)
+        merged["min_gap_seconds"] = _clamp_float(merged.get("min_gap_seconds"), 0.0, 3600.0, 60.0)
+        merged["max_per_hour"] = int(_clamp_float(merged.get("max_per_hour"), 1, 240, 12))
+        merged["prompt"] = str(merged.get("prompt") or "")
         return merged
 
     def get_job_orchestration(self) -> bool:

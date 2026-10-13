@@ -389,7 +389,10 @@ class Session:
         self._task_idle_since: float | None = None
 
         # Self-prompter (mindcraft-style autonomous prompting)
-        self.self_prompter = SelfPrompter(cooldown=15.0, max_idle_cycles=3)
+        # 空闲自主活动（闲置时给模型一条自提示）：配置走共享 ConfigStore → UI 改完即时生效。
+        self.self_prompter = SelfPrompter(
+            cooldown=15.0, max_idle_cycles=3,
+            idle_config_provider=get_config_store(DEFAULT_CONFIG_PATH).get_idle_config)
 
         # Auto-save
         self._last_save = time.monotonic()
@@ -2714,6 +2717,17 @@ class Session:
             # Route through LLM service to generate commands
             self._handle_self_prompt(prompt)
 
+        # 空闲自主活动（**默认开**，`config.json → idle`）：真的闲着够久 ⇒ 给模型一条自提示。
+        # 用户口径（2026-10-12 真机原话）："让这个 AI 有一定的自主活动范围……它不会自主活动了。
+        # 本来它在一个地方站立发呆的时候，可能会主动往其他地方移动。" —— 这里只**把模型请回来
+        # 一轮**（走既有 planner/工具），动不动、动什么由模型自己决定；不注入时行为逐字不变。
+        if autonomy_enabled and not manual_override_active and not self._idle_hold():
+            prompt = self.self_prompter.idle_prompt(
+                is_idle, self.action_manager.is_busy or task_active)
+            if prompt:
+                logger.info("[Session] 空闲自提示：%s", prompt[:60])
+                self._handle_idle_prompt(prompt)
+
         # 控制流心跳：按住期间必须持续下发，否则 Java 侧 500ms 超时会自动松手。
         self.control.flush()
 
@@ -3386,6 +3400,52 @@ class Session:
                 logger.info("[Session] Self-prompt generated %d commands", len(cmd_results))
         except Exception as e:
             logger.error("[Session] Self-prompt LLM error: %s", e)
+
+    def _idle_hold(self) -> bool:
+        """这种情况下**不许**注入空闲自提示（"闲着"不等于"没事"）：
+
+        - 在站点驻守（`go_afk`：站定就是意图，被叫回来会自己走开）；
+        - 路径重放中（`route`：正在按点走）；
+        - 绑定床位链还没走完（走过去 → 右键 → 核对：半路别去干别的）。
+        """
+        runtime = self.runtime if isinstance(self.runtime, dict) else {}
+        afk = runtime.get("afk") if isinstance(runtime.get("afk"), dict) else {}
+        if afk.get("active"):
+            return True
+        route = runtime.get("route") if isinstance(runtime.get("route"), dict) else {}
+        if route.get("active"):
+            return True
+        return isinstance(getattr(getattr(self, "planner", None), "_home_bed", None), dict)
+
+    def _handle_idle_prompt(self, prompt: str) -> Optional[str]:
+        """空闲自提示：把模型请回来一轮（走**既有 planner + 工具**），由它自己决定动不动。
+
+        与事件注入同口径：这一轮**没有任何人授权** ⇒ actor 降回 guest（自发行为不许继承上一轮
+        主人的层级）。与事件注入的区别：空闲自提示**不往公屏发话**（用户要的是"自己动一动"，
+        不是刷屏；模型真想说话可以用 `send_chat`）。这一轮的由头进 L2（`idle_prompt`），
+        所以模型知道自己为什么被叫回来、也允许选择"什么都不做"。
+        """
+        if not self.llm_active():
+            logger.info("[Session] 不在世界 → 跳过空闲自提示")
+            return None
+        self._actor = {"name": "", "tier": "guest"}
+        context = self._runtime_context()
+        context["idle_prompt"] = prompt
+        try:
+            with self.skills.command_context("self_prompt"):
+                response = self.planner.plan_and_execute(
+                    "(自己)", prompt, context, bot_name=self._get_bot_name()
+                )
+        except Exception as e:  # noqa: BLE001 —— 自主轮失败绝不拖垮心跳
+            logger.warning("[Session] 空闲自提示规划失败: %s", e)
+            return None
+        if response:
+            # 自己想的事也进对话记忆（下一轮看得见自己刚才盘算什么），但**不发公屏**。
+            try:
+                self.memory.add_interaction("(自己)", prompt, response=response)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("[Session] 空闲自提示记忆写入失败: %s", e)
+        return response
 
     def stop(self):
         """Gracefully stop the session."""

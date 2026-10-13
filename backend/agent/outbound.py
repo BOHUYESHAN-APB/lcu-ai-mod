@@ -15,8 +15,13 @@
   控制字符 / 零宽与双向控制 / 软连字符 / 孤立代理项 / `§` 染色码 → 删除，
   压缩连续空白并限长。真机事故（2026-10-12 16:22）：AI 回复里带了换行符，
   被服务器判为"非法聊天字符"**直接把玩家踢出**。
-- 两者都做，于是结果**绝不以 `/` 开头**、也绝不含聊天通道不允许的字符；
-  除上述之外，正文内容**一字不动**（不是内容审查，只是不让它变成指令或非法字符）。
+- **剥 markdown 标记**（真机事故 2026-10-12 21:20）：AI 把内部说明里的 `**加粗**`
+  原样发上了公屏（"走过去**右键一次**"）—— 这里是**机械剥离**，不是内容审查：
+  `**`/`__`/`` ` ``/`~~` 与行首的 `#`/`>`/`- `/`1. ` 标记一律去掉，正文一字不动。
+- **公屏不报坐标**（同一次事故：回复里漏出了床的坐标）：公屏文本里的坐标片段
+  一律替换成占位符 —— **坐标只进日志/后端**（`kind="whisper"` 这种私聊不走这条）。
+- 两者都做，于是结果**绝不以 `/` 开头**、绝不含聊天通道不允许的字符；
+  除上述之外，正文内容**一字不动**。
 
 清洗一旦真的发生（原文 ≠ 清洗后），就回调所有已注册的审计 sink（谁 / 原文 /
 清洗后）。sink 抛异常只 warning，绝不拖垮出站链路 —— 这句话是要发出去的。
@@ -25,6 +30,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from typing import Any, Callable
 
@@ -43,6 +49,49 @@ _SLASH_CHARS = frozenset("/\uff0f")
 
 # 清洗后必须满足的不变式（测试与调用方都可以直接引它）。
 FORBIDDEN_LEADING = "/"
+
+#: 公屏聊天（**必须不报坐标**）：坐标只进日志/后端。私聊（`whisper`）不算公屏。
+PUBLIC_CHAT_KINDS = frozenset({"send_chat"})
+
+#: 坐标占位符（替换掉公屏上的坐标片段；原文进审计，不静默丢）。
+COORDS_REDACTED = "（坐标不报）"
+
+# ── markdown 机械剥离 ─────────────────────────────────────────
+# 只剥"标记"本身，正文一字不动：`**粗体**` → `粗体`，孤立的 `**` 直接去掉。
+_MD_EMPHASIS_RE = re.compile(r"\*{2}|_{2}|~~")
+#: 行内代码的反引号（成串的一起剥，内容保留）。
+_MD_CODE_RE = re.compile(r"`+")
+#: 行首标记：`# 标题` / `> 引用` / `- 列表` / `1. 列表`（**行首**才剥，正文里的不动）。
+_MD_LEAD_RE = re.compile(r"^[ \t]*(?:#{1,6}[ \t]+|>[ \t]?|[-*+][ \t]+|\d+[.)][ \t]+)", re.MULTILINE)
+
+# ── 坐标（公屏一律不报）────────────────────────────────────────
+# 带括号的 `(851,63,-2191)` / `（851, 63, -2191）`（全角括号也认）。
+_COORDS_PAREN_RE = re.compile(
+    r"[(（][ \t]*(-?\d{1,6}(?:\.\d+)?)[ \t]*,[ \t]*(-?\d{1,6}(?:\.\d+)?)"
+    r"[ \t]*,[ \t]*(-?\d{1,6}(?:\.\d+)?)[ \t]*[)）]")
+# 不带括号的裸三元组 `851,63,-2191`（前后不能再粘着数字/字母/小数点，免得误伤正文）。
+_COORDS_BARE_RE = re.compile(
+    r"(?<![\w.])-?\d{1,6}(?:\.\d+)?[ \t]*,[ \t]*-?\d{1,6}(?:\.\d+)?"
+    r"[ \t]*,[ \t]*-?\d{1,6}(?:\.\d+)?(?![\w.])")
+
+
+def strip_markdown(text: str) -> str:
+    """机械剥离 markdown 标记（**不是**内容审查：只去标记，正文一字不动）。"""
+    text = _MD_LEAD_RE.sub("", text or "")
+    text = _MD_CODE_RE.sub("", text)
+    return _MD_EMPHASIS_RE.sub("", text)
+
+
+def hide_coordinates(text: str) -> str:
+    """把文本里的坐标片段换成占位符（**公屏**用；坐标只进日志/后端）。"""
+    text = _COORDS_PAREN_RE.sub(COORDS_REDACTED, text or "")
+    return _COORDS_BARE_RE.sub(COORDS_REDACTED, text)
+
+
+def mentions_coordinates(text: Any) -> bool:
+    """这段文本里有没有坐标（同一个判据，测试与调用方都能直接引）。"""
+    cleaned = "" if text is None else str(text)
+    return bool(_COORDS_PAREN_RE.search(cleaned) or _COORDS_BARE_RE.search(cleaned))
 
 _lock = threading.RLock()
 _sinks: list[Callable[[dict], None]] = []
@@ -82,20 +131,30 @@ def sanitize_outbound(text: Any, *, kind: str = "", actor: str = "",
                       server_key: str = "", observer: Optional[Callable[[dict], None]] = None) -> str:
     """把任意 AI 文本清洗成"绝不可能是指令"的字符串（幂等）。
 
+    四件事，按顺序：剥 markdown 标记 → 字符级净化（非法字符）→ 剥行首斜杠/空白
+    → **公屏**（`kind="send_chat"`）把坐标换成占位符（坐标只进日志/后端）。
+
     参数里的 `kind` / `actor` / `server_key` 只用于审计（哪个出口、谁触发的），
-    不影响清洗结果。非字符串一律 `str()` 后处理（None → 空串）。
+    不影响清洗结果（`kind` 例外：只有它决定"要不要按公屏口径藏坐标"）。
+    非字符串一律 `str()` 后处理（None → 空串）。
 
     `observer` 是**本调用方自己的**审计回调（session 通过 Skills 注入），与全局 sink
     并行触发 —— 全局 sink 适合进程级挂载，observer 适合"谁拥有这条出口谁记审计"。
     """
     original = "" if text is None else str(text)
-    # **字符级净化**先做（换行/制表/控制字符/零宽/`§`）——
-    # 真机事故（2026-10-12 16:22）：AI 回复里带了换行符，被服务器判为非法聊天字符**直接踢出**。
-    # 放在"剥行首斜杠"**之前**，这样 `"\n/tp …"` 这种也躲不过（变成行首空白照样被剥）。
-    cleaned = sanitize_chat(original)
+    # ① **剥 markdown 标记**先做（趁换行还在，行首的 `#`/`- `/`1. ` 才认得出来）——
+    #    真机事故（2026-10-12 21:20）：`走过去**右键一次**` 原样发上了公屏。
+    stripped = strip_markdown(original)
+    # ② **字符级净化**（换行/制表/控制字符/零宽/`§`）——
+    #    真机事故（2026-10-12 16:22）：AI 回复里带了换行符，被服务器判为非法聊天字符**直接踢出**。
+    #    放在"剥行首斜杠"**之前**，这样 `"\n/tp …"` 这种也躲不过（变成行首空白照样被剥）。
+    cleaned = sanitize_chat(stripped)
     illegal = find_illegal(original)
     while cleaned and (_is_lead_blank(cleaned[0]) or cleaned[0] in _SLASH_CHARS):
         cleaned = cleaned[1:]
+    # ③ **公屏不报坐标**：坐标只进日志/后端（私聊/任务详情不算公屏）。
+    if str(kind or "") in PUBLIC_CHAT_KINDS:
+        cleaned = hide_coordinates(cleaned)
     if cleaned != original:
         row = {
             "kind": str(kind or "outbound"),
