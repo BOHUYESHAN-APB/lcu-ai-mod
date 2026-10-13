@@ -345,5 +345,55 @@ class WebPanelHtmlTests(_ServerCase):
         self.assertNotIn("/api/v2/", self.contacts)
 
 
+class ManualPanelTests(_ServerCase):
+    """⑥ 手动面板（用户要的调试入口）：页面挂在**真实端点**上；回执出口只读、如实说进程内。"""
+
+    def test_page_is_served_and_points_at_the_real_endpoints(self):
+        resp = self.client.get("/manual")
+
+        self.assertEqual(resp.status_code, 200)
+        body = resp.text
+        for endpoint in ("/api/tools", "/api/sdk/command", "/api/v2/receipts"):
+            self.assertIn(endpoint, body, endpoint)
+
+    def test_receipts_come_from_the_session_ledger_newest_first(self):
+        server.orchestrator = _FakeOrchestrator(_FakeSession(_command_receipts=[
+            {"command": "move_to", "id": "req_1", "success": False, "detail": "no path", "at": 1.0},
+            {"command": "use_on", "id": "req_2", "success": True, "detail": "", "at": 2.0},
+        ]))
+
+        body = self.client.get("/api/v2/receipts").json()
+
+        self.assertTrue(body["available"])
+        self.assertEqual([row["id"] for row in body["receipts"]], ["req_2", "req_1"])
+        self.assertEqual(body["count"], 2)
+        self.assertEqual(body["receipts"][0]["command"], "use_on")
+        self.assertIn("进程内", body["note"], "不落盘就要说清，别假装有台账")
+
+    def test_without_a_session_it_says_so_instead_of_inventing_history(self):
+        server.orchestrator = _FakeOrchestrator(None)
+
+        body = self.client.get("/api/v2/receipts").json()
+
+        self.assertFalse(body["available"])
+        self.assertEqual(body["receipts"], [])
+        self.assertEqual(body["count"], 0)
+
+    def test_it_separates_no_mod_attached_from_a_rejected_command(self):
+        """"模组没连上"与"连上了但命令被拒"是两回事，面板靠这个字段分。"""
+        server.orchestrator = _FakeOrchestrator(_FakeSession(_command_receipts=[]))
+        stored = server.wire
+        self.addCleanup(setattr, server, "wire", stored)
+
+        server.wire = None
+        self.assertFalse(self.client.get("/api/v2/receipts").json()["body_connected"])
+
+        class _FakeWire:
+            connected = True
+
+        server.wire = _FakeWire()
+        self.assertTrue(self.client.get("/api/v2/receipts").json()["body_connected"])
+
+
 if __name__ == "__main__":
     unittest.main()

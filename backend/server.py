@@ -523,6 +523,17 @@ async def get_overlay_stage_page():
     return _static_html("stage.html", "<h1>Overlay</h1>")
 
 
+@app.get("/manual", response_class=HTMLResponse)
+async def manual_page():
+    """手动面板：按**注册表**列工具、手填参数、直接发到模组，并看模组回执。
+
+    这是用户要的调试入口（"直接发工具调用、覆盖大模型"）：工具清单与参数 schema 全部来自
+    `GET /api/tools`，发送走既有的 `POST /api/sdk/command`，回执读既有的 `Session` 台账
+    （`GET /api/v2/receipts`）—— **不新增第二条真源**。
+    """
+    return _static_html("manual.html", "<h1>Manual</h1>")
+
+
 @app.get("/overlay/editor", response_class=HTMLResponse)
 async def get_overlay_editor_page():
     """可视化布局编辑器（拖组件、调缩放/透明度，存 `/api/overlay/layout`）。"""
@@ -1253,6 +1264,28 @@ async def get_tools_catalog():
     return {"tools": rows, "count": len(rows),
             "job_count": sum(1 for row in rows if row["job"]),
             "source": "agent/tool_registry.TOOL_SPECS"}
+
+
+# 命令回执台账的**只读**出口（给 `/manual` 手动面板用）。口径三条：
+#   ① **单一事实来源**：读的就是 `Session._command_receipts` —— 命令名由 wire 在唯一发号点
+#      登记、成败与原因由 Session 在唯一回执行登记，这里**不另记一份**；
+#   ② **进程内**：不落盘、后端重启即清空 —— 前端照实显示，不许假装有台账；
+#   ③ **照抄模组原话**：`detail` 就是模组给的原因，模组没给就空着（前端写"模组没给原因"）。
+RECEIPTS_NOTE = ("仅展示**进程内**最近 12 条命令回执：不落盘、后端重启即清空。"
+                 "「发出去了」≠「做成了」—— 成败与原因照抄模组原话。")
+
+
+@app.get("/api/v2/receipts")
+async def get_command_receipts():
+    """命令回执（只读，最新在前）：手动发命令后面板靠它看"到底成没成、为什么没成"。"""
+    session = getattr(orchestrator, "session", None) if orchestrator else None
+    rows = getattr(session, "_command_receipts", None) if session is not None else None
+    items = [dict(row) for row in rows] if isinstance(rows, list) else []
+    return {"receipts": list(reversed(items)), "count": len(items),
+            "available": session is not None,
+            # 「模组没连上」和「连上了但命令被拒」是两回事：面板的状态灯靠这个分。
+            "body_connected": bool(wire is not None and getattr(wire, "connected", False)),
+            "note": RECEIPTS_NOTE}
 
 
 @app.get("/api/composites")

@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>手动面板 · 直接发工具调用</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#0d1117;--surface:#161b22;--line:#30363d;--fg:#c9d1d9;--muted:#8b949e;--accent:#58a6ff;
+  --ok:#3fb950;--bad:#f85149;--warn:#d29922}
+html,body{height:100%}
+body{font-family:'Segoe UI','PingFang SC','Microsoft YaHei',system-ui,sans-serif;background:var(--bg);
+  color:var(--fg);display:flex;flex-direction:column;overflow:hidden}
+.topbar{display:flex;align-items:center;gap:12px;padding:10px 16px;background:var(--surface);
+  border-bottom:1px solid var(--line);flex-shrink:0}
+.topbar .title{font-size:15px;font-weight:700;color:var(--accent)}
+.topbar .title span{color:var(--muted);font-weight:400;font-size:12px}
+.topbar .spacer{flex:1}
+.status{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px}
+.status.online{background:rgba(63,185,80,.15);color:var(--ok)}
+.status.offline{background:rgba(139,148,158,.15);color:var(--muted)}
+.btn{background:#21262d;color:var(--fg);border:1px solid var(--line);border-radius:4px;
+  padding:6px 12px;font-size:12px;cursor:pointer}
+.btn:hover{background:#30363d}
+.btn.primary{background:#1f6feb;color:#fff;border-color:#1f6feb}
+.btn.primary:hover{background:#388bfd}
+.btn:disabled{opacity:.5;cursor:default}
+.layout{flex:1;display:grid;grid-template-columns:minmax(240px,.72fr) minmax(360px,1.28fr);min-height:0}
+.tools{border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
+.tools .search{padding:8px;border-bottom:1px solid var(--line)}
+.tools input[type=search]{width:100%;background:var(--bg);border:1px solid var(--line);border-radius:4px;
+  padding:6px 8px;color:var(--fg);font-size:12px;font-family:inherit}
+.tools input[type=search]:focus{border-color:var(--accent);outline:none}
+.tool-list{flex:1;overflow-y:auto}
+.tool{width:100%;display:block;text-align:left;background:transparent;color:var(--fg);border:0;
+  border-bottom:1px solid #21262d;padding:7px 12px;cursor:pointer}
+.tool:hover,.tool.active{background:#21262d}
+.tool .nm{font-size:13px;font-weight:600}
+.tool .args{font-size:11px;color:var(--muted);margin-top:2px;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap}
+.tier{font-size:10px;border-radius:3px;padding:1px 5px;border:1px solid var(--line);color:var(--muted)}
+.tier.master{color:var(--warn);border-color:var(--warn)}
+.tier.friend{color:var(--accent);border-color:var(--accent)}
+.pane{display:flex;flex-direction:column;min-width:0;min-height:0}
+.form-head{padding:10px 14px;border-bottom:1px solid var(--line);background:var(--surface);flex-shrink:0}
+.form-head .nm{font-size:14px;font-weight:700}
+.form-head .hint{font-size:11px;color:var(--muted);margin-top:4px;line-height:1.5}
+.form-body{flex:1;overflow-y:auto;padding:12px 14px;min-height:0}
+.field{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+.field label{width:120px;font-size:12px;color:var(--muted);flex:0 0 120px;overflow:hidden;
+  text-overflow:ellipsis}
+.field input,.field select,.field textarea{flex:1;background:var(--bg);border:1px solid var(--line);
+  border-radius:4px;padding:6px 8px;color:var(--fg);font-size:12px;font-family:inherit}
+.field input:focus,.field select:focus,.field textarea:focus{border-color:var(--accent);outline:none}
+.field textarea{min-height:64px;resize:vertical;font-family:ui-monospace,Consolas,monospace}
+.req{color:var(--bad)}
+.actions{display:flex;gap:8px;align-items:center;margin-top:12px}
+.send-out{margin-top:10px;font-size:12px;font-family:ui-monospace,Consolas,monospace;
+  white-space:pre-wrap;word-break:break-word;padding:8px 10px;border-radius:4px;background:#161b22;
+  border:1px solid var(--line);min-height:34px}
+.send-out.ok{border-color:var(--ok)}
+.send-out.bad{border-color:var(--bad)}
+.receipts{border-top:1px solid var(--line);background:var(--surface);flex-shrink:0;max-height:38%;
+  display:flex;flex-direction:column;min-height:0}
+.receipts .rh{display:flex;align-items:center;gap:10px;padding:8px 14px;border-bottom:1px solid var(--line)}
+.receipts .rh .t{font-size:12px;font-weight:700}
+.receipts .rh .note{font-size:11px;color:var(--muted);flex:1;line-height:1.4}
+.rbody{overflow-y:auto;min-height:0}
+.rrow{display:grid;grid-template-columns:150px 84px 62px 1fr;gap:8px;padding:6px 14px;
+  border-bottom:1px solid #21262d;font-size:12px}
+.rrow .cm{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rrow .id,.rrow .ts{color:var(--muted);font-size:11px}
+.rrow .ok{color:var(--ok)}
+.rrow .bad{color:var(--bad)}
+.rrow .detail{word-break:break-word}
+.empty{padding:16px 14px;color:var(--muted);font-size:12px}
+</style>
+<script>
+/* 可见性门（与其它页面同一口径）：页面隐藏 ⇒ 停掉轮询、不碰 DOM；切回前台立刻补刷一次。 */
+(function () {
+  window.__lcuGate = {visible: !document.hidden, onChange: []};
+  document.addEventListener('visibilitychange', function () {
+    window.__lcuGate.visible = !document.hidden;
+    window.__lcuGate.onChange.forEach(function (fn) { try { fn(); } catch (e) {} });
+  });
+})();
+</script>
+</head>
+<body>
+<div class="topbar">
+  <div class="title">手动面板 <span>按注册表发工具调用 · 覆盖大模型 · 看模组回执</span></div>
+  <div class="spacer"></div>
+  <span id="conn" class="status offline">模组未连接</span>
+</div>
+<div class="layout">
+  <div class="tools">
+    <div class="search"><input id="q" type="search" placeholder="搜工具名 / 描述（共 0 个）"></div>
+    <div id="list" class="tool-list"><div class="empty">加载工具目录…</div></div>
+  </div>
+  <div class="pane">
+    <div class="form-head">
+      <div id="selnm" class="nm">未选择工具</div>
+      <div id="seldesc" class="hint">左边选一个工具，填参数，直接发。</div>
+    </div>
+    <div id="form" class="form-body"><div class="empty">参数表单会出现在这里。</div></div>
+    <div class="form-head">
+      <div class="actions">
+        <button id="send" class="btn primary" disabled>发送到模组</button>
+        <button id="jsonmode" class="btn">切换 JSON 模式</button>
+        <span id="perm" class="hint"></span>
+      </div>
+      <div id="out" class="send-out">（还没发过）</div>
+    </div>
+    <div class="receipts">
+      <div class="rh">
+        <span class="t">模组回执</span>
+        <span id="rnote" class="note"></span>
+        <button id="refresh" class="btn">刷新</button>
+      </div>
+      <div id="rbody" class="rbody"><div class="empty">暂无回执</div></div>
+    </div>
+  </div>
+</div>
+<script>
+var GATE = window.__lcuGate, TOOLS = [], CUR = null, JSONMODE = false, TIMER = null;
+
+function el(id) { return document.getElementById(id); }
+function txt(node, value) { node.textContent = value == null ? '' : String(value); }
+
+/* ── 工具目录：**单一事实来源**＝注册表（/api/tools），页面不写死任何工具名 ── */
+function loadTools() {
+  return fetch('/api/tools').then(function (r) { return r.json(); }).then(function (body) {
+    TOOLS = (body && body.tools) || [];
+    el('q').placeholder = '搜工具名 / 描述（共 ' + TOOLS.length + ' 个）';
+    renderList();
+  }).catch(function (e) {
+    el('list').innerHTML = '';
+    var d = document.createElement('div');
+    d.className = 'empty';
+    txt(d, '工具目录读不到：' + e);
+    el('list').appendChild(d);
+  });
+}
+
+function renderList() {
+  var q = (el('q').value || '').trim().toLowerCase();
+  var box = el('list');
+  box.textContent = '';
+  var shown = 0;
+  TOOLS.forEach(function (t) {
+    var hay = (t.name + ' ' + (t.description || '') + ' ' + (t.args || '')).toLowerCase();
+    if (q && hay.indexOf(q) < 0) return;
+    shown++;
+    var btn = document.createElement('button');
+    btn.className = 'tool' + (CUR && CUR.name === t.name ? ' active' : '');
+    var nm = document.createElement('div'); nm.className = 'nm';
+    txt(nm, t.name);
+    var tier = String((t.permission && t.permission.tier) || '');
+    if (tier) {
+      var b = document.createElement('span'); b.className = 'tier ' + tier; txt(b, ' ' + tier + ' ');
+      nm.appendChild(b);
+    }
+    var args = document.createElement('div'); args.className = 'args';
+    txt(args, t.args ? '参数：' + t.args : '无参数');
+    btn.appendChild(nm); btn.appendChild(args);
+    btn.addEventListener('click', function () { select(t); });
+    box.appendChild(btn);
+  });
+  if (!shown) {
+    var d = document.createElement('div');
+    d.className = 'empty';
+    txt(d, q ? '没有匹配的工具' : '目录是空的');
+    box.appendChild(d);
+  }
+}
+
+/* ── 参数表单：**从注册表的 JSON schema 生成**（类型/必填都照它，不自己编）── */
+function select(t) {
+  CUR = t; JSONMODE = false;
+  renderList();
+  txt(el('selnm'), t.name);
+  txt(el('seldesc'), (t.description || '') + (t.job ? '  [job]' : ''));
+  var gates = Object.keys((t.permission && t.permission.gates) || {}).filter(function (k) {
+    var v = t.permission.gates[k];
+    return v && v !== 'none' && v !== false && v !== '';
+  });
+  txt(el('perm'), gates.length ? '门：' + gates.join(' / ') : '无额外门');
+  el('send').disabled = false;
+  renderForm(t);
+}
+
+function props(t) {
+  var p = (t.parameters && t.parameters.properties) || {};
+  return p;
+}
+
+function renderForm(t) {
+  var box = el('form');
+  box.textContent = '';
+  if (JSONMODE) {
+    var ta = document.createElement('textarea');
+    ta.id = 'raw';
+    ta.spellcheck = false;
+    txt(ta, '{}');
+    var w = document.createElement('div'); w.className = 'field';
+    var lb = document.createElement('label'); txt(lb, 'args (JSON)');
+    w.appendChild(lb); w.appendChild(ta);
+    box.appendChild(w);
+    var hint = document.createElement('div'); hint.className = 'hint';
+    txt(hint, '这里的 JSON 直接当 args 发；写错会在发送时如实报错。');
+    box.appendChild(hint);
+    return;
+  }
+  var required = (t.parameters && t.parameters.required) || [];
+  var p = props(t);
+  var names = Object.keys(p);
+  if (!names.length) {
+    var d = document.createElement('div'); d.className = 'empty';
+    txt(d, '这个工具没有参数，直接点「发送到模组」。');
+    box.appendChild(d);
+    return;
+  }
+  names.forEach(function (name) {
+    var spec = p[name] || {};
+    var w = document.createElement('div'); w.className = 'field';
+    var lb = document.createElement('label');
+    txt(lb, name + (required.indexOf(name) >= 0 ? ' *' : ''));
+    if (required.indexOf(name) >= 0) lb.className = 'req';
+    w.appendChild(lb);
+    var type = String(spec.type || 'string');
+    if (type === 'boolean') {
+      var sel = document.createElement('select');
+      ['', 'true', 'false'].forEach(function (v) {
+        var o = document.createElement('option'); o.value = v; txt(o, v || '（不传）'); sel.appendChild(o);
+      });
+      sel.id = 'f_' + name; w.appendChild(sel);
+    } else if (type === 'integer' || type === 'number') {
+      var num = document.createElement('input');
+      num.type = 'number'; num.step = type === 'integer' ? '1' : 'any';
+      num.id = 'f_' + name; w.appendChild(num);
+    } else {
+      var tx = document.createElement('input');
+      tx.type = 'text'; tx.id = 'f_' + name;
+      if (spec.description) tx.placeholder = String(spec.description);
+      w.appendChild(tx);
+    }
+    box.appendChild(w);
+  });
+}
+
+function collect() {
+  if (JSONMODE) {
+    var raw = el('raw');
+    var text = raw ? String(raw.value || '').trim() : '';
+    var parsed = text ? JSON.parse(text) : {};
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('args 必须是 JSON 对象');
+    }
+    return parsed;
+  }
+  var out = {};
+  var p = props(CUR);
+  Object.keys(p).forEach(function (name) {
+    var node = el('f_' + name);
+    if (!node) return;
+    var v = String(node.value == null ? '' : node.value).trim();
+    if (v === '') return;
+    var type = String((p[name] || {}).type || 'string');
+    if (type === 'boolean') out[name] = v === 'true';
+    else if (type === 'integer') out[name] = Math.trunc(Number(v));
+    else if (type === 'number') out[name] = Number(v);
+    else out[name] = v;
+  });
+  return out;
+}
+
+function show(ok, text) {
+  var o = el('out');
+  o.className = 'send-out ' + (ok ? 'ok' : 'bad');
+  txt(o, text);
+}
+
+function send() {
+  if (!CUR) return;
+  var args;
+  try { args = collect(); } catch (e) { show(false, '参数不合法：' + e.message); return; }
+  var body = {command: CUR.name, args: args};
+  show(true, '发送中：' + JSON.stringify(body));
+  fetch('/api/sdk/command', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
+  }).then(function (r) {
+    return r.json().then(function (data) { return {status: r.status, data: data}; });
+  }).then(function (res) {
+    if (res.status >= 200 && res.status < 300) {
+      show(true, '已发出：request_id = ' + (res.data && res.data.request_id) + '\n' + JSON.stringify(res.data));
+      setTimeout(loadReceipts, 1200);
+    } else {
+      show(false, '被后端拒绝（HTTP ' + res.status + '）：' + JSON.stringify(res.data));
+    }
+  }).catch(function (e) { show(false, '发送失败：' + e); });
+}
+
+/* ── 回执：只读出口 /api/v2/receipts（进程内、最新在前、"发出去了≠做成了"）── */
+function loadReceipts() {
+  return fetch('/api/v2/receipts').then(function (r) { return r.json(); }).then(function (body) {
+    txt(el('rnote'), body.note || '');
+    var live = !!body.body_connected;
+    el('conn').className = 'status ' + (live ? 'online' : 'offline');
+    txt(el('conn'), live ? '模组已连接' : '模组未连接');
+    var box = el('rbody');
+    box.textContent = '';
+    var rows = (body && body.receipts) || [];
+    if (!rows.length) {
+      var d = document.createElement('div'); d.className = 'empty';
+      txt(d, body.available ? '还没有回执 —— 发一条命令试试。' : '后端还没起会话，暂无回执。');
+      box.appendChild(d);
+      return;
+    }
+    rows.forEach(function (row) {
+      var line = document.createElement('div'); line.className = 'rrow';
+      var c = document.createElement('div'); c.className = 'cm'; txt(c, row.command || '（未登记）');
+      var i = document.createElement('div'); i.className = 'id'; txt(i, row.id || '');
+      var s = document.createElement('div'); s.className = row.success ? 'ok' : 'bad';
+      txt(s, row.success ? '成功' : '失败');
+      var dt = document.createElement('div'); dt.className = 'detail';
+      txt(dt, row.detail ? String(row.detail) : '（模组没给原因）');
+      line.appendChild(c); line.appendChild(i); line.appendChild(s); line.appendChild(dt);
+      box.appendChild(line);
+    });
+  }).catch(function (e) {
+    txt(el('rnote'), '回执读不到：' + e);
+  });
+}
+
+function tick() { if (GATE.visible && !document.hidden) loadReceipts(); }
+
+el('q').addEventListener('input', renderList);
+el('send').addEventListener('click', send);
+el('refresh').addEventListener('click', loadReceipts);
+el('jsonmode').addEventListener('click', function () {
+  if (!CUR) return;
+  JSONMODE = !JSONMODE;
+  renderForm(CUR);
+});
+GATE.onChange.push(function () { if (GATE.visible) loadReceipts(); });
+loadTools().then(loadReceipts);
+TIMER = setInterval(tick, 1500);
+</script>
+</body>
+</html>
